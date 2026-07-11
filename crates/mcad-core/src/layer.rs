@@ -17,7 +17,9 @@ pub struct Layer {
     pub color: Rgb,
     /// 表示するか。`false` なら描画・ヒットテスト対象から外す想定。
     pub visible: bool,
-    /// ロックされているか。`true` なら編集不可にする想定（強制は上位層で行う）。
+    /// ロックされているか。`true` のレイヤー上のエンティティは追加・変更・削除が
+    /// できない。この禁止は [`crate::Document`] が [`crate::Command`] 適用時に
+    /// [`crate::CoreError::LayerLocked`] として強制する。
     pub locked: bool,
 }
 

@@ -64,6 +64,24 @@ enum Applied {
     Batch(Vec<Applied>),
 }
 
+impl Applied {
+    /// この記録が実質的に「操作なし」か（状態を一切変えていないか）を再帰的に判定する。
+    ///
+    /// 空の [`Applied::Batch`]、およびサブがすべて no-op の `Batch`（ネストした空バッチ）
+    /// のみ `true` を返す。それ以外の記録はすべて何らかの状態変化を伴うので `false`。
+    ///
+    /// [`Document::apply`] はこれを使い、実質 no-op な記録を undo 履歴へ積まないようにする。
+    /// トップレベルの空バッチだけでなく `Batch(vec![Batch(vec![])])` のような
+    /// ネストした空バッチも正しく「操作なし」と判定できる（[`Command::Batch`] の doc 参照）。
+    fn is_noop(&self) -> bool {
+        match self {
+            // 空 Batch では `all` は true を返すため、空/全 no-op の両方を同時に捉える。
+            Applied::Batch(subs) => subs.iter().all(Applied::is_noop),
+            _ => false,
+        }
+    }
+}
+
 /// [`Document::apply`] が新規発行した ID の一覧。
 ///
 /// `AddEntity`/`AddLayer`（単体、および [`Command::Batch`] にネストされたもの）が
@@ -76,27 +94,6 @@ pub struct NewIds {
     pub entities: Vec<EntityId>,
     /// 新規発行されたレイヤー ID（適用順）。
     pub layers: Vec<LayerId>,
-}
-
-impl NewIds {
-    /// [`Applied`] を辿り、新規発行された ID を適用順で `self` へ集約する。
-    /// `Batch` は再帰的に辿る。
-    fn collect_from(&mut self, applied: &Applied) {
-        match applied {
-            Applied::AddEntity { id, .. } => self.entities.push(*id),
-            Applied::AddLayer { id, .. } => self.layers.push(*id),
-            Applied::Batch(subs) => {
-                for sub in subs {
-                    self.collect_from(sub);
-                }
-            }
-            Applied::RemoveEntity { .. }
-            | Applied::ModifyEntity { .. }
-            | Applied::RemoveLayer { .. }
-            | Applied::SetLayerProps { .. }
-            | Applied::SetCurrentLayer { .. } => {}
-        }
-    }
 }
 
 /// CAD ドキュメント。エンティティ・レイヤー・カレントレイヤーと undo/redo 履歴を保持する。
@@ -217,18 +214,20 @@ impl Document {
     /// 存在しない ID への操作、デフォルト/カレント/非空レイヤーの削除、
     /// ロックされたレイヤー上のエンティティへの変更・削除などで [`CoreError`] を返す。
     pub fn apply(&mut self, cmd: Command) -> Result<NewIds, CoreError> {
-        // 空バッチは「操作なし」として扱う: 状態も履歴も一切変えず Ok(()) を返す。
+        // 原子性（検証→変更、失敗時のロールバック）の保証内容は [`Command::Batch`] の
+        // doc（「# 原子性」節）を参照。
+        // 新規発行 ID は execute が変更を起こすのと同時に new_ids へ直接集めるので、
+        // 成功後に別ツリーを走査し直す必要はない。
+        let mut new_ids = NewIds::default();
+        let applied = self.execute(cmd, &mut new_ids)?;
+        // 実質 no-op（空バッチ・ネストした空バッチ）は状態も履歴も一切変えない。
         // undo できる実体がない記録を undo スタックへ積むと、Ctrl+Z 1 回が
         // 見かけ上「何も戻らない」空振りになりユーザー体験を損なうため、
-        // 履歴にも redo スタックにも触れない（redo は保持したままにする）。
-        if matches!(&cmd, Command::Batch(subs) if subs.is_empty()) {
+        // undo/redo スタックのどちらにも触れない（redo は保持したままにする）。
+        // ここで判定することで、トップレベルだけでなくネストした空バッチも正しく弾ける。
+        if applied.is_noop() {
             return Ok(NewIds::default());
         }
-        // execute は「検証 → 変更」の順で行い、検証に失敗した場合は一切変更しない。
-        // バッチもこの保証を境界全体で満たす（途中失敗時は適用済み分を巻き戻す）。
-        let applied = self.execute(cmd)?;
-        let mut new_ids = NewIds::default();
-        new_ids.collect_from(&applied);
         self.undo_stack.push(applied);
         self.redo_stack.clear();
         Ok(new_ids)
@@ -261,23 +260,28 @@ impl Document {
     // ---- 内部ヘルパ ----
 
     /// コマンドを検証・実行し、逆操作記録を返す。検証失敗時は状態不変。
-    fn execute(&mut self, cmd: Command) -> Result<Applied, CoreError> {
+    ///
+    /// 実行中に新規発行した `EntityId`/`LayerId` は `new_ids` へ適用順で push する
+    /// （`Batch` は同じアキュムレータを再帰的に共有する）。エラー時に `new_ids` は
+    /// 途中まで書き込まれうるが、[`Document::apply`] は失敗経路で `new_ids` を返さない。
+    fn execute(&mut self, cmd: Command, new_ids: &mut NewIds) -> Result<Applied, CoreError> {
         match cmd {
             Command::AddEntity(entity) => {
-                // 宙に浮いた layer 参照を防ぐため、所属レイヤーの存在を検証する。
+                // 宙に浮いた layer 参照を防ぐため所属レイヤーの存在を検証し、
+                // ロック済みレイヤーへの追加も Modify/Remove と対称に拒否する。
                 self.require_layer(entity.layer)?;
+                self.ensure_layer_unlocked(entity.layer)?;
                 let id = self.entities.insert(Some(entity.clone()));
+                new_ids.entities.push(id);
                 Ok(Applied::AddEntity { id, entity })
             }
             Command::RemoveEntity(id) => {
-                self.require_entity(id)?;
-                self.require_entity_layer_unlocked(id)?;
+                self.require_editable_entity(id)?;
                 let entity = self.take_entity(id);
                 Ok(Applied::RemoveEntity { id, entity })
             }
             Command::ModifyEntity { id, new_geom } => {
-                self.require_entity(id)?;
-                self.require_entity_layer_unlocked(id)?;
+                self.require_editable_entity(id)?;
                 let slot = self.live_entity_mut(id);
                 let before = std::mem::replace(&mut slot.geom, new_geom.clone());
                 Ok(Applied::ModifyEntity {
@@ -288,6 +292,7 @@ impl Document {
             }
             Command::AddLayer(layer) => {
                 let id = self.layers.insert(Some(layer.clone()));
+                new_ids.layers.push(id);
                 Ok(Applied::AddLayer { id, layer })
             }
             Command::RemoveLayer(id) => {
@@ -327,7 +332,7 @@ impl Document {
             Command::Batch(subs) => {
                 let mut applied: Vec<Applied> = Vec::with_capacity(subs.len());
                 for sub in subs {
-                    match self.execute(sub) {
+                    match self.execute(sub, new_ids) {
                         Ok(a) => applied.push(a),
                         Err(err) => {
                             // 原子性: これまでに適用したサブコマンドを逆順で巻き戻し、
@@ -383,14 +388,6 @@ impl Document {
         }
     }
 
-    fn require_entity(&self, id: EntityId) -> Result<(), CoreError> {
-        if self.entity(id).is_some() {
-            Ok(())
-        } else {
-            Err(CoreError::EntityNotFound(id))
-        }
-    }
-
     fn require_layer(&self, id: LayerId) -> Result<(), CoreError> {
         if self.layer(id).is_some() {
             Ok(())
@@ -399,21 +396,29 @@ impl Document {
         }
     }
 
-    /// 指定エンティティ（生存を前提とする。呼び出し前に `require_entity` 済みであること）が
-    /// 所属するレイヤーがロックされていないか検証する。ロックされていれば
-    /// [`CoreError::LayerLocked`] を返す（`Layer::locked` の doc comment 通り、変更・削除を
-    /// 一元的に禁止する）。
+    /// 指定レイヤーがロックされていれば [`CoreError::LayerLocked`] を返す。
     ///
-    /// 所属レイヤーが（不変条件違反で）存在しない場合はここでは扱わず `Ok(())` とする。
-    fn require_entity_layer_unlocked(&self, id: EntityId) -> Result<(), CoreError> {
-        let layer_id = self
-            .entity(id)
-            .expect("entity must be live (checked by require_entity)")
-            .layer;
-        match self.layer(layer_id) {
-            Some(layer) if layer.locked => Err(CoreError::LayerLocked(layer_id)),
+    /// 編集可否（ロック）の判定を担う唯一の場所であり、`AddEntity`・`RemoveEntity`・
+    /// `ModifyEntity` はすべてこの規則を（[`Document::require_editable_entity`] 経由を含め）
+    /// 必ず通す。判定を一元化することで、レイヤーごとのロック挙動の食い違いや、将来の
+    /// コマンド追加時のチェック漏れを構造的に防ぐ。
+    ///
+    /// 対象レイヤーが（不変条件違反で）存在しない場合はここでは咎めず `Ok(())` とする。
+    fn ensure_layer_unlocked(&self, id: LayerId) -> Result<(), CoreError> {
+        match self.layer(id) {
+            Some(layer) if layer.locked => Err(CoreError::LayerLocked(id)),
             _ => Ok(()),
         }
+    }
+
+    /// エンティティが生存し、かつ所属レイヤーがロックされていないことを一度に検証する。
+    ///
+    /// 「存在確認」と「ロック確認」を 1 つにまとめ、エンティティスロットの参照を 1 回に抑える
+    /// （従来は `require_entity` と `require_entity_layer_unlocked` が各々ルックアップしていた）。
+    /// `RemoveEntity`/`ModifyEntity` がこれを共有し、ロック規則を必ず通す。
+    fn require_editable_entity(&self, id: EntityId) -> Result<(), CoreError> {
+        let layer_id = self.entity(id).ok_or(CoreError::EntityNotFound(id))?.layer;
+        self.ensure_layer_unlocked(layer_id)
     }
 
     /// 生存エンティティを取り出してスロットを墓標化する。生存を前提とする。
@@ -498,14 +503,25 @@ mod tests {
         id
     }
 
+    /// [`NewIds`] の一方のフィールド（`one`）にちょうど 1 件だけ入っており、もう一方
+    /// （`other`）が空であることを検証したうえで、その 1 件を返す。`add_entity_get_id`/
+    /// `add_layer_get_id` はどちらも「新規追加コマンドを 1 件適用し、`NewIds` から
+    /// 新規発行された ID を 1 つだけ取り出す」という同じ形なので、この共通処理へまとめる。
+    fn assert_single_new_id<T: Copy, U>(one: &[T], other: &[U]) -> T {
+        assert_eq!(one.len(), 1, "expected exactly one new id");
+        assert!(
+            other.is_empty(),
+            "expected the other NewIds field to stay empty"
+        );
+        one[0]
+    }
+
     /// [`Command::AddEntity`] を適用し、`apply` の戻り値 [`NewIds`] から新規発行された
     /// エンティティ ID を直接取り出す。以前は適用前後の集合差分を取るハックで代用していたが、
     /// `apply` が `NewIds` を返すようになったため不要になった。
     fn add_entity_get_id(doc: &mut Document, entity: Entity) -> EntityId {
         let new_ids = doc.apply(Command::AddEntity(entity)).unwrap();
-        assert_eq!(new_ids.entities.len(), 1, "expected exactly one new entity");
-        assert!(new_ids.layers.is_empty());
-        new_ids.entities[0]
+        assert_single_new_id(&new_ids.entities, &new_ids.layers)
     }
 
     #[test]
@@ -764,9 +780,11 @@ mod tests {
         assert_eq!(doc.entity_count(), 0);
     }
 
-    /// 全 ID を安定順（挿入順）で列挙する。バッチで複数追加した要素を特定するのに使う。
+    /// 生存エンティティの ID を安定順（挿入順）で列挙する。バッチで複数追加した要素を
+    /// 特定するのに使う。公開の [`Document::entities`] 経由なので、墓標（削除済み）
+    /// スロットが混入することはない。
     fn entity_ids(doc: &Document) -> Vec<EntityId> {
-        doc.entities.iter().map(|(k, _)| k).collect()
+        doc.entities().map(|(k, _)| k).collect()
     }
 
     #[test]
@@ -890,6 +908,44 @@ mod tests {
     }
 
     #[test]
+    fn nested_empty_batch_is_noop() {
+        // 回帰: ネストした空バッチ（サブ数は 0 でない）が履歴を汚さないこと。
+        // 以前はトップレベルの空バッチしか特判しておらず、Batch([Batch([])]) は
+        // execute を通って undo_stack に積まれ、can_undo が偽陽性になっていた。
+        let mut doc = Document::new();
+        let cmd = add_line(&doc, line(0.0));
+        doc.apply(cmd).unwrap();
+
+        let can_undo_before = doc.can_undo();
+        let undo_len_before = doc.undo_stack.len();
+        let redo_len_before = doc.redo_stack.len();
+
+        // 1 段ネストした空バッチ。
+        assert_eq!(
+            doc.apply(Command::Batch(vec![Command::Batch(vec![])])),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.can_undo(), can_undo_before);
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.redo_stack.len(), redo_len_before);
+
+        // さらに深くネストした空バッチも同様に no-op。
+        assert_eq!(
+            doc.apply(Command::Batch(vec![Command::Batch(vec![Command::Batch(
+                vec![]
+            )])])),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.can_undo(), can_undo_before);
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.redo_stack.len(), redo_len_before);
+
+        // 直近の実操作（エンティティ追加）は依然として undo できる。
+        assert!(doc.undo());
+        assert_eq!(doc.entity_count(), 0);
+    }
+
+    #[test]
     fn batch_and_single_commands_interleave_consistently() {
         let mut doc = Document::new();
         let layer = doc.current_layer();
@@ -941,9 +997,7 @@ mod tests {
         let new_ids = doc
             .apply(Command::AddLayer(Layer::new(name, Rgb::WHITE)))
             .unwrap();
-        assert_eq!(new_ids.layers.len(), 1, "expected exactly one new layer");
-        assert!(new_ids.entities.is_empty());
-        new_ids.layers[0]
+        assert_single_new_id(&new_ids.layers, &new_ids.entities)
     }
 
     #[test]
@@ -978,6 +1032,34 @@ mod tests {
         );
         assert_eq!(doc.entity_count(), 1);
         assert!(doc.entity(id).is_some());
+    }
+
+    #[test]
+    fn locked_layer_blocks_add_entity() {
+        // ロック済みレイヤーへの新規追加は、Modify/Remove と対称に拒否される。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+
+        let mut locked = doc.layer(layer).unwrap().clone();
+        locked.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: layer,
+            props: locked,
+        })
+        .unwrap();
+
+        let can_undo_before = doc.can_undo();
+        assert_eq!(
+            doc.apply(Command::AddEntity(Entity::new(
+                line(0.0),
+                layer,
+                Style::inherited(),
+            ))),
+            Err(CoreError::LayerLocked(layer))
+        );
+        // 状態も履歴も変わらない。
+        assert_eq!(doc.entity_count(), 0);
+        assert_eq!(doc.can_undo(), can_undo_before);
     }
 
     #[test]

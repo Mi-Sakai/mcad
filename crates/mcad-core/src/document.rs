@@ -59,6 +59,44 @@ enum Applied {
         before: LayerId,
         after: LayerId,
     },
+    /// 複合コマンドの逆操作記録。サブコマンドの [`Applied`] を **適用順** に保持する。
+    /// undo は逆順・redo は正順に適用することで、バッチ全体が 1 単位で戻る/やり直せる。
+    Batch(Vec<Applied>),
+}
+
+/// [`Document::apply`] が新規発行した ID の一覧。
+///
+/// `AddEntity`/`AddLayer`（単体、および [`Command::Batch`] にネストされたもの）が
+/// 発行した新規キーを、呼び出し側が「集合差分を取る」ような自前のハックなしに
+/// 直接受け取れるようにするための型。含まれる ID は **適用順**。
+/// それ以外のコマンド（`ModifyEntity` など）は空の `NewIds` を返す。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewIds {
+    /// 新規発行されたエンティティ ID（適用順）。
+    pub entities: Vec<EntityId>,
+    /// 新規発行されたレイヤー ID（適用順）。
+    pub layers: Vec<LayerId>,
+}
+
+impl NewIds {
+    /// [`Applied`] を辿り、新規発行された ID を適用順で `self` へ集約する。
+    /// `Batch` は再帰的に辿る。
+    fn collect_from(&mut self, applied: &Applied) {
+        match applied {
+            Applied::AddEntity { id, .. } => self.entities.push(*id),
+            Applied::AddLayer { id, .. } => self.layers.push(*id),
+            Applied::Batch(subs) => {
+                for sub in subs {
+                    self.collect_from(sub);
+                }
+            }
+            Applied::RemoveEntity { .. }
+            | Applied::ModifyEntity { .. }
+            | Applied::RemoveLayer { .. }
+            | Applied::SetLayerProps { .. }
+            | Applied::SetCurrentLayer { .. } => {}
+        }
+    }
 }
 
 /// CAD ドキュメント。エンティティ・レイヤー・カレントレイヤーと undo/redo 履歴を保持する。
@@ -170,16 +208,30 @@ impl Document {
     /// 成功時は逆操作を undo 履歴へ積み、redo スタックをクリアする。
     /// 失敗時は [`CoreError`] を返し、**ドキュメントの状態は変更しない**。
     ///
+    /// 戻り値の [`NewIds`] には、このコマンド（`Batch` の場合はネストされた
+    /// サブコマンドを含む）が新規発行した `EntityId`/`LayerId` が適用順で入る。
+    /// `AddEntity`/`AddLayer` を含まないコマンドでは空になる。
+    ///
     /// # Errors
     ///
-    /// 存在しない ID への操作、デフォルト/カレント/非空レイヤーの削除などで
-    /// [`CoreError`] を返す。
-    pub fn apply(&mut self, cmd: Command) -> Result<(), CoreError> {
+    /// 存在しない ID への操作、デフォルト/カレント/非空レイヤーの削除、
+    /// ロックされたレイヤー上のエンティティへの変更・削除などで [`CoreError`] を返す。
+    pub fn apply(&mut self, cmd: Command) -> Result<NewIds, CoreError> {
+        // 空バッチは「操作なし」として扱う: 状態も履歴も一切変えず Ok(()) を返す。
+        // undo できる実体がない記録を undo スタックへ積むと、Ctrl+Z 1 回が
+        // 見かけ上「何も戻らない」空振りになりユーザー体験を損なうため、
+        // 履歴にも redo スタックにも触れない（redo は保持したままにする）。
+        if matches!(&cmd, Command::Batch(subs) if subs.is_empty()) {
+            return Ok(NewIds::default());
+        }
         // execute は「検証 → 変更」の順で行い、検証に失敗した場合は一切変更しない。
+        // バッチもこの保証を境界全体で満たす（途中失敗時は適用済み分を巻き戻す）。
         let applied = self.execute(cmd)?;
+        let mut new_ids = NewIds::default();
+        new_ids.collect_from(&applied);
         self.undo_stack.push(applied);
         self.redo_stack.clear();
-        Ok(())
+        Ok(new_ids)
     }
 
     /// 直近の操作を取り消す。取り消せた場合 `true`。
@@ -219,11 +271,13 @@ impl Document {
             }
             Command::RemoveEntity(id) => {
                 self.require_entity(id)?;
+                self.require_entity_layer_unlocked(id)?;
                 let entity = self.take_entity(id);
                 Ok(Applied::RemoveEntity { id, entity })
             }
             Command::ModifyEntity { id, new_geom } => {
                 self.require_entity(id)?;
+                self.require_entity_layer_unlocked(id)?;
                 let slot = self.live_entity_mut(id);
                 let before = std::mem::replace(&mut slot.geom, new_geom.clone());
                 Ok(Applied::ModifyEntity {
@@ -270,6 +324,24 @@ impl Document {
                 self.current_layer = id;
                 Ok(Applied::SetCurrentLayer { before, after: id })
             }
+            Command::Batch(subs) => {
+                let mut applied: Vec<Applied> = Vec::with_capacity(subs.len());
+                for sub in subs {
+                    match self.execute(sub) {
+                        Ok(a) => applied.push(a),
+                        Err(err) => {
+                            // 原子性: これまでに適用したサブコマンドを逆順で巻き戻し、
+                            // 呼び出し前の状態へ完全復帰させてからエラーを返す。
+                            // revert は undo と同じ経路なので部分適用は残らない。
+                            for done in applied.iter().rev() {
+                                self.revert(done);
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                Ok(Applied::Batch(applied))
+            }
         }
     }
 
@@ -283,6 +355,12 @@ impl Document {
             Applied::RemoveLayer { id, layer } => self.set_layer(*id, Some(layer.clone())),
             Applied::SetLayerProps { id, before, .. } => self.set_layer(*id, Some(before.clone())),
             Applied::SetCurrentLayer { before, .. } => self.current_layer = *before,
+            // バッチは逆順に各サブ逆操作を適用する（依存関係を正しく巻き戻すため）。
+            Applied::Batch(applied) => {
+                for a in applied.iter().rev() {
+                    self.revert(a);
+                }
+            }
         }
     }
 
@@ -296,6 +374,12 @@ impl Document {
             Applied::RemoveLayer { id, .. } => self.set_layer(*id, None),
             Applied::SetLayerProps { id, after, .. } => self.set_layer(*id, Some(after.clone())),
             Applied::SetCurrentLayer { after, .. } => self.current_layer = *after,
+            // バッチは正順に各サブ操作を再適用する（execute と同じ順序）。
+            Applied::Batch(applied) => {
+                for a in applied.iter() {
+                    self.reapply(a);
+                }
+            }
         }
     }
 
@@ -312,6 +396,23 @@ impl Document {
             Ok(())
         } else {
             Err(CoreError::LayerNotFound(id))
+        }
+    }
+
+    /// 指定エンティティ（生存を前提とする。呼び出し前に `require_entity` 済みであること）が
+    /// 所属するレイヤーがロックされていないか検証する。ロックされていれば
+    /// [`CoreError::LayerLocked`] を返す（`Layer::locked` の doc comment 通り、変更・削除を
+    /// 一元的に禁止する）。
+    ///
+    /// 所属レイヤーが（不変条件違反で）存在しない場合はここでは扱わず `Ok(())` とする。
+    fn require_entity_layer_unlocked(&self, id: EntityId) -> Result<(), CoreError> {
+        let layer_id = self
+            .entity(id)
+            .expect("entity must be live (checked by require_entity)")
+            .layer;
+        match self.layer(layer_id) {
+            Some(layer) if layer.locked => Err(CoreError::LayerLocked(layer_id)),
+            _ => Ok(()),
         }
     }
 
@@ -386,11 +487,25 @@ mod tests {
     }
 
     /// 直近に追加された（唯一の）エンティティの ID を取り出す。
+    ///
+    /// これは「新規発行 ID を知るには前後の集合差分を取るしかない」場合の
+    /// 汎用ヘルパではなく、undo/redo 後に「同一キーが復元されているか」を検証する
+    /// 用途に限定して使う（新規追加直後の ID 取得には [`add_entity_get_id`] を使う）。
     fn only_entity(doc: &Document) -> EntityId {
         let mut it = doc.entities();
         let (id, _) = it.next().expect("expected exactly one entity");
         assert!(it.next().is_none(), "expected exactly one entity");
         id
+    }
+
+    /// [`Command::AddEntity`] を適用し、`apply` の戻り値 [`NewIds`] から新規発行された
+    /// エンティティ ID を直接取り出す。以前は適用前後の集合差分を取るハックで代用していたが、
+    /// `apply` が `NewIds` を返すようになったため不要になった。
+    fn add_entity_get_id(doc: &mut Document, entity: Entity) -> EntityId {
+        let new_ids = doc.apply(Command::AddEntity(entity)).unwrap();
+        assert_eq!(new_ids.entities.len(), 1, "expected exactly one new entity");
+        assert!(new_ids.layers.is_empty());
+        new_ids.entities[0]
     }
 
     #[test]
@@ -427,8 +542,7 @@ mod tests {
             width: 2.5,
         };
         let original = Entity::new(line(3.0), layer, style);
-        doc.apply(Command::AddEntity(original.clone())).unwrap();
-        let id = only_entity(&doc);
+        let id = add_entity_get_id(&mut doc, original.clone());
 
         doc.apply(Command::RemoveEntity(id)).unwrap();
         assert_eq!(doc.entity_count(), 0);
@@ -446,13 +560,7 @@ mod tests {
     fn modify_entity_undo_redo_swaps_geometry() {
         let mut doc = Document::new();
         let layer = doc.current_layer();
-        doc.apply(Command::AddEntity(Entity::new(
-            line(0.0),
-            layer,
-            Style::inherited(),
-        )))
-        .unwrap();
-        let id = only_entity(&doc);
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
 
         doc.apply(Command::ModifyEntity {
             id,
@@ -631,13 +739,7 @@ mod tests {
         // 依存する Modify が正しく対象を見つけられる。
         let mut doc = Document::new();
         let layer = doc.current_layer();
-        doc.apply(Command::AddEntity(Entity::new(
-            line(0.0),
-            layer,
-            Style::inherited(),
-        )))
-        .unwrap();
-        let id = only_entity(&doc);
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
         doc.apply(Command::ModifyEntity {
             id,
             new_geom: line(9.0),
@@ -662,16 +764,329 @@ mod tests {
         assert_eq!(doc.entity_count(), 0);
     }
 
+    /// 全 ID を安定順（挿入順）で列挙する。バッチで複数追加した要素を特定するのに使う。
+    fn entity_ids(doc: &Document) -> Vec<EntityId> {
+        doc.entities.iter().map(|(k, _)| k).collect()
+    }
+
+    #[test]
+    fn batch_modify_undo_redo_moves_all_entities_as_one_unit() {
+        // 検収シナリオ: 矩形選択→複数移動→undo 1 回で全戻り→redo 1 回で全再移動。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        for x in [0.0, 1.0, 2.0] {
+            doc.apply(Command::AddEntity(Entity::new(
+                line(x),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        }
+        let ids = entity_ids(&doc);
+        assert_eq!(ids.len(), 3);
+
+        // 各エンティティを +10 相当の別幾何へまとめて移動するバッチ。
+        let batch = Command::Batch(
+            ids.iter()
+                .enumerate()
+                .map(|(i, &id)| Command::ModifyEntity {
+                    id,
+                    new_geom: line(10.0 + i as f64),
+                })
+                .collect(),
+        );
+        doc.apply(batch).unwrap();
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(doc.entity(id).unwrap().geom, line(10.0 + i as f64));
+        }
+
+        // undo 1 回で全エンティティが元に戻る。
+        assert!(doc.undo());
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(doc.entity(id).unwrap().geom, line(i as f64));
+        }
+        // バッチは 1 単位なので、もう戻す元操作はエンティティ追加の 3 件のみ。
+        assert!(doc.can_undo());
+
+        // redo 1 回で全エンティティが再び移動する。
+        assert!(doc.redo());
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(doc.entity(id).unwrap().geom, line(10.0 + i as f64));
+        }
+    }
+
+    #[test]
+    fn batch_add_undo_redo_is_single_unit() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let batch = Command::Batch(vec![
+            Command::AddEntity(Entity::new(line(0.0), layer, Style::inherited())),
+            Command::AddEntity(Entity::new(line(1.0), layer, Style::inherited())),
+            Command::AddEntity(Entity::new(line(2.0), layer, Style::inherited())),
+        ]);
+        doc.apply(batch).unwrap();
+        assert_eq!(doc.entity_count(), 3);
+
+        // undo 1 回で 3 件すべて消える。
+        assert!(doc.undo());
+        assert_eq!(doc.entity_count(), 0);
+        // 空ドキュメントに戻るので、これ以上 undo するものはない。
+        assert!(!doc.can_undo());
+
+        // redo 1 回で 3 件すべて復活する。
+        assert!(doc.redo());
+        assert_eq!(doc.entity_count(), 3);
+    }
+
+    #[test]
+    fn batch_is_atomic_on_sub_command_failure() {
+        // 2 番目のサブコマンドが失敗するバッチ。1 番目の効果も残ってはならない。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+        let ghost = EntityId::default();
+
+        let can_undo_before = doc.can_undo();
+        let batch = Command::Batch(vec![
+            // 1 番目は成功する変更。
+            Command::ModifyEntity {
+                id,
+                new_geom: line(7.0),
+            },
+            // 2 番目は存在しない ID なので失敗する。
+            Command::ModifyEntity {
+                id: ghost,
+                new_geom: line(8.0),
+            },
+        ]);
+        assert_eq!(doc.apply(batch), Err(CoreError::EntityNotFound(ghost)));
+
+        // 1 番目の変更も巻き戻り、幾何は完全に元通り。
+        assert_eq!(doc.entity(id).unwrap().geom, line(0.0));
+        // 失敗したバッチは履歴に積まれない（undo 可能性は変化しない）。
+        assert_eq!(doc.can_undo(), can_undo_before);
+        assert_eq!(doc.entity_count(), 1);
+    }
+
+    #[test]
+    fn empty_batch_is_noop() {
+        let mut doc = Document::new();
+        doc.apply(Command::AddEntity(Entity::new(
+            line(0.0),
+            doc.current_layer(),
+            Style::inherited(),
+        )))
+        .unwrap();
+        let can_undo_before = doc.can_undo();
+        let count_before = doc.entity_count();
+
+        // 空バッチは Ok(NewIds::default()) を返し、状態も undo 可能性も変えない。
+        assert_eq!(doc.apply(Command::Batch(vec![])), Ok(NewIds::default()));
+        assert_eq!(doc.can_undo(), can_undo_before);
+        assert_eq!(doc.entity_count(), count_before);
+        // 直近操作（エンティティ追加）を undo できる状態が保たれている。
+        assert!(doc.undo());
+        assert_eq!(doc.entity_count(), 0);
+    }
+
+    #[test]
+    fn batch_and_single_commands_interleave_consistently() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+
+        // 単一: A 追加
+        let a = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+
+        // バッチ: B, C 追加
+        doc.apply(Command::Batch(vec![
+            Command::AddEntity(Entity::new(line(1.0), layer, Style::inherited())),
+            Command::AddEntity(Entity::new(line(2.0), layer, Style::inherited())),
+        ]))
+        .unwrap();
+        assert_eq!(doc.entity_count(), 3);
+
+        // 単一: A を移動
+        doc.apply(Command::ModifyEntity {
+            id: a,
+            new_geom: line(5.0),
+        })
+        .unwrap();
+        assert_eq!(doc.entity(a).unwrap().geom, line(5.0));
+
+        // undo 3 回で完全に空へ戻る（単一・バッチ・単一の順で 1 単位ずつ）。
+        assert!(doc.undo()); // A 移動を取り消し
+        assert_eq!(doc.entity(a).unwrap().geom, line(0.0));
+        assert!(doc.undo()); // バッチ（B,C 追加）を取り消し
+        assert_eq!(doc.entity_count(), 1);
+        assert!(doc.undo()); // A 追加を取り消し
+        assert_eq!(doc.entity_count(), 0);
+        assert!(!doc.can_undo());
+
+        // redo 3 回で完全に再現する。
+        assert!(doc.redo()); // A 追加
+        assert!(doc.redo()); // バッチ
+        assert!(doc.redo()); // A 移動
+        assert_eq!(doc.entity_count(), 3);
+        assert_eq!(doc.entity(a).unwrap().geom, line(5.0));
+        assert!(!doc.can_redo());
+    }
+
     // --- テスト用ヘルパ ---
 
     /// レイヤーを 1 つ追加し、その ID を返す。
+    ///
+    /// 以前は適用前後の集合差分を取るハックで新規 ID を特定していたが、`apply` が
+    /// [`NewIds`] を返すようになったため、戻り値から直接取り出せばよい。
     fn add_layer_get_id(doc: &mut Document, name: &str) -> LayerId {
-        let before: std::collections::HashSet<LayerId> = doc.layers().map(|(k, _)| k).collect();
-        doc.apply(Command::AddLayer(Layer::new(name, Rgb::WHITE)))
+        let new_ids = doc
+            .apply(Command::AddLayer(Layer::new(name, Rgb::WHITE)))
             .unwrap();
-        doc.layers()
-            .map(|(k, _)| k)
-            .find(|k| !before.contains(k))
-            .expect("newly added layer")
+        assert_eq!(new_ids.layers.len(), 1, "expected exactly one new layer");
+        assert!(new_ids.entities.is_empty());
+        new_ids.layers[0]
+    }
+
+    #[test]
+    fn locked_layer_blocks_modify_and_remove() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+
+        // カレントレイヤーをロックする。
+        let mut locked = doc.layer(layer).unwrap().clone();
+        locked.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: layer,
+            props: locked,
+        })
+        .unwrap();
+
+        // ModifyEntity はロックされたレイヤーのエンティティに対して拒否される。
+        assert_eq!(
+            doc.apply(Command::ModifyEntity {
+                id,
+                new_geom: line(9.0),
+            }),
+            Err(CoreError::LayerLocked(layer))
+        );
+        assert_eq!(doc.entity(id).unwrap().geom, line(0.0));
+
+        // RemoveEntity も同様に拒否される。
+        assert_eq!(
+            doc.apply(Command::RemoveEntity(id)),
+            Err(CoreError::LayerLocked(layer))
+        );
+        assert_eq!(doc.entity_count(), 1);
+        assert!(doc.entity(id).is_some());
+    }
+
+    #[test]
+    fn locked_layer_in_batch_rolls_back_whole_batch() {
+        // ロックされていないレイヤーの b と、ロックされた別レイヤーの a を用意し、
+        // 「1 番目は成功するはずの変更・2 番目はロックで失敗する変更」を 1 バッチにする。
+        // バッチはアトミックなので、1 番目の効果も残らず完全に巻き戻るはず。
+        let mut doc = Document::new();
+        let default_layer = doc.current_layer();
+        let extra_layer = add_layer_get_id(&mut doc, "aux");
+
+        let b = add_entity_get_id(
+            &mut doc,
+            Entity::new(line(0.0), default_layer, Style::inherited()),
+        );
+        let a = add_entity_get_id(
+            &mut doc,
+            Entity::new(line(1.0), extra_layer, Style::inherited()),
+        );
+
+        let mut locked = doc.layer(extra_layer).unwrap().clone();
+        locked.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: extra_layer,
+            props: locked,
+        })
+        .unwrap();
+
+        let can_undo_before = doc.can_undo();
+        let batch = Command::Batch(vec![
+            // 1 番目: ロックされていない default_layer 上の b への変更（単体なら成功する）。
+            Command::ModifyEntity {
+                id: b,
+                new_geom: line(20.0),
+            },
+            // 2 番目: ロックされた extra_layer 上の a への変更（失敗する）。
+            Command::ModifyEntity {
+                id: a,
+                new_geom: line(30.0),
+            },
+        ]);
+        assert_eq!(doc.apply(batch), Err(CoreError::LayerLocked(extra_layer)));
+
+        // バッチ全体が巻き戻り、b の変更も残らない。
+        assert_eq!(doc.entity(b).unwrap().geom, line(0.0));
+        assert_eq!(doc.entity(a).unwrap().geom, line(1.0));
+        assert_eq!(doc.can_undo(), can_undo_before);
+    }
+
+    #[test]
+    fn apply_add_entity_returns_new_entity_id() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let new_ids = doc
+            .apply(Command::AddEntity(Entity::new(
+                line(0.0),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        assert_eq!(new_ids.entities.len(), 1);
+        assert!(new_ids.layers.is_empty());
+        assert!(doc.entity(new_ids.entities[0]).is_some());
+    }
+
+    #[test]
+    fn apply_add_layer_returns_new_layer_id() {
+        let mut doc = Document::new();
+        let new_ids = doc
+            .apply(Command::AddLayer(Layer::new("aux", Rgb::WHITE)))
+            .unwrap();
+        assert_eq!(new_ids.layers.len(), 1);
+        assert!(new_ids.entities.is_empty());
+        assert!(doc.layer(new_ids.layers[0]).is_some());
+    }
+
+    #[test]
+    fn apply_batch_collects_new_entity_ids_in_order() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let batch = Command::Batch(vec![
+            Command::AddEntity(Entity::new(line(0.0), layer, Style::inherited())),
+            Command::AddEntity(Entity::new(line(1.0), layer, Style::inherited())),
+            Command::AddEntity(Entity::new(line(2.0), layer, Style::inherited())),
+        ]);
+        let new_ids = doc.apply(batch).unwrap();
+        assert_eq!(new_ids.entities.len(), 3);
+        assert!(new_ids.layers.is_empty());
+        // 適用順で並んでいることを、それぞれの幾何から確認する。
+        for (i, &id) in new_ids.entities.iter().enumerate() {
+            assert_eq!(doc.entity(id).unwrap().geom, line(i as f64));
+        }
+    }
+
+    #[test]
+    fn apply_modify_and_remove_return_empty_new_ids() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+
+        let new_ids = doc
+            .apply(Command::ModifyEntity {
+                id,
+                new_geom: line(5.0),
+            })
+            .unwrap();
+        assert_eq!(new_ids, NewIds::default());
+
+        let new_ids = doc.apply(Command::RemoveEntity(id)).unwrap();
+        assert_eq!(new_ids, NewIds::default());
     }
 }

@@ -8,7 +8,8 @@
 //! - ID: [`EntityId`], [`LayerId`]（`slotmap` キー。undo/redo をまたいでも安定）
 //! - 値型: [`Rgb`], [`Style`], [`Layer`], [`Entity`]
 //! - ドキュメント: [`Document`]（エンティティ・レイヤー・カレントレイヤーと履歴を保持）
-//! - 変更: [`Command`] を [`Document::apply`] に渡す。取り消し/やり直しは
+//! - 変更: [`Command`] を [`Document::apply`] に渡す。戻り値の [`NewIds`] で
+//!   新規発行された ID を受け取れる。取り消し/やり直しは
 //!   [`Document::undo`] / [`Document::redo`]
 //! - エラー: [`CoreError`]
 //!
@@ -30,7 +31,7 @@ mod layer;
 mod style;
 
 pub use command::Command;
-pub use document::Document;
+pub use document::{Document, NewIds};
 pub use entity::Entity;
 pub use error::CoreError;
 pub use id::{EntityId, LayerId};

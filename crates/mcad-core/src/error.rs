@@ -30,4 +30,9 @@ pub enum CoreError {
     /// 宙に浮いた `layer` 参照を防ぐために非空レイヤーの削除を禁止する。
     #[error("layer is not empty and cannot be deleted: {0:?}")]
     LayerNotEmpty(LayerId),
+
+    /// 対象エンティティが所属するレイヤーがロック（[`crate::Layer::locked`]）されているため、
+    /// このエンティティへの変更・削除はできない。
+    #[error("layer is locked: {0:?}")]
+    LayerLocked(LayerId),
 }

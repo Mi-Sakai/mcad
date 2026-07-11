@@ -1,0 +1,10 @@
+[package]
+name = "mcad-core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+mcad-geom = { version = "0.1.0", path = "../mcad-geom" }
+serde = { version = "1.0.228", features = ["derive"] }
+slotmap = "1.1.1"
+thiserror = "2.0.18"

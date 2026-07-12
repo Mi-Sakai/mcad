@@ -9,7 +9,7 @@
 //! - 基本型: [`Point2`], [`Vec2`], [`Aabb`]
 //! - プリミティブ: [`LineSeg`], [`Circle`], [`Arc`], [`Polyline`]
 //! - それらをまとめる列挙型 [`Shape`]（mcad-core の `Entity { geom: Shape, .. }` が使う）
-//! - 幾何クエリ: [`closest_point`], [`distance_to`], [`intersect`]
+//! - 幾何クエリ: [`closest_point`], [`distance_to`], [`intersect`], [`circumcircle`]
 //!
 //! すべての形状は [`Shape::aabb`]（および各プリミティブの `aabb` メソッド）で
 //! 軸並行境界ボックスを算出でき、ビューポートカリング・矩形選択に使う。
@@ -23,7 +23,9 @@ mod vec2;
 pub use aabb::Aabb;
 pub use intersect::intersect;
 pub use point::Point2;
-pub use primitives::{Arc, Circle, LineSeg, Polyline, Shape, closest_point, distance_to};
+pub use primitives::{
+    Arc, Circle, LineSeg, Polyline, Shape, circumcircle, closest_point, distance_to,
+};
 pub use vec2::Vec2;
 
 /// 幾何述語で用いる基準となる相対イプシロン。

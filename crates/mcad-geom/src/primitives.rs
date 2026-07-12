@@ -333,6 +333,36 @@ impl Shape {
     }
 }
 
+/// 3 点 `a`, `b`, `c` を通る円（外接円）を求める。
+///
+/// 3 点が同一直線上（またはそれに極めて近い）場合は一意な円が定まらないため
+/// `None` を返す。判定は `a` を基準にした相対座標での外積を使い、[`crate::EPS`]
+/// による相対許容量（`|cross| <= EPS * |ab| * |ac|`、これは他の平行判定と同じ
+/// 基準）で行う。
+///
+/// 数値安定性のため、絶対座標のまま行列式を組むのではなく `a` を原点とした
+/// 相対座標（`ab = b - a`, `ac = c - a`）で外心を計算し、最後に `a` を足し戻す
+/// （標準的な外心の公式を相対座標へ適用したもの）。
+///
+/// 円弧作図ツール（3点指定）が、3点を通る円弧を確定するために使う
+/// （円の中心・半径が決まれば、各点の中心からの角度で開始角・終了角を求められる）。
+#[must_use]
+pub fn circumcircle(a: Point2, b: Point2, c: Point2) -> Option<Circle> {
+    let ab = b - a;
+    let ac = c - a;
+    let d = 2.0 * ab.cross(ac);
+    if d.abs() <= crate::EPS * ab.length() * ac.length() {
+        return None; // 同一直線上（またはほぼ）で外接円が定まらない。
+    }
+    let ab2 = ab.length_squared();
+    let ac2 = ac.length_squared();
+    let ux = (ac.y * ab2 - ab.y * ac2) / d;
+    let uy = (ab.x * ac2 - ac.x * ab2) / d;
+    let center = a + Vec2::new(ux, uy);
+    let radius = center.distance(a);
+    Some(Circle::new(center, radius))
+}
+
 /// 形状 `shape` 上で、点 `p` に最も近い点を返す。
 #[must_use]
 pub fn closest_point(shape: &Shape, p: Point2) -> Point2 {
@@ -494,6 +524,46 @@ mod tests {
             pl.closest_point(Point2::new(13.0, 5.0)),
             Point2::new(10.0, 5.0)
         ));
+    }
+
+    #[test]
+    fn circumcircle_of_points_on_unit_circle() {
+        // 単位円上の3点（角度 0, 2π/3, 4π/3）→ 中心 (0,0)、半径 1 が求まるはず。
+        let a = Point2::new(1.0, 0.0);
+        let b = Point2::new(
+            (2.0 * std::f64::consts::FRAC_PI_3).cos(),
+            (2.0 * std::f64::consts::FRAC_PI_3).sin(),
+        );
+        let c = Point2::new(
+            (4.0 * std::f64::consts::FRAC_PI_3).cos(),
+            (4.0 * std::f64::consts::FRAC_PI_3).sin(),
+        );
+        let circle = circumcircle(a, b, c).expect("3点は同一直線上ではない");
+        assert!(approx(circle.center, Point2::ORIGIN));
+        assert!((circle.radius - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn circumcircle_of_axis_points() {
+        // (0,0),(2,0),(0,2) の外接円は中心(1,1)、半径 sqrt(2)。
+        let circle = circumcircle(
+            Point2::new(0.0, 0.0),
+            Point2::new(2.0, 0.0),
+            Point2::new(0.0, 2.0),
+        )
+        .expect("直角三角形の外心は一意");
+        assert!(approx(circle.center, Point2::new(1.0, 1.0)));
+        assert!((circle.radius - std::f64::consts::SQRT_2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn circumcircle_of_collinear_points_is_none() {
+        let result = circumcircle(
+            Point2::new(0.0, 0.0),
+            Point2::new(1.0, 1.0),
+            Point2::new(2.0, 2.0),
+        );
+        assert!(result.is_none());
     }
 
     #[test]

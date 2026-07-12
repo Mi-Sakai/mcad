@@ -7,6 +7,7 @@
 //! クリック/Enter/Escで確定・キャンセルできるようにする。後続タスクで
 //! 選択・編集ツールとスナップエンジンを追加する。
 
+mod snap;
 mod tool;
 mod viewport;
 
@@ -33,6 +34,16 @@ const GRID_TARGET_PX: f64 = 48.0;
 /// 選択ヒットテストのピック許容量（スクリーンピクセル）。ワールド単位へは
 /// `PICK_TOLERANCE_PX / viewport.zoom` で変換する。
 const PICK_TOLERANCE_PX: f64 = 6.0;
+
+/// スナップの探索半径（スクリーンピクセル）。ワールド単位へは
+/// `SNAP_RADIUS_PX / viewport.zoom` で変換する。ピック許容量より少し大きめにして、
+/// 作図時に候補点へ吸い付きやすくする。
+const SNAP_RADIUS_PX: f64 = 12.0;
+
+/// スナップマーカーの色（作図色・選択色と区別しやすい明るい緑）。
+const SNAP_MARKER_COLOR: Color32 = Color32::from_rgb(60, 255, 120);
+/// スナップマーカーの基準サイズ（スクリーンピクセル。中心からの半幅相当）。
+const SNAP_MARKER_SIZE: f32 = 6.0;
 
 /// 選択エンティティのハイライト色（確定済みエンティティ色とは別の強調色）。
 const SELECTION_COLOR: Color32 = Color32::from_rgb(80, 200, 255);
@@ -93,6 +104,11 @@ struct McadApp {
     /// 選択・編集ツール。選択集合を所有し、`tool_kind == Select` のとき有効。
     /// 選択集合はアプリ UI 状態でありドキュメント履歴には積まない（[`SelectTool`] の doc 参照）。
     select_tool: SelectTool,
+    /// スナップの有効/無効。`F3` でトグルする（既定は有効）。
+    snap_enabled: bool,
+    /// 直近フレームで作図ツールのカーソルがスナップした先。マーカー描画に使う。
+    /// スナップしていない・作図ツール非アクティブ・スナップ無効のときは `None`。
+    snap_marker: Option<snap::SnapResult>,
 }
 
 impl McadApp {
@@ -155,6 +171,8 @@ impl McadApp {
             tool_kind: ToolKind::Select,
             tool: None,
             select_tool: SelectTool::default(),
+            snap_enabled: true,
+            snap_marker: None,
         }
     }
 }
@@ -174,13 +192,26 @@ impl eframe::App for McadApp {
             &mut self.select_tool,
         );
 
+        // F3 でスナップの有効/無効をトグルする（作図時の吸着を一時的に切りたい場面用）。
+        if ui.input(|i| i.key_pressed(Key::F3)) {
+            self.snap_enabled = !self.snap_enabled;
+            if !self.snap_enabled {
+                self.snap_marker = None;
+            }
+        }
+
         egui::Panel::top("tool_status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("Tool: {}", self.tool_kind.label()));
                 ui.separator();
+                ui.label(format!(
+                    "Snap: {}",
+                    if self.snap_enabled { "ON" } else { "OFF" }
+                ));
+                ui.separator();
                 ui.label(
                     "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
-                     Del=Delete  Esc=Cancel",
+                     Del=Delete  Esc=Cancel  F3=Snap",
                 );
             });
         });
@@ -192,6 +223,9 @@ impl eframe::App for McadApp {
             handle_pan_input(ui, &response, &mut self.viewport);
             handle_zoom_input(ui, &response, rect, &mut self.viewport);
             if self.tool_kind == ToolKind::Select {
+                // 選択・編集モードではスナップを効かせない（設計判断は
+                // `handle_tool_input` の doc を参照）。マーカーも消す。
+                self.snap_marker = None;
                 handle_select_input(
                     ui,
                     &response,
@@ -209,6 +243,8 @@ impl eframe::App for McadApp {
                     &mut self.document,
                     &mut self.tool_kind,
                     &mut self.tool,
+                    self.snap_enabled,
+                    &mut self.snap_marker,
                 );
             }
 
@@ -226,6 +262,9 @@ impl eframe::App for McadApp {
             );
             if let Some(tool) = &self.tool {
                 tool.draw_preview(&painter, rect, &self.viewport);
+            }
+            if let Some(marker) = &self.snap_marker {
+                draw_snap_marker(&painter, rect, &self.viewport, marker);
             }
         });
     }
@@ -276,6 +315,16 @@ fn handle_tool_shortcut_keys(
 /// よう、Space 押下中および実際にパン用ドラッグが進行中は左クリックをツールへ
 /// 渡さない。ツールが `Commit`/`Cancel` を返した場合、ツールをリセット（`Commit` は
 /// 同じ種類の新しいインスタンスへ、`Cancel` は非アクティブ = `Select` へ）する。
+///
+/// # スナップの統合
+///
+/// スクリーン→ワールド変換した素のカーソル位置に対し、`snap_enabled` なら
+/// [`snap::snap`] を掛けて候補点へ吸着させた座標を `InputEvent` に載せる。移動時は
+/// スナップ先を `snap_marker` に記録し、描画層がマーカーを表示する。スナップは作図
+/// ツール（Point/Line/…）にのみ効かせる。選択・編集ツールはドラッグ矩形・移動の
+/// 変位を扱い、頂点入力とは性質が異なるため MVP ではスナップ対象外とする
+/// （`handle_select_input` は素のワールド座標を使う）。
+#[allow(clippy::too_many_arguments)]
 fn handle_tool_input(
     ui: &egui::Ui,
     response: &egui::Response,
@@ -284,6 +333,8 @@ fn handle_tool_input(
     document: &mut Document,
     tool_kind: &mut ToolKind,
     tool: &mut Option<Box<dyn Tool>>,
+    snap_enabled: bool,
+    snap_marker: &mut Option<snap::SnapResult>,
 ) {
     let Some(active) = tool.as_mut() else {
         return;
@@ -294,10 +345,21 @@ fn handle_tool_input(
         style: Style::inherited(),
     };
 
-    // マウス移動は毎フレーム流し、プレビュー追従に使ってもらう。
+    // スナップ用パラメータ（探索半径・可視 AABB・グリッド間隔）。半径はピック許容量と
+    // 同じ考え方で px→ワールド換算する。グリッド間隔は描画グリッドと同じ副グリッド刻み。
+    let radius = SNAP_RADIUS_PX / viewport.zoom;
+    let visible = viewport.visible_aabb(rect);
+    let grid_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
+
+    // マウス移動は毎フレーム流し、プレビュー追従に使ってもらう。スナップ先はマーカー
+    // 描画のために記録する（ホバーしていなければマーカーを消す）。
     if let Some(pos) = response.hover_pos() {
-        let world = viewport.screen_to_world(rect, pos);
+        let raw = viewport.screen_to_world(rect, pos);
+        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, &visible, grid_step);
+        *snap_marker = marker;
         let _ = active.on_input(&ctx, InputEvent::Move(world));
+    } else {
+        *snap_marker = None;
     }
 
     // Space 押下中の左ドラッグはパン操作に使われているため、作図クリックとしては
@@ -308,7 +370,8 @@ fn handle_tool_input(
         && response.clicked_by(egui::PointerButton::Primary)
         && let Some(pos) = response.interact_pointer_pos()
     {
-        let world = viewport.screen_to_world(rect, pos);
+        let raw = viewport.screen_to_world(rect, pos);
+        let (world, _) = apply_snap(document, snap_enabled, raw, radius, &visible, grid_step);
         result = active.on_input(&ctx, InputEvent::Click(world));
     }
 
@@ -332,6 +395,25 @@ fn handle_tool_input(
             *tool = None;
         }
         ToolResult::Continue => {}
+    }
+}
+
+/// 素のカーソル位置 `raw` にスナップを掛ける。有効かつ候補が見つかれば
+/// `(スナップ先, Some(結果))`、無効または候補なしなら `(raw, None)` を返す。
+fn apply_snap(
+    document: &Document,
+    enabled: bool,
+    raw: Point2,
+    radius: f64,
+    visible: &Aabb,
+    grid_step: f64,
+) -> (Point2, Option<snap::SnapResult>) {
+    if !enabled {
+        return (raw, None);
+    }
+    match snap::snap(document, raw, radius, visible, grid_step) {
+        Some(result) => (result.point, Some(result)),
+        None => (raw, None),
     }
 }
 
@@ -551,6 +633,56 @@ fn draw_selected(
     for &id in select_tool.selection() {
         if let Some(entity) = document.entity(id) {
             draw_shape(painter, rect, viewport, &entity.geom, stroke);
+        }
+    }
+}
+
+/// スナップ先にマーカーを描画する。候補種別ごとに形を変えて、どの種別に吸着したか
+/// が一目で分かるようにする（端点=□、交点=×、中点=△、中心=○、グリッド=＋）。
+fn draw_snap_marker(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    marker: &snap::SnapResult,
+) {
+    use snap::SnapKind;
+
+    let c = viewport.world_to_screen(rect, marker.point);
+    let s = SNAP_MARKER_SIZE;
+    let stroke = Stroke::new(1.5, SNAP_MARKER_COLOR);
+    let seg = |a: Pos2, b: Pos2| painter.line_segment([a, b], stroke);
+
+    match marker.kind {
+        SnapKind::Endpoint => {
+            // 正方形（4 辺を線分で描く）。
+            let r = Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0));
+            seg(r.left_top(), r.right_top());
+            seg(r.right_top(), r.right_bottom());
+            seg(r.right_bottom(), r.left_bottom());
+            seg(r.left_bottom(), r.left_top());
+        }
+        SnapKind::Intersection => {
+            // ×。
+            seg(c + egui::vec2(-s, -s), c + egui::vec2(s, s));
+            seg(c + egui::vec2(-s, s), c + egui::vec2(s, -s));
+        }
+        SnapKind::Midpoint => {
+            // 上向き三角形。
+            let top = c + egui::vec2(0.0, -s);
+            let left = c + egui::vec2(-s, s);
+            let right = c + egui::vec2(s, s);
+            seg(top, left);
+            seg(left, right);
+            seg(right, top);
+        }
+        SnapKind::Center => {
+            // 円。
+            painter.circle_stroke(c, s, stroke);
+        }
+        SnapKind::Grid => {
+            // ＋。
+            seg(c + egui::vec2(-s, 0.0), c + egui::vec2(s, 0.0));
+            seg(c + egui::vec2(0.0, -s), c + egui::vec2(0.0, s));
         }
     }
 }

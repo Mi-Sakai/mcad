@@ -17,10 +17,15 @@
 //!
 //! # 交点候補の事前絞り込み（AABB カリング）
 //!
-//! 交点計算は全エンティティの全ペアに掛けると O(n^2) になるため、DESIGN.md の
-//! 指示どおり「画面内（可視 AABB と交差する）エンティティのみ」を対象に総当たり
-//! する。可視 AABB との交差判定で事前に絞り込むことで、画面外どうしの交点計算を
-//! 省く。
+//! 交点計算は全エンティティの全ペアに掛けると O(n^2) になるため、「カーソル近傍
+//! AABB（カーソル位置を探索半径ぶん拡張したボックス）と交差する」エンティティのみを
+//! 対象に総当たりする。この絞り込みは **無損失**: スナップ候補は定義上カーソルから
+//! 半径内の点に限られ、交点は両エンティティの AABB 内に必ずあるため、半径内の交点を
+//! 持つペアは両方とも必ずカーソル近傍 AABB と交差する（Chebyshev 距離 ≦ Euclid 距離）。
+//! カーソルは画面内にあるので、これは DESIGN.md 3.4 の「画面内エンティティのみ対象に
+//! AABB で事前絞り込み」よりさらに狭い、上位互換の絞り込みである。マウス移動のたびに
+//! 呼ばれる関数なので、画面内エンティティ数 k に対する O(k^2) をカーソル近傍の
+//! ごく少数に抑えることがフレームレート維持に効く。
 //!
 //! 一方、端点・中点・中心は 1 エンティティあたり定数個で列挙コストが O(n) に
 //! 収まるため、可視 AABB での事前絞り込みは行わず、可視レイヤーの全エンティティを
@@ -77,14 +82,12 @@ pub struct SnapResult {
 /// - `document`: 候補の元となるエンティティ（可視レイヤーのみ対象）。
 /// - `cursor`: カーソルのワールド座標。
 /// - `radius`: 探索半径（ワールド単位。呼び出し側で `半径px / zoom` に換算済み）。
-/// - `visible`: 交点候補の事前絞り込みに使う可視 AABB。
 /// - `grid_step`: グリッド間隔（ワールド単位）。`0` 以下・非有限ならグリッド候補なし。
 #[must_use]
 pub fn snap(
     document: &Document,
     cursor: Point2,
     radius: f64,
-    visible: &Aabb,
     grid_step: f64,
 ) -> Option<SnapResult> {
     if !radius.is_finite() || radius <= 0.0 {
@@ -101,17 +104,19 @@ pub fn snap(
         enumerate_features(&entity.geom, cursor, r2, &mut best);
     }
 
-    // 交点: 画面内（可視 AABB と交差する）エンティティのみを AABB で事前絞り込みし、
-    // その集合内の全ペアで交点を求める（DESIGN.md 3.4）。
-    let onscreen: Vec<&Shape> = document
+    // 交点: カーソル近傍 AABB（カーソル±半径のボックス）と交差するエンティティのみを
+    // 事前絞り込みし、その集合内の全ペアで交点を求める。絞り込みが無損失である理由は
+    // モジュール doc を参照。
+    let cursor_box = Aabb::from_point(cursor).expanded(radius);
+    let near: Vec<&Shape> = document
         .entities()
         .filter(|(_, e)| layer_visible(document, e))
-        .filter(|(_, e)| e.geom.aabb().intersects(visible))
+        .filter(|(_, e)| e.geom.aabb().intersects(&cursor_box))
         .map(|(_, e)| &e.geom)
         .collect();
-    for i in 0..onscreen.len() {
-        for j in (i + 1)..onscreen.len() {
-            for p in intersect(onscreen[i], onscreen[j]) {
+    for i in 0..near.len() {
+        for j in (i + 1)..near.len() {
+            for p in intersect(near[i], near[j]) {
                 best.consider(SnapKind::Intersection, p, cursor, r2);
             }
         }
@@ -211,11 +216,6 @@ mod tests {
     use mcad_core::{Command, Entity, Style};
     use mcad_geom::{Circle, LineSeg, Shape};
 
-    /// 実質「全域」の可視 AABB（可視 AABB による絞り込みを無効化したいテスト用）。
-    fn everywhere() -> Aabb {
-        Aabb::from_corners(Point2::new(-1.0e6, -1.0e6), Point2::new(1.0e6, 1.0e6))
-    }
-
     /// カレントレイヤーに `shape` を追加する。
     fn add(doc: &mut Document, shape: Shape) {
         let layer = doc.current_layer();
@@ -231,9 +231,9 @@ mod tests {
         Shape::Line(LineSeg::new(Point2::new(ax, ay), Point2::new(bx, by)))
     }
 
-    /// グリッド無効（`grid_step = 0`）で全域を可視としてスナップする短縮版。
+    /// グリッド無効（`grid_step = 0`）でスナップする短縮版。
     fn snap_no_grid(doc: &Document, cursor: Point2, radius: f64) -> Option<SnapResult> {
-        snap(doc, cursor, radius, &everywhere(), 0.0)
+        snap(doc, cursor, radius, 0.0)
     }
 
     #[test]
@@ -306,7 +306,7 @@ mod tests {
 
         // カーソル (0.1,0.1): 最寄りグリッド交点(0,0)まで ≈0.14、中心(0.3,0.3)まで ≈0.28。
         // グリッドの方が近いが、優先度で中心が勝つ。
-        let r = snap(&doc, Point2::new(0.1, 0.1), 0.5, &everywhere(), 1.0).unwrap();
+        let r = snap(&doc, Point2::new(0.1, 0.1), 0.5, 1.0).unwrap();
         assert_eq!(r.kind, SnapKind::Center);
         assert_eq!(r.point, Point2::new(0.3, 0.3));
     }
@@ -315,7 +315,7 @@ mod tests {
     fn grid_is_fallback_when_nothing_else_in_range() {
         // エンティティのない空ドキュメントでもグリッドにはスナップする。
         let doc = Document::new();
-        let r = snap(&doc, Point2::new(0.2, -0.1), 0.5, &everywhere(), 1.0).unwrap();
+        let r = snap(&doc, Point2::new(0.2, -0.1), 0.5, 1.0).unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
         assert_eq!(r.point, Point2::new(0.0, 0.0));
     }
@@ -363,23 +363,31 @@ mod tests {
     }
 
     #[test]
-    fn intersection_prefilter_excludes_offscreen_entities() {
+    fn intersection_prefilter_keeps_candidate_at_radius_boundary() {
+        // カーソル近傍 AABB による事前絞り込みが無損失であること（半径ちょうどの
+        // 交点候補を取りこぼさないこと）の境界ケース。
         // 交点 (100,100) で交差する 2 線分。端点・中点は交点から 5 以上離す。
         // A (80,100)-(110,100): 中点 (95,100)。B (100,70)-(100,110): 中点 (100,90)。
         let mut doc = Document::new();
         add(&mut doc, line(80.0, 100.0, 110.0, 100.0));
         add(&mut doc, line(100.0, 70.0, 100.0, 110.0));
-        let cursor = Point2::new(100.0, 100.0);
 
-        // 可視 AABB がエンティティを含む場合: 交点にスナップする。
-        let visible_in = Aabb::from_corners(Point2::new(0.0, 0.0), Point2::new(200.0, 200.0));
-        let r = snap(&doc, cursor, 3.0, &visible_in, 0.0).unwrap();
+        // カーソルを交点から半径ちょうど（距離 3.0、半径 3.0）離しても交点にスナップする。
+        let cursor = Point2::new(103.0, 100.0);
+        let r = snap(&doc, cursor, 3.0, 0.0).unwrap();
         assert_eq!(r.kind, SnapKind::Intersection);
         assert_eq!(r.point, Point2::new(100.0, 100.0));
+    }
 
-        // 可視 AABB がエンティティ（(100,100) 付近）を含まない場合: 交点は事前絞り込みで
-        // 除外され、半径 3 内に他候補もない（端点・中点は 5 以上離れている）ので None。
-        let visible_out = Aabb::from_corners(Point2::new(-10.0, -10.0), Point2::new(10.0, 10.0));
-        assert_eq!(snap(&doc, cursor, 3.0, &visible_out, 0.0), None);
+    #[test]
+    fn intersections_far_from_cursor_do_not_snap() {
+        // 交点 (100,100) を持つ 2 線分があっても、カーソルがそこから半径外に
+        // 離れていれば交点候補にならない（事前絞り込み経路でも半径規則が保たれる）。
+        let mut doc = Document::new();
+        add(&mut doc, line(80.0, 100.0, 110.0, 100.0));
+        add(&mut doc, line(100.0, 70.0, 100.0, 110.0));
+
+        // カーソル (0,0): 交点まで距離 ≈141。半径 3 では何にもスナップしない。
+        assert_eq!(snap(&doc, Point2::new(0.0, 0.0), 3.0, 0.0), None);
     }
 }

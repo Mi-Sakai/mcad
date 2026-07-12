@@ -345,17 +345,17 @@ fn handle_tool_input(
         style: Style::inherited(),
     };
 
-    // スナップ用パラメータ（探索半径・可視 AABB・グリッド間隔）。半径はピック許容量と
-    // 同じ考え方で px→ワールド換算する。グリッド間隔は描画グリッドと同じ副グリッド刻み。
+    // スナップ用パラメータ（探索半径・グリッド間隔）。半径はピック許容量と同じ考え方で
+    // px→ワールド換算する。グリッド間隔は描画グリッドと同じ副グリッド刻み。交点候補の
+    // 事前絞り込みはカーソル近傍 AABB を snap 側が内部で構成する（`snap.rs` 参照）。
     let radius = SNAP_RADIUS_PX / viewport.zoom;
-    let visible = viewport.visible_aabb(rect);
     let grid_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
 
     // マウス移動は毎フレーム流し、プレビュー追従に使ってもらう。スナップ先はマーカー
     // 描画のために記録する（ホバーしていなければマーカーを消す）。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, &visible, grid_step);
+        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid_step);
         *snap_marker = marker;
         let _ = active.on_input(&ctx, InputEvent::Move(world));
     } else {
@@ -371,7 +371,7 @@ fn handle_tool_input(
         && let Some(pos) = response.interact_pointer_pos()
     {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, _) = apply_snap(document, snap_enabled, raw, radius, &visible, grid_step);
+        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid_step);
         result = active.on_input(&ctx, InputEvent::Click(world));
     }
 
@@ -405,13 +405,12 @@ fn apply_snap(
     enabled: bool,
     raw: Point2,
     radius: f64,
-    visible: &Aabb,
     grid_step: f64,
 ) -> (Point2, Option<snap::SnapResult>) {
     if !enabled {
         return (raw, None);
     }
-    match snap::snap(document, raw, radius, visible, grid_step) {
+    match snap::snap(document, raw, radius, grid_step) {
         Some(result) => (result.point, Some(result)),
         None => (raw, None),
     }

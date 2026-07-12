@@ -224,6 +224,16 @@ impl Document {
         !self.redo_stack.is_empty()
     }
 
+    /// undo/redo 履歴を空にする。ドキュメントの内容自体は変更しない。
+    ///
+    /// ファイル読込直後など「ここより前へは戻れない」基準点を作るために使う。
+    /// mcad-io の import は `Command` 列でドキュメントを再構築するため、これを
+    /// 呼ばないと読込直後の Ctrl+Z で再構築手順が 1 つずつ巻き戻ってしまう。
+    pub fn clear_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
     // ---- 変更系 ----
 
     /// コマンドを適用する。

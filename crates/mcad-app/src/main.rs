@@ -11,10 +11,13 @@ mod snap;
 mod tool;
 mod viewport;
 
+use std::path::{Path, PathBuf};
+
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{Command, Document, Entity, Layer, LayerId, Rgb, Style};
 use mcad_geom::{Aabb, Arc, Circle, LineSeg, Point2, Polyline, Shape};
+use mcad_io::{load_mcad, save_mcad};
 
 use tool::{
     ArcTool, CircleTool, DragPreview, InputEvent, LineTool, PointTool, PolylineTool, SelectTool,
@@ -47,6 +50,16 @@ const SNAP_MARKER_SIZE: f32 = 6.0;
 
 /// ステータスメッセージの表示時間（秒）。経過後は自動で消える。
 const STATUS_MESSAGE_SECS: f64 = 5.0;
+
+/// `.mcad` ファイルの拡張子（ファイルダイアログのフィルタ・拡張子補完の両方で使う）。
+const MCAD_EXTENSION: &str = "mcad";
+
+/// パス未定のドキュメントを「名前を付けて保存」する際の初期ファイル名。
+const DEFAULT_FILE_NAME: &str = "Untitled.mcad";
+
+/// ファイルパス未定のドキュメントをウィンドウタイトル/ステータスバーへ表示する際の
+/// ラベル。
+const UNTITLED_LABEL: &str = "Untitled";
 
 /// 新規レイヤーへ作成順に巡回で割り当てる色のパレット。
 ///
@@ -130,6 +143,17 @@ struct McadApp {
     /// ステータスバーに一時表示するメッセージ（主にコア操作のエラー通知）。
     /// [`STATUS_MESSAGE_SECS`] 経過で自動的に消える。
     status: Option<StatusMessage>,
+    /// 現在開いている `.mcad` ファイルのパス。`None` は「一度も保存/読込していない
+    /// (Untitled)」を意味する。新規文書（Ctrl+N）で `None` に戻る。
+    current_path: Option<PathBuf>,
+    /// ドキュメントが直近の保存/読込/新規作成から変更されているか。
+    ///
+    /// `document.apply` が成功するたびに（作図確定・選択削除・移動・レイヤー操作の
+    /// 各呼び出し箇所で）`true` にセットする。undo/redo も内容を変える操作なので、
+    /// `Document::undo`/`redo` が `true`（実際に戻す/やり直す操作があった）を返した
+    /// ときも `true` にする。「undo でファイル保存時の内容に一致して戻っても dirty
+    /// のままになる」精密な判定はせず、単純化のため一律 dirty 扱いにする設計判断。
+    dirty: bool,
 }
 
 /// ステータスバーに一時表示するメッセージ。
@@ -152,8 +176,18 @@ impl McadApp {
     /// 動作確認用にサンプルエンティティ（線分・円・円弧・ポリライン）を
     /// 追加したドキュメントを持つアプリを作る。
     ///
-    /// 本番の「ファイルを開く」機能は別タスク（.mcad保存/読込）の範囲であり、
-    /// ここでは Viewport・描画の動作確認だけが目的。
+    /// # サンプルエンティティを起動時に残す判断について
+    ///
+    /// M3第4段（ファイル操作のapp統合）の Codex レビュー指摘は、「実用的な新規文書/
+    /// 読込フローを作る際にはこれを開発用サンプルとして分離または削除すること」だった。
+    /// 対応として、**Ctrl+N（新規文書）は必ず [`Document::new()`] のみの真に空の
+    /// ドキュメントを作る**（[`McadApp::new_document`] 参照、サンプルは一切混ぜない）。
+    ///
+    /// 一方、アプリ起動時（`main` から呼ばれる本関数）にはサンプルを残すことにした。
+    /// 理由: ここで作るのは「新規文書」ではなく「起動直後の画面」であり、
+    /// 目視確認（`cargo run -p mcad-app` で起動して形状・スナップ・レイヤー等が
+    /// 一目で見える）用の実利がある。ユーザーが本当に白紙から始めたい場合は
+    /// 起動直後に Ctrl+N を押せばよく、実用上の不利益はないと判断した。
     fn new() -> Self {
         let mut document = Document::new();
         let layer = document.current_layer();
@@ -211,6 +245,114 @@ impl McadApp {
             snap_enabled: true,
             snap_marker: None,
             status: None,
+            current_path: None,
+            dirty: false,
+        }
+    }
+
+    /// 選択集合・進行中の作図ツール・スナップマーカーをリセットする。
+    ///
+    /// 新規文書・読込の直後に呼ぶ。読込前のドキュメントを参照していた選択
+    /// `EntityId` や作図ツールの途中状態を持ち越すと、死んだ ID や不整合な
+    /// プレビューが残ってしまうため、ツール種別を `Select` へ戻し選択を空にする。
+    fn reset_transient_ui_state(&mut self) {
+        self.tool_kind = ToolKind::Select;
+        self.tool = None;
+        self.select_tool.clear_selection();
+        self.snap_marker = None;
+    }
+
+    /// 現在のドキュメントが未保存の変更を持つとき、破棄してよいか確認する。
+    /// dirty でなければ確認なしで常に続行してよい（`true`）。
+    fn confirm_discard_if_dirty(&self) -> bool {
+        !self.dirty || confirm_discard_unsaved()
+    }
+
+    /// Ctrl+N: 未保存の変更があれば確認したうえで、真に空の新規ドキュメントへ
+    /// 置き換える（サンプルエンティティは一切追加しない。[`McadApp::new`] の doc 参照）。
+    fn new_document(&mut self, now: f64) {
+        if !self.confirm_discard_if_dirty() {
+            return;
+        }
+        self.document = Document::new();
+        self.current_path = None;
+        self.dirty = false;
+        self.reset_transient_ui_state();
+        set_status(&mut self.status, now, "New document");
+    }
+
+    /// Ctrl+O: 未保存の変更があれば確認したうえで、ネイティブのファイル選択
+    /// ダイアログ（`.mcad` フィルタ付き）で選んだファイルを読み込む。
+    ///
+    /// 読込失敗時は現在のドキュメントを一切変更せず、理由をステータスバーへ表示する。
+    fn open_document(&mut self, now: f64) {
+        if !self.confirm_discard_if_dirty() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("mcad", &[MCAD_EXTENSION])
+            .pick_file()
+        else {
+            return;
+        };
+        match load_mcad(&path) {
+            Ok(doc) => {
+                self.document = doc;
+                self.current_path = Some(path);
+                self.dirty = false;
+                self.reset_transient_ui_state();
+                set_status(&mut self.status, now, "Opened file");
+            }
+            Err(err) => {
+                set_status(&mut self.status, now, format!("Open failed: {err}"));
+            }
+        }
+    }
+
+    /// Ctrl+S: 開いているファイルパスへ上書き保存する。パスが未定なら
+    /// 「名前を付けて保存」（[`McadApp::save_document_as`]）と同じ扱いにする。
+    fn save_document(&mut self, now: f64) {
+        let Some(path) = self.current_path.clone() else {
+            self.save_document_as(now);
+            return;
+        };
+        self.save_to(&path, now);
+    }
+
+    /// Ctrl+Shift+S: 常にネイティブの保存ダイアログを表示し、選んだ先へ保存する。
+    /// 成功時は「現在開いているファイルパス」を選んだ先に更新する。
+    fn save_document_as(&mut self, now: f64) {
+        let default_name = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or(DEFAULT_FILE_NAME);
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("mcad", &[MCAD_EXTENSION])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        // ネイティブダイアログ（特に Linux の xdg-portal 経由）は必ずしも拡張子を
+        // 自動付与しないため、`.mcad` 以外（無し含む）なら明示的に付け直す。
+        let path = ensure_mcad_extension(path);
+        self.save_to(&path, now);
+    }
+
+    /// 指定パスへ保存する。成功時は「現在開いているファイルパス」を更新し dirty を
+    /// 解除する。失敗時はドキュメント・パスを変更せず、理由をステータスバーへ表示する。
+    fn save_to(&mut self, path: &Path, now: f64) {
+        match save_mcad(&self.document, path) {
+            Ok(()) => {
+                self.current_path = Some(path.to_path_buf());
+                self.dirty = false;
+                set_status(&mut self.status, now, "Saved");
+            }
+            Err(err) => {
+                set_status(&mut self.status, now, format!("Save failed: {err}"));
+            }
         }
     }
 }
@@ -219,6 +361,36 @@ impl Default for McadApp {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// パスの拡張子が `.mcad`（大小無視）でなければ付け直す。
+fn ensure_mcad_extension(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(MCAD_EXTENSION))
+    {
+        path
+    } else {
+        path.with_extension(MCAD_EXTENSION)
+    }
+}
+
+/// 未保存の変更を破棄してよいか、ネイティブの確認ダイアログで問い合わせる。
+/// `Yes` で破棄して続行、それ以外（`No`/ダイアログを閉じる等）は続行しない。
+///
+/// 「保存/破棄/キャンセル」の3択ではなく Yes/No の2択にしているのは、この場から
+/// 「保存」を選ばせると保存先未定の場合に「名前を付けて保存」ダイアログへ入れ子で
+/// 分岐する必要があり、呼び出し側（新規/開く/終了）の状態遷移が複雑になるため。
+/// 保存したい場合はユーザーがこの操作の前に Ctrl+S を押せばよい、という単純な運用で
+/// 割り切った（実装しやすさを優先した設計判断）。
+fn confirm_discard_unsaved() -> bool {
+    rfd::MessageDialog::new()
+        .set_title("Unsaved changes")
+        .set_description("Discard unsaved changes?")
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
 }
 
 impl eframe::App for McadApp {
@@ -238,10 +410,69 @@ impl eframe::App for McadApp {
         });
         if undo_pressed && self.document.undo() {
             self.select_tool.retain_alive(&self.document);
+            // undo/redo もドキュメント内容を変える操作なので dirty 扱いにする
+            // （管理方針は `McadApp::dirty` の doc を参照）。
+            self.dirty = true;
         }
         if redo_pressed && self.document.redo() {
             self.select_tool.retain_alive(&self.document);
+            self.dirty = true;
         }
+
+        // Ctrl+N/Ctrl+O/Ctrl+S/Ctrl+Shift+S: 新規/開く/保存/名前を付けて保存。
+        // undo/redo と同様、ツール切替キー（`handle_tool_shortcut_keys`）は Ctrl 併用を
+        // 無視するので衝突しない。
+        let (new_pressed, open_pressed, save_pressed, save_as_pressed) = ui.input(|i| {
+            let cmd = i.modifiers.command;
+            (
+                cmd && !i.modifiers.shift && i.key_pressed(Key::N),
+                cmd && !i.modifiers.shift && i.key_pressed(Key::O),
+                cmd && !i.modifiers.shift && i.key_pressed(Key::S),
+                cmd && i.modifiers.shift && i.key_pressed(Key::S),
+            )
+        });
+        if new_pressed {
+            self.new_document(now);
+        }
+        if open_pressed {
+            self.open_document(now);
+        }
+        if save_pressed {
+            self.save_document(now);
+        }
+        if save_as_pressed {
+            self.save_document_as(now);
+        }
+
+        // ウィンドウを閉じる操作（OSの閉じるボタン等）を検出する。未保存の変更が
+        // あれば、この場でネイティブの確認ダイアログ（`confirm_discard_unsaved`）を
+        // 出し、破棄が選ばれなければ `ViewportCommand::CancelClose` でクローズを
+        // キャンセルする。eframe 0.35 のネイティブランナー
+        // （`epi_integration::update`）は `ui()` 呼び出し中に積まれた
+        // viewport コマンドを同フレームの close 判定に使うため、ここで送れば
+        // 間に合う（`ctx.input(|i| i.viewport().close_requested())` で検出、
+        // `ctx.send_viewport_cmd(ViewportCommand::CancelClose)` でキャンセル、という
+        // eframe 側の推奨手順どおり）。
+        let close_requested = ui.ctx().input(|i| i.viewport().close_requested());
+        if close_requested && self.dirty && !confirm_discard_unsaved() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+
+        // ウィンドウタイトルへ現在のファイル名（未定なら Untitled）と dirty 状態
+        // （末尾の `*`）を表示する。`ViewportCommand::Title` の送信は軽量なので
+        // 変化の有無を追跡せず毎フレーム送ってよい。
+        let file_label = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map_or_else(|| UNTITLED_LABEL.to_string(), str::to_string);
+        let dirty_marker = if self.dirty { "*" } else { "" };
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                "mcad - {file_label}{dirty_marker}"
+            )));
 
         handle_tool_shortcut_keys(
             ui,
@@ -269,6 +500,8 @@ impl eframe::App for McadApp {
 
         egui::Panel::top("tool_status").show(ui, |ui| {
             ui.horizontal(|ui| {
+                ui.label(format!("File: {file_label}{dirty_marker}"));
+                ui.separator();
                 ui.label(format!("Tool: {}", self.tool_kind.label()));
                 ui.separator();
                 ui.label(format!(
@@ -278,7 +511,8 @@ impl eframe::App for McadApp {
                 ui.separator();
                 ui.label(
                     "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
-                     Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo",
+                     Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo  \
+                     Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As",
                 );
                 if let Some(msg) = &self.status {
                     ui.separator();
@@ -288,7 +522,13 @@ impl eframe::App for McadApp {
         });
 
         egui::Panel::right("layer_panel").show(ui, |ui| {
-            layer_panel(ui, &mut self.document, &mut self.status, now);
+            layer_panel(
+                ui,
+                &mut self.document,
+                &mut self.status,
+                now,
+                &mut self.dirty,
+            );
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -310,6 +550,7 @@ impl eframe::App for McadApp {
                     &mut self.select_tool,
                     &mut self.status,
                     now,
+                    &mut self.dirty,
                 );
             } else {
                 handle_tool_input(
@@ -324,6 +565,7 @@ impl eframe::App for McadApp {
                     &mut self.snap_marker,
                     &mut self.status,
                     now,
+                    &mut self.dirty,
                 );
             }
 
@@ -421,6 +663,7 @@ fn handle_tool_input(
     snap_marker: &mut Option<snap::SnapResult>,
     status: &mut Option<StatusMessage>,
     now: f64,
+    dirty: &mut bool,
 ) {
     let Some(active) = tool.as_mut() else {
         return;
@@ -473,8 +716,9 @@ fn handle_tool_input(
             // ドキュメント側のレイヤーロックなどで失敗することがある（例: カレント
             // レイヤーがロック中の AddEntity）。失敗はステータスバーへ表示し、
             // ツール状態はリセットして操作を続行可能にしておく。
-            if let Err(err) = document.apply(cmd) {
-                set_status(status, now, format!("Commit failed: {err}"));
+            match document.apply(cmd) {
+                Ok(_) => *dirty = true,
+                Err(err) => set_status(status, now, format!("Commit failed: {err}")),
             }
             *tool = tool_kind.spawn();
         }
@@ -500,6 +744,7 @@ fn layer_panel(
     document: &mut Document,
     status: &mut Option<StatusMessage>,
     now: f64,
+    dirty: &mut bool,
 ) {
     ui.heading("Layers");
 
@@ -507,8 +752,9 @@ fn layer_panel(
         let n = document.layer_count();
         let color = LAYER_COLOR_PALETTE[n % LAYER_COLOR_PALETTE.len()];
         let cmd = Command::AddLayer(Layer::new(format!("Layer {n}"), color));
-        if let Err(err) = document.apply(cmd) {
-            set_status(status, now, format!("Add layer failed: {err}"));
+        match document.apply(cmd) {
+            Ok(_) => *dirty = true,
+            Err(err) => set_status(status, now, format!("Add layer failed: {err}")),
         }
     }
     ui.separator();
@@ -567,8 +813,9 @@ fn layer_panel(
     }
 
     for cmd in pending {
-        if let Err(err) = document.apply(cmd) {
-            set_status(status, now, format!("Layer operation failed: {err}"));
+        match document.apply(cmd) {
+            Ok(_) => *dirty = true,
+            Err(err) => set_status(status, now, format!("Layer operation failed: {err}")),
         }
     }
 }
@@ -610,6 +857,7 @@ fn handle_select_input(
     select_tool: &mut SelectTool,
     status: &mut Option<StatusMessage>,
     now: f64,
+    dirty: &mut bool,
 ) {
     // ピック許容量（px）をワールド単位へ換算する。
     let tol = PICK_TOLERANCE_PX / viewport.zoom;
@@ -620,7 +868,10 @@ fn handle_select_input(
         && let Some(cmd) = select_tool.delete_command()
     {
         match document.apply(cmd) {
-            Ok(_) => select_tool.clear_selection(),
+            Ok(_) => {
+                select_tool.clear_selection();
+                *dirty = true;
+            }
             Err(err) => set_status(status, now, format!("Delete failed: {err}")),
         }
     }
@@ -647,8 +898,9 @@ fn handle_select_input(
             if let Some(cmd) = select_tool.on_drag_end(document, world) {
                 // 移動の確定。ロックレイヤー混在時は Batch 原子性で全体が失敗し、
                 // 何も動かない。失敗理由はステータスバーへ表示する。
-                if let Err(err) = document.apply(cmd) {
-                    set_status(status, now, format!("Move failed: {err}"));
+                match document.apply(cmd) {
+                    Ok(_) => *dirty = true,
+                    Err(err) => set_status(status, now, format!("Move failed: {err}")),
                 }
             }
         } else if response.clicked_by(egui::PointerButton::Primary) {
@@ -950,4 +1202,86 @@ fn main() -> anyhow::Result<()> {
         Box::new(|_cc| Ok(Box::new(McadApp::new()))),
     )
     .map_err(|err| anyhow::anyhow!("failed to run mcad-app: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // rfd のファイルダイアログ・確認ダイアログ（`confirm_discard_unsaved` の
+    // `self.dirty == true` 分岐、`open_document`/`save_document*` のダイアログ経路）は
+    // ネイティブ UI を開くため headless では自動テストできない。ここでは GUI
+    // コンテキストを要しない部分（拡張子補完・dirty が false の早期リターン経路・
+    // 新規文書のリセット内容）のみを検証する。
+
+    #[test]
+    fn ensure_mcad_extension_appends_when_missing() {
+        assert_eq!(
+            ensure_mcad_extension(PathBuf::from("/tmp/drawing")),
+            PathBuf::from("/tmp/drawing.mcad")
+        );
+    }
+
+    #[test]
+    fn ensure_mcad_extension_replaces_other_extension() {
+        assert_eq!(
+            ensure_mcad_extension(PathBuf::from("/tmp/drawing.json")),
+            PathBuf::from("/tmp/drawing.mcad")
+        );
+    }
+
+    #[test]
+    fn ensure_mcad_extension_is_case_insensitive_noop() {
+        // 既に（大小問わず）.mcad ならそのまま返す。
+        assert_eq!(
+            ensure_mcad_extension(PathBuf::from("/tmp/drawing.MCAD")),
+            PathBuf::from("/tmp/drawing.MCAD")
+        );
+    }
+
+    #[test]
+    fn new_app_starts_clean_and_untitled() {
+        let app = McadApp::new();
+        assert!(!app.dirty);
+        assert!(app.current_path.is_none());
+    }
+
+    #[test]
+    fn confirm_discard_if_dirty_short_circuits_when_not_dirty() {
+        // dirty == false のときはダイアログを開かず true を返す（続行してよい）。
+        // dirty == true の分岐は rfd のネイティブダイアログを開いてしまうため、
+        // ここではテストしない。
+        let mut app = McadApp::new();
+        app.dirty = false;
+        assert!(app.confirm_discard_if_dirty());
+    }
+
+    #[test]
+    fn new_document_resets_to_empty_document_and_clears_path_and_dirty() {
+        let mut app = McadApp::new();
+        // dirty のままだと new_document がダイアログを開いてしまうため false にしておく
+        // （実際の Ctrl+N 経路では `confirm_discard_if_dirty` がこれを保証する）。
+        app.dirty = false;
+        app.current_path = Some(PathBuf::from("/tmp/existing.mcad"));
+
+        let layer = app.document.current_layer();
+        app.document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Point(Point2::new(1.0, 1.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        assert!(app.document.entity_count() > 0);
+
+        app.new_document(0.0);
+
+        // Codex レビュー指摘への対応: Ctrl+N はサンプルを含まない真に空の文書にする。
+        assert_eq!(app.document.entity_count(), 0);
+        assert_eq!(app.document.layer_count(), 1);
+        assert!(app.current_path.is_none());
+        assert!(!app.dirty);
+        assert_eq!(app.tool_kind, ToolKind::Select);
+        assert!(app.select_tool.selection().is_empty());
+    }
 }

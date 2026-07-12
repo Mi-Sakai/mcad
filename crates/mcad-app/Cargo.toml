@@ -10,3 +10,4 @@ egui = "0.35.0"
 mcad-core = { version = "0.1.0", path = "../mcad-core" }
 mcad-geom = { version = "0.1.0", path = "../mcad-geom" }
 mcad-io = { version = "0.1.0", path = "../mcad-io" }
+rfd = "0.17.2"

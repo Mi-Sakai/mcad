@@ -64,24 +64,6 @@ enum Applied {
     Batch(Vec<Applied>),
 }
 
-impl Applied {
-    /// この記録が実質的に「操作なし」か（状態を一切変えていないか）を再帰的に判定する。
-    ///
-    /// 空の [`Applied::Batch`]、およびサブがすべて no-op の `Batch`（ネストした空バッチ）
-    /// のみ `true` を返す。それ以外の記録はすべて何らかの状態変化を伴うので `false`。
-    ///
-    /// [`Document::apply`] はこれを使い、実質 no-op な記録を undo 履歴へ積まないようにする。
-    /// トップレベルの空バッチだけでなく `Batch(vec![Batch(vec![])])` のような
-    /// ネストした空バッチも正しく「操作なし」と判定できる（[`Command::Batch`] の doc 参照）。
-    fn is_noop(&self) -> bool {
-        match self {
-            // 空 Batch では `all` は true を返すため、空/全 no-op の両方を同時に捉える。
-            Applied::Batch(subs) => subs.iter().all(Applied::is_noop),
-            _ => false,
-        }
-    }
-}
-
 /// [`Document::apply`] が新規発行した ID の一覧。
 ///
 /// `AddEntity`/`AddLayer`（単体、および [`Command::Batch`] にネストされたもの）が
@@ -94,6 +76,50 @@ pub struct NewIds {
     pub entities: Vec<EntityId>,
     /// 新規発行されたレイヤー ID（適用順）。
     pub layers: Vec<LayerId>,
+}
+
+/// [`Document::execute`] の実行結果（内部専用）。
+///
+/// 逆操作記録・新規発行 ID・実質的な状態変化の有無を 1 つにまとめて返す。
+///
+/// `new_ids` を `&mut` の出力引数として関数外から渡す設計を避け、戻り値へ集約している。
+/// こうすることで `execute` が `Err` を返した経路では、途中まで積んだ `new_ids` も
+/// ローカル変数として自動的に破棄され、「エラー時に墓標化済み ID を含む `new_ids` を
+/// 誤って外部で使ってしまう」構造的リスクが型システムのレベルで消える。
+///
+/// `changed` は「このコマンドが実際に状態を変えたか」を [`Applied`] の構築と同時に
+/// O(1) で判定した結果で、意味的 no-op（空バッチ・`before == after` の設定など）では
+/// `false` になる。[`Document::apply`] はこれを見て、実体のない記録を undo 履歴へ
+/// 積まないようにする（事後に `Applied` ツリーを再走査する必要はない）。
+struct ExecuteOutcome {
+    /// 逆操作記録（undo/redo 用）。
+    applied: Applied,
+    /// このコマンドが新規発行した ID（適用順）。
+    new_ids: NewIds,
+    /// 実質的に状態を変えたか。`false` は意味的 no-op。
+    changed: bool,
+}
+
+impl ExecuteOutcome {
+    /// 新規 ID を発行せず、必ず状態を変える操作（`RemoveEntity`/`RemoveLayer` など、
+    /// 追加・削除のように意味的 no-op がありえないもの）の結果を作る。
+    fn mutation(applied: Applied) -> Self {
+        Self {
+            applied,
+            new_ids: NewIds::default(),
+            changed: true,
+        }
+    }
+
+    /// 新規 ID を発行せず、`before == after` のとき意味的 no-op になりうる操作
+    /// （`ModifyEntity`/`SetLayerProps`/`SetCurrentLayer`）の結果を作る。
+    fn conditional(applied: Applied, changed: bool) -> Self {
+        Self {
+            applied,
+            new_ids: NewIds::default(),
+            changed,
+        }
+    }
 }
 
 /// CAD ドキュメント。エンティティ・レイヤー・カレントレイヤーと undo/redo 履歴を保持する。
@@ -215,17 +241,17 @@ impl Document {
     /// ロックされたレイヤー上のエンティティへの変更・削除などで [`CoreError`] を返す。
     pub fn apply(&mut self, cmd: Command) -> Result<NewIds, CoreError> {
         // 原子性（検証→変更、失敗時のロールバック）の保証内容は [`Command::Batch`] の
-        // doc（「# 原子性」節）を参照。
-        // 新規発行 ID は execute が変更を起こすのと同時に new_ids へ直接集めるので、
-        // 成功後に別ツリーを走査し直す必要はない。
-        let mut new_ids = NewIds::default();
-        let applied = self.execute(cmd, &mut new_ids)?;
-        // 実質 no-op（空バッチ・ネストした空バッチ）は状態も履歴も一切変えない。
-        // undo できる実体がない記録を undo スタックへ積むと、Ctrl+Z 1 回が
-        // 見かけ上「何も戻らない」空振りになりユーザー体験を損なうため、
-        // undo/redo スタックのどちらにも触れない（redo は保持したままにする）。
-        // ここで判定することで、トップレベルだけでなくネストした空バッチも正しく弾ける。
-        if applied.is_noop() {
+        // doc（「# 原子性」節）を参照。no-op 判定の仕組みは [`ExecuteOutcome`] の doc を参照。
+        let ExecuteOutcome {
+            applied,
+            new_ids,
+            changed,
+        } = self.execute(cmd)?;
+        // 実質 no-op（changed == false）は状態も履歴も一切変えない。undo できる実体が
+        // ない記録を undo スタックへ積むと、Ctrl+Z 1 回が見かけ上「何も戻らない」空振り
+        // になりユーザー体験を損なうため、undo/redo スタックのどちらにも触れない
+        // （redo は保持したままにする）。
+        if !changed {
             return Ok(NewIds::default());
         }
         self.undo_stack.push(applied);
@@ -259,41 +285,64 @@ impl Document {
 
     // ---- 内部ヘルパ ----
 
-    /// コマンドを検証・実行し、逆操作記録を返す。検証失敗時は状態不変。
+    /// コマンドを検証・実行し、逆操作記録・新規発行 ID・状態変化の有無を
+    /// [`ExecuteOutcome`] にまとめて返す。検証失敗時は状態不変。
     ///
-    /// 実行中に新規発行した `EntityId`/`LayerId` は `new_ids` へ適用順で push する
-    /// （`Batch` は同じアキュムレータを再帰的に共有する）。エラー時に `new_ids` は
-    /// 途中まで書き込まれうるが、[`Document::apply`] は失敗経路で `new_ids` を返さない。
-    fn execute(&mut self, cmd: Command, new_ids: &mut NewIds) -> Result<Applied, CoreError> {
+    /// 新規発行した `EntityId`/`LayerId` と「実際に状態を変えたか」（`changed`）は、
+    /// 変更を起こすのと同時に O(1) で組み立てる（`Batch` はサブの結果を再帰的に集約する）。
+    /// 戻り値へ集約しているため、`Err` を返した経路では途中まで積んだ `new_ids` も
+    /// 呼び出し元のローカル変数として自動的に破棄される（[`ExecuteOutcome`] の doc 参照）。
+    fn execute(&mut self, cmd: Command) -> Result<ExecuteOutcome, CoreError> {
         match cmd {
             Command::AddEntity(entity) => {
                 // 宙に浮いた layer 参照を防ぐため所属レイヤーの存在を検証し、
                 // ロック済みレイヤーへの追加も Modify/Remove と対称に拒否する。
-                self.require_layer(entity.layer)?;
-                self.ensure_layer_unlocked(entity.layer)?;
+                self.require_editable_layer(entity.layer)?;
                 let id = self.entities.insert(Some(entity.clone()));
-                new_ids.entities.push(id);
-                Ok(Applied::AddEntity { id, entity })
+                // 追加は常に状態を変えるので changed = true。
+                Ok(ExecuteOutcome {
+                    applied: Applied::AddEntity { id, entity },
+                    new_ids: NewIds {
+                        entities: vec![id],
+                        layers: Vec::new(),
+                    },
+                    changed: true,
+                })
             }
             Command::RemoveEntity(id) => {
                 self.require_editable_entity(id)?;
                 let entity = self.take_entity(id);
-                Ok(Applied::RemoveEntity { id, entity })
+                Ok(ExecuteOutcome::mutation(Applied::RemoveEntity {
+                    id,
+                    entity,
+                }))
             }
             Command::ModifyEntity { id, new_geom } => {
                 self.require_editable_entity(id)?;
                 let slot = self.live_entity_mut(id);
                 let before = std::mem::replace(&mut slot.geom, new_geom.clone());
-                Ok(Applied::ModifyEntity {
-                    id,
-                    before,
-                    after: new_geom,
-                })
+                // 同一幾何への差し替えは意味的 no-op（履歴を汚さない）。
+                let changed = before != new_geom;
+                Ok(ExecuteOutcome::conditional(
+                    Applied::ModifyEntity {
+                        id,
+                        before,
+                        after: new_geom,
+                    },
+                    changed,
+                ))
             }
             Command::AddLayer(layer) => {
                 let id = self.layers.insert(Some(layer.clone()));
-                new_ids.layers.push(id);
-                Ok(Applied::AddLayer { id, layer })
+                // 追加は常に状態を変えるので changed = true。
+                Ok(ExecuteOutcome {
+                    applied: Applied::AddLayer { id, layer },
+                    new_ids: NewIds {
+                        entities: Vec::new(),
+                        layers: vec![id],
+                    },
+                    changed: true,
+                })
             }
             Command::RemoveLayer(id) => {
                 self.require_layer(id)?;
@@ -307,7 +356,7 @@ impl Document {
                     return Err(CoreError::LayerNotEmpty(id));
                 }
                 let layer = self.take_layer(id);
-                Ok(Applied::RemoveLayer { id, layer })
+                Ok(ExecuteOutcome::mutation(Applied::RemoveLayer { id, layer }))
             }
             Command::SetLayerProps { id, props } => {
                 self.require_layer(id)?;
@@ -317,23 +366,42 @@ impl Document {
                     .expect("layer key checked by require_layer")
                     .replace(props.clone())
                     .expect("layer is live (checked by require_layer)");
-                Ok(Applied::SetLayerProps {
-                    id,
-                    before,
-                    after: props,
-                })
+                // 同一プロパティの設定は意味的 no-op（履歴を汚さない）。
+                let changed = before != props;
+                Ok(ExecuteOutcome::conditional(
+                    Applied::SetLayerProps {
+                        id,
+                        before,
+                        after: props,
+                    },
+                    changed,
+                ))
             }
             Command::SetCurrentLayer(id) => {
                 self.require_layer(id)?;
                 let before = self.current_layer;
                 self.current_layer = id;
-                Ok(Applied::SetCurrentLayer { before, after: id })
+                // 現在と同じレイヤーの指定は意味的 no-op（履歴を汚さない）。
+                Ok(ExecuteOutcome::conditional(
+                    Applied::SetCurrentLayer { before, after: id },
+                    before != id,
+                ))
             }
             Command::Batch(subs) => {
                 let mut applied: Vec<Applied> = Vec::with_capacity(subs.len());
+                let mut new_ids = NewIds::default();
+                // バッチは 1 つでも実変更を含めば changed。空バッチ・全 no-op サブの
+                // バッチ（ネストした空バッチ含む）は changed = false のままとなり、
+                // apply が undo 履歴へ積まない。
+                let mut changed = false;
                 for sub in subs {
-                    match self.execute(sub, new_ids) {
-                        Ok(a) => applied.push(a),
+                    match self.execute(sub) {
+                        Ok(outcome) => {
+                            applied.push(outcome.applied);
+                            new_ids.entities.extend(outcome.new_ids.entities);
+                            new_ids.layers.extend(outcome.new_ids.layers);
+                            changed |= outcome.changed;
+                        }
                         Err(err) => {
                             // 原子性: これまでに適用したサブコマンドを逆順で巻き戻し、
                             // 呼び出し前の状態へ完全復帰させてからエラーを返す。
@@ -345,7 +413,11 @@ impl Document {
                         }
                     }
                 }
-                Ok(Applied::Batch(applied))
+                Ok(ExecuteOutcome {
+                    applied: Applied::Batch(applied),
+                    new_ids,
+                    changed,
+                })
             }
         }
     }
@@ -398,10 +470,14 @@ impl Document {
 
     /// 指定レイヤーがロックされていれば [`CoreError::LayerLocked`] を返す。
     ///
-    /// 編集可否（ロック）の判定を担う唯一の場所であり、`AddEntity`・`RemoveEntity`・
-    /// `ModifyEntity` はすべてこの規則を（[`Document::require_editable_entity`] 経由を含め）
-    /// 必ず通す。判定を一元化することで、レイヤーごとのロック挙動の食い違いや、将来の
-    /// コマンド追加時のチェック漏れを構造的に防ぐ。
+    /// `execute` 経由で新規コマンドを適用する経路（`AddEntity`（[`Document::require_editable_layer`]
+    /// 経由）・`RemoveEntity`・`ModifyEntity`（いずれも [`Document::require_editable_entity`]
+    /// 経由））がこの規則を通す。判定をここへ一元化することで、レイヤーごとのロック挙動の
+    /// 食い違いや、将来のコマンド追加時のチェック漏れのリスクを下げる（ただし各コマンド
+    /// アームが手動でこのヘルパーを呼ぶ規約に依っており、型やマクロによる強制はない）。
+    ///
+    /// `revert`/`reapply`（undo/redo 経路）はこのチェックを一切通らない。ロック中の
+    /// レイヤーに対しても undo/redo は常に成功させる、という意図した設計判断である。
     ///
     /// 対象レイヤーが（不変条件違反で）存在しない場合はここでは咎めず `Ok(())` とする。
     fn ensure_layer_unlocked(&self, id: LayerId) -> Result<(), CoreError> {
@@ -411,11 +487,29 @@ impl Document {
         }
     }
 
+    /// レイヤーが存在し、かつロックされていないことを一度のルックアップで検証する。
+    ///
+    /// エンティティ側の [`Document::require_editable_entity`] と対になるヘルパー。
+    /// 存在確認とロック確認を別々のヘルパー呼び出しで行うと同じレイヤー ID を 2 回
+    /// ルックアップすることになるため、1 回にまとめている。`AddEntity` がこれを使う。
+    ///
+    /// ロック判定の適用範囲は [`Document::ensure_layer_unlocked`] を参照。
+    fn require_editable_layer(&self, id: LayerId) -> Result<(), CoreError> {
+        match self.layer(id) {
+            Some(layer) if layer.locked => Err(CoreError::LayerLocked(id)),
+            Some(_) => Ok(()),
+            None => Err(CoreError::LayerNotFound(id)),
+        }
+    }
+
     /// エンティティが生存し、かつ所属レイヤーがロックされていないことを一度に検証する。
     ///
-    /// 「存在確認」と「ロック確認」を 1 つにまとめ、エンティティスロットの参照を 1 回に抑える
-    /// （従来は `require_entity` と `require_entity_layer_unlocked` が各々ルックアップしていた）。
-    /// `RemoveEntity`/`ModifyEntity` がこれを共有し、ロック規則を必ず通す。
+    /// 「存在確認」と「ロック確認」を 1 つのヘルパーにまとめている。ただし呼び出し元
+    /// （`RemoveEntity`/`ModifyEntity`）はこの後 `take_entity`/`live_entity_mut` で
+    /// 改めて対象スロットを参照するため、エンティティスロットへの参照そのものは合計
+    /// 2 回になる（抑えているのは検証ロジックの重複であり、参照回数そのものではない）。
+    ///
+    /// ロック判定の適用範囲は [`Document::ensure_layer_unlocked`] を参照。
     fn require_editable_entity(&self, id: EntityId) -> Result<(), CoreError> {
         let layer_id = self.entity(id).ok_or(CoreError::EntityNotFound(id))?.layer;
         self.ensure_layer_unlocked(layer_id)
@@ -946,6 +1040,91 @@ mod tests {
     }
 
     #[test]
+    fn set_current_layer_to_same_layer_is_noop() {
+        // 回帰: 現在と同じレイヤーを SetCurrentLayer しても履歴を汚さないこと。
+        // 以前は before == after でも Applied::SetCurrentLayer が undo_stack に積まれ、
+        // can_undo が false→true に変化し、次の Ctrl+Z が空振りになっていた。
+        let mut doc = Document::new();
+        let current = doc.current_layer();
+
+        let can_undo_before = doc.can_undo();
+        let undo_len_before = doc.undo_stack.len();
+        let redo_len_before = doc.redo_stack.len();
+
+        assert_eq!(
+            doc.apply(Command::SetCurrentLayer(current)),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.current_layer(), current);
+        assert_eq!(doc.can_undo(), can_undo_before);
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.redo_stack.len(), redo_len_before);
+    }
+
+    #[test]
+    fn set_layer_props_with_identical_props_is_noop() {
+        // 回帰: 現在と全く同じ props を設定しても before == after なので履歴を汚さない。
+        let mut doc = Document::new();
+        let id = doc.default_layer();
+        let same = doc.layer(id).unwrap().clone();
+
+        let can_undo_before = doc.can_undo();
+        let undo_len_before = doc.undo_stack.len();
+        let redo_len_before = doc.redo_stack.len();
+
+        assert_eq!(
+            doc.apply(Command::SetLayerProps { id, props: same }),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.can_undo(), can_undo_before);
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.redo_stack.len(), redo_len_before);
+    }
+
+    #[test]
+    fn modify_entity_with_identical_geometry_is_noop() {
+        // 回帰: 現在と全く同じ幾何を設定しても before == after なので履歴を汚さない。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+
+        let can_undo_before = doc.can_undo();
+        let undo_len_before = doc.undo_stack.len();
+        let redo_len_before = doc.redo_stack.len();
+
+        assert_eq!(
+            doc.apply(Command::ModifyEntity {
+                id,
+                new_geom: line(0.0),
+            }),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.entity(id).unwrap().geom, line(0.0));
+        assert_eq!(doc.can_undo(), can_undo_before);
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.redo_stack.len(), redo_len_before);
+    }
+
+    #[test]
+    fn noop_command_preserves_redo_stack() {
+        // 意味的 no-op は redo スタックを保持する（クリアしない）こと。
+        let mut doc = Document::new();
+        let current = doc.current_layer();
+        doc.apply(add_line(&doc, line(0.0))).unwrap();
+        assert!(doc.undo()); // redo スタックに 1 件積まれる
+        assert!(doc.can_redo());
+
+        // no-op な SetCurrentLayer は redo を消さない。
+        assert_eq!(
+            doc.apply(Command::SetCurrentLayer(current)),
+            Ok(NewIds::default())
+        );
+        assert!(doc.can_redo());
+        assert!(doc.redo());
+        assert_eq!(doc.entity_count(), 1);
+    }
+
+    #[test]
     fn batch_and_single_commands_interleave_consistently() {
         let mut doc = Document::new();
         let layer = doc.current_layer();
@@ -1000,6 +1179,13 @@ mod tests {
         assert_single_new_id(&new_ids.layers, &new_ids.entities)
     }
 
+    /// 指定レイヤーをロック状態にする（`SetLayerProps` で `locked = true` を適用する）。
+    fn lock_layer(doc: &mut Document, id: LayerId) {
+        let mut props = doc.layer(id).unwrap().clone();
+        props.locked = true;
+        doc.apply(Command::SetLayerProps { id, props }).unwrap();
+    }
+
     #[test]
     fn locked_layer_blocks_modify_and_remove() {
         let mut doc = Document::new();
@@ -1007,13 +1193,7 @@ mod tests {
         let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
 
         // カレントレイヤーをロックする。
-        let mut locked = doc.layer(layer).unwrap().clone();
-        locked.locked = true;
-        doc.apply(Command::SetLayerProps {
-            id: layer,
-            props: locked,
-        })
-        .unwrap();
+        lock_layer(&mut doc, layer);
 
         // ModifyEntity はロックされたレイヤーのエンティティに対して拒否される。
         assert_eq!(
@@ -1040,13 +1220,7 @@ mod tests {
         let mut doc = Document::new();
         let layer = doc.current_layer();
 
-        let mut locked = doc.layer(layer).unwrap().clone();
-        locked.locked = true;
-        doc.apply(Command::SetLayerProps {
-            id: layer,
-            props: locked,
-        })
-        .unwrap();
+        lock_layer(&mut doc, layer);
 
         let can_undo_before = doc.can_undo();
         assert_eq!(
@@ -1080,13 +1254,7 @@ mod tests {
             Entity::new(line(1.0), extra_layer, Style::inherited()),
         );
 
-        let mut locked = doc.layer(extra_layer).unwrap().clone();
-        locked.locked = true;
-        doc.apply(Command::SetLayerProps {
-            id: extra_layer,
-            props: locked,
-        })
-        .unwrap();
+        lock_layer(&mut doc, extra_layer);
 
         let can_undo_before = doc.can_undo();
         let batch = Command::Batch(vec![
@@ -1120,9 +1288,8 @@ mod tests {
                 Style::inherited(),
             )))
             .unwrap();
-        assert_eq!(new_ids.entities.len(), 1);
-        assert!(new_ids.layers.is_empty());
-        assert!(doc.entity(new_ids.entities[0]).is_some());
+        let id = assert_single_new_id(&new_ids.entities, &new_ids.layers);
+        assert!(doc.entity(id).is_some());
     }
 
     #[test]
@@ -1131,9 +1298,8 @@ mod tests {
         let new_ids = doc
             .apply(Command::AddLayer(Layer::new("aux", Rgb::WHITE)))
             .unwrap();
-        assert_eq!(new_ids.layers.len(), 1);
-        assert!(new_ids.entities.is_empty());
-        assert!(doc.layer(new_ids.layers[0]).is_some());
+        let id = assert_single_new_id(&new_ids.layers, &new_ids.entities);
+        assert!(doc.layer(id).is_some());
     }
 
     #[test]

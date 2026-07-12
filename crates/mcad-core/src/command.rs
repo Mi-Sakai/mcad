@@ -72,12 +72,18 @@ pub enum Command {
     /// バッチは undo 履歴へ **1 記録** として積まれる。undo はサブコマンドの逆操作を
     /// 逆順に、redo は正順に適用するので、Ctrl+Z 1 回でバッチ全体が戻る。
     ///
-    /// # 空バッチ
+    /// # 空バッチと意味的no-op
     ///
-    /// 空の [`Command::Batch`] は「操作なし」として `Ok(())` を返し、履歴には積まない
-    /// （[`crate::Document::apply`] 参照）。
+    /// 空の [`Command::Batch`] や、サブコマンドがすべて意味的 no-op（ネストした空
+    /// [`Command::Batch`] を含む）であるバッチは「操作なし」として扱われる。
+    /// [`crate::Document::apply`] はこの場合 `Ok(`[`crate::NewIds`]`::default())` を
+    /// 返し、undo/redo 履歴には一切触れない。
     ///
-    /// サブコマンドに [`Command::Batch`] を含めるネストも、`apply` が再帰的に扱うため
+    /// これは `Batch` に固有の扱いではなく、状態を変えないコマンド全般（例: 現在と
+    /// 同じ幾何・プロパティ・レイヤーを指定する `ModifyEntity`/`SetLayerProps`/
+    /// `SetCurrentLayer`）に共通する。判定基準の詳細は [`crate::Document::apply`] を参照。
+    ///
+    /// サブコマンドに [`Command::Batch`] を含めるネストも `apply` が再帰的に扱うため
     /// 破綻しないが、MVP で意図しているのはフラットな複数操作を 1 単位にすることである。
     Batch(Vec<Command>),
 }

@@ -13,7 +13,7 @@ mod viewport;
 
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
-use mcad_core::{Command, Document, Entity, Rgb, Style};
+use mcad_core::{Command, Document, Entity, Layer, LayerId, Rgb, Style};
 use mcad_geom::{Aabb, Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
 use tool::{
@@ -47,6 +47,18 @@ const SNAP_MARKER_SIZE: f32 = 6.0;
 
 /// ステータスメッセージの表示時間（秒）。経過後は自動で消える。
 const STATUS_MESSAGE_SECS: f64 = 5.0;
+
+/// 新規レイヤーへ作成順に巡回で割り当てる色のパレット。
+///
+/// デフォルトレイヤー（白想定）と区別しやすい彩度のある色を並べる。
+const LAYER_COLOR_PALETTE: [Rgb; 6] = [
+    Rgb::new(230, 80, 80),
+    Rgb::new(80, 200, 120),
+    Rgb::new(90, 140, 255),
+    Rgb::new(230, 200, 60),
+    Rgb::new(200, 90, 220),
+    Rgb::new(70, 210, 210),
+];
 
 /// ステータスメッセージの文字色（エラー通知が主用途なので警告寄りの赤）。
 const STATUS_MESSAGE_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
@@ -275,6 +287,10 @@ impl eframe::App for McadApp {
             });
         });
 
+        egui::Panel::right("layer_panel").show(ui, |ui| {
+            layer_panel(ui, &mut self.document, &mut self.status, now);
+        });
+
         egui::CentralPanel::default().show(ui, |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -458,7 +474,7 @@ fn handle_tool_input(
             // レイヤーがロック中の AddEntity）。失敗はステータスバーへ表示し、
             // ツール状態はリセットして操作を続行可能にしておく。
             if let Err(err) = document.apply(cmd) {
-                set_status(status, now, format!("作図を確定できません: {err}"));
+                set_status(status, now, format!("Commit failed: {err}"));
             }
             *tool = tool_kind.spawn();
         }
@@ -467,6 +483,93 @@ fn handle_tool_input(
             *tool = None;
         }
         ToolResult::Continue => {}
+    }
+}
+
+/// 右側のレイヤーパネル（DESIGN.md 3.4 の UI レイアウト）。
+///
+/// 一覧・カレント切替（ラジオ）・色変更・表示/ロック切替・追加/削除を提供する。
+/// すべての変更は [`Command`] として [`Document::apply`] へ載せるため undo/redo の
+/// 対象になる。削除の制約（デフォルト/カレント/非空レイヤーは不可）はコア側が
+/// 検証し、失敗はステータスバーへ表示する。
+///
+/// ラベル等のユーザー可視文字列を ASCII に限定しているのは、egui の既定フォントが
+/// CJK グリフを含まず日本語が豆腐（□）になるため。
+fn layer_panel(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    status: &mut Option<StatusMessage>,
+    now: f64,
+) {
+    ui.heading("Layers");
+
+    if ui.button("+ Add layer").clicked() {
+        let n = document.layer_count();
+        let color = LAYER_COLOR_PALETTE[n % LAYER_COLOR_PALETTE.len()];
+        let cmd = Command::AddLayer(Layer::new(format!("Layer {n}"), color));
+        if let Err(err) = document.apply(cmd) {
+            set_status(status, now, format!("Add layer failed: {err}"));
+        }
+    }
+    ui.separator();
+
+    let current = document.current_layer();
+    let default_layer = document.default_layer();
+    // パネル描画中の可変借用を避けるため、レイヤー一覧のスナップショットを取り、
+    // 操作から生じたコマンドは走査後に一括適用する。
+    let layers: Vec<(LayerId, Layer)> = document
+        .layers()
+        .map(|(id, layer)| (id, layer.clone()))
+        .collect();
+    let mut pending: Vec<Command> = Vec::new();
+
+    for (id, layer) in &layers {
+        ui.horizontal(|ui| {
+            // カレントレイヤー切替（ラジオ）。新規エンティティの投入先になる。
+            if ui
+                .radio(*id == current, "")
+                .on_hover_text("Set current layer")
+                .clicked()
+                && *id != current
+            {
+                pending.push(Command::SetCurrentLayer(*id));
+            }
+
+            let mut rgb = [layer.color.r, layer.color.g, layer.color.b];
+            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                let mut props = layer.clone();
+                props.color = Rgb::new(rgb[0], rgb[1], rgb[2]);
+                pending.push(Command::SetLayerProps { id: *id, props });
+            }
+
+            let mut visible = layer.visible;
+            if ui.checkbox(&mut visible, "show").changed() {
+                let mut props = layer.clone();
+                props.visible = visible;
+                pending.push(Command::SetLayerProps { id: *id, props });
+            }
+
+            let mut locked = layer.locked;
+            if ui.checkbox(&mut locked, "lock").changed() {
+                let mut props = layer.clone();
+                props.locked = locked;
+                pending.push(Command::SetLayerProps { id: *id, props });
+            }
+
+            ui.label(&layer.name);
+
+            // 削除。デフォルトレイヤーにはボタン自体を出さない（コア側でも拒否される）。
+            // カレント・非空レイヤーの削除失敗はコアの検証に任せ、理由を表示する。
+            if *id != default_layer && ui.button("x").on_hover_text("Delete layer").clicked() {
+                pending.push(Command::RemoveLayer(*id));
+            }
+        });
+    }
+
+    for cmd in pending {
+        if let Err(err) = document.apply(cmd) {
+            set_status(status, now, format!("Layer operation failed: {err}"));
+        }
     }
 }
 
@@ -518,7 +621,7 @@ fn handle_select_input(
     {
         match document.apply(cmd) {
             Ok(_) => select_tool.clear_selection(),
-            Err(err) => set_status(status, now, format!("削除できません: {err}")),
+            Err(err) => set_status(status, now, format!("Delete failed: {err}")),
         }
     }
 
@@ -545,7 +648,7 @@ fn handle_select_input(
                 // 移動の確定。ロックレイヤー混在時は Batch 原子性で全体が失敗し、
                 // 何も動かない。失敗理由はステータスバーへ表示する。
                 if let Err(err) = document.apply(cmd) {
-                    set_status(status, now, format!("移動できません: {err}"));
+                    set_status(status, now, format!("Move failed: {err}"));
                 }
             }
         } else if response.clicked_by(egui::PointerButton::Primary) {

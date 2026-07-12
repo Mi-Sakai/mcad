@@ -230,7 +230,10 @@ pub fn load_mcad(path: impl AsRef<Path>) -> Result<Document, IoError> {
 /// 条件: すべての座標・半径・角度が有限、半径は非負、ポリラインは頂点 1 つ以上。
 /// 半径 0 の円や長さ 0 の線分は退化しているが描画・計算を壊さないため許容する
 /// （作図ツールでも同一点クリックで作れるものを io だけ拒否しない）。
-fn validate_shape(shape: &Shape) -> Result<(), String> {
+///
+/// `pub(crate)`: DXF import（[`crate::dxf_file`]）でも同じ判定基準を再利用する
+/// ため（ロジックの重複・divergence を避ける）。
+pub(crate) fn validate_shape(shape: &Shape) -> Result<(), String> {
     let finite = |p: Point2| p.x.is_finite() && p.y.is_finite();
     match shape {
         Shape::Point(p) => {

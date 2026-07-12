@@ -52,4 +52,13 @@ pub enum IoError {
     /// 起きない想定の防御的バリアント）。
     #[error("core rejected command during import: {0}")]
     Core(#[from] CoreError),
+
+    /// DXF の読み書き・構文解析の失敗（`dxf` クレート由来）。
+    ///
+    /// 個々のエンティティの対応可否・ジオメトリの妥当性の問題はここに含めない
+    /// （[`crate::dxf_file::ImportSummary::skipped_entities`] として扱う）。
+    /// これはあくまで DXF ファイル全体の構造的な異常（構文エラー・
+    /// 読み書き失敗など）を表す。
+    #[error("dxf error: {0}")]
+    Dxf(#[from] dxf::DxfError),
 }

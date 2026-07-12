@@ -1,0 +1,53 @@
+# Changelog
+
+mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠する。
+
+## [0.3.0] - 2026-07-12 — M3「実用化」
+
+DESIGN.md の全11タスクを完了し、MVP の検収基準をすべて満たした。
+
+### 追加
+
+- GUI の undo/redo 結線（Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y）と、undo/redo 後の選択集合の浄化（死んだ EntityId の除去）
+- ステータスバーのエラー表示（コマンド失敗・ファイル操作失敗を5秒間表示）
+- レイヤーパネル（一覧・カレント切替・色変更・表示/ロック切替・追加/削除。すべて Command 経由で undo/redo 対象）
+- `.mcad` 保存/読込（version 必須の JSON。レイヤー参照をインデックス方式にしたポータブル DTO `FileDocument` を経由）
+- ファイル操作の GUI 統合（Ctrl+N/O/S/Shift+S、rfd ネイティブダイアログ、未保存確認、ウィンドウタイトルのファイル名と dirty 表示、ウィンドウ閉鎖の割り込み）
+- DXF 入出力（LINE / CIRCLE / ARC / LWPOLYLINE / POINT とレイヤー。未対応エンティティは読み飛ばして `ImportSummary` で件数を返す）※ライブラリ API のみ。GUI 結線は M4 予定
+- クレート横断の統合テスト4本（DESIGN.md 検収基準を検証）
+
+### 変更
+
+- ワークスペース内部依存を `[workspace.dependencies]` で一元管理（バージョン文字列のハードコードを排除）
+- io 境界のジオメトリ検証（非有限座標・負半径・空ポリラインの拒否）
+- egui のユーザー可視文字列を ASCII に統一（既定フォントが CJK 非対応のため）
+
+## [0.2.0] - 2026-07-12 — M2 レビュー反映
+
+### 変更
+
+- スナップの交点計算の事前絞り込みを、可視領域 AABB からカーソル近傍 AABB へ変更（取りこぼしのない絞り込みで高速化）
+- README を M2 完了状態へ更新
+
+※ Cargo.toml のバージョンは 0.1.0 のまま（タグのみ）。0.3.0 で解消。
+
+## [0.1.0+M2] - 2026-07-12 — M2「描けるCAD」
+
+（タグなし。v0.2.0 に含まれる）
+
+### 追加
+
+- Viewport（ワールド f64 ⇔ スクリーン f32 変換、カーソル中心ズーム、パン、1/2/5系列グリッド、AABB カリング描画）
+- Tool フレームワークと作図ツール（Point / Line / Circle / 3点円弧 / Polyline、プレビュー表示、GUI 非依存でテスト可能な入力イベント設計）
+- 選択・編集ツール（最近傍クリック選択、完全内包の矩形選択、ドラッグ移動、削除。移動/削除は `Command::Batch` で undo 1単位、ロックレイヤー混在時は原子的に失敗）
+- スナップエンジン（端点 > 交点 > 中点 > 中心 > グリッドの優先度、種別ごとのマーカー表示、F3 切替）
+
+## [0.1.0] - 2026-07-12 — M1「土台」
+
+### 追加
+
+- Cargo ワークスペース4クレート構成（`mcad-app` → `mcad-io` → `mcad-core` → `mcad-geom` の一方向依存）と CI（fmt / clippy / test）
+- `mcad-geom`: 幾何プリミティブ（Point2 / Vec2 / Aabb / LineSeg / Circle / Arc / Polyline / Shape）と純関数の計算（最近点・距離・交点）、proptest
+- `mcad-core`: Document / Entity / Layer、コマンドパターン undo/redo、`Command::Batch` の原子性、no-op 検出、レイヤーロック機構
+
+プロジェクト開始は 2026-07-11（設計書 `DESIGN.md` の作成から）。

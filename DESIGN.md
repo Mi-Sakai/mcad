@@ -120,3 +120,45 @@ mcad/
 - レイヤーを分けて非表示・ロックが効く
 - .mcadで保存→再起動→読込で完全復元される
 - 描いた図面をDXF出力し、再インポートして同一内容になる(往復テストがCIで通る)
+
+**→ 全項目 v0.3.0 で達成済み(2026-07-12)。**
+
+## 6. M4: 入出力の一貫性(v0.4.0)
+
+2026-07-12 設計。v0.3.0 の外部レビュー(Codex)と内部レビューで挙がった、
+**実ユーザーに見える入出力の一貫性と初期状態**の課題を解消する。
+新しい作図・編集機能は足さない(トリム/フィレット・寸法・拘束ソルバーは引き続きスコープ外)。
+
+### 設計判断
+
+1. **DXF importは`.mcad`と混同しない**: DXF を開いたら `current_path = None`・`dirty = true` とし、
+   Ctrl+S では元の DXF を上書きせず「名前を付けて `.mcad` 保存」へ誘導する。DXF は交換用の
+   import/export 形式であり、作業ファイル形式ではない
+2. **起動は空文書**: 作図ツールが揃った今、起動時サンプルの役目は終わった。サンプル生成は
+   テスト用ヘルパーへ移す(feature flag より単純)
+3. **dirtyは履歴世代ベースへ**: `Document` に世代カウンタを設け、保存成功時の世代を記録して
+   現在世代と比較する。undo 後の再 apply による履歴分岐・no-op・`clear_history()` との
+   相互作用に注意
+4. **ジオメトリ検証をcoreへ引き上げ**: `Shape::validate()` を mcad-geom に置き、
+   `Document::apply` の AddEntity / ModifyEntity でも検証する。ゼロ半径・ゼロ長線分は
+   現行どおり許容(UI と整合)。mcad-io の `validate_shape` はこれへ委譲して重複排除
+5. **DXF lineweight(線幅)対応はスコープ外**: 「width は保存されない」と仕様明記のみ行う
+
+### タスク分割
+
+| # | タスク | 内容 | 担当 | 依存 |
+|---|---|---|---|---|
+| 12 | DXFのGUI結線 | Open DXF / Export DXF(キーバインド例: Ctrl+Shift+O / Ctrl+E)。import成功時に `skipped_entities` 件数とロック非復元をステータス表示。`current_path = None`・`dirty = true` | implement-sonnet | — |
+| 13 | 起動状態とズームフィット | 起動を空文書化(サンプルはテストヘルパーへ)。ファイル読込後(.mcad/DXF共通)に図面全体のAABBへズームフィット、空文書は既定ビューへリセット | implement-sonnet | 12 |
+| 14 | dirtyの世代管理 | Documentに世代カウンタ、保存時世代との比較でdirty判定。undo分岐・no-op・clear_historyの各分岐をテストで固定 | implement-opus | — |
+| 15 | ジオメトリ不変条件 | `Shape::validate()` をmcad-geomへ追加、`Document::apply` で検証、mcad-ioは委譲 | implement-sonnet | — |
+| 16 | ドキュメント整合 | README・モジュールdocをM4の変更(DXF操作・キーバインド・dirty仕様)に合わせて更新 | haiku-assistant | 12-15 |
+
+### 検収基準(M4完了の定義)
+
+- GUIからDXFを開き・書き出しでき、importのスキップ件数がステータスに表示される
+- DXFを開いた直後にCtrl+Sを押すと「名前を付けて`.mcad`保存」ダイアログが開く(元DXFを上書きしない)
+- 起動直後は空文書。ファイルを開くと図面全体が視界に収まる
+- 保存→1操作→undoで保存時内容へ戻ると、タイトルの`*`が消え未保存確認も出ない
+- NaN/∞を含むShapeは`Command::AddEntity`/`ModifyEntity`で拒否される
+- 全段で fmt / clippy / workspace test が通り、GUI変更(12・13)は手動スモークテストを記録する

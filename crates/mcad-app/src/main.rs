@@ -16,7 +16,8 @@ use mcad_core::{Command, Document, Entity, Rgb, Style};
 use mcad_geom::{Aabb, Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
 use tool::{
-    ArcTool, CircleTool, InputEvent, LineTool, PointTool, PolylineTool, Tool, ToolCtx, ToolResult,
+    ArcTool, CircleTool, DragPreview, InputEvent, LineTool, PointTool, PolylineTool, SelectTool,
+    Tool, ToolCtx, ToolResult,
 };
 use viewport::Viewport;
 
@@ -29,9 +30,21 @@ const WHEEL_ZOOM_SPEED: f64 = 0.0015;
 /// グリッドの目標スクリーン間隔（ピクセル）。
 const GRID_TARGET_PX: f64 = 48.0;
 
-/// 現在アクティブな作図ツールの種類。`Select` はツール非アクティブ
-/// （キャンバスクリックは何もしない）を表す。選択ツール自体は別タスク
-/// （M2タスク6: 選択・編集ツール）の範囲。
+/// 選択ヒットテストのピック許容量（スクリーンピクセル）。ワールド単位へは
+/// `PICK_TOLERANCE_PX / viewport.zoom` で変換する。
+const PICK_TOLERANCE_PX: f64 = 6.0;
+
+/// 選択エンティティのハイライト色（確定済みエンティティ色とは別の強調色）。
+const SELECTION_COLOR: Color32 = Color32::from_rgb(80, 200, 255);
+/// 選択ハイライトの線の太さ。
+const SELECTION_WIDTH: f32 = 2.5;
+/// 矩形選択プレビューの塗り色（半透明）。
+const RECT_FILL_COLOR: Color32 = Color32::from_rgba_premultiplied(30, 60, 90, 60);
+/// 矩形選択プレビューの枠線色。
+const RECT_OUTLINE_COLOR: Color32 = Color32::from_rgb(80, 160, 255);
+
+/// 現在アクティブなツールの種類。`Select` は選択・編集モード（[`SelectTool`]）で、
+/// 作図ツール（Point/Line/…）とは別経路で処理する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
     Select,
@@ -43,8 +56,9 @@ enum ToolKind {
 }
 
 impl ToolKind {
-    /// この種類に対応するツールの新しいインスタンスを作る。
-    /// `Select` はツールなし（`None`）。
+    /// この種類に対応する作図ツールの新しいインスタンスを作る。
+    /// `Select` は作図ツールを持たず（選択・編集は [`McadApp::select_tool`] が
+    /// 別経路で担う）、`None` を返す。
     fn spawn(self) -> Option<Box<dyn Tool>> {
         match self {
             ToolKind::Select => None,
@@ -74,8 +88,11 @@ struct McadApp {
     viewport: Viewport,
     /// 現在アクティブなツールの種類（UI表示・キー切替用）。
     tool_kind: ToolKind,
-    /// 現在アクティブなツール本体。`tool_kind == Select` のとき `None`。
+    /// 現在アクティブな作図ツール本体。`tool_kind == Select` のとき `None`。
     tool: Option<Box<dyn Tool>>,
+    /// 選択・編集ツール。選択集合を所有し、`tool_kind == Select` のとき有効。
+    /// 選択集合はアプリ UI 状態でありドキュメント履歴には積まない（[`SelectTool`] の doc 参照）。
+    select_tool: SelectTool,
 }
 
 impl McadApp {
@@ -137,6 +154,7 @@ impl McadApp {
             viewport: Viewport::new(),
             tool_kind: ToolKind::Select,
             tool: None,
+            select_tool: SelectTool::default(),
         }
     }
 }
@@ -149,13 +167,21 @@ impl Default for McadApp {
 
 impl eframe::App for McadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        handle_tool_shortcut_keys(ui, &mut self.tool_kind, &mut self.tool);
+        handle_tool_shortcut_keys(
+            ui,
+            &mut self.tool_kind,
+            &mut self.tool,
+            &mut self.select_tool,
+        );
 
         egui::Panel::top("tool_status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("Tool: {}", self.tool_kind.label()));
                 ui.separator();
-                ui.label("L=Line  C=Circle  A=Arc  P=Polyline  (点ツールは 1 キー)  Esc=Select");
+                ui.label(
+                    "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
+                     Del=Delete  Esc=Cancel",
+                );
             });
         });
 
@@ -165,21 +191,39 @@ impl eframe::App for McadApp {
 
             handle_pan_input(ui, &response, &mut self.viewport);
             handle_zoom_input(ui, &response, rect, &mut self.viewport);
-            handle_tool_input(
-                ui,
-                &response,
-                rect,
-                &self.viewport,
-                &mut self.document,
-                &mut self.tool_kind,
-                &mut self.tool,
-            );
+            if self.tool_kind == ToolKind::Select {
+                handle_select_input(
+                    ui,
+                    &response,
+                    rect,
+                    &self.viewport,
+                    &mut self.document,
+                    &mut self.select_tool,
+                );
+            } else {
+                handle_tool_input(
+                    ui,
+                    &response,
+                    rect,
+                    &self.viewport,
+                    &mut self.document,
+                    &mut self.tool_kind,
+                    &mut self.tool,
+                );
+            }
 
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, Color32::from_gray(30));
 
             draw_grid(&painter, rect, &self.viewport);
             draw_entities(&painter, rect, &self.document, &self.viewport);
+            draw_selection(
+                &painter,
+                rect,
+                &self.document,
+                &self.viewport,
+                &self.select_tool,
+            );
             if let Some(tool) = &self.tool {
                 tool.draw_preview(&painter, rect, &self.viewport);
             }
@@ -189,18 +233,22 @@ impl eframe::App for McadApp {
 
 /// キーボードショートカットでアクティブツールを切り替える（DESIGN.md 3.4 のツール群）。
 ///
-/// `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `P`=Polyline, `Esc`=Select（非アクティブ）。
+/// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `P`=Polyline。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
+/// 作図ツールへ切り替えるときは、描画中に古い選択ハイライトが残らないよう選択をクリアする。
 fn handle_tool_shortcut_keys(
     ui: &egui::Ui,
     tool_kind: &mut ToolKind,
     tool: &mut Option<Box<dyn Tool>>,
+    select_tool: &mut SelectTool,
 ) {
     // テキスト入力欄がない前提なので、修飾キーなしのキー入力はすべてショートカット
     // として扱ってよい。
     let mut requested: Option<ToolKind> = None;
     ui.input(|i| {
-        if i.key_pressed(Key::Num1) {
+        if i.key_pressed(Key::S) {
+            requested = Some(ToolKind::Select);
+        } else if i.key_pressed(Key::Num1) {
             requested = Some(ToolKind::Point);
         } else if i.key_pressed(Key::L) {
             requested = Some(ToolKind::Line);
@@ -215,6 +263,10 @@ fn handle_tool_shortcut_keys(
     if let Some(kind) = requested {
         *tool_kind = kind;
         *tool = kind.spawn();
+        // 作図ツールへ移るときは選択を解除する（Select のままなら選択は保持）。
+        if kind != ToolKind::Select {
+            select_tool.clear_selection();
+        }
     }
 }
 
@@ -280,6 +332,65 @@ fn handle_tool_input(
             *tool = None;
         }
         ToolResult::Continue => {}
+    }
+}
+
+/// 選択・編集モード（`tool_kind == Select`）のキャンバス入力を [`SelectTool`] へ渡す。
+///
+/// egui 組み込みのクリック/ドラッグ判定を利用し、単発クリック（＝選択）と
+/// ドラッグ（＝矩形選択 or 移動）を振り分ける。移動・削除の確定コマンドは
+/// [`Document::apply`] で適用する（`Batch` の原子性・undo/redo 結線はコア側に従う）。
+///
+/// - `Delete`/`Backspace`: 選択エンティティを 1 バッチで削除。適用成功時のみ選択を解除する。
+/// - `Esc`: 進行中のドラッグを破棄（選択は変えない）。
+/// - `Space` 押下中の左ドラッグはパン用なので、選択操作としては扱わない。
+fn handle_select_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    rect: Rect,
+    viewport: &Viewport,
+    document: &mut Document,
+    select_tool: &mut SelectTool,
+) {
+    // ピック許容量（px）をワールド単位へ換算する。
+    let tol = PICK_TOLERANCE_PX / viewport.zoom;
+
+    // Delete / Backspace: 選択を 1 バッチで削除。ロックレイヤー混在時は Batch 原子性で
+    // 全体失敗しうるので、apply が成功したときだけ選択を解除する。
+    if ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
+        && let Some(cmd) = select_tool.delete_command()
+        && document.apply(cmd).is_ok()
+    {
+        select_tool.clear_selection();
+    }
+
+    // Esc: 進行中のドラッグだけ破棄する（選択集合は変えない）。
+    if ui.input(|i| i.key_pressed(Key::Escape)) {
+        select_tool.on_cancel();
+    }
+
+    // Space 押下中の左ドラッグはパン。選択操作とは扱わない。
+    if ui.input(|i| i.key_down(Key::Space)) {
+        return;
+    }
+
+    let world_at = |pos| viewport.screen_to_world(rect, pos);
+    let pointer = response.interact_pointer_pos();
+    if let Some(pos) = pointer {
+        let world = world_at(pos);
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            select_tool.on_drag_start(document, world, tol);
+        } else if response.dragged_by(egui::PointerButton::Primary) {
+            select_tool.on_drag(world);
+        } else if response.drag_stopped_by(egui::PointerButton::Primary) {
+            if let Some(cmd) = select_tool.on_drag_end(document, world) {
+                // 移動の確定。ロックレイヤー混在時は失敗しうるが、その場合は何も動かない
+                // （Batch 原子性）。エラー表示は別タスクの範囲なので握りつぶす。
+                let _ = document.apply(cmd);
+            }
+        } else if response.clicked_by(egui::PointerButton::Primary) {
+            select_tool.on_click(document, world, tol);
+        }
     }
 }
 
@@ -381,6 +492,66 @@ fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewp
         let color = entity.style.effective_color(layer.color);
         let stroke = Stroke::new(entity.style.width.max(1.0), to_color32(color));
         draw_shape(painter, rect, viewport, &entity.geom, stroke);
+    }
+}
+
+/// 選択ハイライトと、ドラッグ中のプレビュー（矩形選択枠・移動の仮表示）を描画する。
+///
+/// `draw_entities` の後に呼び、選択エンティティを強調色で上書きする（[`draw_shape`] 再利用）。
+fn draw_selection(
+    painter: &egui::Painter,
+    rect: Rect,
+    document: &Document,
+    viewport: &Viewport,
+    select_tool: &SelectTool,
+) {
+    let highlight = Stroke::new(SELECTION_WIDTH, SELECTION_COLOR);
+    match select_tool.drag_preview() {
+        Some(DragPreview::Move { delta }) => {
+            // 移動中: 元の位置は draw_entities が通常色で描くので、ここでは移動後の
+            // 位置を強調色で仮表示する（元＝ゴースト、プレビュー＝ハイライト）。
+            for &id in select_tool.selection() {
+                if let Some(entity) = document.entity(id) {
+                    draw_shape(
+                        painter,
+                        rect,
+                        viewport,
+                        &entity.geom.translated(delta),
+                        highlight,
+                    );
+                }
+            }
+        }
+        Some(DragPreview::Rect { start, current }) => {
+            // 矩形選択中: 現在の選択はそのまま強調しつつ、ドラッグ矩形を描く。
+            draw_selected(painter, rect, document, viewport, select_tool, highlight);
+            let a = viewport.world_to_screen(rect, start);
+            let b = viewport.world_to_screen(rect, current);
+            let r = Rect::from_two_pos(a, b);
+            painter.rect_filled(r, 0.0, RECT_FILL_COLOR);
+            let outline = Stroke::new(1.0, RECT_OUTLINE_COLOR);
+            painter.line_segment([r.left_top(), r.right_top()], outline);
+            painter.line_segment([r.right_top(), r.right_bottom()], outline);
+            painter.line_segment([r.right_bottom(), r.left_bottom()], outline);
+            painter.line_segment([r.left_bottom(), r.left_top()], outline);
+        }
+        None => draw_selected(painter, rect, document, viewport, select_tool, highlight),
+    }
+}
+
+/// 選択エンティティを、その実位置に強調色 `stroke` で重ね描きする。
+fn draw_selected(
+    painter: &egui::Painter,
+    rect: Rect,
+    document: &Document,
+    viewport: &Viewport,
+    select_tool: &SelectTool,
+    stroke: Stroke,
+) {
+    for &id in select_tool.selection() {
+        if let Some(entity) = document.entity(id) {
+            draw_shape(painter, rect, viewport, &entity.geom, stroke);
+        }
     }
 }
 

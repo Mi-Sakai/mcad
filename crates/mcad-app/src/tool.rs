@@ -37,8 +37,8 @@
 
 use egui::{Color32, Painter, Rect, Stroke};
 
-use mcad_core::{Command, Entity, LayerId, Style};
-use mcad_geom::{Arc, LineSeg, Point2, Polyline, Shape, circumcircle};
+use mcad_core::{Command, Document, Entity, EntityId, LayerId, Style};
+use mcad_geom::{Aabb, Arc, LineSeg, Point2, Polyline, Shape, Vec2, circumcircle, distance_to};
 
 use crate::draw_shape;
 use crate::viewport::Viewport;
@@ -427,6 +427,246 @@ impl Tool for PolylineTool {
     }
 }
 
+// ---------------------------------------------------------------------
+// Select / 編集（単一選択・矩形選択・移動・削除）
+// ---------------------------------------------------------------------
+
+/// 選択エンティティのピック許容量以外に、[`SelectTool`] が扱う操作の設計判断。
+///
+/// # なぜ [`Tool`] トレイト（[`InputEvent`]）に載せないのか
+///
+/// 作図ツール（Point/Line/…）は「クリック列 → 新規 1 エンティティ」という純粋な
+/// 状態機械で、[`Tool::on_input`] が受け取る [`InputEvent`]（`Move`/`Click`/
+/// `Confirm`/`Cancel`）と `&ToolCtx`（レイヤー・スタイル）だけで完結する。ドキュメントを
+/// 一切参照しない。
+///
+/// 一方、選択・編集ツールは本質的に異なる:
+///
+/// - ヒットテスト・矩形選択は **ドキュメントの既存エンティティを読む** 必要があり、
+///   ピック許容量のためにビューポートのズームも要る。`Tool::on_input` の
+///   シグネチャにはどちらも無い。
+/// - 「選択集合の変化」は undo/redo される **ドキュメント状態ではなく、アプリの UI 状態**
+///   であって、`ToolResult`（`Continue`/`Commit(Command)`/`Cancel`）では表現できない。
+/// - ドラッグ（矩形選択・移動）は始点で開始し、途中はプレビュー、離した時点で確定という
+///   操作で、単発 `Click` では表せない。
+///
+/// これらを `Tool`/`InputEvent` へ押し込むと、作図ツール側が使わない `Document` 引数や
+/// ドラッグ用バリアントを常に無視することになり、純粋な状態機械という設計を汚す。そこで
+/// **`Tool` トレイトと `InputEvent` は作図ツール専用のまま一切変更せず**（既存 4 ツールと
+/// 13 テストも不変）、選択・編集ツールには `&Document` を受け取る専用 API を与える。
+///
+/// # 選択状態の所有者
+///
+/// 選択集合（[`SelectTool::selection`]）はこのツールが所有し、`McadApp` はツールを
+/// 永続フィールドとして保持する。選択はアプリ UI 状態なのでドキュメント履歴には積まない。
+/// ハイライト描画・Delete は `McadApp` がこのツールの選択集合を読んで行う。
+///
+/// # クリックとドラッグ移動の区別
+///
+/// 「動かなければ選択、動けば移動/矩形」の閾値判定は **egui 組み込みのクリック/ドラッグ
+/// 判定に委ねる**（`Response::clicked` と `drag_started`/`dragged`/`drag_stopped` は
+/// egui 内部のドラッグ閾値で排他的に分岐する）。`McadApp` 側がこれらを対応する
+/// メソッド呼び出しへ振り分けるため、本ツールにピクセル閾値を持たせる必要はない。
+///
+/// # 矩形選択の判定基準（完全内包）
+///
+/// ドラッグ矩形に **AABB が完全に含まれる** エンティティを選ぶ（交差ではなく内包）。
+/// 理由: AABB が矩形に内包されていれば実形状も必ず内包されるため、この基準は
+/// AABB のみで **厳密**（偽陽性なし）。AABB 交差方式だと、大きな円の外接ボックスが
+/// 矩形に触れるだけで実際には弧が矩形外、という過剰選択が起こりうる。予測しやすさと
+/// 厳密性を優先して内包方式を採る（左→右/右→左の窓・交差の区別は MVP では設けない）。
+///
+/// # ロックレイヤーが選択に混ざった場合
+///
+/// ロックされたレイヤーのエンティティも（可視なら）選択自体は許す。移動・削除は
+/// 選択集合全体を 1 つの [`Command::Batch`] にまとめて `Document::apply` へ渡すため、
+/// 混在時は既存のバッチ原子性（1 つでも失敗＝全体ロールバック）に従い操作全体が
+/// [`mcad_core::CoreError::LayerLocked`] で失敗し、何も動かない/消えない。これは
+/// 「一部だけ動かす」より一貫性が高く、`Batch` の設計意図どおり。`McadApp` は
+/// `apply` の `Err` を無視する（エラー表示は別タスクの範囲）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DragState {
+    /// 矩形選択中（`start` から `current` までのドラッグ矩形）。
+    Rect { start: Point2, current: Point2 },
+    /// 選択エンティティの移動中（`start` から `current` への変位ぶん動かす）。
+    Move { start: Point2, current: Point2 },
+}
+
+/// ドラッグ中のプレビュー描画に必要な情報（`McadApp` の描画層向けの公開ビュー）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DragPreview {
+    /// 矩形選択のプレビュー（2 隅のワールド座標）。
+    Rect { start: Point2, current: Point2 },
+    /// 移動プレビュー（選択エンティティをこの変位ぶん動かした位置に仮表示する）。
+    Move { delta: Vec2 },
+}
+
+/// 選択・編集ツール。単一選択（クリック）・矩形選択（ドラッグ）・移動（選択物上の
+/// ドラッグ）・削除（Delete/Backspace）を担う。設計判断の詳細は [`DragState`] の
+/// doc を参照。
+#[derive(Debug, Default)]
+pub struct SelectTool {
+    /// 現在の選択集合（アプリ UI 状態。ドキュメント履歴には積まない）。
+    selection: Vec<EntityId>,
+    /// 進行中のドラッグ操作。無ければ `None`。
+    drag: Option<DragState>,
+}
+
+/// エンティティの所属レイヤーが可視か（非表示レイヤーは描画・ヒットテスト対象外）。
+fn layer_visible(document: &Document, entity: &Entity) -> bool {
+    document.layer(entity.layer).is_some_and(|l| l.visible)
+}
+
+impl SelectTool {
+    /// 現在の選択集合。
+    #[must_use]
+    pub fn selection(&self) -> &[EntityId] {
+        &self.selection
+    }
+
+    /// 選択を空にする。
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
+    /// ドラッグ中のプレビュー情報。ドラッグしていなければ `None`。
+    #[must_use]
+    pub fn drag_preview(&self) -> Option<DragPreview> {
+        match self.drag {
+            Some(DragState::Rect { start, current }) => Some(DragPreview::Rect { start, current }),
+            Some(DragState::Move { start, current }) => Some(DragPreview::Move {
+                delta: current - start,
+            }),
+            None => None,
+        }
+    }
+
+    /// クリック位置 `world` から許容量 `tol`（ワールド単位）以内で最も近い可視
+    /// エンティティを返す。該当なしなら `None`。
+    fn pick(&self, document: &Document, world: Point2, tol: f64) -> Option<EntityId> {
+        let mut best: Option<(f64, EntityId)> = None;
+        for (id, entity) in document.entities() {
+            if !layer_visible(document, entity) {
+                continue;
+            }
+            let d = distance_to(&entity.geom, world);
+            if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// `world` が現在の選択エンティティのいずれかの許容量 `tol` 内にあるか。
+    /// 移動ドラッグの開始判定に使う。
+    fn hits_selected(&self, document: &Document, world: Point2, tol: f64) -> bool {
+        self.selection.iter().any(|&id| {
+            document
+                .entity(id)
+                .is_some_and(|e| distance_to(&e.geom, world) <= tol)
+        })
+    }
+
+    /// 単一クリック（ドラッグを伴わない）。ヒットしたエンティティ 1 つを選択に置き換え、
+    /// 何もヒットしなければ選択を空にする（＝空クリックでのクリア）。
+    pub fn on_click(&mut self, document: &Document, world: Point2, tol: f64) {
+        match self.pick(document, world, tol) {
+            Some(id) => self.selection = vec![id],
+            None => self.selection.clear(),
+        }
+    }
+
+    /// ドラッグ開始。選択済みエンティティ上なら移動、そうでなければ矩形選択を始める。
+    pub fn on_drag_start(&mut self, document: &Document, world: Point2, tol: f64) {
+        self.drag = if self.hits_selected(document, world, tol) {
+            Some(DragState::Move {
+                start: world,
+                current: world,
+            })
+        } else {
+            Some(DragState::Rect {
+                start: world,
+                current: world,
+            })
+        };
+    }
+
+    /// ドラッグ中の現在位置を更新する（プレビュー用）。ドラッグしていなければ無視。
+    pub fn on_drag(&mut self, world: Point2) {
+        match &mut self.drag {
+            Some(DragState::Rect { current, .. } | DragState::Move { current, .. }) => {
+                *current = world;
+            }
+            None => {}
+        }
+    }
+
+    /// ドラッグ確定。矩形選択なら選択集合を更新して `None` を返す。移動なら選択物全部を
+    /// 1 つの [`Command::Batch`] にまとめて返す（呼び出し側が `Document::apply` する）。
+    /// 変位が 0・選択が空などで確定すべき変更が無ければ `None`。
+    #[must_use]
+    pub fn on_drag_end(&mut self, document: &Document, world: Point2) -> Option<Command> {
+        match self.drag.take()? {
+            DragState::Rect { start, .. } => {
+                let rect = Aabb::from_corners(start, world);
+                // 完全内包（rect ⊇ entity.aabb）で選ぶ。基準の理由は DragState の doc を参照。
+                self.selection = document
+                    .entities()
+                    .filter(|(_, e)| layer_visible(document, e))
+                    .filter(|(_, e)| rect.contains(&e.geom.aabb()))
+                    .map(|(id, _)| id)
+                    .collect();
+                None
+            }
+            DragState::Move { start, .. } => {
+                let delta = world - start;
+                if delta == Vec2::ZERO || self.selection.is_empty() {
+                    return None;
+                }
+                // 選択物全部を 1 バッチにまとめて undo/redo を 1 単位にする。
+                let subs: Vec<Command> = self
+                    .selection
+                    .iter()
+                    .filter_map(|&id| {
+                        document.entity(id).map(|e| Command::ModifyEntity {
+                            id,
+                            new_geom: e.geom.translated(delta),
+                        })
+                    })
+                    .collect();
+                if subs.is_empty() {
+                    None
+                } else {
+                    Some(Command::Batch(subs))
+                }
+            }
+        }
+    }
+
+    /// 進行中のドラッグ（矩形選択・移動）を破棄する（Esc）。選択集合は変えない。
+    /// 選択そのもののクリアは「空クリック」で行う（Esc とは別）。
+    pub fn on_cancel(&mut self) {
+        self.drag = None;
+    }
+
+    /// 現在の選択を削除する [`Command`]。選択が空なら `None`。
+    ///
+    /// 単一選択でも一貫して [`Command::Batch`] にまとめる（undo/redo が常に 1 単位に
+    /// なり、複数削除と挙動が揃う）。
+    #[must_use]
+    pub fn delete_command(&self) -> Option<Command> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        Some(Command::Batch(
+            self.selection
+                .iter()
+                .map(|&id| Command::RemoveEntity(id))
+                .collect(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,5 +904,329 @@ mod tests {
             tool.on_input(&ctx, InputEvent::Confirm),
             ToolResult::Continue
         );
+    }
+
+    // --- Select / 編集 ---
+
+    /// カレントレイヤー上に線分 `(x,0)-(x+1,0)`（x 軸に平行な水平線分）を追加し、
+    /// その [`EntityId`] を返す。
+    fn add_hline(doc: &mut Document, x: f64) -> mcad_core::EntityId {
+        let layer = doc.current_layer();
+        let entity = Entity::new(
+            Shape::Line(LineSeg::new(Point2::new(x, 0.0), Point2::new(x + 1.0, 0.0))),
+            layer,
+            Style::inherited(),
+        );
+        let new_ids = doc.apply(Command::AddEntity(entity)).unwrap();
+        new_ids.entities[0]
+    }
+
+    #[test]
+    fn click_selects_nearest_within_tolerance() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0); // 線分 (0,0)-(1,0)
+        let b = add_hline(&mut doc, 10.0); // 線分 (10,0)-(11,0)
+        let mut tool = SelectTool::default();
+
+        // (0.5, 0.05) は a に非常に近く、b からは遠い。許容量 0.1 以内で a を選ぶ。
+        tool.on_click(&doc, Point2::new(0.5, 0.05), 0.1);
+        assert_eq!(tool.selection(), &[a]);
+
+        // b の近くをクリックすれば選択が b に置き換わる（単一選択）。
+        tool.on_click(&doc, Point2::new(10.5, 0.0), 0.1);
+        assert_eq!(tool.selection(), &[b]);
+    }
+
+    #[test]
+    fn click_beyond_tolerance_clears_selection() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1);
+        assert_eq!(tool.selection(), &[a]);
+
+        // 何もない場所（許容量外）をクリックすると選択がクリアされる。
+        tool.on_click(&doc, Point2::new(0.5, 100.0), 0.1);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn click_picks_the_closest_of_multiple_candidates() {
+        let mut doc = Document::new();
+        let near = add_hline(&mut doc, 0.0); // (0,0)-(1,0)
+        let _far = add_hline(&mut doc, 0.0); // 同座標の別線分…
+        // near のほうがクリック点に近くなるよう、2 本目を少し上へずらして作り直す。
+        let layer = doc.current_layer();
+        let above = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(0.0, 0.3), Point2::new(1.0, 0.3))),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
+        let mut tool = SelectTool::default();
+        // (0.5, 0.05): near（y=0）まで 0.05、above（y=0.3）まで 0.25。許容量 1.0 で near。
+        tool.on_click(&doc, Point2::new(0.5, 0.05), 1.0);
+        assert_eq!(tool.selection(), &[near]);
+        assert_ne!(tool.selection(), &[above]);
+    }
+
+    #[test]
+    fn hidden_layer_entities_are_not_selectable() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        // カレント（デフォルト）レイヤーを非表示にする。
+        let layer_id = doc.current_layer();
+        let mut props = doc.layer(layer_id).unwrap().clone();
+        props.visible = false;
+        doc.apply(Command::SetLayerProps {
+            id: layer_id,
+            props,
+        })
+        .unwrap();
+
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1);
+        assert!(tool.selection().is_empty(), "非表示レイヤーは選択できない");
+        let _ = a;
+    }
+
+    #[test]
+    fn rectangle_selection_uses_full_containment() {
+        let mut doc = Document::new();
+        let inside = add_hline(&mut doc, 0.0); // AABB [0,0]-[1,0]
+        let _outside = add_hline(&mut doc, 100.0); // AABB [100,0]-[101,0]
+        let mut tool = SelectTool::default();
+
+        // ドラッグ矩形 (-1,-1)→(5,5) は inside を完全内包し outside は含まない。
+        tool.on_drag_start(&doc, Point2::new(-1.0, -1.0), 0.1);
+        tool.on_drag(Point2::new(5.0, 5.0));
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(5.0, 5.0)), None);
+        assert_eq!(tool.selection(), &[inside]);
+    }
+
+    #[test]
+    fn rectangle_partially_covering_does_not_select() {
+        let mut doc = Document::new();
+        let _line = add_hline(&mut doc, 0.0); // AABB [0,0]-[1,0]
+        let mut tool = SelectTool::default();
+
+        // 矩形 (-1,-1)→(0.5,1) は線分の右半分を覆うが完全には内包しない → 非選択。
+        tool.on_drag_start(&doc, Point2::new(-1.0, -1.0), 0.1);
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(0.5, 1.0)), None);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn drag_on_selected_entity_starts_move_and_commits_batch() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let b = add_hline(&mut doc, 10.0);
+        let mut tool = SelectTool::default();
+
+        // まず矩形で 2 本とも選択する（両方を完全内包する矩形）。
+        tool.on_drag_start(&doc, Point2::new(-1.0, -1.0), 0.1);
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(12.0, 1.0)), None);
+        assert_eq!(tool.selection().len(), 2);
+
+        // 選択済みエンティティ a の上（0.5,0）からドラッグ → 移動。変位 (0,5)。
+        tool.on_drag_start(&doc, Point2::new(0.5, 0.0), 0.1);
+        tool.on_drag(Point2::new(0.5, 5.0));
+        let cmd = tool
+            .on_drag_end(&doc, Point2::new(0.5, 5.0))
+            .expect("移動は Batch コマンドを返す");
+
+        // 2 本ぶんの ModifyEntity を含む Batch。各 new_geom は元の幾何を (0,5) 平行移動したもの。
+        match cmd {
+            Command::Batch(subs) => {
+                assert_eq!(subs.len(), 2);
+                let expect = |id: mcad_core::EntityId| {
+                    let g = doc.entity(id).unwrap().geom.translated(Vec2::new(0.0, 5.0));
+                    Command::ModifyEntity { id, new_geom: g }
+                };
+                assert!(subs.contains(&expect(a)));
+                assert!(subs.contains(&expect(b)));
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+        // 移動の確定コマンドを返しただけでは選択は変わらない（呼び出し側が apply）。
+        assert_eq!(tool.selection().len(), 2);
+    }
+
+    #[test]
+    fn drag_on_empty_space_starts_rectangle_even_with_selection() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let _b = add_hline(&mut doc, 10.0);
+        let mut tool = SelectTool::default();
+
+        // a を選択済みにしておく。
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1);
+        assert_eq!(tool.selection(), &[a]);
+
+        // 何もない場所 (50,50) からドラッグ開始 → 移動ではなく矩形選択。
+        tool.on_drag_start(&doc, Point2::new(50.0, 50.0), 0.1);
+        // 矩形が何も内包しなければ選択は空になる（矩形選択は集合を置き換える）。
+        let cmd = tool.on_drag_end(&doc, Point2::new(60.0, 60.0));
+        assert_eq!(cmd, None);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn move_with_zero_delta_commits_nothing() {
+        let mut doc = Document::new();
+        let _a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1);
+
+        // 選択物上でドラッグ開始したが同じ点で離した → 変位 0 → コマンドなし。
+        tool.on_drag_start(&doc, Point2::new(0.5, 0.0), 0.1);
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(0.5, 0.0)), None);
+    }
+
+    #[test]
+    fn escape_cancels_in_progress_drag_without_changing_selection() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1);
+        assert_eq!(tool.selection(), &[a]);
+
+        // 移動ドラッグを始めてから Esc（on_cancel）。
+        tool.on_drag_start(&doc, Point2::new(0.5, 0.0), 0.1);
+        tool.on_drag(Point2::new(0.5, 9.0));
+        assert!(tool.drag_preview().is_some());
+        tool.on_cancel();
+
+        // ドラッグは破棄され、選択は変わらない。
+        assert!(tool.drag_preview().is_none());
+        assert_eq!(tool.selection(), &[a]);
+        // キャンセル後に離しても確定コマンドは生じない。
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(0.5, 9.0)), None);
+    }
+
+    #[test]
+    fn delete_builds_batch_remove_of_selection() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let b = add_hline(&mut doc, 10.0);
+        let mut tool = SelectTool::default();
+
+        // 空選択なら削除コマンドは無い。
+        assert_eq!(tool.delete_command(), None);
+
+        tool.on_drag_start(&doc, Point2::new(-1.0, -1.0), 0.1);
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(12.0, 1.0)), None);
+        assert_eq!(tool.selection().len(), 2);
+
+        match tool
+            .delete_command()
+            .expect("選択があれば削除コマンドがある")
+        {
+            Command::Batch(subs) => {
+                assert_eq!(subs.len(), 2);
+                assert!(subs.contains(&Command::RemoveEntity(a)));
+                assert!(subs.contains(&Command::RemoveEntity(b)));
+            }
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_then_apply_and_undo_roundtrip() {
+        // 検収シナリオ: 選択 → 削除 → undo で 1 単位復元。
+        let mut doc = Document::new();
+        add_hline(&mut doc, 0.0);
+        add_hline(&mut doc, 10.0);
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(&doc, Point2::new(-1.0, -1.0), 0.1);
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(12.0, 1.0)), None);
+        assert_eq!(tool.selection().len(), 2);
+
+        let cmd = tool.delete_command().unwrap();
+        doc.apply(cmd).unwrap();
+        assert_eq!(doc.entity_count(), 0);
+
+        // Batch なので undo 1 回で両方復元。
+        assert!(doc.undo());
+        assert_eq!(doc.entity_count(), 2);
+    }
+
+    #[test]
+    fn move_then_apply_moves_all_and_undo_is_single_unit() {
+        // 検収シナリオ: 矩形選択 → 移動 → undo 1 回で全戻り。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let b = add_hline(&mut doc, 10.0);
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let before_b = doc.entity(b).unwrap().geom.clone();
+
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(&doc, Point2::new(-1.0, -1.0), 0.1);
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(12.0, 1.0)), None);
+
+        tool.on_drag_start(&doc, Point2::new(0.5, 0.0), 0.1);
+        let cmd = tool.on_drag_end(&doc, Point2::new(0.5, 7.0)).unwrap();
+        doc.apply(cmd).unwrap();
+
+        let delta = Vec2::new(0.0, 7.0);
+        assert_eq!(doc.entity(a).unwrap().geom, before_a.translated(delta));
+        assert_eq!(doc.entity(b).unwrap().geom, before_b.translated(delta));
+
+        // 1 バッチなので undo 1 回で両方元へ戻る。
+        assert!(doc.undo());
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+        assert_eq!(doc.entity(b).unwrap().geom, before_b);
+    }
+
+    #[test]
+    fn move_touching_locked_layer_fails_atomically() {
+        // ロックされたレイヤーのエンティティが混ざると、Batch 原子性により
+        // 移動全体が失敗し、どのエンティティも動かない。
+        let mut doc = Document::new();
+        let unlocked = add_hline(&mut doc, 0.0);
+
+        // 別レイヤーを作り、そこに 1 本追加してからロックする。
+        let locked_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "locked",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let locked_entity = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))),
+                locked_layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut props = doc.layer(locked_layer).unwrap().clone();
+        props.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: locked_layer,
+            props,
+        })
+        .unwrap();
+
+        let before_unlocked = doc.entity(unlocked).unwrap().geom.clone();
+        let before_locked = doc.entity(locked_entity).unwrap().geom.clone();
+
+        // 両方を選択（同座標に重ねてあり、どちらも可視なので矩形で 2 本とも拾える）。
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(&doc, Point2::new(-1.0, -1.0), 0.1);
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(2.0, 1.0)), None);
+        assert_eq!(tool.selection().len(), 2);
+
+        tool.on_drag_start(&doc, Point2::new(0.5, 0.0), 0.1);
+        let cmd = tool.on_drag_end(&doc, Point2::new(0.5, 5.0)).unwrap();
+        // Batch 原子性で全体が失敗する。
+        assert!(doc.apply(cmd).is_err());
+        // どちらも動いていない。
+        assert_eq!(doc.entity(unlocked).unwrap().geom, before_unlocked);
+        assert_eq!(doc.entity(locked_entity).unwrap().geom, before_locked);
     }
 }

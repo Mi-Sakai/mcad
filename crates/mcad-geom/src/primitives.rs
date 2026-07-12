@@ -68,6 +68,13 @@ impl LineSeg {
         let t = ((p - self.a).dot(d) / len2).clamp(0.0, 1.0);
         self.a + d * t
     }
+
+    /// 変位 `delta` だけ平行移動した新しい線分。
+    #[inline]
+    #[must_use]
+    pub fn translated(self, delta: Vec2) -> LineSeg {
+        LineSeg::new(self.a + delta, self.b + delta)
+    }
 }
 
 /// 円。中心 `center` と半径 `radius`。
@@ -115,6 +122,13 @@ impl Circle {
             Some(dir) => self.center + dir * self.radius,
             None => self.center + Vec2::new(self.radius, 0.0),
         }
+    }
+
+    /// 変位 `delta` だけ平行移動した新しい円（中心のみ動き、半径は不変）。
+    #[inline]
+    #[must_use]
+    pub fn translated(self, delta: Vec2) -> Circle {
+        Circle::new(self.center + delta, self.radius)
     }
 }
 
@@ -232,6 +246,18 @@ impl Arc {
             }
         }
     }
+
+    /// 変位 `delta` だけ平行移動した新しい円弧（中心のみ動き、半径・開始/終了角は不変）。
+    #[inline]
+    #[must_use]
+    pub fn translated(self, delta: Vec2) -> Arc {
+        Arc::new(
+            self.center + delta,
+            self.radius,
+            self.start_angle,
+            self.end_angle,
+        )
+    }
 }
 
 /// ポリライン。頂点列と、閉じているか（始点と終点を結ぶか）のフラグ。
@@ -291,6 +317,15 @@ impl Polyline {
             None => self.vertices.first().copied().unwrap_or(p),
         }
     }
+
+    /// 全頂点を変位 `delta` だけ平行移動した新しいポリライン。
+    #[must_use]
+    pub fn translated(&self, delta: Vec2) -> Polyline {
+        Polyline::new(
+            self.vertices.iter().map(|v| *v + delta).collect(),
+            self.closed,
+        )
+    }
 }
 
 /// エンティティの幾何を表す列挙型。mcad-core の `Entity { geom: Shape, .. }` が使う。
@@ -329,6 +364,22 @@ impl Shape {
             Shape::Polyline(pl) => pl
                 .aabb()
                 .unwrap_or_else(|| Aabb::from_point(Point2::ORIGIN)),
+        }
+    }
+
+    /// 形状全体を変位 `delta` だけ平行移動した新しい形状を返す純関数。
+    ///
+    /// 選択エンティティの移動（Move）で、確定時に各エンティティの `Shape` を
+    /// 平行移動した幾何（`Command::ModifyEntity { new_geom }` に載せる値）を作るのに使う。
+    /// GUI 非依存の再利用可能な幾何演算なので、mcad-geom 側に置く（DESIGN 3.1）。
+    #[must_use]
+    pub fn translated(&self, delta: Vec2) -> Shape {
+        match self {
+            Shape::Point(p) => Shape::Point(*p + delta),
+            Shape::Line(s) => Shape::Line(s.translated(delta)),
+            Shape::Circle(c) => Shape::Circle(c.translated(delta)),
+            Shape::Arc(a) => Shape::Arc(a.translated(delta)),
+            Shape::Polyline(pl) => Shape::Polyline(pl.translated(delta)),
         }
     }
 }
@@ -572,5 +623,52 @@ mod tests {
         let bb = s.aabb();
         assert_eq!(bb.min, Point2::new(1.0, 1.0));
         assert_eq!(bb.max, Point2::new(3.0, 5.0));
+    }
+
+    #[test]
+    fn translated_moves_each_primitive_kind() {
+        let d = Vec2::new(2.0, -3.0);
+
+        // Point
+        assert_eq!(
+            Shape::Point(Point2::new(1.0, 1.0)).translated(d),
+            Shape::Point(Point2::new(3.0, -2.0))
+        );
+
+        // Line: 両端点が動く
+        let line = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(4.0, 0.0));
+        assert_eq!(
+            line.translated(d),
+            LineSeg::new(Point2::new(2.0, -3.0), Point2::new(6.0, -3.0))
+        );
+
+        // Circle: 中心のみ動き半径は不変
+        let circle = Circle::new(Point2::new(0.0, 0.0), 5.0);
+        let moved = circle.translated(d);
+        assert_eq!(moved.center, Point2::new(2.0, -3.0));
+        assert!((moved.radius - 5.0).abs() < T);
+
+        // Arc: 中心のみ動き、半径・開始/終了角は不変
+        let arc = Arc::new(Point2::new(1.0, 1.0), 2.0, 0.0, std::f64::consts::PI);
+        let arc_moved = arc.translated(d);
+        assert_eq!(arc_moved.center, Point2::new(3.0, -2.0));
+        assert!((arc_moved.radius - 2.0).abs() < T);
+        assert_eq!(arc_moved.start_angle, arc.start_angle);
+        assert_eq!(arc_moved.end_angle, arc.end_angle);
+
+        // Polyline: 全頂点が動き、closed フラグは不変
+        let pl = Polyline::new(vec![Point2::new(0.0, 0.0), Point2::new(1.0, 2.0)], true);
+        let pl_moved = pl.translated(d);
+        assert_eq!(
+            pl_moved.vertices,
+            vec![Point2::new(2.0, -3.0), Point2::new(3.0, -1.0)]
+        );
+        assert!(pl_moved.closed);
+    }
+
+    #[test]
+    fn translated_by_zero_is_identity() {
+        let arc = Shape::Arc(Arc::new(Point2::new(1.0, 2.0), 3.0, 0.5, 2.0));
+        assert_eq!(arc.translated(Vec2::ZERO), arc);
     }
 }

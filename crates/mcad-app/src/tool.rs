@@ -483,7 +483,7 @@ impl Tool for PolylineTool {
 /// 混在時は既存のバッチ原子性（1 つでも失敗＝全体ロールバック）に従い操作全体が
 /// [`mcad_core::CoreError::LayerLocked`] で失敗し、何も動かない/消えない。これは
 /// 「一部だけ動かす」より一貫性が高く、`Batch` の設計意図どおり。`McadApp` は
-/// `apply` の `Err` を無視する（エラー表示は別タスクの範囲）。
+/// `apply` の `Err` をステータスバーへ表示する。
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DragState {
     /// 矩形選択中（`start` から `current` までのドラッグ矩形）。
@@ -527,6 +527,16 @@ impl SelectTool {
     /// 選択を空にする。
     pub fn clear_selection(&mut self) {
         self.selection.clear();
+    }
+
+    /// ドキュメントに存在しなくなったエンティティを選択集合から取り除く。
+    ///
+    /// undo/redo はエンティティを削除・復活させるが、選択集合はアプリ UI 状態なので
+    /// 履歴の巻き戻しに追随しない。死んだ ID が選択に残ると、削除
+    /// （[`SelectTool::delete_command`]）が `EntityNotFound` でバッチごと原子的に
+    /// 失敗し続けるため、undo/redo の直後に呼んで選択を浄化する。
+    pub fn retain_alive(&mut self, document: &Document) {
+        self.selection.retain(|&id| document.entity(id).is_some());
     }
 
     /// ドラッグ中のプレビュー情報。ドラッグしていなければ `None`。
@@ -1228,5 +1238,34 @@ mod tests {
         // どちらも動いていない。
         assert_eq!(doc.entity(unlocked).unwrap().geom, before_unlocked);
         assert_eq!(doc.entity(locked_entity).unwrap().geom, before_locked);
+    }
+
+    #[test]
+    fn retain_alive_drops_dead_ids_and_unblocks_delete() {
+        // undo でエンティティが消えた後、選択に死んだ ID が残ると削除バッチが
+        // EntityNotFound で失敗し続ける。retain_alive で浄化すれば残りを削除できる。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let b = add_hline(&mut doc, 10.0);
+
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(&doc, Point2::new(-1.0, -1.0), 0.1);
+        assert_eq!(tool.on_drag_end(&doc, Point2::new(12.0, 1.0)), None);
+        assert_eq!(tool.selection().len(), 2);
+
+        // 直近の AddEntity(b) を undo → b は存在しなくなる。
+        assert!(doc.undo());
+        assert!(doc.entity(b).is_none());
+
+        // 浄化しないままの削除バッチは RemoveEntity(b) を含み、原子的に失敗する。
+        let stale_cmd = tool.delete_command().unwrap();
+        assert!(doc.apply(stale_cmd).is_err());
+        assert!(doc.entity(a).is_some(), "失敗時は a も消えない（原子性）");
+
+        // 浄化後は a だけの削除バッチになり、成功する。
+        tool.retain_alive(&doc);
+        assert_eq!(tool.selection(), &[a]);
+        doc.apply(tool.delete_command().unwrap()).unwrap();
+        assert!(doc.entity(a).is_none());
     }
 }

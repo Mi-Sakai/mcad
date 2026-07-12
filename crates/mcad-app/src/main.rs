@@ -45,6 +45,12 @@ const SNAP_MARKER_COLOR: Color32 = Color32::from_rgb(60, 255, 120);
 /// スナップマーカーの基準サイズ（スクリーンピクセル。中心からの半幅相当）。
 const SNAP_MARKER_SIZE: f32 = 6.0;
 
+/// ステータスメッセージの表示時間（秒）。経過後は自動で消える。
+const STATUS_MESSAGE_SECS: f64 = 5.0;
+
+/// ステータスメッセージの文字色（エラー通知が主用途なので警告寄りの赤）。
+const STATUS_MESSAGE_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
+
 /// 選択エンティティのハイライト色（確定済みエンティティ色とは別の強調色）。
 const SELECTION_COLOR: Color32 = Color32::from_rgb(80, 200, 255);
 /// 選択ハイライトの線の太さ。
@@ -109,6 +115,25 @@ struct McadApp {
     /// 直近フレームで作図ツールのカーソルがスナップした先。マーカー描画に使う。
     /// スナップしていない・作図ツール非アクティブ・スナップ無効のときは `None`。
     snap_marker: Option<snap::SnapResult>,
+    /// ステータスバーに一時表示するメッセージ（主にコア操作のエラー通知）。
+    /// [`STATUS_MESSAGE_SECS`] 経過で自動的に消える。
+    status: Option<StatusMessage>,
+}
+
+/// ステータスバーに一時表示するメッセージ。
+struct StatusMessage {
+    /// 表示する文言。
+    text: String,
+    /// 表示を開始した時刻（`egui::InputState::time`、秒）。
+    shown_at: f64,
+}
+
+/// ステータスメッセージを設定する（既存の表示は上書き）。
+fn set_status(status: &mut Option<StatusMessage>, now: f64, text: impl Into<String>) {
+    *status = Some(StatusMessage {
+        text: text.into(),
+        shown_at: now,
+    });
 }
 
 impl McadApp {
@@ -173,6 +198,7 @@ impl McadApp {
             select_tool: SelectTool::default(),
             snap_enabled: true,
             snap_marker: None,
+            status: None,
         }
     }
 }
@@ -185,6 +211,26 @@ impl Default for McadApp {
 
 impl eframe::App for McadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let now = ui.input(|i| i.time);
+
+        // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y で undo/redo。ツール切替キーより先に処理する
+        // （handle_tool_shortcut_keys は修飾キー付きの入力を無視するので衝突はしないが、
+        // 「履歴操作が最優先」という意図を並び順でも示す）。undo/redo はエンティティを
+        // 削除・復活させるため、直後に選択集合から死んだ ID を取り除く。
+        let (undo_pressed, redo_pressed) = ui.input(|i| {
+            let cmd = i.modifiers.command;
+            (
+                cmd && !i.modifiers.shift && i.key_pressed(Key::Z),
+                cmd && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
+            )
+        });
+        if undo_pressed && self.document.undo() {
+            self.select_tool.retain_alive(&self.document);
+        }
+        if redo_pressed && self.document.redo() {
+            self.select_tool.retain_alive(&self.document);
+        }
+
         handle_tool_shortcut_keys(
             ui,
             &mut self.tool_kind,
@@ -200,6 +246,15 @@ impl eframe::App for McadApp {
             }
         }
 
+        // 表示時間を過ぎたステータスメッセージは消す。
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|m| now - m.shown_at > STATUS_MESSAGE_SECS)
+        {
+            self.status = None;
+        }
+
         egui::Panel::top("tool_status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("Tool: {}", self.tool_kind.label()));
@@ -211,8 +266,12 @@ impl eframe::App for McadApp {
                 ui.separator();
                 ui.label(
                     "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
-                     Del=Delete  Esc=Cancel  F3=Snap",
+                     Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo",
                 );
+                if let Some(msg) = &self.status {
+                    ui.separator();
+                    ui.colored_label(STATUS_MESSAGE_COLOR, &msg.text);
+                }
             });
         });
 
@@ -233,6 +292,8 @@ impl eframe::App for McadApp {
                     &self.viewport,
                     &mut self.document,
                     &mut self.select_tool,
+                    &mut self.status,
+                    now,
                 );
             } else {
                 handle_tool_input(
@@ -245,6 +306,8 @@ impl eframe::App for McadApp {
                     &mut self.tool,
                     self.snap_enabled,
                     &mut self.snap_marker,
+                    &mut self.status,
+                    now,
                 );
             }
 
@@ -285,6 +348,11 @@ fn handle_tool_shortcut_keys(
     // として扱ってよい。
     let mut requested: Option<ToolKind> = None;
     ui.input(|i| {
+        // Ctrl/Cmd 併用はツール切替として扱わない（Ctrl+Z/Ctrl+Y の undo/redo や
+        // 将来の Ctrl+C/Ctrl+S 系ショートカットと衝突させない）。
+        if i.modifiers.command {
+            return;
+        }
         if i.key_pressed(Key::S) {
             requested = Some(ToolKind::Select);
         } else if i.key_pressed(Key::Num1) {
@@ -335,6 +403,8 @@ fn handle_tool_input(
     tool: &mut Option<Box<dyn Tool>>,
     snap_enabled: bool,
     snap_marker: &mut Option<snap::SnapResult>,
+    status: &mut Option<StatusMessage>,
+    now: f64,
 ) {
     let Some(active) = tool.as_mut() else {
         return;
@@ -384,10 +454,12 @@ fn handle_tool_input(
 
     match result {
         ToolResult::Commit(cmd) => {
-            // ドキュメント側のレイヤー不整合などで失敗することは通常ないが（`ctx.layer`
-            // は常にカレントレイヤー）、失敗時もツール状態はリセットして操作を続行可能に
-            // しておく（エラー内容の表示は別タスクの範囲）。
-            let _ = document.apply(cmd);
+            // ドキュメント側のレイヤーロックなどで失敗することがある（例: カレント
+            // レイヤーがロック中の AddEntity）。失敗はステータスバーへ表示し、
+            // ツール状態はリセットして操作を続行可能にしておく。
+            if let Err(err) = document.apply(cmd) {
+                set_status(status, now, format!("作図を確定できません: {err}"));
+            }
             *tool = tool_kind.spawn();
         }
         ToolResult::Cancel => {
@@ -425,6 +497,7 @@ fn apply_snap(
 /// - `Delete`/`Backspace`: 選択エンティティを 1 バッチで削除。適用成功時のみ選択を解除する。
 /// - `Esc`: 進行中のドラッグを破棄（選択は変えない）。
 /// - `Space` 押下中の左ドラッグはパン用なので、選択操作としては扱わない。
+#[allow(clippy::too_many_arguments)]
 fn handle_select_input(
     ui: &egui::Ui,
     response: &egui::Response,
@@ -432,17 +505,21 @@ fn handle_select_input(
     viewport: &Viewport,
     document: &mut Document,
     select_tool: &mut SelectTool,
+    status: &mut Option<StatusMessage>,
+    now: f64,
 ) {
     // ピック許容量（px）をワールド単位へ換算する。
     let tol = PICK_TOLERANCE_PX / viewport.zoom;
 
     // Delete / Backspace: 選択を 1 バッチで削除。ロックレイヤー混在時は Batch 原子性で
-    // 全体失敗しうるので、apply が成功したときだけ選択を解除する。
+    // 全体失敗しうるので、apply が成功したときだけ選択を解除し、失敗は表示する。
     if ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
         && let Some(cmd) = select_tool.delete_command()
-        && document.apply(cmd).is_ok()
     {
-        select_tool.clear_selection();
+        match document.apply(cmd) {
+            Ok(_) => select_tool.clear_selection(),
+            Err(err) => set_status(status, now, format!("削除できません: {err}")),
+        }
     }
 
     // Esc: 進行中のドラッグだけ破棄する（選択集合は変えない）。
@@ -465,9 +542,11 @@ fn handle_select_input(
             select_tool.on_drag(world);
         } else if response.drag_stopped_by(egui::PointerButton::Primary) {
             if let Some(cmd) = select_tool.on_drag_end(document, world) {
-                // 移動の確定。ロックレイヤー混在時は失敗しうるが、その場合は何も動かない
-                // （Batch 原子性）。エラー表示は別タスクの範囲なので握りつぶす。
-                let _ = document.apply(cmd);
+                // 移動の確定。ロックレイヤー混在時は Batch 原子性で全体が失敗し、
+                // 何も動かない。失敗理由はステータスバーへ表示する。
+                if let Err(err) = document.apply(cmd) {
+                    set_status(status, now, format!("移動できません: {err}"));
+                }
             }
         } else if response.clicked_by(egui::PointerButton::Primary) {
             select_tool.on_click(document, world, tol);

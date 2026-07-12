@@ -468,23 +468,35 @@ impl Document {
         }
     }
 
-    /// 指定レイヤーがロックされていれば [`CoreError::LayerLocked`] を返す。
+    /// レイヤーがロックされていれば [`CoreError::LayerLocked`] を返す判定ロジック本体。
     ///
     /// `execute` 経由で新規コマンドを適用する経路（`AddEntity`（[`Document::require_editable_layer`]
     /// 経由）・`RemoveEntity`・`ModifyEntity`（いずれも [`Document::require_editable_entity`]
-    /// 経由））がこの規則を通す。判定をここへ一元化することで、レイヤーごとのロック挙動の
-    /// 食い違いや、将来のコマンド追加時のチェック漏れのリスクを下げる（ただし各コマンド
-    /// アームが手動でこのヘルパーを呼ぶ規約に依っており、型やマクロによる強制はない）。
+    /// 経由）を介した [`Document::ensure_layer_unlocked`]）がこの規則を通す。ロック判定
+    /// ロジックをここへ一元化することで、レイヤーごとのロック挙動の食い違いや、将来の
+    /// コマンド追加時のチェック漏れのリスクを下げる（ただし各コマンドアームが手動で
+    /// このヘルパー経由で呼ぶ規約に依っており、型やマクロによる強制はない）。
     ///
     /// `revert`/`reapply`（undo/redo 経路）はこのチェックを一切通らない。ロック中の
     /// レイヤーに対しても undo/redo は常に成功させる、という意図した設計判断である。
     ///
-    /// 対象レイヤーが（不変条件違反で）存在しない場合はここでは咎めず `Ok(())` とする。
-    fn ensure_layer_unlocked(&self, id: LayerId) -> Result<(), CoreError> {
-        match self.layer(id) {
+    /// `layer` が `None`（対象レイヤーが存在しない）の場合はここでは咎めず `Ok(())` と
+    /// する。存在確認を行うかどうかは呼び出し側の責務であり、
+    /// [`Document::ensure_layer_unlocked`] と [`Document::require_editable_layer`] とで
+    /// 扱いが異なる。
+    fn check_layer_lock(id: LayerId, layer: Option<&Layer>) -> Result<(), CoreError> {
+        match layer {
             Some(layer) if layer.locked => Err(CoreError::LayerLocked(id)),
             _ => Ok(()),
         }
+    }
+
+    /// 指定レイヤーがロックされていれば [`CoreError::LayerLocked`] を返す。
+    ///
+    /// 対象レイヤーが（不変条件違反で）存在しない場合はここでは咎めず `Ok(())` とする。
+    /// ロック判定ロジック自体は [`Document::check_layer_lock`] に一元化されている。
+    fn ensure_layer_unlocked(&self, id: LayerId) -> Result<(), CoreError> {
+        Self::check_layer_lock(id, self.layer(id))
     }
 
     /// レイヤーが存在し、かつロックされていないことを一度のルックアップで検証する。
@@ -493,13 +505,12 @@ impl Document {
     /// 存在確認とロック確認を別々のヘルパー呼び出しで行うと同じレイヤー ID を 2 回
     /// ルックアップすることになるため、1 回にまとめている。`AddEntity` がこれを使う。
     ///
-    /// ロック判定の適用範囲は [`Document::ensure_layer_unlocked`] を参照。
+    /// ロック判定ロジック自体は [`Document::check_layer_lock`] に一元化されている。
+    /// 適用範囲（どの経路がこのチェックを通るか）は [`Document::check_layer_lock`] を
+    /// 参照。
     fn require_editable_layer(&self, id: LayerId) -> Result<(), CoreError> {
-        match self.layer(id) {
-            Some(layer) if layer.locked => Err(CoreError::LayerLocked(id)),
-            Some(_) => Ok(()),
-            None => Err(CoreError::LayerNotFound(id)),
-        }
+        let layer = self.layer(id).ok_or(CoreError::LayerNotFound(id))?;
+        Self::check_layer_lock(id, Some(layer))
     }
 
     /// エンティティが生存し、かつ所属レイヤーがロックされていないことを一度に検証する。

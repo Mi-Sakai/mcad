@@ -40,7 +40,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use mcad_core::{Command, Document, Entity, Layer, LayerId, Style};
-use mcad_geom::{Point2, Shape};
+use mcad_geom::Shape;
 
 use crate::IoError;
 
@@ -227,61 +227,21 @@ pub fn load_mcad(path: impl AsRef<Path>) -> Result<Document, IoError> {
 
 /// ジオメトリが io 境界の妥当性条件を満たすか検証する。
 ///
-/// 条件: すべての座標・半径・角度が有限、半径は非負、ポリラインは頂点 1 つ以上。
-/// 半径 0 の円や長さ 0 の線分は退化しているが描画・計算を壊さないため許容する
-/// （作図ツールでも同一点クリックで作れるものを io だけ拒否しない）。
+/// 判定条件の実体は [`Shape::validate`]（mcad-geom、DESIGN.md M4 タスク15）に
+/// 引き上げ済み。ここは io 側の呼び出し規約（`pub(crate)`、`Result<(), String>`）
+/// を保つだけの薄いラッパー。
 ///
 /// `pub(crate)`: DXF import（[`crate::dxf_file`]）でも同じ判定基準を再利用する
 /// ため（ロジックの重複・divergence を避ける）。
 pub(crate) fn validate_shape(shape: &Shape) -> Result<(), String> {
-    let finite = |p: Point2| p.x.is_finite() && p.y.is_finite();
-    match shape {
-        Shape::Point(p) => {
-            if !finite(*p) {
-                return Err("non-finite point coordinates".into());
-            }
-        }
-        Shape::Line(l) => {
-            if !finite(l.a) || !finite(l.b) {
-                return Err("non-finite line coordinates".into());
-            }
-        }
-        Shape::Circle(c) => {
-            if !finite(c.center) {
-                return Err("non-finite circle center".into());
-            }
-            if !c.radius.is_finite() || c.radius < 0.0 {
-                return Err(format!("invalid circle radius: {}", c.radius));
-            }
-        }
-        Shape::Arc(a) => {
-            if !finite(a.center) {
-                return Err("non-finite arc center".into());
-            }
-            if !a.radius.is_finite() || a.radius < 0.0 {
-                return Err(format!("invalid arc radius: {}", a.radius));
-            }
-            if !a.start_angle.is_finite() || !a.end_angle.is_finite() {
-                return Err("non-finite arc angles".into());
-            }
-        }
-        Shape::Polyline(pl) => {
-            if pl.vertices.is_empty() {
-                return Err("empty polyline".into());
-            }
-            if !pl.vertices.iter().all(|v| finite(*v)) {
-                return Err("non-finite polyline vertex".into());
-            }
-        }
-    }
-    Ok(())
+    shape.validate()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mcad_core::Rgb;
-    use mcad_geom::{Arc, Circle, LineSeg, Polyline};
+    use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline};
 
     /// レイヤー2枚（1枚はロック+非表示+色付き）・全 Shape 種・個別スタイル・
     /// 非デフォルトのカレントレイヤーを持つドキュメントを作る。

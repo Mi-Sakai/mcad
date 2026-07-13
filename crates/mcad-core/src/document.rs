@@ -305,6 +305,9 @@ impl Document {
     fn execute(&mut self, cmd: Command) -> Result<ExecuteOutcome, CoreError> {
         match cmd {
             Command::AddEntity(entity) => {
+                // NaN/∞座標・負半径などの不正ジオメトリはそもそもドキュメントへ
+                // 入れない（DESIGN.md M4 タスク15）。
+                entity.geom.validate().map_err(CoreError::InvalidGeometry)?;
                 // 宙に浮いた layer 参照を防ぐため所属レイヤーの存在を検証し、
                 // ロック済みレイヤーへの追加も Modify/Remove と対称に拒否する。
                 self.require_editable_layer(entity.layer)?;
@@ -328,6 +331,9 @@ impl Document {
                 }))
             }
             Command::ModifyEntity { id, new_geom } => {
+                // NaN/∞座標・負半径などの不正ジオメトリへの差し替えは拒否する
+                // （DESIGN.md M4 タスク15）。
+                new_geom.validate().map_err(CoreError::InvalidGeometry)?;
                 self.require_editable_entity(id)?;
                 let slot = self.live_entity_mut(id);
                 let before = std::mem::replace(&mut slot.geom, new_geom.clone());
@@ -1357,5 +1363,51 @@ mod tests {
 
         let new_ids = doc.apply(Command::RemoveEntity(id)).unwrap();
         assert_eq!(new_ids, NewIds::default());
+    }
+
+    /// NaN 座標を持つ、幾何として不正な線分。
+    fn invalid_line() -> Shape {
+        Shape::Line(LineSeg::new(
+            Point2::new(f64::NAN, 0.0),
+            Point2::new(1.0, 1.0),
+        ))
+    }
+
+    #[test]
+    fn add_entity_rejects_invalid_geometry() {
+        // DESIGN.md M4 タスク15: NaN/∞座標などの不正ジオメトリは AddEntity で拒否される。
+        let mut doc = Document::new();
+        let entities_before = doc.entity_count();
+
+        let result = doc.apply(add_line(&doc, invalid_line()));
+        assert!(
+            matches!(result, Err(CoreError::InvalidGeometry(_))),
+            "expected InvalidGeometry, got {result:?}"
+        );
+        // 状態が変化していないこと(部分適用がない)。
+        assert_eq!(doc.entity_count(), entities_before);
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn modify_entity_rejects_invalid_geometry() {
+        // DESIGN.md M4 タスク15: NaN/∞座標などの不正ジオメトリへの差し替えは
+        // ModifyEntity で拒否される。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+        let undo_len_before = doc.undo_stack.len();
+
+        let result = doc.apply(Command::ModifyEntity {
+            id,
+            new_geom: invalid_line(),
+        });
+        assert!(
+            matches!(result, Err(CoreError::InvalidGeometry(_))),
+            "expected InvalidGeometry, got {result:?}"
+        );
+        // 元の幾何が保たれ、履歴も汚れていないこと(部分適用がない)。
+        assert_eq!(doc.entity(id).unwrap().geom, line(0.0));
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
     }
 }

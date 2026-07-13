@@ -35,4 +35,11 @@ pub enum CoreError {
     /// このエンティティへの変更・削除はできない。
     #[error("layer is locked: {0:?}")]
     LayerLocked(LayerId),
+
+    /// ジオメトリが不正（NaN/∞座標、負半径など）で追加・変更を拒否した。
+    ///
+    /// 判定条件は [`mcad_geom::Shape::validate`]（DESIGN.md M4 タスク15）。
+    /// `Command::AddEntity` / `Command::ModifyEntity` の実行前チェックで返る。
+    #[error("invalid geometry: {0}")]
+    InvalidGeometry(String),
 }

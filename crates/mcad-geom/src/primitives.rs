@@ -382,6 +382,64 @@ impl Shape {
             Shape::Polyline(pl) => Shape::Polyline(pl.translated(delta)),
         }
     }
+
+    /// 形状が幾何的に妥当か検証する。
+    ///
+    /// 条件: すべての座標・半径・角度が有限、半径は非負、ポリラインは頂点 1 つ以上。
+    /// 半径 0 の円や長さ 0 の線分は退化しているが描画・計算を壊さないため許容する
+    /// （作図ツールでも同一点クリックで作れるものをここだけ拒否しない）。
+    ///
+    /// mcad-io（ファイル入出力の境界）・mcad-core（`Document::apply` の
+    /// `AddEntity`/`ModifyEntity`）の双方から呼ばれる、唯一のジオメトリ妥当性
+    /// 判定（DESIGN.md M4 タスク15: 判定ロジックの重複を避けるため mcad-geom へ
+    /// 引き上げた）。
+    ///
+    /// # Errors
+    ///
+    /// 不正な理由を人が読める `String` で返す。
+    pub fn validate(&self) -> Result<(), String> {
+        let finite = |p: Point2| p.x.is_finite() && p.y.is_finite();
+        match self {
+            Shape::Point(p) => {
+                if !finite(*p) {
+                    return Err("non-finite point coordinates".into());
+                }
+            }
+            Shape::Line(l) => {
+                if !finite(l.a) || !finite(l.b) {
+                    return Err("non-finite line coordinates".into());
+                }
+            }
+            Shape::Circle(c) => {
+                if !finite(c.center) {
+                    return Err("non-finite circle center".into());
+                }
+                if !c.radius.is_finite() || c.radius < 0.0 {
+                    return Err(format!("invalid circle radius: {}", c.radius));
+                }
+            }
+            Shape::Arc(a) => {
+                if !finite(a.center) {
+                    return Err("non-finite arc center".into());
+                }
+                if !a.radius.is_finite() || a.radius < 0.0 {
+                    return Err(format!("invalid arc radius: {}", a.radius));
+                }
+                if !a.start_angle.is_finite() || !a.end_angle.is_finite() {
+                    return Err("non-finite arc angles".into());
+                }
+            }
+            Shape::Polyline(pl) => {
+                if pl.vertices.is_empty() {
+                    return Err("empty polyline".into());
+                }
+                if !pl.vertices.iter().all(|v| finite(*v)) {
+                    return Err("non-finite polyline vertex".into());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 3 点 `a`, `b`, `c` を通る円（外接円）を求める。
@@ -670,5 +728,40 @@ mod tests {
     fn translated_by_zero_is_identity() {
         let arc = Shape::Arc(Arc::new(Point2::new(1.0, 2.0), 3.0, 0.5, 2.0));
         assert_eq!(arc.translated(Vec2::ZERO), arc);
+    }
+
+    #[test]
+    fn validate_accepts_degenerate_but_finite_shapes() {
+        // 半径 0 の円・長さ 0 の線分は退化しているが許容する。
+        let cases = [
+            Shape::Point(Point2::new(1.0, 2.0)),
+            Shape::Line(LineSeg::new(Point2::new(2.0, 2.0), Point2::new(2.0, 2.0))),
+            Shape::Circle(Circle::new(Point2::new(0.0, 0.0), 0.0)),
+            Shape::Arc(Arc::new(Point2::new(0.0, 0.0), 1.0, 0.0, 0.0)),
+            Shape::Polyline(Polyline::new(vec![Point2::new(0.0, 0.0)], false)),
+        ];
+        for shape in cases {
+            assert!(shape.validate().is_ok(), "should accept: {shape:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_and_invalid_shapes() {
+        let cases: Vec<Shape> = vec![
+            Shape::Point(Point2::new(f64::NAN, 0.0)),
+            Shape::Point(Point2::new(f64::INFINITY, 0.0)),
+            Shape::Line(LineSeg::new(Point2::new(f64::NAN, 0.0), Point2::ORIGIN)),
+            Shape::Circle(Circle::new(Point2::new(0.0, 0.0), -1.0)),
+            Shape::Circle(Circle::new(Point2::new(0.0, 0.0), f64::INFINITY)),
+            Shape::Circle(Circle::new(Point2::new(f64::NAN, 0.0), 1.0)),
+            Shape::Arc(Arc::new(Point2::new(0.0, 0.0), 1.0, f64::NAN, 1.0)),
+            Shape::Arc(Arc::new(Point2::new(0.0, 0.0), -1.0, 0.0, 1.0)),
+            Shape::Arc(Arc::new(Point2::new(f64::NAN, 0.0), 1.0, 0.0, 1.0)),
+            Shape::Polyline(Polyline::new(vec![], false)),
+            Shape::Polyline(Polyline::new(vec![Point2::new(f64::NAN, 0.0)], false)),
+        ];
+        for shape in cases {
+            assert!(shape.validate().is_err(), "should reject: {shape:?}");
+        }
     }
 }

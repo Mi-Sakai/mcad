@@ -146,14 +146,16 @@ struct McadApp {
     /// 現在開いている `.mcad` ファイルのパス。`None` は「一度も保存/読込していない
     /// (Untitled)」を意味する。新規文書（Ctrl+N）で `None` に戻る。
     current_path: Option<PathBuf>,
-    /// ドキュメントが直近の保存/読込/新規作成から変更されているか。
+    /// 最後に保存/読込/新規作成した時点のドキュメント世代番号
+    /// （[`Document::generation`]）。
     ///
-    /// `document.apply` が成功するたびに（作図確定・選択削除・移動・レイヤー操作の
-    /// 各呼び出し箇所で）`true` にセットする。undo/redo も内容を変える操作なので、
-    /// `Document::undo`/`redo` が `true`（実際に戻す/やり直す操作があった）を返した
-    /// ときも `true` にする。「undo でファイル保存時の内容に一致して戻っても dirty
-    /// のままになる」精密な判定はせず、単純化のため一律 dirty 扱いにする設計判断。
-    dirty: bool,
+    /// 未保存の変更（dirty）判定は [`McadApp::is_dirty`] が
+    /// `document.generation() != saved_generation` で行う。世代はコアが「実際に状態を
+    /// 変えたコマンドの適用」ごとに単調増加し、undo/redo は対応する履歴時点の世代へ戻す。
+    /// このため「保存 → 1 操作 → undo で保存時点の内容へ厳密に戻る」と世代が再び
+    /// `saved_generation` に一致し、`*` 表示が消える（redo でやり直せば再び dirty）。
+    /// no-op なコマンドは世代を変えないので dirty 状態にも影響しない。
+    saved_generation: u64,
 }
 
 /// ステータスバーに一時表示するメッセージ。
@@ -237,7 +239,6 @@ impl McadApp {
         }
 
         Self {
-            document,
             viewport: Viewport::new(),
             tool_kind: ToolKind::Select,
             tool: None,
@@ -246,7 +247,9 @@ impl McadApp {
             snap_marker: None,
             status: None,
             current_path: None,
-            dirty: false,
+            // 起動直後（サンプル追加後）の世代を保存済み基準点とし、未保存扱いにしない。
+            saved_generation: document.generation(),
+            document,
         }
     }
 
@@ -262,10 +265,20 @@ impl McadApp {
         self.snap_marker = None;
     }
 
+    /// ドキュメントに未保存の変更があるか。
+    ///
+    /// 現在の世代（[`Document::generation`]）が、最後に保存/読込/新規作成した時点の
+    /// 世代（[`McadApp::saved_generation`]）と一致しなければ dirty。undo で保存時点の
+    /// 内容へ厳密に戻れば世代も一致し dirty でなくなる（[`McadApp::saved_generation`] の
+    /// doc 参照）。
+    fn is_dirty(&self) -> bool {
+        self.document.generation() != self.saved_generation
+    }
+
     /// 現在のドキュメントが未保存の変更を持つとき、破棄してよいか確認する。
     /// dirty でなければ確認なしで常に続行してよい（`true`）。
     fn confirm_discard_if_dirty(&self) -> bool {
-        !self.dirty || confirm_discard_unsaved()
+        !self.is_dirty() || confirm_discard_unsaved()
     }
 
     /// Ctrl+N: 未保存の変更があれば確認したうえで、真に空の新規ドキュメントへ
@@ -276,7 +289,8 @@ impl McadApp {
         }
         self.document = Document::new();
         self.current_path = None;
-        self.dirty = false;
+        // 新規ドキュメントの現在世代を保存済み基準点にする（読込直後は未保存でない）。
+        self.saved_generation = self.document.generation();
         self.reset_transient_ui_state();
         set_status(&mut self.status, now, "New document");
     }
@@ -299,7 +313,9 @@ impl McadApp {
             Ok(doc) => {
                 self.document = doc;
                 self.current_path = Some(path);
-                self.dirty = false;
+                // load_mcad は再構築後に clear_history 済みで世代が基準点に戻っている。
+                // 読込直後を未保存でない状態にするため、その世代へ合わせる。
+                self.saved_generation = self.document.generation();
                 self.reset_transient_ui_state();
                 set_status(&mut self.status, now, "Opened file");
             }
@@ -347,7 +363,8 @@ impl McadApp {
         match save_mcad(&self.document, path) {
             Ok(()) => {
                 self.current_path = Some(path.to_path_buf());
-                self.dirty = false;
+                // 保存成功時点の世代を記録する。以後この世代と一致する限り未保存でない。
+                self.saved_generation = self.document.generation();
                 set_status(&mut self.status, now, "Saved");
             }
             Err(err) => {
@@ -408,15 +425,14 @@ impl eframe::App for McadApp {
                 cmd && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
             )
         });
+        // undo/redo による dirty 状態の変化は世代カウンタが自動で表す
+        // （[`McadApp::is_dirty`] が `document.generation()` を見る）。ここで明示的に
+        // dirty を立てる必要はなく、保存時点へ厳密に戻れば自然と `*` が消える。
         if undo_pressed && self.document.undo() {
             self.select_tool.retain_alive(&self.document);
-            // undo/redo もドキュメント内容を変える操作なので dirty 扱いにする
-            // （管理方針は `McadApp::dirty` の doc を参照）。
-            self.dirty = true;
         }
         if redo_pressed && self.document.redo() {
             self.select_tool.retain_alive(&self.document);
-            self.dirty = true;
         }
 
         // Ctrl+N/Ctrl+O/Ctrl+S/Ctrl+Shift+S: 新規/開く/保存/名前を付けて保存。
@@ -454,7 +470,7 @@ impl eframe::App for McadApp {
         // `ctx.send_viewport_cmd(ViewportCommand::CancelClose)` でキャンセル、という
         // eframe 側の推奨手順どおり）。
         let close_requested = ui.ctx().input(|i| i.viewport().close_requested());
-        if close_requested && self.dirty && !confirm_discard_unsaved() {
+        if close_requested && self.is_dirty() && !confirm_discard_unsaved() {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -468,7 +484,7 @@ impl eframe::App for McadApp {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .map_or_else(|| UNTITLED_LABEL.to_string(), str::to_string);
-        let dirty_marker = if self.dirty { "*" } else { "" };
+        let dirty_marker = if self.is_dirty() { "*" } else { "" };
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Title(format!(
                 "mcad - {file_label}{dirty_marker}"
@@ -522,13 +538,7 @@ impl eframe::App for McadApp {
         });
 
         egui::Panel::right("layer_panel").show(ui, |ui| {
-            layer_panel(
-                ui,
-                &mut self.document,
-                &mut self.status,
-                now,
-                &mut self.dirty,
-            );
+            layer_panel(ui, &mut self.document, &mut self.status, now);
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -550,7 +560,6 @@ impl eframe::App for McadApp {
                     &mut self.select_tool,
                     &mut self.status,
                     now,
-                    &mut self.dirty,
                 );
             } else {
                 handle_tool_input(
@@ -565,7 +574,6 @@ impl eframe::App for McadApp {
                     &mut self.snap_marker,
                     &mut self.status,
                     now,
-                    &mut self.dirty,
                 );
             }
 
@@ -663,7 +671,6 @@ fn handle_tool_input(
     snap_marker: &mut Option<snap::SnapResult>,
     status: &mut Option<StatusMessage>,
     now: f64,
-    dirty: &mut bool,
 ) {
     let Some(active) = tool.as_mut() else {
         return;
@@ -715,10 +722,10 @@ fn handle_tool_input(
         ToolResult::Commit(cmd) => {
             // ドキュメント側のレイヤーロックなどで失敗することがある（例: カレント
             // レイヤーがロック中の AddEntity）。失敗はステータスバーへ表示し、
-            // ツール状態はリセットして操作を続行可能にしておく。
-            match document.apply(cmd) {
-                Ok(_) => *dirty = true,
-                Err(err) => set_status(status, now, format!("Commit failed: {err}")),
+            // ツール状態はリセットして操作を続行可能にしておく。dirty 状態は世代カウンタ
+            // が自動で表すため、成功時に明示的なフラグ操作は不要。
+            if let Err(err) = document.apply(cmd) {
+                set_status(status, now, format!("Commit failed: {err}"));
             }
             *tool = tool_kind.spawn();
         }
@@ -744,7 +751,6 @@ fn layer_panel(
     document: &mut Document,
     status: &mut Option<StatusMessage>,
     now: f64,
-    dirty: &mut bool,
 ) {
     ui.heading("Layers");
 
@@ -752,9 +758,8 @@ fn layer_panel(
         let n = document.layer_count();
         let color = LAYER_COLOR_PALETTE[n % LAYER_COLOR_PALETTE.len()];
         let cmd = Command::AddLayer(Layer::new(format!("Layer {n}"), color));
-        match document.apply(cmd) {
-            Ok(_) => *dirty = true,
-            Err(err) => set_status(status, now, format!("Add layer failed: {err}")),
+        if let Err(err) = document.apply(cmd) {
+            set_status(status, now, format!("Add layer failed: {err}"));
         }
     }
     ui.separator();
@@ -813,9 +818,8 @@ fn layer_panel(
     }
 
     for cmd in pending {
-        match document.apply(cmd) {
-            Ok(_) => *dirty = true,
-            Err(err) => set_status(status, now, format!("Layer operation failed: {err}")),
+        if let Err(err) = document.apply(cmd) {
+            set_status(status, now, format!("Layer operation failed: {err}"));
         }
     }
 }
@@ -857,7 +861,6 @@ fn handle_select_input(
     select_tool: &mut SelectTool,
     status: &mut Option<StatusMessage>,
     now: f64,
-    dirty: &mut bool,
 ) {
     // ピック許容量（px）をワールド単位へ換算する。
     let tol = PICK_TOLERANCE_PX / viewport.zoom;
@@ -868,10 +871,7 @@ fn handle_select_input(
         && let Some(cmd) = select_tool.delete_command()
     {
         match document.apply(cmd) {
-            Ok(_) => {
-                select_tool.clear_selection();
-                *dirty = true;
-            }
+            Ok(_) => select_tool.clear_selection(),
             Err(err) => set_status(status, now, format!("Delete failed: {err}")),
         }
     }
@@ -898,9 +898,8 @@ fn handle_select_input(
             if let Some(cmd) = select_tool.on_drag_end(document, world) {
                 // 移動の確定。ロックレイヤー混在時は Batch 原子性で全体が失敗し、
                 // 何も動かない。失敗理由はステータスバーへ表示する。
-                match document.apply(cmd) {
-                    Ok(_) => *dirty = true,
-                    Err(err) => set_status(status, now, format!("Move failed: {err}")),
+                if let Err(err) = document.apply(cmd) {
+                    set_status(status, now, format!("Move failed: {err}"));
                 }
             }
         } else if response.clicked_by(egui::PointerButton::Primary) {
@@ -1209,10 +1208,10 @@ mod tests {
     use super::*;
 
     // rfd のファイルダイアログ・確認ダイアログ（`confirm_discard_unsaved` の
-    // `self.dirty == true` 分岐、`open_document`/`save_document*` のダイアログ経路）は
+    // `is_dirty() == true` 分岐、`open_document`/`save_document*` のダイアログ経路）は
     // ネイティブ UI を開くため headless では自動テストできない。ここでは GUI
     // コンテキストを要しない部分（拡張子補完・dirty が false の早期リターン経路・
-    // 新規文書のリセット内容）のみを検証する。
+    // 世代ベースの dirty 判定・新規文書のリセット内容）のみを検証する。
 
     #[test]
     fn ensure_mcad_extension_appends_when_missing() {
@@ -1242,26 +1241,50 @@ mod tests {
     #[test]
     fn new_app_starts_clean_and_untitled() {
         let app = McadApp::new();
-        assert!(!app.dirty);
+        assert!(!app.is_dirty());
         assert!(app.current_path.is_none());
     }
 
     #[test]
-    fn confirm_discard_if_dirty_short_circuits_when_not_dirty() {
-        // dirty == false のときはダイアログを開かず true を返す（続行してよい）。
-        // dirty == true の分岐は rfd のネイティブダイアログを開いてしまうため、
-        // ここではテストしない。
+    fn is_dirty_tracks_generation_against_saved_point() {
+        // 世代ベースの dirty 判定を app レベルで確認する（rfd を一切開かない経路）。
         let mut app = McadApp::new();
-        app.dirty = false;
+        assert!(!app.is_dirty());
+
+        let layer = app.document.current_layer();
+        let point =
+            |x: f64| Entity::new(Shape::Point(Point2::new(x, x)), layer, Style::inherited());
+
+        // 1 操作で未保存の変更あり。
+        app.document.apply(Command::AddEntity(point(1.0))).unwrap();
+        assert!(app.is_dirty());
+
+        // 「保存した」= saved_generation を現在世代へ合わせると未保存でなくなる。
+        app.saved_generation = app.document.generation();
+        assert!(!app.is_dirty());
+
+        // さらに 1 操作で dirty。undo で保存時点へ厳密に戻ると clean、redo で再び dirty。
+        app.document.apply(Command::AddEntity(point(2.0))).unwrap();
+        assert!(app.is_dirty());
+        assert!(app.document.undo());
+        assert!(!app.is_dirty());
+        assert!(app.document.redo());
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn confirm_discard_if_dirty_short_circuits_when_not_dirty() {
+        // 未 dirty のときはダイアログを開かず true を返す（続行してよい）。dirty のときの
+        // 分岐は rfd のネイティブダイアログを開いてしまうため、ここではテストしない。
+        // McadApp::new() は saved_generation を現在世代へ合わせるので未 dirty で始まる。
+        let app = McadApp::new();
+        assert!(!app.is_dirty());
         assert!(app.confirm_discard_if_dirty());
     }
 
     #[test]
     fn new_document_resets_to_empty_document_and_clears_path_and_dirty() {
         let mut app = McadApp::new();
-        // dirty のままだと new_document がダイアログを開いてしまうため false にしておく
-        // （実際の Ctrl+N 経路では `confirm_discard_if_dirty` がこれを保証する）。
-        app.dirty = false;
         app.current_path = Some(PathBuf::from("/tmp/existing.mcad"));
 
         let layer = app.document.current_layer();
@@ -1274,13 +1297,20 @@ mod tests {
             .unwrap();
         assert!(app.document.entity_count() > 0);
 
+        // dirty のままだと new_document が confirm_discard_if_dirty でネイティブダイアログを
+        // 開いてしまうため、保存済み相当（未 dirty）にしておく（実際の Ctrl+N 経路では
+        // 確認ダイアログがこの前提を保証する）。
+        app.saved_generation = app.document.generation();
+        assert!(!app.is_dirty());
+
         app.new_document(0.0);
 
         // Codex レビュー指摘への対応: Ctrl+N はサンプルを含まない真に空の文書にする。
         assert_eq!(app.document.entity_count(), 0);
         assert_eq!(app.document.layer_count(), 1);
         assert!(app.current_path.is_none());
-        assert!(!app.dirty);
+        // 新規文書は saved_generation を新しい基準点へ合わせるので未 dirty。
+        assert!(!app.is_dirty());
         assert_eq!(app.tool_kind, ToolKind::Select);
         assert!(app.select_tool.selection().is_empty());
     }

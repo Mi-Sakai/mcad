@@ -64,6 +64,21 @@ enum Applied {
     Batch(Vec<Applied>),
 }
 
+/// undo/redo スタックの 1 エントリ。逆操作記録に加え、そのコマンドを適用した直後の
+/// ドキュメント世代番号（[`Document::generation`]）を持つ。
+///
+/// 世代番号は「未保存の変更（dirty）判定」のために保持する。undo は 1 つ前の履歴時点の
+/// 世代へ、redo はこのエントリが記録した世代へ [`Document::generation`] を戻す。これにより
+/// 「保存 → 変更 → undo で保存時点へ戻ったら再び未保存でない」といった精密な判定が、
+/// スナップショット比較なしに O(1) で行える。
+#[derive(Debug, Clone)]
+struct HistoryEntry {
+    /// 逆操作記録（undo/redo 用）。
+    applied: Applied,
+    /// このコマンドを適用した直後のドキュメント世代番号。
+    generation: u64,
+}
+
 /// [`Document::apply`] が新規発行した ID の一覧。
 ///
 /// `AddEntity`/`AddLayer`（単体、および [`Command::Batch`] にネストされたもの）が
@@ -137,9 +152,19 @@ pub struct Document {
     /// デフォルトレイヤー（レイヤー0相当）。削除不可。
     default_layer: LayerId,
     /// undo スタック（末尾が直近の操作）。
-    undo_stack: Vec<Applied>,
+    undo_stack: Vec<HistoryEntry>,
     /// redo スタック（末尾が次に redo する操作）。
-    redo_stack: Vec<Applied>,
+    redo_stack: Vec<HistoryEntry>,
+    /// 現在のドキュメント内容を表す世代番号。実際に状態を変えたコマンドの適用ごとに
+    /// [`Document::next_generation`] から採番した新しい番号へ更新し、undo/redo は対応する
+    /// 履歴時点の世代へ戻す。no-op は変えない。保存時点の世代との比較で dirty を判定する。
+    generation: u64,
+    /// 次に新規コマンドを適用したときに採番する世代番号（単調増加の高水位）。
+    ///
+    /// undo で [`Document::generation`] を戻しても、この値は減らさない。こうすることで、
+    /// undo 後に別の新規コマンドを適用しても、過去に使った世代番号を再利用せず、
+    /// 「内容が違えば世代も必ず違う」不変条件を保つ（dirty の誤判定を防ぐ）。
+    next_generation: u64,
 }
 
 impl Document {
@@ -157,6 +182,8 @@ impl Document {
             default_layer,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            generation: 0,
+            next_generation: 0,
         }
     }
 
@@ -224,14 +251,36 @@ impl Document {
         !self.redo_stack.is_empty()
     }
 
+    /// 現在のドキュメント内容を表す世代番号。
+    ///
+    /// 実際に状態を変えたコマンドの適用ごとに単調増加した新しい番号が割り当てられ、
+    /// undo/redo は対応する履歴時点の世代へ戻す。意味的 no-op（空バッチ・`before == after`
+    /// の設定など）は世代を変えない。アプリ側は保存成功時の世代を記録し、現在の世代と
+    /// 比較することで「未保存の変更（dirty）」を正確に判定する（保存 → 変更 → undo で
+    /// 保存時点へ厳密に戻ったら再び未保存でない、まで表現できる）。
+    ///
+    /// [`Document::clear_history`] は世代を初期値へリセットするため、ファイル読込・新規
+    /// 作成の直後は必ず新しい基準点（`0`）になる。
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// undo/redo 履歴を空にする。ドキュメントの内容自体は変更しない。
     ///
     /// ファイル読込直後など「ここより前へは戻れない」基準点を作るために使う。
     /// mcad-io の import は `Command` 列でドキュメントを再構築するため、これを
     /// 呼ばないと読込直後の Ctrl+Z で再構築手順が 1 つずつ巻き戻ってしまう。
+    ///
+    /// 履歴を消すのと同時に、世代番号（[`Document::generation`] /
+    /// [`Document::next_generation`]）も初期状態へリセットする。これにより読込・新規作成の
+    /// 直後は世代が新しい基準点（`0`）になり、アプリ側が保存済み世代をここへ合わせれば
+    /// 「読込直後は未保存の変更なし」が保たれる。
     pub fn clear_history(&mut self) {
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.generation = 0;
+        self.next_generation = 0;
     }
 
     // ---- 変更系 ----
@@ -264,7 +313,16 @@ impl Document {
         if !changed {
             return Ok(NewIds::default());
         }
-        self.undo_stack.push(applied);
+        // 実変更があったので新しい世代を採番する。`next_generation` は単調増加の高水位で、
+        // undo で世代を戻しても減らさないため、過去に使った番号を再利用しない（内容が違えば
+        // 世代も必ず違う、という dirty 判定の前提を保つ）。採番した世代を履歴エントリに
+        // 記録し、redo 時に同じ世代へ復元できるようにする。
+        self.next_generation += 1;
+        self.generation = self.next_generation;
+        self.undo_stack.push(HistoryEntry {
+            applied,
+            generation: self.generation,
+        });
         self.redo_stack.clear();
         Ok(new_ids)
     }
@@ -272,9 +330,13 @@ impl Document {
     /// 直近の操作を取り消す。取り消せた場合 `true`。
     pub fn undo(&mut self) -> bool {
         match self.undo_stack.pop() {
-            Some(applied) => {
-                self.revert(&applied);
-                self.redo_stack.push(applied);
+            Some(entry) => {
+                self.revert(&entry.applied);
+                // 世代は「undo 後に到達する内容」の世代へ戻す。それは undo スタックに残った
+                // 直前エントリが記録した世代であり、履歴が空になる（最古の状態へ戻る）場合は
+                // 初期世代 `0`。これにより、保存時点の内容へ厳密に戻れば世代も保存時と一致する。
+                self.generation = self.undo_stack.last().map_or(0, |e| e.generation);
+                self.redo_stack.push(entry);
                 true
             }
             None => false,
@@ -284,9 +346,12 @@ impl Document {
     /// 直近に取り消した操作をやり直す。やり直せた場合 `true`。
     pub fn redo(&mut self) -> bool {
         match self.redo_stack.pop() {
-            Some(applied) => {
-                self.reapply(&applied);
-                self.undo_stack.push(applied);
+            Some(entry) => {
+                self.reapply(&entry.applied);
+                // 同じ操作をやり直すだけなので新規採番はせず、元の適用時に記録した世代を
+                // そのまま復元する（`next_generation` は増やさない）。
+                self.generation = entry.generation;
+                self.undo_stack.push(entry);
                 true
             }
             None => false,
@@ -1409,5 +1474,141 @@ mod tests {
         // 元の幾何が保たれ、履歴も汚れていないこと(部分適用がない)。
         assert_eq!(doc.entity(id).unwrap().geom, line(0.0));
         assert_eq!(doc.undo_stack.len(), undo_len_before);
+    }
+
+    // --- 世代カウンタ（dirty 判定の基盤、DESIGN.md M4 タスク14）---
+
+    #[test]
+    fn new_document_generation_is_zero() {
+        // 新規ドキュメントの世代は初期基準点 0。
+        let doc = Document::new();
+        assert_eq!(doc.generation(), 0);
+    }
+
+    #[test]
+    fn applied_change_bumps_generation() {
+        // 実変更のあるコマンドは世代を単調増加させる。
+        let mut doc = Document::new();
+        assert_eq!(doc.generation(), 0);
+        doc.apply(add_line(&doc, line(0.0))).unwrap();
+        let g1 = doc.generation();
+        assert!(g1 > 0);
+        doc.apply(add_line(&doc, line(1.0))).unwrap();
+        assert!(doc.generation() > g1);
+    }
+
+    #[test]
+    fn save_change_undo_returns_to_saved_generation() {
+        // シナリオ1: 保存 → 変更 → undo で保存時点へ戻ったら、世代が保存時の世代と一致する
+        // （= dirty でない）。
+        let mut doc = Document::new();
+        doc.apply(add_line(&doc, line(0.0))).unwrap();
+        // 「保存した」瞬間の世代を記録する（アプリ側の saved_generation 相当）。
+        let saved_generation = doc.generation();
+
+        // 1 操作して未保存の変更が生じる（世代が保存時と食い違う）。
+        doc.apply(add_line(&doc, line(1.0))).unwrap();
+        assert_ne!(doc.generation(), saved_generation);
+
+        // undo で保存時点の内容へ厳密に戻ると、世代も保存時と一致する。
+        assert!(doc.undo());
+        assert_eq!(doc.generation(), saved_generation);
+    }
+
+    #[test]
+    fn change_undo_redo_restores_changed_generation() {
+        // シナリオ2: 変更 → undo → redo で、世代が変更後の世代へ戻る（= 再び dirty）。
+        let mut doc = Document::new();
+        doc.apply(add_line(&doc, line(0.0))).unwrap();
+        let saved_generation = doc.generation();
+
+        doc.apply(add_line(&doc, line(1.0))).unwrap();
+        let changed_generation = doc.generation();
+        assert_ne!(changed_generation, saved_generation);
+
+        assert!(doc.undo());
+        assert_eq!(doc.generation(), saved_generation);
+
+        // redo は元の適用時に採番した世代をそのまま復元する（新規採番はしない）。
+        assert!(doc.redo());
+        assert_eq!(doc.generation(), changed_generation);
+    }
+
+    #[test]
+    fn noop_command_does_not_change_generation() {
+        // シナリオ3: 意味的 no-op はドキュメントを変えないので世代も変えない。
+        let mut doc = Document::new();
+        let current = doc.current_layer();
+        doc.apply(add_line(&doc, line(0.0))).unwrap();
+        let before = doc.generation();
+
+        // 現在と同じレイヤーの SetCurrentLayer は no-op。
+        doc.apply(Command::SetCurrentLayer(current)).unwrap();
+        assert_eq!(doc.generation(), before);
+
+        // 空バッチも no-op。
+        doc.apply(Command::Batch(vec![])).unwrap();
+        assert_eq!(doc.generation(), before);
+
+        // 同一幾何への差し替えも no-op。
+        let id = only_entity(&doc);
+        doc.apply(Command::ModifyEntity {
+            id,
+            new_geom: line(0.0),
+        })
+        .unwrap();
+        assert_eq!(doc.generation(), before);
+    }
+
+    #[test]
+    fn clear_history_resets_generation_and_stacks() {
+        // シナリオ4: clear_history 後は世代が初期化され、undo/redo スタックが空になる。
+        let mut doc = Document::new();
+        doc.apply(add_line(&doc, line(0.0))).unwrap();
+        doc.apply(add_line(&doc, line(1.0))).unwrap();
+        assert!(doc.undo()); // redo スタックへ 1 件積む
+        assert!(doc.generation() > 0);
+        assert!(doc.can_undo());
+        assert!(doc.can_redo());
+
+        doc.clear_history();
+
+        assert_eq!(doc.generation(), 0);
+        assert!(!doc.can_undo());
+        assert!(!doc.can_redo());
+        assert!(doc.undo_stack.is_empty());
+        assert!(doc.redo_stack.is_empty());
+    }
+
+    #[test]
+    fn undo_to_empty_history_returns_to_initial_generation() {
+        // 履歴が空になるまで undo すると、世代は初期基準点 0 に戻る。
+        let mut doc = Document::new();
+        doc.apply(add_line(&doc, line(0.0))).unwrap();
+        assert!(doc.generation() > 0);
+
+        assert!(doc.undo());
+        assert_eq!(doc.generation(), 0);
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn new_command_after_undo_does_not_reuse_generation() {
+        // undo 後に別の新規コマンドを適用しても、過去に使った世代番号を再利用しない。
+        // これにより「保存時点の内容と違うのに世代が偶然一致して dirty を見落とす」事故を防ぐ。
+        let mut doc = Document::new();
+        doc.apply(add_line(&doc, line(0.0))).unwrap();
+        let saved_generation = doc.generation();
+        doc.apply(add_line(&doc, line(1.0))).unwrap();
+        let branched_generation = doc.generation();
+
+        // 保存時点まで undo し、別の内容の新規コマンドを適用する。
+        assert!(doc.undo());
+        assert_eq!(doc.generation(), saved_generation);
+        doc.apply(add_line(&doc, line(2.0))).unwrap();
+
+        // 内容が違う（line(1.0) ではなく line(2.0)）ので、世代も分岐前とは異なる。
+        assert_ne!(doc.generation(), branched_generation);
+        assert_ne!(doc.generation(), saved_generation);
     }
 }

@@ -85,6 +85,49 @@ const RECT_FILL_COLOR: Color32 = Color32::from_rgba_premultiplied(30, 60, 90, 60
 /// 矩形選択プレビューの枠線色。
 const RECT_OUTLINE_COLOR: Color32 = Color32::from_rgb(80, 160, 255);
 
+/// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O の3経路で共有）。
+///
+/// いずれの経路も、ネイティブの確認ダイアログ（`rfd::MessageDialog`）を同期表示すると
+/// メインウィンドウの裏に隠れてユーザーが気づけない、あるいは（閉じるボタン経路では）
+/// イベントループが止まり「応答なし」になる問題があったため、egui 内製の
+/// 非ブロッキングモーダルへ統一した。その状態遷移をこの enum で管理し、閉じるボタン
+/// 経路では「破棄して終了」時の無限クローズループも防ぐ（[`McadApp::ui`] の
+/// close 検知ロジック参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmState {
+    /// 通常。確認モーダルは出ていない。
+    Idle,
+    /// OS のクローズ確認モーダルを表示中（OS のクローズはキャンセル済み）。
+    ConfirmingClose,
+    /// Ctrl+N（新規文書）の確認モーダルを表示中。
+    ConfirmingNew,
+    /// Ctrl+O（ファイルを開く）の確認モーダルを表示中。
+    ConfirmingOpen,
+    /// ユーザーが破棄を選択済み。以降の close 要求はキャンセルせず通す。
+    Closing,
+}
+
+impl ConfirmState {
+    /// この状態で確認モーダルを描くべきなら `(本文, 破棄ボタンのラベル)` を返す。
+    /// `Idle`（モーダルなし）・`Closing`（破棄確定済みで再描画不要）では `None`。
+    fn prompt(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            ConfirmState::ConfirmingClose => {
+                Some(("Discard unsaved changes and quit?", "Discard and quit"))
+            }
+            ConfirmState::ConfirmingNew => Some((
+                "Discard unsaved changes and start a new document?",
+                "Discard and continue",
+            )),
+            ConfirmState::ConfirmingOpen => Some((
+                "Discard unsaved changes and open another file?",
+                "Discard and continue",
+            )),
+            ConfirmState::Idle | ConfirmState::Closing => None,
+        }
+    }
+}
+
 /// 現在アクティブなツールの種類。`Select` は選択・編集モード（[`SelectTool`]）で、
 /// 作図ツール（Point/Line/…）とは別経路で処理する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +199,9 @@ struct McadApp {
     /// `saved_generation` に一致し、`*` 表示が消える（redo でやり直せば再び dirty）。
     /// no-op なコマンドは世代を変えないので dirty 状態にも影響しない。
     saved_generation: u64,
+    /// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O 共通、
+    /// [`ConfirmState`] の doc 参照）。
+    confirm_state: ConfirmState,
 }
 
 /// ステータスバーに一時表示するメッセージ。
@@ -249,6 +295,7 @@ impl McadApp {
             current_path: None,
             // 起動直後（サンプル追加後）の世代を保存済み基準点とし、未保存扱いにしない。
             saved_generation: document.generation(),
+            confirm_state: ConfirmState::Idle,
             document,
         }
     }
@@ -275,18 +322,30 @@ impl McadApp {
         self.document.generation() != self.saved_generation
     }
 
-    /// 現在のドキュメントが未保存の変更を持つとき、破棄してよいか確認する。
-    /// dirty でなければ確認なしで常に続行してよい（`true`）。
-    fn confirm_discard_if_dirty(&self) -> bool {
-        !self.is_dirty() || confirm_discard_unsaved()
+    /// Ctrl+N: 未保存の変更があれば確認モーダルを出し、なければ即座に新規文書へ置き換える。
+    fn request_new_document(&mut self, now: f64) {
+        if self.is_dirty() {
+            self.confirm_state = ConfirmState::ConfirmingNew;
+        } else {
+            self.new_document(now);
+        }
     }
 
-    /// Ctrl+N: 未保存の変更があれば確認したうえで、真に空の新規ドキュメントへ
-    /// 置き換える（サンプルエンティティは一切追加しない。[`McadApp::new`] の doc 参照）。
-    fn new_document(&mut self, now: f64) {
-        if !self.confirm_discard_if_dirty() {
-            return;
+    /// Ctrl+O: 未保存の変更があれば確認モーダルを出し、なければ即座にファイル選択へ進む。
+    fn request_open_document(&mut self, now: f64) {
+        if self.is_dirty() {
+            self.confirm_state = ConfirmState::ConfirmingOpen;
+        } else {
+            self.open_document(now);
         }
+    }
+
+    /// 真に空の新規ドキュメントへ置き換える（サンプルエンティティは一切追加しない。
+    /// [`McadApp::new`] の doc 参照）。
+    ///
+    /// 未保存の変更があるかどうかは確認しない。呼び出し側（[`McadApp::request_new_document`]
+    /// または確認モーダルの「破棄して続行」選択）が確認済みであることを前提とする。
+    fn new_document(&mut self, now: f64) {
         self.document = Document::new();
         self.current_path = None;
         // 新規ドキュメントの現在世代を保存済み基準点にする（読込直後は未保存でない）。
@@ -295,14 +354,13 @@ impl McadApp {
         set_status(&mut self.status, now, "New document");
     }
 
-    /// Ctrl+O: 未保存の変更があれば確認したうえで、ネイティブのファイル選択
-    /// ダイアログ（`.mcad` フィルタ付き）で選んだファイルを読み込む。
+    /// ネイティブのファイル選択ダイアログ（`.mcad` フィルタ付き）で選んだファイルを
+    /// 読み込む。
     ///
+    /// 未保存の変更があるかどうかは確認しない。呼び出し側（[`McadApp::request_open_document`]
+    /// または確認モーダルの「破棄して続行」選択）が確認済みであることを前提とする。
     /// 読込失敗時は現在のドキュメントを一切変更せず、理由をステータスバーへ表示する。
     fn open_document(&mut self, now: f64) {
-        if !self.confirm_discard_if_dirty() {
-            return;
-        }
         let Some(path) = rfd::FileDialog::new()
             .add_filter("mcad", &[MCAD_EXTENSION])
             .pick_file()
@@ -392,24 +450,6 @@ fn ensure_mcad_extension(path: PathBuf) -> PathBuf {
     }
 }
 
-/// 未保存の変更を破棄してよいか、ネイティブの確認ダイアログで問い合わせる。
-/// `Yes` で破棄して続行、それ以外（`No`/ダイアログを閉じる等）は続行しない。
-///
-/// 「保存/破棄/キャンセル」の3択ではなく Yes/No の2択にしているのは、この場から
-/// 「保存」を選ばせると保存先未定の場合に「名前を付けて保存」ダイアログへ入れ子で
-/// 分岐する必要があり、呼び出し側（新規/開く/終了）の状態遷移が複雑になるため。
-/// 保存したい場合はユーザーがこの操作の前に Ctrl+S を押せばよい、という単純な運用で
-/// 割り切った（実装しやすさを優先した設計判断）。
-fn confirm_discard_unsaved() -> bool {
-    rfd::MessageDialog::new()
-        .set_title("Unsaved changes")
-        .set_description("Discard unsaved changes?")
-        .set_level(rfd::MessageLevel::Warning)
-        .set_buttons(rfd::MessageButtons::YesNo)
-        .show()
-        == rfd::MessageDialogResult::Yes
-}
-
 impl eframe::App for McadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = ui.input(|i| i.time);
@@ -448,10 +488,10 @@ impl eframe::App for McadApp {
             )
         });
         if new_pressed {
-            self.new_document(now);
+            self.request_new_document(now);
         }
         if open_pressed {
-            self.open_document(now);
+            self.request_open_document(now);
         }
         if save_pressed {
             self.save_document(now);
@@ -461,18 +501,35 @@ impl eframe::App for McadApp {
         }
 
         // ウィンドウを閉じる操作（OSの閉じるボタン等）を検出する。未保存の変更が
-        // あれば、この場でネイティブの確認ダイアログ（`confirm_discard_unsaved`）を
-        // 出し、破棄が選ばれなければ `ViewportCommand::CancelClose` でクローズを
-        // キャンセルする。eframe 0.35 のネイティブランナー
-        // （`epi_integration::update`）は `ui()` 呼び出し中に積まれた
-        // viewport コマンドを同フレームの close 判定に使うため、ここで送れば
-        // 間に合う（`ctx.input(|i| i.viewport().close_requested())` で検出、
-        // `ctx.send_viewport_cmd(ViewportCommand::CancelClose)` でキャンセル、という
-        // eframe 側の推奨手順どおり）。
+        // あれば OS 側のクローズを即キャンセルし、egui 内製の非ブロッキングモーダル
+        // （下部の `confirm_state == ConfirmingClose` 描画）で破棄可否を確認する。
+        // ネイティブダイアログを `ui()` 中に同期表示するとイベントループが止まり
+        // 「応答なし」になるため、この経路ではネイティブ確認ダイアログを使わない。
+        //
+        // eframe 0.35 のネイティブランナー（`epi_integration::update`）は `ui()` 中に
+        // 積まれた viewport コマンドを同フレームの close 判定に使うため、ここで
+        // `ViewportCommand::CancelClose` を送れば間に合う（`close_requested()` で検出、
+        // `CancelClose` でキャンセル、という eframe 側の推奨手順どおり）。
+        //
+        // 「破棄して終了」で自分が `ViewportCommand::Close` を送ると次フレームで再び
+        // `close_requested` が立つが、そのとき dirty はまだ true のままなので、単純な
+        // ロジックだと再度 CancelClose してモーダルが出っぱなしになり永久に閉じられない。
+        // これを防ぐため `Closing` 状態では close 要求をそのまま OS へ通す。
         let close_requested = ui.ctx().input(|i| i.viewport().close_requested());
-        if close_requested && self.is_dirty() && !confirm_discard_unsaved() {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if close_requested {
+            match self.confirm_state {
+                // 破棄確定済み: 何もせず OS クローズを通す。
+                ConfirmState::Closing => {}
+                _ => {
+                    if self.is_dirty() {
+                        // OS 側クローズを即キャンセルし、次フレームで egui モーダルを描く。
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        self.confirm_state = ConfirmState::ConfirmingClose;
+                    }
+                    // dirty でなければ Idle のまま OS クローズを通す（何もしない）。
+                }
+            }
         }
 
         // ウィンドウタイトルへ現在のファイル名（未定なら Untitled）と dirty 状態
@@ -596,6 +653,49 @@ impl eframe::App for McadApp {
                 draw_snap_marker(&painter, rect, &self.viewport, marker);
             }
         });
+
+        // 未保存確認モーダル（OS の閉じるボタン / Ctrl+N / Ctrl+O 共通、非ブロッキング）。
+        // egui::Modal は最前面レイヤに背景付きで描かれるので、パネル群の後に描いてよい。
+        // ユーザー可視文字列は ASCII 限定（egui 既定フォントは CJK 非対応）。
+        // 3経路とも同じモーダル外観を使い、「破棄」ボタンが押されたときの分岐だけ
+        // `confirm_state` で切り替える（[`ConfirmState::prompt`] の doc 参照）。
+        if let Some((message, discard_label)) = self.confirm_state.prompt() {
+            let modal =
+                egui::Modal::new(egui::Id::new("confirm_unsaved_modal")).show(ui.ctx(), |ui| {
+                    ui.set_width(280.0);
+                    ui.heading("Unsaved changes");
+                    ui.label(message);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(discard_label).clicked() {
+                            match self.confirm_state {
+                                ConfirmState::ConfirmingClose => {
+                                    // 破棄確定。次フレームの close 要求は Closing 分岐で
+                                    // OS へ通す。
+                                    self.confirm_state = ConfirmState::Closing;
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                ConfirmState::ConfirmingNew => {
+                                    self.confirm_state = ConfirmState::Idle;
+                                    self.new_document(now);
+                                }
+                                ConfirmState::ConfirmingOpen => {
+                                    self.confirm_state = ConfirmState::Idle;
+                                    self.open_document(now);
+                                }
+                                ConfirmState::Idle | ConfirmState::Closing => {}
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_state = ConfirmState::Idle;
+                        }
+                    });
+                });
+            // モーダル外クリック / Esc はキャンセル扱い（実行しない）。
+            if modal.should_close() {
+                self.confirm_state = ConfirmState::Idle;
+            }
+        }
     }
 }
 
@@ -1207,11 +1307,14 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    // rfd のファイルダイアログ・確認ダイアログ（`confirm_discard_unsaved` の
-    // `is_dirty() == true` 分岐、`open_document`/`save_document*` のダイアログ経路）は
-    // ネイティブ UI を開くため headless では自動テストできない。ここでは GUI
-    // コンテキストを要しない部分（拡張子補完・dirty が false の早期リターン経路・
-    // 世代ベースの dirty 判定・新規文書のリセット内容）のみを検証する。
+    // rfd のファイルダイアログ（`open_document`/`save_document*` のダイアログ経路）は
+    // ネイティブ UI を開くため headless では自動テストできない。未保存確認は
+    // egui 内製モーダル（`ConfirmState`）に統一済みなのでロジック自体はテストできるが、
+    // 「破棄して続行」時に実際にダイアログを開く経路（`request_open_document` が
+    // dirty でないとき即座に `open_document` を呼ぶ分岐、モーダルの
+    // `ConfirmingOpen` 分岐）はここでは検証しない。ここでは GUI コンテキストを
+    // 要しない部分（拡張子補完・世代ベースの dirty 判定・確認モーダルへの状態遷移・
+    // 新規文書のリセット内容）のみを検証する。
 
     #[test]
     fn ensure_mcad_extension_appends_when_missing() {
@@ -1273,17 +1376,76 @@ mod tests {
     }
 
     #[test]
-    fn confirm_discard_if_dirty_short_circuits_when_not_dirty() {
-        // 未 dirty のときはダイアログを開かず true を返す（続行してよい）。dirty のときの
-        // 分岐は rfd のネイティブダイアログを開いてしまうため、ここではテストしない。
+    fn request_new_document_executes_immediately_when_not_dirty() {
+        // 未 dirty のときは確認モーダルを出さず、即座に新規文書へ置き換える。
         // McadApp::new() は saved_generation を現在世代へ合わせるので未 dirty で始まる。
-        let app = McadApp::new();
+        let mut app = McadApp::new();
+        app.current_path = Some(PathBuf::from("/tmp/existing.mcad"));
         assert!(!app.is_dirty());
-        assert!(app.confirm_discard_if_dirty());
+
+        app.request_new_document(0.0);
+
+        assert_eq!(app.confirm_state, ConfirmState::Idle);
+        assert_eq!(app.document.entity_count(), 0);
+        assert!(app.current_path.is_none());
+    }
+
+    #[test]
+    fn request_new_document_defers_to_modal_when_dirty() {
+        // dirty のときは即座に置き換えず、ConfirmingNew へ遷移するだけ
+        // （ドキュメントは変更されない。実行はモーダルの「破棄して続行」を待つ）。
+        let mut app = McadApp::new();
+        let layer = app.document.current_layer();
+        app.document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Point(Point2::new(1.0, 1.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        assert!(app.is_dirty());
+        let entity_count_before = app.document.entity_count();
+
+        app.request_new_document(0.0);
+
+        assert_eq!(app.confirm_state, ConfirmState::ConfirmingNew);
+        assert_eq!(app.document.entity_count(), entity_count_before);
+    }
+
+    #[test]
+    fn request_open_document_defers_to_modal_when_dirty() {
+        // Ctrl+O も同じ経路。dirty なら rfd のネイティブファイル選択を一切開かず
+        // ConfirmingOpen へ遷移するだけなので headless でも安全にテストできる。
+        let mut app = McadApp::new();
+        let layer = app.document.current_layer();
+        app.document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Point(Point2::new(2.0, 2.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        assert!(app.is_dirty());
+
+        app.request_open_document(0.0);
+
+        assert_eq!(app.confirm_state, ConfirmState::ConfirmingOpen);
+    }
+
+    #[test]
+    fn confirm_state_prompt_is_some_only_while_confirming() {
+        // Idle と Closing はモーダルを描かない（`None`）。3つの Confirming* は描く。
+        assert!(ConfirmState::Idle.prompt().is_none());
+        assert!(ConfirmState::Closing.prompt().is_none());
+        assert!(ConfirmState::ConfirmingClose.prompt().is_some());
+        assert!(ConfirmState::ConfirmingNew.prompt().is_some());
+        assert!(ConfirmState::ConfirmingOpen.prompt().is_some());
     }
 
     #[test]
     fn new_document_resets_to_empty_document_and_clears_path_and_dirty() {
+        // new_document 自体は dirty を確認しない（呼び出し側の
+        // request_new_document/確認モーダルが確認済みであることを前提とする）。
         let mut app = McadApp::new();
         app.current_path = Some(PathBuf::from("/tmp/existing.mcad"));
 
@@ -1296,12 +1458,6 @@ mod tests {
             )))
             .unwrap();
         assert!(app.document.entity_count() > 0);
-
-        // dirty のままだと new_document が confirm_discard_if_dirty でネイティブダイアログを
-        // 開いてしまうため、保存済み相当（未 dirty）にしておく（実際の Ctrl+N 経路では
-        // 確認ダイアログがこの前提を保証する）。
-        app.saved_generation = app.document.generation();
-        assert!(!app.is_dirty());
 
         app.new_document(0.0);
 

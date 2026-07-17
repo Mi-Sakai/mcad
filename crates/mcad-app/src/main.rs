@@ -454,50 +454,56 @@ impl eframe::App for McadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = ui.input(|i| i.time);
 
-        // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y で undo/redo。ツール切替キーより先に処理する
-        // （handle_tool_shortcut_keys は修飾キー付きの入力を無視するので衝突はしないが、
-        // 「履歴操作が最優先」という意図を並び順でも示す）。undo/redo はエンティティを
-        // 削除・復活させるため、直後に選択集合から死んだ ID を取り除く。
-        let (undo_pressed, redo_pressed) = ui.input(|i| {
-            let cmd = i.modifiers.command;
-            (
-                cmd && !i.modifiers.shift && i.key_pressed(Key::Z),
-                cmd && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
-            )
-        });
-        // undo/redo による dirty 状態の変化は世代カウンタが自動で表す
-        // （[`McadApp::is_dirty`] が `document.generation()` を見る）。ここで明示的に
-        // dirty を立てる必要はなく、保存時点へ厳密に戻れば自然と `*` が消える。
-        if undo_pressed && self.document.undo() {
-            self.select_tool.retain_alive(&self.document);
-        }
-        if redo_pressed && self.document.redo() {
-            self.select_tool.retain_alive(&self.document);
-        }
+        // 未保存確認モーダル表示中（`confirm_state != Idle`）は、履歴操作・ファイル
+        // 操作ショートカットを一切処理しない。モーダル表示中に Ctrl+N 等が先に走ると、
+        // 例えば「閉じる」確認中に `confirm_state` が `ConfirmingNew` へ上書きされ、
+        // モーダルの文言が終了確認から新規文書確認へすり替わってしまうため。
+        if self.confirm_state == ConfirmState::Idle {
+            // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y で undo/redo。ツール切替キーより先に処理する
+            // （handle_tool_shortcut_keys は修飾キー付きの入力を無視するので衝突はしないが、
+            // 「履歴操作が最優先」という意図を並び順でも示す）。undo/redo はエンティティを
+            // 削除・復活させるため、直後に選択集合から死んだ ID を取り除く。
+            let (undo_pressed, redo_pressed) = ui.input(|i| {
+                let cmd = i.modifiers.command;
+                (
+                    cmd && !i.modifiers.shift && i.key_pressed(Key::Z),
+                    cmd && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
+                )
+            });
+            // undo/redo による dirty 状態の変化は世代カウンタが自動で表す
+            // （[`McadApp::is_dirty`] が `document.generation()` を見る）。ここで明示的に
+            // dirty を立てる必要はなく、保存時点へ厳密に戻れば自然と `*` が消える。
+            if undo_pressed && self.document.undo() {
+                self.select_tool.retain_alive(&self.document);
+            }
+            if redo_pressed && self.document.redo() {
+                self.select_tool.retain_alive(&self.document);
+            }
 
-        // Ctrl+N/Ctrl+O/Ctrl+S/Ctrl+Shift+S: 新規/開く/保存/名前を付けて保存。
-        // undo/redo と同様、ツール切替キー（`handle_tool_shortcut_keys`）は Ctrl 併用を
-        // 無視するので衝突しない。
-        let (new_pressed, open_pressed, save_pressed, save_as_pressed) = ui.input(|i| {
-            let cmd = i.modifiers.command;
-            (
-                cmd && !i.modifiers.shift && i.key_pressed(Key::N),
-                cmd && !i.modifiers.shift && i.key_pressed(Key::O),
-                cmd && !i.modifiers.shift && i.key_pressed(Key::S),
-                cmd && i.modifiers.shift && i.key_pressed(Key::S),
-            )
-        });
-        if new_pressed {
-            self.request_new_document(now);
-        }
-        if open_pressed {
-            self.request_open_document(now);
-        }
-        if save_pressed {
-            self.save_document(now);
-        }
-        if save_as_pressed {
-            self.save_document_as(now);
+            // Ctrl+N/Ctrl+O/Ctrl+S/Ctrl+Shift+S: 新規/開く/保存/名前を付けて保存。
+            // undo/redo と同様、ツール切替キー（`handle_tool_shortcut_keys`）は Ctrl 併用を
+            // 無視するので衝突しない。
+            let (new_pressed, open_pressed, save_pressed, save_as_pressed) = ui.input(|i| {
+                let cmd = i.modifiers.command;
+                (
+                    cmd && !i.modifiers.shift && i.key_pressed(Key::N),
+                    cmd && !i.modifiers.shift && i.key_pressed(Key::O),
+                    cmd && !i.modifiers.shift && i.key_pressed(Key::S),
+                    cmd && i.modifiers.shift && i.key_pressed(Key::S),
+                )
+            });
+            if new_pressed {
+                self.request_new_document(now);
+            }
+            if open_pressed {
+                self.request_open_document(now);
+            }
+            if save_pressed {
+                self.save_document(now);
+            }
+            if save_as_pressed {
+                self.save_document_as(now);
+            }
         }
 
         // ウィンドウを閉じる操作（OSの閉じるボタン等）を検出する。未保存の変更が
@@ -547,18 +553,22 @@ impl eframe::App for McadApp {
                 "mcad - {file_label}{dirty_marker}"
             )));
 
-        handle_tool_shortcut_keys(
-            ui,
-            &mut self.tool_kind,
-            &mut self.tool,
-            &mut self.select_tool,
-        );
+        // モーダル表示中はツール切替（S/1/L/C/A/P）や F3（スナップ切替）も処理しない。
+        // 特にツール切替はモーダルの裏で作図ツールが起動してしまう副作用があるため。
+        if self.confirm_state == ConfirmState::Idle {
+            handle_tool_shortcut_keys(
+                ui,
+                &mut self.tool_kind,
+                &mut self.tool,
+                &mut self.select_tool,
+            );
 
-        // F3 でスナップの有効/無効をトグルする（作図時の吸着を一時的に切りたい場面用）。
-        if ui.input(|i| i.key_pressed(Key::F3)) {
-            self.snap_enabled = !self.snap_enabled;
-            if !self.snap_enabled {
-                self.snap_marker = None;
+            // F3 でスナップの有効/無効をトグルする（作図時の吸着を一時的に切りたい場面用）。
+            if ui.input(|i| i.key_pressed(Key::F3)) {
+                self.snap_enabled = !self.snap_enabled;
+                if !self.snap_enabled {
+                    self.snap_marker = None;
+                }
             }
         }
 
@@ -604,34 +614,40 @@ impl eframe::App for McadApp {
 
             handle_pan_input(ui, &response, &mut self.viewport);
             handle_zoom_input(ui, &response, rect, &mut self.viewport);
-            if self.tool_kind == ToolKind::Select {
-                // 選択・編集モードではスナップを効かせない（設計判断は
-                // `handle_tool_input` の doc を参照）。マーカーも消す。
-                self.snap_marker = None;
-                handle_select_input(
-                    ui,
-                    &response,
-                    rect,
-                    &self.viewport,
-                    &mut self.document,
-                    &mut self.select_tool,
-                    &mut self.status,
-                    now,
-                );
-            } else {
-                handle_tool_input(
-                    ui,
-                    &response,
-                    rect,
-                    &self.viewport,
-                    &mut self.document,
-                    &mut self.tool_kind,
-                    &mut self.tool,
-                    self.snap_enabled,
-                    &mut self.snap_marker,
-                    &mut self.status,
-                    now,
-                );
+            // 未保存確認モーダル表示中は、キャンバスへのクリック/ドラッグ/Delete/Enter/Esc
+            // などを一切ツール・選択処理へ渡さない。素通りさせると、モーダルの裏で
+            // エンティティが削除・作図確定されてしまう（Delete/Enter は egui::Modal が
+            // 消費しないため）。パン/ズームは見るだけの操作なので許容する。
+            if self.confirm_state == ConfirmState::Idle {
+                if self.tool_kind == ToolKind::Select {
+                    // 選択・編集モードではスナップを効かせない（設計判断は
+                    // `handle_tool_input` の doc を参照）。マーカーも消す。
+                    self.snap_marker = None;
+                    handle_select_input(
+                        ui,
+                        &response,
+                        rect,
+                        &self.viewport,
+                        &mut self.document,
+                        &mut self.select_tool,
+                        &mut self.status,
+                        now,
+                    );
+                } else {
+                    handle_tool_input(
+                        ui,
+                        &response,
+                        rect,
+                        &self.viewport,
+                        &mut self.document,
+                        &mut self.tool_kind,
+                        &mut self.tool,
+                        self.snap_enabled,
+                        &mut self.snap_marker,
+                        &mut self.status,
+                        now,
+                    );
+                }
             }
 
             let painter = ui.painter_at(rect);

@@ -5,14 +5,14 @@
 
 ## プロジェクト概要
 
-Rust + egui の 2D CAD。現在 **v0.3.0(M3完了、MVP検収基準達成)**。
-次の作業は **M4「入出力の一貫性」(DESIGN.md 第6章、タスク12〜16)**。
+Rust + egui の 2D CAD。現在 **v0.4.0(M4「入出力の一貫性」完了)**。
+次のマイルストーン設計は未定。
 
 ## ビルド・検証
 
 ```bash
 cargo build                                  # ワークスペース全体
-cargo test --workspace                       # 全テスト(v0.3.0時点で164本)
+cargo test --workspace                       # 全テスト(M4実装時点で202本)
 cargo clippy --workspace --all-targets       # 警告ゼロを維持
 cargo fmt --all --check                      # 整形チェック
 ```

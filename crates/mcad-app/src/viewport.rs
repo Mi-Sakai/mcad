@@ -15,6 +15,20 @@ use mcad_geom::{Aabb, Point2};
 pub const MIN_ZOOM: f64 = 1e-6;
 pub const MAX_ZOOM: f64 = 1e6;
 
+/// [`Viewport::fit_to_aabb`] で余白として使う比率（AABBの一辺サイズに対する割合）。
+///
+/// `Aabb::expanded` は絶対値マージンを取るため、AABBの最大辺（`width().max(height())`）に
+/// この比率を掛けて絶対値マージンへ変換する。上下左右それぞれにこの分だけ広げるので、
+/// 図面全体は画面の `1 / (1 + 2*FIT_MARGIN_RATIO)` 程度の割合を占める。
+const FIT_MARGIN_RATIO: f64 = 0.1;
+
+/// [`Viewport::fit_to_aabb`] で使う絶対値マージンの下限（ワールド単位）。
+///
+/// 単一点のみ・水平/垂直線のみなど、AABBの一辺（またはその両方）がゼロになる
+/// 退化ケースで `FIT_MARGIN_RATIO * 0` もゼロになりゼロ除算を招くため、
+/// 常にこの値以上のマージンを保証するフォールバックとして使う。
+const FIT_MIN_MARGIN: f64 = 1.0;
+
 /// ワールド(f64)↔スクリーン(egui, f32)変換とズーム/パン状態を保持するビューポート。
 ///
 /// `zoom` はワールド単位→スクリーンピクセルの倍率、`center` は画面中心が指す
@@ -97,6 +111,36 @@ impl Viewport {
         }
         self.center.x -= f64::from(screen_delta.x) / self.zoom;
         self.center.y += f64::from(screen_delta.y) / self.zoom;
+    }
+
+    /// `aabb` がスクリーン矩形 `screen_rect` に（余白付きで）収まるよう `zoom`・`center`
+    /// を更新する（M4タスク13: ファイル読込後のズームフィット）。
+    ///
+    /// `center` は常に `aabb.center()` に設定する。`zoom` は `aabb` の上下左右に
+    /// [`FIT_MARGIN_RATIO`]（AABB最大辺に対する比率、下限 [`FIT_MIN_MARGIN`]）分の余白を
+    /// 持たせたうえで、幅・高さそれぞれがスクリーンへ収まる倍率のうち小さい方を採用し、
+    /// 最後に [`MIN_ZOOM`]..=[`MAX_ZOOM`] へクランプする。
+    ///
+    /// 単一点のみ・水平/垂直線のみの退化した `aabb`（`width()`/`height()` が 0）でも、
+    /// 余白の下限 [`FIT_MIN_MARGIN`] により `expanded` 後の幅・高さは必ず正になるため
+    /// ゼロ除算・無限大にはならない。`screen_rect` が空（幅または高さが 0 以下、
+    /// レイアウト確定前のフレーム等）の場合は何も更新しない。
+    pub fn fit_to_aabb(&mut self, aabb: Aabb, screen_rect: Rect) {
+        let screen_w = f64::from(screen_rect.width());
+        let screen_h = f64::from(screen_rect.height());
+        if !(screen_w > 0.0 && screen_h > 0.0) {
+            return;
+        }
+
+        self.center = aabb.center();
+
+        let extent = aabb.width().max(aabb.height());
+        let margin = (extent * FIT_MARGIN_RATIO).max(FIT_MIN_MARGIN);
+        let padded = aabb.expanded(margin);
+
+        let zoom_x = screen_w / padded.width();
+        let zoom_y = screen_h / padded.height();
+        self.zoom = zoom_x.min(zoom_y).clamp(MIN_ZOOM, MAX_ZOOM);
     }
 }
 
@@ -340,6 +384,129 @@ mod tests {
         // ズームが小さくなる（縮小）と、必要なワールド間隔は大きくなる。
         let step_zoomed_out = nice_grid_step(0.01, 50.0);
         assert!(step_zoomed_out > step);
+    }
+
+    #[test]
+    fn fit_to_aabb_centers_on_aabb_center() {
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(-10.0, -4.0), Point2::new(20.0, 6.0));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+        assert!((vp.center.x - 5.0).abs() < 1e-9);
+        assert!((vp.center.y - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fit_to_aabb_makes_whole_aabb_visible_with_margin() {
+        // フィット後、AABBの4隅すべてがスクリーン矩形の内側（余白ぶん収まる側）に
+        // 収まっているはず。
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(0.0, 0.0), Point2::new(100.0, 40.0));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+
+        let corners = [
+            Point2::new(aabb.min.x, aabb.min.y),
+            Point2::new(aabb.min.x, aabb.max.y),
+            Point2::new(aabb.max.x, aabb.min.y),
+            Point2::new(aabb.max.x, aabb.max.y),
+        ];
+        for c in corners {
+            let sp = vp.world_to_screen(r, c);
+            assert!(r.contains(sp), "corner {c:?} -> {sp:?} not inside {r:?}");
+        }
+
+        // 余白がゼロではないことも確認する（AABBがスクリーン端にぴったり接しない）。
+        let min_screen = vp.world_to_screen(r, aabb.min);
+        assert!(min_screen.x > r.left() + 1.0);
+        assert!(min_screen.y < r.bottom() - 1.0);
+    }
+
+    #[test]
+    fn fit_to_aabb_single_point_does_not_produce_nan_or_infinite_zoom() {
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_point(Point2::new(3.0, -2.0));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+
+        assert!(vp.zoom.is_finite());
+        assert!(vp.zoom > 0.0);
+        assert!((vp.center.x - 3.0).abs() < 1e-9);
+        assert!((vp.center.y - (-2.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fit_to_aabb_degenerate_horizontal_line_does_not_produce_nan_or_infinite_zoom() {
+        // 高さゼロ（水平線のみ）の AABB でもゼロ除算せず有限な zoom になること。
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(-5.0, 2.0), Point2::new(5.0, 2.0));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+
+        assert!(vp.zoom.is_finite());
+        assert!(vp.zoom > 0.0);
+    }
+
+    #[test]
+    fn fit_to_aabb_degenerate_vertical_line_does_not_produce_nan_or_infinite_zoom() {
+        // 幅ゼロ(垂直線のみ)の AABB でもゼロ除算せず有限な zoom になること。
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(2.0, -5.0), Point2::new(2.0, 5.0));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+
+        assert!(vp.zoom.is_finite());
+        assert!(vp.zoom > 0.0);
+    }
+
+    #[test]
+    fn fit_to_aabb_huge_aabb_clamps_zoom_to_min() {
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(-1e12, -1e12), Point2::new(1e12, 1e12));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+        assert!((vp.zoom - MIN_ZOOM).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fit_to_aabb_tiny_aabb_stays_finite_and_does_not_zoom_absurdly() {
+        // FIT_MIN_MARGIN のフォールバックにより、ほぼ点に近い AABB でも
+        // マージンが最小サイズ未満には縮まらない。有限かつ極端に巨大でない
+        // (MAX_ZOOM 未満の) 常識的な zoom になることを確認する。
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(-1e-12, -1e-12), Point2::new(1e-12, 1e-12));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+        assert!(vp.zoom.is_finite());
+        assert!(vp.zoom > 0.0);
+        assert!(vp.zoom < MAX_ZOOM);
+    }
+
+    #[test]
+    fn fit_to_aabb_with_huge_screen_rect_clamps_zoom_to_max() {
+        // 画面（スクリーン矩形）に対してAABBが極端に小さい場合、クランプ前の
+        // zoom は MAX_ZOOM を超えうる。MAX_ZOOM でクランプされることを確認する
+        // （通常の画面解像度では起きないが、クランプ機構自体の検証として
+        // 意図的に非現実的に大きいスクリーン矩形を使う）。
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(-1.0, -1.0), Point2::new(1.0, 1.0));
+        let r = rect(1e9, 1e9);
+        vp.fit_to_aabb(aabb, r);
+        assert!((vp.zoom - MAX_ZOOM).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fit_to_aabb_ignores_empty_screen_rect() {
+        let mut vp = Viewport {
+            zoom: 2.0,
+            center: Point2::new(1.0, 1.0),
+        };
+        let before = vp;
+        let aabb = Aabb::from_corners(Point2::new(-1.0, -1.0), Point2::new(1.0, 1.0));
+        // 幅・高さが 0 のスクリーン矩形（レイアウト確定前を模す）。
+        let degenerate_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(0.0, 0.0));
+        vp.fit_to_aabb(aabb, degenerate_rect);
+        assert_eq!(vp, before);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! - プリミティブ: [`LineSeg`], [`Circle`], [`Arc`], [`Polyline`]
 //! - それらをまとめる列挙型 [`Shape`]（mcad-core の `Entity { geom: Shape, .. }` が使う）
 //! - 幾何クエリ: [`closest_point`], [`distance_to`], [`intersect`], [`circumcircle`]
+//! - ジオメトリ検証: [`Shape::validate`]（非有限座標・負半径・空ポリラインなどを検出）
 //!
 //! すべての形状は [`Shape::aabb`]（および各プリミティブの `aabb` メソッド）で
 //! 軸並行境界ボックスを算出でき、ビューポートカリング・矩形選択に使う。

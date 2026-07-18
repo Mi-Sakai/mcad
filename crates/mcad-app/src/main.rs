@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
-use mcad_core::{Command, Document, Entity, Layer, LayerId, Rgb, Style};
-use mcad_geom::{Aabb, Arc, Circle, LineSeg, Point2, Polyline, Shape};
-use mcad_io::{load_mcad, save_mcad};
+use mcad_core::{Command, Document, Layer, LayerId, Rgb, Style};
+use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
+use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use tool::{
     ArcTool, CircleTool, DragPreview, InputEvent, LineTool, PointTool, PolylineTool, SelectTool,
@@ -54,8 +54,26 @@ const STATUS_MESSAGE_SECS: f64 = 5.0;
 /// `.mcad` ファイルの拡張子（ファイルダイアログのフィルタ・拡張子補完の両方で使う）。
 const MCAD_EXTENSION: &str = "mcad";
 
+/// DXF ファイルの拡張子（ファイルダイアログのフィルタ・拡張子補完の両方で使う）。
+const DXF_EXTENSION: &str = "dxf";
+
 /// パス未定のドキュメントを「名前を付けて保存」する際の初期ファイル名。
 const DEFAULT_FILE_NAME: &str = "Untitled.mcad";
+
+/// DXF エクスポートダイアログの初期ファイル名（`current_path` が未定のとき）。
+const DEFAULT_DXF_FILE_NAME: &str = "Untitled.dxf";
+
+/// DXF importで生成した文書に割り当てる `saved_generation` の番兵値。
+///
+/// `load_dxf`（内部で `clear_history()` を呼ぶ）が返す `Document` の世代は必ず `0`
+/// になる。もし `.mcad` の `open_document` のように `saved_generation` をその世代へ
+/// 合わせると dirty 判定（[`McadApp::is_dirty`]）が偽になってしまうが、DXF import は
+/// 設計判断上「必ず未保存」として扱う必要がある（DESIGN.md 6章 設計判断1: DXFは
+/// `.mcad` と混同しない。Ctrl+S を押すと元の DXF を上書きせず「名前を付けて保存」へ
+/// 誘導する）。そのため `document.generation()`（常に0）とは一致し得ない `u64::MAX`
+/// を「まだ一度もこの文書を保存していない」ことを表す番兵として使い、
+/// 常に dirty=true になるようにする。
+const DXF_IMPORT_SAVED_GENERATION_SENTINEL: u64 = u64::MAX;
 
 /// ファイルパス未定のドキュメントをウィンドウタイトル/ステータスバーへ表示する際の
 /// ラベル。
@@ -103,6 +121,8 @@ enum ConfirmState {
     ConfirmingNew,
     /// Ctrl+O（ファイルを開く）の確認モーダルを表示中。
     ConfirmingOpen,
+    /// Ctrl+Shift+O（DXFを開く）の確認モーダルを表示中。
+    ConfirmingOpenDxf,
     /// ユーザーが破棄を選択済み。以降の close 要求はキャンセルせず通す。
     Closing,
 }
@@ -121,6 +141,10 @@ impl ConfirmState {
             )),
             ConfirmState::ConfirmingOpen => Some((
                 "Discard unsaved changes and open another file?",
+                "Discard and continue",
+            )),
+            ConfirmState::ConfirmingOpenDxf => Some((
+                "Discard unsaved changes and import a DXF file?",
                 "Discard and continue",
             )),
             ConfirmState::Idle | ConfirmState::Closing => None,
@@ -202,6 +226,16 @@ struct McadApp {
     /// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O 共通、
     /// [`ConfirmState`] の doc 参照）。
     confirm_state: ConfirmState,
+    /// ファイル読込直後、次フレームで図面全体へズームフィットする必要があるか。
+    ///
+    /// M4タスク13: 読込ショートカット処理（`ui()` 前半）の時点ではまだキャンバスの
+    /// スクリーン矩形が確定していないため、フィット計算をその場で行えない。
+    /// `open_document`/`apply_imported_dxf` は読込直後にこのフラグだけを立て、
+    /// `CentralPanel` 内でスクリーン矩形が確定した直後（`ui()` 後半）にこのフラグを
+    /// 見て `Viewport::fit_to_aabb` を呼び、`false` へ戻す。エンティティ0件の読込
+    /// （空の`.mcad`/DXF）はフィット対象がないため、このフラグは立てず代わりに
+    /// その場で `Viewport::new()` の既定ビューへ戻す。
+    pending_zoom_fit: bool,
 }
 
 /// ステータスバーに一時表示するメッセージ。
@@ -221,70 +255,30 @@ fn set_status(status: &mut Option<StatusMessage>, now: f64, text: impl Into<Stri
 }
 
 impl McadApp {
-    /// 動作確認用にサンプルエンティティ（線分・円・円弧・ポリライン）を
-    /// 追加したドキュメントを持つアプリを作る。
+    /// 空文書（起動直後の画面）を持つアプリを作る。
     ///
-    /// # サンプルエンティティを起動時に残す判断について
+    /// # 起動時サンプルを廃止した経緯
     ///
     /// M3第4段（ファイル操作のapp統合）の Codex レビュー指摘は、「実用的な新規文書/
     /// 読込フローを作る際にはこれを開発用サンプルとして分離または削除すること」だった。
-    /// 対応として、**Ctrl+N（新規文書）は必ず [`Document::new()`] のみの真に空の
-    /// ドキュメントを作る**（[`McadApp::new_document`] 参照、サンプルは一切混ぜない）。
+    /// 当時の対応は、**Ctrl+N（新規文書）は必ず [`Document::new()`] のみの真に空の
+    /// ドキュメントを作る**（[`McadApp::new_document`] 参照）一方、アプリ起動時
+    /// （本関数）はサンプル（線分・円・円弧・ポリライン）を残す、というものだった。
+    /// 理由: ここで作るのは「新規文書」ではなく「起動直後の画面」であり、目視確認
+    /// （`cargo run -p mcad-app` で起動して形状・スナップ・レイヤー等が一目で見える）
+    /// 用の実利があると判断したため。
     ///
-    /// 一方、アプリ起動時（`main` から呼ばれる本関数）にはサンプルを残すことにした。
-    /// 理由: ここで作るのは「新規文書」ではなく「起動直後の画面」であり、
-    /// 目視確認（`cargo run -p mcad-app` で起動して形状・スナップ・レイヤー等が
-    /// 一目で見える）用の実利がある。ユーザーが本当に白紙から始めたい場合は
-    /// 起動直後に Ctrl+N を押せばよく、実用上の不利益はないと判断した。
+    /// M4設計判断2（DESIGN.md 6章「M4: 入出力の一貫性」）でこの判断は覆った:
+    /// 作図ツール一式（Point/Line/Circle/Arc/Polyline）が揃った今、起動時サンプルによる
+    /// 目視確認という役目は終わったとみなし、起動も Ctrl+N と同じ真に空の
+    /// [`Document::new()`] にする。サンプル生成コード自体は削除せず、複数種の
+    /// エンティティを要するテストのためのヘルパー（`tests::sample_document`）へ移した。
     fn new() -> Self {
-        let mut document = Document::new();
-        let layer = document.current_layer();
-
-        let sample_entities = [
-            Entity::new(
-                Shape::Line(LineSeg::new(Point2::new(-5.0, 0.0), Point2::new(5.0, 0.0))),
-                layer,
-                Style::inherited(),
-            ),
-            Entity::new(
-                Shape::Circle(Circle::new(Point2::new(0.0, 3.0), 2.0)),
-                layer,
-                Style::inherited(),
-            ),
-            Entity::new(
-                Shape::Arc(Arc::new(
-                    Point2::new(-6.0, -4.0),
-                    3.0,
-                    0.0,
-                    std::f64::consts::PI,
-                )),
-                layer,
-                Style {
-                    color: Some(Rgb::new(220, 80, 40)),
-                    width: 2.0,
-                },
-            ),
-            Entity::new(
-                Shape::Polyline(Polyline::new(
-                    vec![
-                        Point2::new(2.0, -5.0),
-                        Point2::new(4.0, -2.0),
-                        Point2::new(6.0, -5.0),
-                        Point2::new(8.0, -2.0),
-                    ],
-                    false,
-                )),
-                layer,
-                Style::inherited(),
-            ),
-        ];
-        for entity in sample_entities {
-            document
-                .apply(Command::AddEntity(entity))
-                .expect("sample entity on current layer must be addable");
-        }
-
+        let document = Document::new();
         Self {
+            // 起動直後（空文書）の世代を保存済み基準点とし、未保存扱いにしない。
+            saved_generation: document.generation(),
+            document,
             viewport: Viewport::new(),
             tool_kind: ToolKind::Select,
             tool: None,
@@ -293,10 +287,8 @@ impl McadApp {
             snap_marker: None,
             status: None,
             current_path: None,
-            // 起動直後（サンプル追加後）の世代を保存済み基準点とし、未保存扱いにしない。
-            saved_generation: document.generation(),
             confirm_state: ConfirmState::Idle,
-            document,
+            pending_zoom_fit: false,
         }
     }
 
@@ -310,6 +302,23 @@ impl McadApp {
         self.tool = None;
         self.select_tool.clear_selection();
         self.snap_marker = None;
+    }
+
+    /// ファイル読込（`.mcad`/DXF共通）直後に呼ぶ。M4タスク13（起動状態とズームフィット）。
+    ///
+    /// 読込直後の時点ではキャンバスのスクリーン矩形がまだ確定していないため、
+    /// フィット計算をその場では行えない。読み込んだドキュメントにエンティティが
+    /// 1件以上あれば [`McadApp::pending_zoom_fit`] を立てて次フレームの `CentralPanel`
+    /// （スクリーン矩形確定後）へ計算を委ねる。エンティティが0件（空の`.mcad`/DXF）なら
+    /// フィット対象がないため、その場で [`Viewport::new`] の既定ビューへリセットする
+    /// （DESIGN.md 6章タスク13: 「空文書は既定ビューへリセット」）。
+    fn request_zoom_fit_after_load(&mut self) {
+        if self.document.entity_count() > 0 {
+            self.pending_zoom_fit = true;
+        } else {
+            self.viewport = Viewport::new();
+            self.pending_zoom_fit = false;
+        }
     }
 
     /// ドキュメントに未保存の変更があるか。
@@ -340,6 +349,16 @@ impl McadApp {
         }
     }
 
+    /// Ctrl+Shift+O: 未保存の変更があれば確認モーダルを出し、なければ即座に
+    /// DXF ファイル選択へ進む。
+    fn request_open_dxf(&mut self, now: f64) {
+        if self.is_dirty() {
+            self.confirm_state = ConfirmState::ConfirmingOpenDxf;
+        } else {
+            self.open_dxf(now);
+        }
+    }
+
     /// 真に空の新規ドキュメントへ置き換える（サンプルエンティティは一切追加しない。
     /// [`McadApp::new`] の doc 参照）。
     ///
@@ -351,6 +370,10 @@ impl McadApp {
         // 新規ドキュメントの現在世代を保存済み基準点にする（読込直後は未保存でない）。
         self.saved_generation = self.document.generation();
         self.reset_transient_ui_state();
+        // 新規文書は常に空なのでフィット対象がない。一貫性のため既定ビューへ戻す
+        // （M4タスク13。DESIGN.md 6章の検収基準には明記されていないが望ましい挙動）。
+        self.viewport = Viewport::new();
+        self.pending_zoom_fit = false;
         set_status(&mut self.status, now, "New document");
     }
 
@@ -375,10 +398,97 @@ impl McadApp {
                 // 読込直後を未保存でない状態にするため、その世代へ合わせる。
                 self.saved_generation = self.document.generation();
                 self.reset_transient_ui_state();
+                self.request_zoom_fit_after_load();
                 set_status(&mut self.status, now, "Opened file");
             }
             Err(err) => {
                 set_status(&mut self.status, now, format!("Open failed: {err}"));
+            }
+        }
+    }
+
+    /// ネイティブのファイル選択ダイアログ（`.dxf` フィルタ付き）で選んだ DXF ファイルを
+    /// import する。
+    ///
+    /// 未保存の変更があるかどうかは確認しない。呼び出し側（[`McadApp::request_open_dxf`]
+    /// または確認モーダルの「破棄して続行」選択）が確認済みであることを前提とする。
+    /// import失敗時は現在のドキュメントを一切変更せず、理由をステータスバーへ表示する。
+    ///
+    /// DESIGN.md 6章 設計判断1（DXFは`.mcad`と混同しない）に従い、成功時は
+    /// `current_path = None` とし、`saved_generation` を [`DXF_IMPORT_SAVED_GENERATION_SENTINEL`]
+    /// へ設定して必ず dirty=true にする（doc 参照）。これにより直後の Ctrl+S は
+    /// `save_document` → `save_document_as` 経由で「名前を付けて`.mcad`保存」ダイアログへ
+    /// 誘導され、元の DXF ファイルは上書きされない。
+    fn open_dxf(&mut self, now: f64) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("dxf", &[DXF_EXTENSION])
+            .pick_file()
+        else {
+            return;
+        };
+        match load_dxf(&path) {
+            Ok(summary) => self.apply_imported_dxf(summary, now),
+            Err(err) => {
+                set_status(&mut self.status, now, format!("DXF import failed: {err}"));
+            }
+        }
+    }
+
+    /// [`McadApp::open_dxf`] のダイアログ非依存部分。`load_dxf` が返した
+    /// [`ImportSummary`] をアプリ状態へ反映する（ネイティブダイアログを一切開かない
+    /// ため headless テストで直接検証できる）。
+    fn apply_imported_dxf(&mut self, summary: ImportSummary, now: f64) {
+        let ImportSummary {
+            document,
+            skipped_entities,
+        } = summary;
+        self.document = document;
+        self.current_path = None;
+        self.saved_generation = DXF_IMPORT_SAVED_GENERATION_SENTINEL;
+        self.reset_transient_ui_state();
+        self.request_zoom_fit_after_load();
+        let message = if skipped_entities > 0 {
+            format!(
+                "Imported DXF: {skipped_entities} entity(ies) skipped \
+                 (unsupported type); layer locks are not restored from DXF"
+            )
+        } else {
+            "Imported DXF file; layer locks are not restored from DXF".to_string()
+        };
+        set_status(&mut self.status, now, message);
+    }
+
+    /// Ctrl+E: ネイティブの保存ダイアログで選んだ先へ現在のドキュメントを DXF として
+    /// エクスポートする。
+    ///
+    /// エクスポートは既存ドキュメントを変更しない読み取り専用操作なので、未保存の
+    /// 変更があっても確認モーダルは出さない。成功しても `current_path`・
+    /// `saved_generation` は一切変更しない（DESIGN.md 6章 設計判断1: DXFは交換用
+    /// 形式であり「保存」とは別物として扱う。dirty 状態は変わらない）。
+    fn export_dxf_file(&mut self, now: f64) {
+        let default_name = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|n| n.to_str())
+            .map_or_else(
+                || DEFAULT_DXF_FILE_NAME.to_string(),
+                |stem| format!("{stem}.{DXF_EXTENSION}"),
+            );
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("dxf", &[DXF_EXTENSION])
+            .set_file_name(&default_name)
+            .save_file()
+        else {
+            return;
+        };
+        let path = ensure_dxf_extension(path);
+        match save_dxf(&self.document, &path) {
+            Ok(()) => {
+                set_status(&mut self.status, now, "Exported DXF file");
+            }
+            Err(err) => {
+                set_status(&mut self.status, now, format!("DXF export failed: {err}"));
             }
         }
     }
@@ -450,6 +560,27 @@ fn ensure_mcad_extension(path: PathBuf) -> PathBuf {
     }
 }
 
+/// パスの拡張子が `.dxf`（大小無視）でなければ付け直す。
+fn ensure_dxf_extension(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(DXF_EXTENSION))
+    {
+        path
+    } else {
+        path.with_extension(DXF_EXTENSION)
+    }
+}
+
+/// ドキュメント中の全エンティティを包む AABB。エンティティが1つもなければ `None`
+/// （M4タスク13: ズームフィット対象の算出。[`Viewport::fit_to_aabb`] に渡す）。
+fn document_aabb(document: &Document) -> Option<Aabb> {
+    document
+        .entities()
+        .map(|(_, entity)| entity.geom.aabb())
+        .reduce(|acc, bb| acc.union(&bb))
+}
+
 impl eframe::App for McadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = ui.input(|i| i.time);
@@ -481,15 +612,25 @@ impl eframe::App for McadApp {
             }
 
             // Ctrl+N/Ctrl+O/Ctrl+S/Ctrl+Shift+S: 新規/開く/保存/名前を付けて保存。
+            // Ctrl+Shift+O/Ctrl+E: DXF を開く/DXF へ書き出す。
             // undo/redo と同様、ツール切替キー（`handle_tool_shortcut_keys`）は Ctrl 併用を
             // 無視するので衝突しない。
-            let (new_pressed, open_pressed, save_pressed, save_as_pressed) = ui.input(|i| {
+            let (
+                new_pressed,
+                open_pressed,
+                save_pressed,
+                save_as_pressed,
+                open_dxf_pressed,
+                export_dxf_pressed,
+            ) = ui.input(|i| {
                 let cmd = i.modifiers.command;
                 (
                     cmd && !i.modifiers.shift && i.key_pressed(Key::N),
                     cmd && !i.modifiers.shift && i.key_pressed(Key::O),
                     cmd && !i.modifiers.shift && i.key_pressed(Key::S),
                     cmd && i.modifiers.shift && i.key_pressed(Key::S),
+                    cmd && i.modifiers.shift && i.key_pressed(Key::O),
+                    cmd && !i.modifiers.shift && i.key_pressed(Key::E),
                 )
             });
             if new_pressed {
@@ -503,6 +644,12 @@ impl eframe::App for McadApp {
             }
             if save_as_pressed {
                 self.save_document_as(now);
+            }
+            if open_dxf_pressed {
+                self.request_open_dxf(now);
+            }
+            if export_dxf_pressed {
+                self.export_dxf_file(now);
             }
         }
 
@@ -595,7 +742,8 @@ impl eframe::App for McadApp {
                 ui.label(
                     "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
                      Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo  \
-                     Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As",
+                     Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As  \
+                     Ctrl+Shift+O=Import DXF  Ctrl+E=Export DXF",
                 );
                 if let Some(msg) = &self.status {
                     ui.separator();
@@ -611,6 +759,16 @@ impl eframe::App for McadApp {
         egui::CentralPanel::default().show(ui, |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+
+            // M4タスク13: ファイル読込直後のズームフィットは、読込時点ではまだこの
+            // スクリーン矩形（rect）が確定していないため実行できず、ここまで遅延させる
+            // 必要がある（`request_zoom_fit_after_load` の doc 参照）。
+            if self.pending_zoom_fit {
+                if let Some(aabb) = document_aabb(&self.document) {
+                    self.viewport.fit_to_aabb(aabb, rect);
+                }
+                self.pending_zoom_fit = false;
+            }
 
             handle_pan_input(ui, &response, &mut self.viewport);
             handle_zoom_input(ui, &response, rect, &mut self.viewport);
@@ -698,6 +856,10 @@ impl eframe::App for McadApp {
                                 ConfirmState::ConfirmingOpen => {
                                     self.confirm_state = ConfirmState::Idle;
                                     self.open_document(now);
+                                }
+                                ConfirmState::ConfirmingOpenDxf => {
+                                    self.confirm_state = ConfirmState::Idle;
+                                    self.open_dxf(now);
                                 }
                                 ConfirmState::Idle | ConfirmState::Closing => {}
                             }
@@ -1322,6 +1484,8 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcad_core::Entity;
+    use mcad_geom::{Circle, LineSeg};
 
     // rfd のファイルダイアログ（`open_document`/`save_document*` のダイアログ経路）は
     // ネイティブ UI を開くため headless では自動テストできない。未保存確認は
@@ -1331,6 +1495,61 @@ mod tests {
     // `ConfirmingOpen` 分岐）はここでは検証しない。ここでは GUI コンテキストを
     // 要しない部分（拡張子補完・世代ベースの dirty 判定・確認モーダルへの状態遷移・
     // 新規文書のリセット内容）のみを検証する。
+
+    /// 複数種のエンティティ（線分・円・円弧・ポリライン）を追加したドキュメントを作る。
+    ///
+    /// M3期は `McadApp::new()`（起動直後の画面）が同内容を持っていたが、M4設計判断2
+    /// （DESIGN.md 6章: 起動は空文書）により本体からは削除し、複数エンティティを要する
+    /// テスト専用のヘルパーとしてここへ残す。
+    fn sample_document() -> Document {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+
+        let sample_entities = [
+            Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(-5.0, 0.0), Point2::new(5.0, 0.0))),
+                layer,
+                Style::inherited(),
+            ),
+            Entity::new(
+                Shape::Circle(Circle::new(Point2::new(0.0, 3.0), 2.0)),
+                layer,
+                Style::inherited(),
+            ),
+            Entity::new(
+                Shape::Arc(Arc::new(
+                    Point2::new(-6.0, -4.0),
+                    3.0,
+                    0.0,
+                    std::f64::consts::PI,
+                )),
+                layer,
+                Style {
+                    color: Some(Rgb::new(220, 80, 40)),
+                    width: 2.0,
+                },
+            ),
+            Entity::new(
+                Shape::Polyline(Polyline::new(
+                    vec![
+                        Point2::new(2.0, -5.0),
+                        Point2::new(4.0, -2.0),
+                        Point2::new(6.0, -5.0),
+                        Point2::new(8.0, -2.0),
+                    ],
+                    false,
+                )),
+                layer,
+                Style::inherited(),
+            ),
+        ];
+        for entity in sample_entities {
+            document
+                .apply(Command::AddEntity(entity))
+                .expect("sample entity on current layer must be addable");
+        }
+        document
+    }
 
     #[test]
     fn ensure_mcad_extension_appends_when_missing() {
@@ -1362,6 +1581,17 @@ mod tests {
         let app = McadApp::new();
         assert!(!app.is_dirty());
         assert!(app.current_path.is_none());
+    }
+
+    #[test]
+    fn new_app_starts_with_empty_document_and_default_viewport() {
+        // M4設計判断2: 起動は空文書。サンプルエンティティは一切追加しない
+        // （テストが必要なら `sample_document()` を使う）。
+        let app = McadApp::new();
+        assert_eq!(app.document.entity_count(), 0);
+        assert_eq!(app.document.layer_count(), 1);
+        assert_eq!(app.viewport, Viewport::new());
+        assert!(!app.pending_zoom_fit);
     }
 
     #[test]
@@ -1456,6 +1686,7 @@ mod tests {
         assert!(ConfirmState::ConfirmingClose.prompt().is_some());
         assert!(ConfirmState::ConfirmingNew.prompt().is_some());
         assert!(ConfirmState::ConfirmingOpen.prompt().is_some());
+        assert!(ConfirmState::ConfirmingOpenDxf.prompt().is_some());
     }
 
     #[test]
@@ -1485,5 +1716,186 @@ mod tests {
         assert!(!app.is_dirty());
         assert_eq!(app.tool_kind, ToolKind::Select);
         assert!(app.select_tool.selection().is_empty());
+    }
+
+    #[test]
+    fn ensure_dxf_extension_appends_when_missing() {
+        assert_eq!(
+            ensure_dxf_extension(PathBuf::from("/tmp/drawing")),
+            PathBuf::from("/tmp/drawing.dxf")
+        );
+    }
+
+    #[test]
+    fn ensure_dxf_extension_replaces_other_extension() {
+        assert_eq!(
+            ensure_dxf_extension(PathBuf::from("/tmp/drawing.mcad")),
+            PathBuf::from("/tmp/drawing.dxf")
+        );
+    }
+
+    #[test]
+    fn ensure_dxf_extension_is_case_insensitive_noop() {
+        assert_eq!(
+            ensure_dxf_extension(PathBuf::from("/tmp/drawing.DXF")),
+            PathBuf::from("/tmp/drawing.DXF")
+        );
+    }
+
+    #[test]
+    fn request_open_dxf_defers_to_modal_when_dirty() {
+        // Ctrl+Shift+O も他の open 系ショートカットと同様、dirty なら rfd のネイティブ
+        // ファイル選択を一切開かず ConfirmingOpenDxf へ遷移するだけなので headless でも
+        // 安全にテストできる。
+        let mut app = McadApp::new();
+        let layer = app.document.current_layer();
+        app.document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Point(Point2::new(3.0, 3.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        assert!(app.is_dirty());
+
+        app.request_open_dxf(0.0);
+
+        assert_eq!(app.confirm_state, ConfirmState::ConfirmingOpenDxf);
+    }
+
+    #[test]
+    fn apply_imported_dxf_clears_current_path_and_forces_dirty() {
+        // DESIGN.md 6章 設計判断1: DXF importは `.mcad` と混同しない。import直後は
+        // `current_path = None` になり、`load_dxf` が返す文書の世代は常に 0 だが
+        // `saved_generation` はそれと一致しない番兵値になるため必ず dirty になる
+        // （Ctrl+S を押すと元の DXF を上書きせず「名前を付けて保存」ダイアログへ誘導される）。
+        let mut app = McadApp::new();
+        app.current_path = Some(PathBuf::from("/tmp/existing.mcad"));
+        // McadApp::new() 直後は not dirty（saved_generation が現在世代に一致）。
+        assert!(!app.is_dirty());
+
+        let imported = Document::new();
+        assert_eq!(imported.generation(), 0);
+        let summary = ImportSummary {
+            document: imported,
+            skipped_entities: 2,
+        };
+
+        app.apply_imported_dxf(summary, 0.0);
+
+        assert!(app.current_path.is_none());
+        assert!(app.is_dirty());
+        assert_eq!(app.saved_generation, DXF_IMPORT_SAVED_GENERATION_SENTINEL);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|m| m.text.contains('2') && m.text.contains("skipped"))
+        );
+    }
+
+    #[test]
+    fn apply_imported_dxf_resets_transient_ui_state() {
+        // import直後は選択集合・作図ツールが読込前のドキュメントを参照しないよう
+        // リセットされる（`reset_transient_ui_state` の doc 参照）。
+        let mut app = McadApp::new();
+        app.tool_kind = ToolKind::Line;
+        app.tool = ToolKind::Line.spawn();
+
+        let summary = ImportSummary {
+            document: Document::new(),
+            skipped_entities: 0,
+        };
+        app.apply_imported_dxf(summary, 0.0);
+
+        assert_eq!(app.tool_kind, ToolKind::Select);
+        assert!(app.tool.is_none());
+        assert!(app.select_tool.selection().is_empty());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|m| m.text.contains("Imported DXF"))
+        );
+    }
+
+    #[test]
+    fn apply_imported_dxf_with_entities_sets_pending_zoom_fit() {
+        // M4タスク13: import直後、スクリーン矩形がまだ確定していないためその場では
+        // フィットできず、次フレームの CentralPanel へ委ねる `pending_zoom_fit` を立てる。
+        let mut app = McadApp::new();
+        assert!(!app.pending_zoom_fit);
+
+        let summary = ImportSummary {
+            document: sample_document(),
+            skipped_entities: 0,
+        };
+        app.apply_imported_dxf(summary, 0.0);
+
+        assert!(app.pending_zoom_fit);
+    }
+
+    #[test]
+    fn apply_imported_dxf_with_no_entities_resets_default_viewport_without_pending_fit() {
+        // 空のDXFを開いた場合はフィット対象がないので、pending_zoom_fit は立てず
+        // その場で既定ビュー（Viewport::new()）へリセットする。
+        let mut app = McadApp::new();
+        app.viewport.zoom = 42.0;
+        app.viewport.center = Point2::new(100.0, -50.0);
+
+        let summary = ImportSummary {
+            document: Document::new(),
+            skipped_entities: 0,
+        };
+        app.apply_imported_dxf(summary, 0.0);
+
+        assert!(!app.pending_zoom_fit);
+        assert_eq!(app.viewport, Viewport::new());
+    }
+
+    #[test]
+    fn request_zoom_fit_after_load_sets_flag_only_when_entities_present() {
+        let mut app = McadApp::new();
+
+        app.document = sample_document();
+        app.pending_zoom_fit = false;
+        app.request_zoom_fit_after_load();
+        assert!(app.pending_zoom_fit);
+
+        app.document = Document::new();
+        app.viewport.zoom = 7.0;
+        app.request_zoom_fit_after_load();
+        assert!(!app.pending_zoom_fit);
+        assert_eq!(app.viewport, Viewport::new());
+    }
+
+    #[test]
+    fn new_document_resets_viewport_to_default() {
+        let mut app = McadApp::new();
+        app.viewport.zoom = 5.0;
+        app.viewport.center = Point2::new(3.0, 4.0);
+        app.pending_zoom_fit = true;
+
+        app.new_document(0.0);
+
+        assert_eq!(app.viewport, Viewport::new());
+        assert!(!app.pending_zoom_fit);
+    }
+
+    #[test]
+    fn document_aabb_is_none_for_empty_document() {
+        let document = Document::new();
+        assert!(document_aabb(&document).is_none());
+    }
+
+    #[test]
+    fn document_aabb_unions_all_entity_bounds() {
+        let document = sample_document();
+        let aabb = document_aabb(&document).expect("sample document has entities");
+
+        // sample_document のエンティティのうち、最も外側の座標
+        // （円弧の左端 x=-9, ポリラインの右端 x=8/y=-5, 円の上端 y=5）を包んでいるはず。
+        assert!(aabb.min.x <= -6.0);
+        assert!(aabb.max.x >= 8.0);
+        assert!(aabb.min.y <= -5.0);
+        assert!(aabb.max.y >= 5.0);
     }
 }

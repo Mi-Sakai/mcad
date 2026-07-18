@@ -5,7 +5,7 @@
 //! - 交わる 2 線分の交点は、両線分上にある。
 //! - 線分×円の交点は、円周上かつ線分上にある。
 
-use mcad_geom::{Arc, Circle, LineSeg, Point2, Shape, closest_point, intersect};
+use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape, closest_point, intersect};
 use proptest::prelude::*;
 
 /// テストで用いる許容量。intersect 内部の相対 EPS(1e-9) と数値誤差の累積を見込み、
@@ -19,6 +19,73 @@ fn coord() -> impl Strategy<Value = f64> {
 
 fn point() -> impl Strategy<Value = Point2> {
     (coord(), coord()).prop_map(|(x, y)| Point2::new(x, y))
+}
+
+/// 常識的な半径。
+fn radius() -> impl Strategy<Value = f64> {
+    1.0f64..500.0f64
+}
+
+/// 回転角・弧の開始/終了角に使う無次元のラジアン範囲。
+fn angle() -> impl Strategy<Value = f64> {
+    -10.0f64..10.0f64
+}
+
+/// 変換の往復不変性テスト用に、Line/Circle/Arc/Polyline を一様に生成する。
+fn any_shape() -> impl Strategy<Value = Shape> {
+    prop_oneof![
+        (point(), point()).prop_map(|(a, b)| Shape::Line(LineSeg::new(a, b))),
+        (point(), radius()).prop_map(|(c, r)| Shape::Circle(Circle::new(c, r))),
+        (point(), radius(), angle(), angle())
+            .prop_map(|(c, r, s, e)| Shape::Arc(Arc::new(c, r, s, e))),
+        // 小さな頂点列のポリライン（1〜4 頂点）。
+        (prop::collection::vec(point(), 1..5), any::<bool>())
+            .prop_map(|(v, closed)| Shape::Polyline(Polyline::new(v, closed))),
+    ]
+}
+
+/// 2 点が許容量内で一致するか。
+fn approx_pt(a: Point2, b: Point2) -> bool {
+    a.distance(b) < TOL
+}
+
+/// 2 つの形状が許容量内で一致するか（往復不変性の判定に使う）。
+///
+/// `Arc` の開始/終了角は往復が浮動小数の加減算・反射で復元されるので、直接差分を
+/// `TOL` で比較する（正規化はしない。本型は非正規化のまま角度を保持するため）。
+fn shape_approx(a: &Shape, b: &Shape) -> bool {
+    let ang = |x: f64, y: f64| (x - y).abs() < TOL;
+    match (a, b) {
+        (Shape::Point(p), Shape::Point(q)) => approx_pt(*p, *q),
+        (Shape::Line(x), Shape::Line(y)) => approx_pt(x.a, y.a) && approx_pt(x.b, y.b),
+        (Shape::Circle(x), Shape::Circle(y)) => {
+            approx_pt(x.center, y.center) && (x.radius - y.radius).abs() < TOL
+        }
+        (Shape::Arc(x), Shape::Arc(y)) => {
+            approx_pt(x.center, y.center)
+                && (x.radius - y.radius).abs() < TOL
+                && ang(x.start_angle, y.start_angle)
+                && ang(x.end_angle, y.end_angle)
+        }
+        (Shape::Polyline(x), Shape::Polyline(y)) => {
+            x.closed == y.closed
+                && x.vertices.len() == y.vertices.len()
+                && x.vertices
+                    .iter()
+                    .zip(&y.vertices)
+                    .all(|(p, q)| approx_pt(*p, *q))
+        }
+        _ => false,
+    }
+}
+
+/// 形状の半径（`Circle`/`Arc` のみ）。等長変換で不変であることの確認に使う。
+fn shape_radius(s: &Shape) -> Option<f64> {
+    match s {
+        Shape::Circle(c) => Some(c.radius),
+        Shape::Arc(a) => Some(a.radius),
+        _ => None,
+    }
 }
 
 proptest! {
@@ -177,5 +244,63 @@ proptest! {
         // mid_angle の点は範囲内なので、その側の交点は必ず含まれる。
         prop_assert!(pts.iter().any(|p| p.distance(on_arc) < TOL),
             "expected arc point {on_arc:?} among {pts:?}");
+    }
+
+    /// 回転の往復不変性: 任意の形状・中心・角度で `rotated(pivot, θ)` の後に
+    /// `rotated(pivot, -θ)` を適用すると元の形状へ戻る。
+    #[test]
+    fn rotate_roundtrip_is_identity(
+        shape in any_shape(),
+        pivot in point(),
+        theta in angle(),
+    ) {
+        let back = shape.rotated(pivot, theta).rotated(pivot, -theta);
+        prop_assert!(shape_approx(&shape, &back), "shape={shape:?} back={back:?}");
+    }
+
+    /// 鏡映の往復不変性: 同一軸で 2 回鏡映すると元の形状へ戻る。
+    #[test]
+    fn mirror_twice_is_identity(
+        shape in any_shape(),
+        axis_a in point(),
+        axis_ang in 0.0f64..std::f64::consts::TAU,
+        axis_len in 1.0f64..200.0f64,
+    ) {
+        // 退化しない軸を、始点＋方向角＋正の長さで構成する。
+        let axis_b = Point2::new(
+            axis_a.x + axis_len * axis_ang.cos(),
+            axis_a.y + axis_len * axis_ang.sin(),
+        );
+        let back = shape.mirrored(axis_a, axis_b).mirrored(axis_a, axis_b);
+        prop_assert!(shape_approx(&shape, &back), "shape={shape:?} back={back:?}");
+    }
+
+    /// 半径不変性: `Circle`/`Arc` は回転・鏡映の前後で半径が変わらない。
+    #[test]
+    fn rotate_and_mirror_preserve_radius(
+        center in point(),
+        r in radius(),
+        start in angle(),
+        end in angle(),
+        pivot in point(),
+        theta in angle(),
+        axis_a in point(),
+        axis_ang in 0.0f64..std::f64::consts::TAU,
+        axis_len in 1.0f64..200.0f64,
+        use_arc in any::<bool>(),
+    ) {
+        let shape = if use_arc {
+            Shape::Arc(Arc::new(center, r, start, end))
+        } else {
+            Shape::Circle(Circle::new(center, r))
+        };
+        let axis_b = Point2::new(
+            axis_a.x + axis_len * axis_ang.cos(),
+            axis_a.y + axis_len * axis_ang.sin(),
+        );
+        let rotated = shape.rotated(pivot, theta);
+        let mirrored = shape.mirrored(axis_a, axis_b);
+        prop_assert!((shape_radius(&rotated).unwrap() - r).abs() < TOL);
+        prop_assert!((shape_radius(&mirrored).unwrap() - r).abs() < TOL);
     }
 }

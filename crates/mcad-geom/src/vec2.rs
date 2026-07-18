@@ -84,6 +84,35 @@ impl Vec2 {
             Some(self / len)
         }
     }
+
+    /// 原点まわりに反時計回り（CCW）で `angle` ラジアン回転したベクトル。
+    ///
+    /// 標準の回転行列 `(x·cos − y·sin, x·sin + y·cos)` を適用する。
+    /// 点の回転は「中心を原点へ移す変位に対して本メソッドを適用し、中心を足し戻す」
+    /// 形で組み立てる（各プリミティブの `rotated` を参照）。
+    #[inline]
+    #[must_use]
+    pub fn rotated(self, angle: f64) -> Vec2 {
+        let (sin, cos) = angle.sin_cos();
+        Vec2::new(self.x * cos - self.y * sin, self.x * sin + self.y * cos)
+    }
+
+    /// 原点を通り方向 `axis_dir` の直線に対して反射したベクトル。
+    ///
+    /// `axis_dir` は正規化されていなくてよい（内部で正規化する）。軸方向の成分を
+    /// 保持し、それに直交する成分を反転する（`2·proj − self`）。
+    ///
+    /// `axis_dir` が退化（ほぼゼロベクトル）で軸の向きが定まらない場合は、安全な
+    /// フォールバックとして `self` をそのまま返す（恒等写像）。呼び出し側で異常系を
+    /// 作らないための措置。
+    #[inline]
+    #[must_use]
+    pub fn reflected(self, axis_dir: Vec2) -> Vec2 {
+        match axis_dir.normalize() {
+            Some(d) => d * (2.0 * self.dot(d)) - self,
+            None => self,
+        }
+    }
 }
 
 impl Add for Vec2 {

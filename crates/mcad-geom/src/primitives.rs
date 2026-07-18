@@ -16,6 +16,20 @@ pub(crate) fn wrap_2pi(a: f64) -> f64 {
     a.rem_euclid(TAU)
 }
 
+/// 点 `p` を `pivot` を中心に CCW へ `angle` ラジアン回転する。
+#[inline]
+#[must_use]
+fn rotate_point(p: Point2, pivot: Point2, angle: f64) -> Point2 {
+    pivot + (p - pivot).rotated(angle)
+}
+
+/// 点 `p` を `axis_a`→`axis_b` を通る直線に対して鏡映する。
+#[inline]
+#[must_use]
+fn mirror_point(p: Point2, axis_a: Point2, axis_b: Point2) -> Point2 {
+    axis_a + (p - axis_a).reflected(axis_b - axis_a)
+}
+
 /// 線分。始点 `a` と終点 `b`。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LineSeg {
@@ -75,6 +89,30 @@ impl LineSeg {
     pub fn translated(self, delta: Vec2) -> LineSeg {
         LineSeg::new(self.a + delta, self.b + delta)
     }
+
+    /// `pivot` を中心に反時計回り（CCW）へ `angle` ラジアン回転した新しい線分。
+    ///
+    /// 両端点をそれぞれ `pivot + (p − pivot).rotated(angle)` へ写す。
+    #[inline]
+    #[must_use]
+    pub fn rotated(self, pivot: Point2, angle: f64) -> LineSeg {
+        LineSeg::new(
+            rotate_point(self.a, pivot, angle),
+            rotate_point(self.b, pivot, angle),
+        )
+    }
+
+    /// `axis_a`→`axis_b` を通る直線に対して鏡映した新しい線分。
+    ///
+    /// 両端点をそれぞれ `axis_a + (p − axis_a).reflected(axis_b − axis_a)` へ写す。
+    #[inline]
+    #[must_use]
+    pub fn mirrored(self, axis_a: Point2, axis_b: Point2) -> LineSeg {
+        LineSeg::new(
+            mirror_point(self.a, axis_a, axis_b),
+            mirror_point(self.b, axis_a, axis_b),
+        )
+    }
 }
 
 /// 円。中心 `center` と半径 `radius`。
@@ -129,6 +167,24 @@ impl Circle {
     #[must_use]
     pub fn translated(self, delta: Vec2) -> Circle {
         Circle::new(self.center + delta, self.radius)
+    }
+
+    /// `pivot` を中心に CCW へ `angle` ラジアン回転した新しい円。
+    ///
+    /// 円の中心 `self.center` のみ回転し、半径は不変（回転は等長変換）。
+    #[inline]
+    #[must_use]
+    pub fn rotated(self, pivot: Point2, angle: f64) -> Circle {
+        Circle::new(rotate_point(self.center, pivot, angle), self.radius)
+    }
+
+    /// `axis_a`→`axis_b` を通る直線に対して鏡映した新しい円。
+    ///
+    /// 中心のみ鏡映し、半径は不変（鏡映は等長変換）。
+    #[inline]
+    #[must_use]
+    pub fn mirrored(self, axis_a: Point2, axis_b: Point2) -> Circle {
+        Circle::new(mirror_point(self.center, axis_a, axis_b), self.radius)
     }
 }
 
@@ -258,6 +314,48 @@ impl Arc {
             self.end_angle,
         )
     }
+
+    /// `pivot` を中心に CCW へ `angle` ラジアン回転した新しい円弧。
+    ///
+    /// 弧の中心を回転し、開始角・終了角にはともに `angle` を加える（回転は掃引の
+    /// 向きを保つため、開始・終了の入れ替えは不要）。半径は不変。角度の正規化は
+    /// 行わない（本型は開始/終了角を非正規化のまま保持する。掃引は
+    /// [`Arc::sweep`] が `wrap_2pi` で解釈する）。
+    #[inline]
+    #[must_use]
+    pub fn rotated(self, pivot: Point2, angle: f64) -> Arc {
+        Arc::new(
+            rotate_point(self.center, pivot, angle),
+            self.radius,
+            self.start_angle + angle,
+            self.end_angle + angle,
+        )
+    }
+
+    /// `axis_a`→`axis_b` を通る直線に対して鏡映した新しい円弧。半径は不変。
+    ///
+    /// # 掃引の向きの補正
+    ///
+    /// 鏡映は向きを反転させる等長変換なので、開始角・終了角を単純に個別へ反射する
+    /// だけでは CCW 掃引の意味が壊れる。軸の方向角を `alpha = (axis_b − axis_a).angle()`
+    /// とすると、軸を通る直線に対する角度の反射は `reflect_angle(θ) = 2·alpha − θ`
+    /// で与えられる（角度の反射は方向のみに依存し、軸の位置 `axis_a` には依存しない）。
+    /// 反射で周回方向が逆転する分を、開始角と終了角を入れ替えて帳尻を合わせる:
+    /// `new_start = reflect_angle(end_angle)`、`new_end = reflect_angle(start_angle)`。
+    /// これにより「元の弧が start→end へ CCW に掃引する」なら「鏡映後の弧も
+    /// new_start→new_end へ CCW に掃引する」ことが保証される。
+    #[inline]
+    #[must_use]
+    pub fn mirrored(self, axis_a: Point2, axis_b: Point2) -> Arc {
+        let alpha = (axis_b - axis_a).angle();
+        let reflect_angle = |theta: f64| 2.0 * alpha - theta;
+        Arc::new(
+            mirror_point(self.center, axis_a, axis_b),
+            self.radius,
+            reflect_angle(self.end_angle),
+            reflect_angle(self.start_angle),
+        )
+    }
 }
 
 /// ポリライン。頂点列と、閉じているか（始点と終点を結ぶか）のフラグ。
@@ -326,6 +424,34 @@ impl Polyline {
             self.closed,
         )
     }
+
+    /// 全頂点を `pivot` を中心に CCW へ `angle` ラジアン回転した新しいポリライン。
+    ///
+    /// `closed` フラグは不変。
+    #[must_use]
+    pub fn rotated(&self, pivot: Point2, angle: f64) -> Polyline {
+        Polyline::new(
+            self.vertices
+                .iter()
+                .map(|v| rotate_point(*v, pivot, angle))
+                .collect(),
+            self.closed,
+        )
+    }
+
+    /// 全頂点を `axis_a`→`axis_b` を通る直線に対して鏡映した新しいポリライン。
+    ///
+    /// `closed` フラグは不変。
+    #[must_use]
+    pub fn mirrored(&self, axis_a: Point2, axis_b: Point2) -> Polyline {
+        Polyline::new(
+            self.vertices
+                .iter()
+                .map(|v| mirror_point(*v, axis_a, axis_b))
+                .collect(),
+            self.closed,
+        )
+    }
 }
 
 /// エンティティの幾何を表す列挙型。mcad-core の `Entity { geom: Shape, .. }` が使う。
@@ -380,6 +506,40 @@ impl Shape {
             Shape::Circle(c) => Shape::Circle(c.translated(delta)),
             Shape::Arc(a) => Shape::Arc(a.translated(delta)),
             Shape::Polyline(pl) => Shape::Polyline(pl.translated(delta)),
+        }
+    }
+
+    /// 形状全体を `pivot` を中心に CCW へ `angle` ラジアン回転した新しい形状を返す純関数。
+    ///
+    /// 選択エンティティの回転（Rotate）で、確定時に各エンティティの `Shape` を
+    /// 回転した幾何（`Command::ModifyEntity { new_geom }` に載せる値）を作るのに使う。
+    /// [`Shape::translated`] と同じく GUI 非依存の再利用可能な幾何演算として mcad-geom
+    /// 側に置く（DESIGN M5 設計判断1: app 層での座標いじりを禁止する）。
+    #[must_use]
+    pub fn rotated(&self, pivot: Point2, angle: f64) -> Shape {
+        match self {
+            Shape::Point(p) => Shape::Point(rotate_point(*p, pivot, angle)),
+            Shape::Line(s) => Shape::Line(s.rotated(pivot, angle)),
+            Shape::Circle(c) => Shape::Circle(c.rotated(pivot, angle)),
+            Shape::Arc(a) => Shape::Arc(a.rotated(pivot, angle)),
+            Shape::Polyline(pl) => Shape::Polyline(pl.rotated(pivot, angle)),
+        }
+    }
+
+    /// 形状全体を `axis_a`→`axis_b` を通る直線に対して鏡映した新しい形状を返す純関数。
+    ///
+    /// 選択エンティティの鏡映（Mirror）で、確定時に各エンティティの `Shape` を
+    /// 鏡映した幾何（`Command::ModifyEntity { new_geom }` に載せる値）を作るのに使う。
+    /// [`Shape::translated`] と同じく GUI 非依存の再利用可能な幾何演算として mcad-geom
+    /// 側に置く（DESIGN M5 設計判断1: app 層での座標いじりを禁止する）。
+    #[must_use]
+    pub fn mirrored(&self, axis_a: Point2, axis_b: Point2) -> Shape {
+        match self {
+            Shape::Point(p) => Shape::Point(mirror_point(*p, axis_a, axis_b)),
+            Shape::Line(s) => Shape::Line(s.mirrored(axis_a, axis_b)),
+            Shape::Circle(c) => Shape::Circle(c.mirrored(axis_a, axis_b)),
+            Shape::Arc(a) => Shape::Arc(a.mirrored(axis_a, axis_b)),
+            Shape::Polyline(pl) => Shape::Polyline(pl.mirrored(axis_a, axis_b)),
         }
     }
 
@@ -728,6 +888,108 @@ mod tests {
     fn translated_by_zero_is_identity() {
         let arc = Shape::Arc(Arc::new(Point2::new(1.0, 2.0), 3.0, 0.5, 2.0));
         assert_eq!(arc.translated(Vec2::ZERO), arc);
+    }
+
+    #[test]
+    fn rotated_turns_each_primitive_kind() {
+        use std::f64::consts::FRAC_PI_2;
+        let pivot = Point2::ORIGIN;
+
+        // Point: (1,0) を原点まわり +90° → (0,1)
+        assert!(approx(
+            match Shape::Point(Point2::new(1.0, 0.0)).rotated(pivot, FRAC_PI_2) {
+                Shape::Point(p) => p,
+                _ => unreachable!(),
+            },
+            Point2::new(0.0, 1.0)
+        ));
+
+        // Line: (1,0)-(2,0) を +90° → (0,1)-(0,2)
+        let line = LineSeg::new(Point2::new(1.0, 0.0), Point2::new(2.0, 0.0));
+        let r = line.rotated(pivot, FRAC_PI_2);
+        assert!(approx(r.a, Point2::new(0.0, 1.0)));
+        assert!(approx(r.b, Point2::new(0.0, 2.0)));
+
+        // Circle: 中心 (3,0) を +90° → (0,3)、半径は不変
+        let circle = Circle::new(Point2::new(3.0, 0.0), 5.0);
+        let rc = circle.rotated(pivot, FRAC_PI_2);
+        assert!(approx(rc.center, Point2::new(0.0, 3.0)));
+        assert!((rc.radius - 5.0).abs() < T);
+
+        // Arc: 中心 (1,0)・start 0・end π/2 を +90° → 中心 (0,1)、両角に +π/2、半径不変
+        let arc = Arc::new(Point2::new(1.0, 0.0), 2.0, 0.0, FRAC_PI_2);
+        let ra = arc.rotated(pivot, FRAC_PI_2);
+        assert!(approx(ra.center, Point2::new(0.0, 1.0)));
+        assert!((ra.radius - 2.0).abs() < T);
+        assert!((ra.start_angle - FRAC_PI_2).abs() < T);
+        assert!((ra.end_angle - std::f64::consts::PI).abs() < T);
+
+        // Polyline: 全頂点が回転し closed は不変
+        let pl = Polyline::new(vec![Point2::new(1.0, 0.0), Point2::new(2.0, 0.0)], true);
+        let rpl = pl.rotated(pivot, FRAC_PI_2);
+        assert!(approx(rpl.vertices[0], Point2::new(0.0, 1.0)));
+        assert!(approx(rpl.vertices[1], Point2::new(0.0, 2.0)));
+        assert!(rpl.closed);
+    }
+
+    #[test]
+    fn mirrored_reflects_each_primitive_kind() {
+        // x 軸（原点→(1,0)）に対する鏡映。
+        let axis_a = Point2::ORIGIN;
+        let axis_b = Point2::new(1.0, 0.0);
+
+        // Point: (1,2) → (1,-2)
+        assert!(approx(
+            match Shape::Point(Point2::new(1.0, 2.0)).mirrored(axis_a, axis_b) {
+                Shape::Point(p) => p,
+                _ => unreachable!(),
+            },
+            Point2::new(1.0, -2.0)
+        ));
+
+        // Line: (1,2)-(3,4) → (1,-2)-(3,-4)
+        let line = LineSeg::new(Point2::new(1.0, 2.0), Point2::new(3.0, 4.0));
+        let m = line.mirrored(axis_a, axis_b);
+        assert!(approx(m.a, Point2::new(1.0, -2.0)));
+        assert!(approx(m.b, Point2::new(3.0, -4.0)));
+
+        // Circle: 中心 (2,3) → (2,-3)、半径は不変
+        let circle = Circle::new(Point2::new(2.0, 3.0), 5.0);
+        let mc = circle.mirrored(axis_a, axis_b);
+        assert!(approx(mc.center, Point2::new(2.0, -3.0)));
+        assert!((mc.radius - 5.0).abs() < T);
+
+        // Polyline: 全頂点が鏡映し closed は不変
+        let pl = Polyline::new(vec![Point2::new(1.0, 2.0), Point2::new(3.0, 4.0)], true);
+        let mpl = pl.mirrored(axis_a, axis_b);
+        assert!(approx(mpl.vertices[0], Point2::new(1.0, -2.0)));
+        assert!(approx(mpl.vertices[1], Point2::new(3.0, -4.0)));
+        assert!(mpl.closed);
+    }
+
+    #[test]
+    fn arc_mirror_first_to_fourth_quadrant() {
+        use std::f64::consts::FRAC_PI_2;
+        // 中心原点・start 0 → end π/2（第 1 象限、sweep=π/2）の弧を x 軸で鏡映すると、
+        // 第 4 象限の弧（start=-π/2, end=0, sweep=π/2）になる。
+        let arc = Arc::new(Point2::ORIGIN, 3.0, 0.0, FRAC_PI_2);
+        let m = arc.mirrored(Point2::ORIGIN, Point2::new(1.0, 0.0));
+        assert!(approx(m.center, Point2::ORIGIN));
+        assert!((m.radius - 3.0).abs() < T);
+        // reflect_angle(θ)=-θ なので new_start=reflect(π/2)=-π/2, new_end=reflect(0)=0。
+        assert!((m.start_angle - (-FRAC_PI_2)).abs() < T);
+        assert!((m.end_angle - 0.0).abs() < T);
+        // 掃引の大きさは保存される。
+        assert!((m.sweep() - FRAC_PI_2).abs() < T);
+        // 端点で確認: 元の始点(3,0)は鏡映後も(3,0)、元の終点(0,3)は(0,-3)。
+        assert!(approx(m.start_point(), Point2::new(0.0, -3.0)));
+        assert!(approx(m.end_point(), Point2::new(3.0, 0.0)));
+    }
+
+    #[test]
+    fn rotated_by_zero_is_identity() {
+        let arc = Shape::Arc(Arc::new(Point2::new(1.0, 2.0), 3.0, 0.5, 2.0));
+        assert_eq!(arc.rotated(Point2::new(5.0, -1.0), 0.0), arc);
     }
 
     #[test]

@@ -12,7 +12,7 @@ M5「編集操作の充実」(DESIGN.md 第7章)が進行中で、タスク17・
 
 ```bash
 cargo build                                  # ワークスペース全体
-cargo test --workspace                       # 全テスト(v0.4.1時点で236本)
+cargo test --workspace                       # 全テスト(v0.4.1時点で238本)
 cargo clippy --workspace --all-targets       # 警告ゼロを維持
 cargo fmt --all --check                      # 整形チェック
 ```

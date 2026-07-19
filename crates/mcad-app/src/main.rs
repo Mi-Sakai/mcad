@@ -20,8 +20,8 @@ use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use tool::{
-    ArcTool, CircleTool, DragPreview, InputEvent, LineTool, PointTool, PolylineTool, SelectTool,
-    Tool, ToolCtx, ToolResult,
+    ArcTool, CircleTool, DragPreview, InputEvent, LineTool, PlacementKind, PlacementOutcome,
+    PlacementPreview, PointTool, PolylineTool, SelectTool, Tool, ToolCtx, ToolResult,
 };
 use viewport::Viewport;
 
@@ -301,6 +301,34 @@ impl McadApp {
         self.tool_kind = ToolKind::Select;
         self.tool = None;
         self.select_tool.clear_selection();
+        self.select_tool.cancel_placement();
+        self.snap_marker = None;
+    }
+
+    /// undo/redo が成功した直後の UI 状態の後始末。
+    ///
+    /// undo/redo はエンティティを削除・復活させるため、選択集合から死んだ ID を
+    /// 取り除く（[`SelectTool::retain_alive`]）。加えて、配置モード（Ctrl+D 複製の
+    /// 基準点確定後〜配置先クリック前）が進行中に選択が変わると、生き残った部分集合
+    /// だけの複製が無警告で確定してしまう。これを防ぐため配置モードも解除する
+    /// （DESIGN.md 設計判断2: 選択の意図が崩れたら配置は畳む）。
+    fn after_history_change(&mut self) {
+        self.select_tool.retain_alive(&self.document);
+        self.select_tool.cancel_placement();
+        self.snap_marker = None;
+    }
+
+    /// ファイル操作（新規・開く・インポート・保存・名前を付けて保存・エクスポート）の
+    /// 入口で呼ぶ。進行中の配置モード（Ctrl+D 複製）を、操作の成否やネイティブダイアログ
+    /// のキャンセルに関係なく解除する。
+    ///
+    /// 未保存確認モーダル経由の解除（`confirm_state != Idle` の分岐）や
+    /// `reset_transient_ui_state` はモーダルを出す/ドキュメントを置き換える経路しか
+    /// カバーせず、保存系（`confirm_state` 不変）やキャンセルされたファイル選択
+    /// （`reset_transient_ui_state` に到達しない）では配置モードが武装したまま残る。
+    /// その後のキャンバスクリックで意図しない複製が確定するのを防ぐ。
+    fn cancel_placement_for_file_op(&mut self) {
+        self.select_tool.cancel_placement();
         self.snap_marker = None;
     }
 
@@ -333,6 +361,7 @@ impl McadApp {
 
     /// Ctrl+N: 未保存の変更があれば確認モーダルを出し、なければ即座に新規文書へ置き換える。
     fn request_new_document(&mut self, now: f64) {
+        self.cancel_placement_for_file_op();
         if self.is_dirty() {
             self.confirm_state = ConfirmState::ConfirmingNew;
         } else {
@@ -342,6 +371,7 @@ impl McadApp {
 
     /// Ctrl+O: 未保存の変更があれば確認モーダルを出し、なければ即座にファイル選択へ進む。
     fn request_open_document(&mut self, now: f64) {
+        self.cancel_placement_for_file_op();
         if self.is_dirty() {
             self.confirm_state = ConfirmState::ConfirmingOpen;
         } else {
@@ -352,10 +382,22 @@ impl McadApp {
     /// Ctrl+Shift+O: 未保存の変更があれば確認モーダルを出し、なければ即座に
     /// DXF ファイル選択へ進む。
     fn request_open_dxf(&mut self, now: f64) {
+        self.cancel_placement_for_file_op();
         if self.is_dirty() {
             self.confirm_state = ConfirmState::ConfirmingOpenDxf;
         } else {
             self.open_dxf(now);
+        }
+    }
+
+    /// Ctrl+D: 選択集合の複製配置モードへ入る。選択が空なら ASCII ステータスメッセージを
+    /// 出して何もしない。非空なら基準点クリック待ちに入り、以降のキャンバス入力は
+    /// [`handle_select_input`] の配置モード経路が受け取る（DESIGN.md 設計判断2）。
+    fn request_duplicate(&mut self, now: f64) {
+        if self.select_tool.start_duplicate() {
+            set_status(&mut self.status, now, "Duplicate: click base point");
+        } else {
+            set_status(&mut self.status, now, "Select entities to duplicate");
         }
     }
 
@@ -466,6 +508,7 @@ impl McadApp {
     /// `saved_generation` は一切変更しない（DESIGN.md 6章 設計判断1: DXFは交換用
     /// 形式であり「保存」とは別物として扱う。dirty 状態は変わらない）。
     fn export_dxf_file(&mut self, now: f64) {
+        self.cancel_placement_for_file_op();
         let default_name = self
             .current_path
             .as_ref()
@@ -496,6 +539,7 @@ impl McadApp {
     /// Ctrl+S: 開いているファイルパスへ上書き保存する。パスが未定なら
     /// 「名前を付けて保存」（[`McadApp::save_document_as`]）と同じ扱いにする。
     fn save_document(&mut self, now: f64) {
+        self.cancel_placement_for_file_op();
         let Some(path) = self.current_path.clone() else {
             self.save_document_as(now);
             return;
@@ -506,6 +550,7 @@ impl McadApp {
     /// Ctrl+Shift+S: 常にネイティブの保存ダイアログを表示し、選んだ先へ保存する。
     /// 成功時は「現在開いているファイルパス」を選んだ先に更新する。
     fn save_document_as(&mut self, now: f64) {
+        self.cancel_placement_for_file_op();
         let default_name = self
             .current_path
             .as_ref()
@@ -605,10 +650,10 @@ impl eframe::App for McadApp {
             // （[`McadApp::is_dirty`] が `document.generation()` を見る）。ここで明示的に
             // dirty を立てる必要はなく、保存時点へ厳密に戻れば自然と `*` が消える。
             if undo_pressed && self.document.undo() {
-                self.select_tool.retain_alive(&self.document);
+                self.after_history_change();
             }
             if redo_pressed && self.document.redo() {
-                self.select_tool.retain_alive(&self.document);
+                self.after_history_change();
             }
 
             // Ctrl+N/Ctrl+O/Ctrl+S/Ctrl+Shift+S: 新規/開く/保存/名前を付けて保存。
@@ -622,6 +667,7 @@ impl eframe::App for McadApp {
                 save_as_pressed,
                 open_dxf_pressed,
                 export_dxf_pressed,
+                duplicate_pressed,
             ) = ui.input(|i| {
                 let cmd = i.modifiers.command;
                 (
@@ -631,6 +677,7 @@ impl eframe::App for McadApp {
                     cmd && i.modifiers.shift && i.key_pressed(Key::S),
                     cmd && i.modifiers.shift && i.key_pressed(Key::O),
                     cmd && !i.modifiers.shift && i.key_pressed(Key::E),
+                    cmd && !i.modifiers.shift && i.key_pressed(Key::D),
                 )
             });
             if new_pressed {
@@ -651,6 +698,19 @@ impl eframe::App for McadApp {
             if export_dxf_pressed {
                 self.export_dxf_file(now);
             }
+            if duplicate_pressed {
+                self.request_duplicate(now);
+            }
+        }
+
+        // 未保存確認モーダルが出ている間は配置モード（Ctrl+D 複製等）を解除する。
+        // モーダル表示中はキャンバス入力がゲートされ配置を進められないため、宙ぶらりんの
+        // 配置ステートを残さない（DESIGN.md 設計判断2: モーダル表示は配置モードを解除）。
+        // Ctrl+N/Ctrl+O 等でモーダルを開いたのがこのフレームでも、上のショートカット処理で
+        // `confirm_state` が更新済みなので同フレームで確実に解除できる。
+        if self.confirm_state != ConfirmState::Idle && self.select_tool.is_placing() {
+            self.select_tool.cancel_placement();
+            self.snap_marker = None;
         }
 
         // ウィンドウを閉じる操作（OSの閉じるボタン等）を検出する。未保存の変更が
@@ -747,7 +807,8 @@ impl eframe::App for McadApp {
                 }
                 ui.label(
                     "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
-                     Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo  \
+                     M=Move  Ctrl+D=Duplicate  Del=Delete  Esc=Cancel  F3=Snap  \
+                     Ctrl+Z=Undo  Ctrl+Y=Redo  \
                      Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As  \
                      Ctrl+Shift+O=Import DXF  Ctrl+E=Export DXF",
                 );
@@ -780,9 +841,6 @@ impl eframe::App for McadApp {
             // 消費しないため）。パン/ズームは見るだけの操作なので許容する。
             if self.confirm_state == ConfirmState::Idle {
                 if self.tool_kind == ToolKind::Select {
-                    // 選択・編集モードではスナップを効かせない（設計判断は
-                    // `handle_tool_input` の doc を参照）。マーカーも消す。
-                    self.snap_marker = None;
                     handle_select_input(
                         ui,
                         &response,
@@ -790,6 +848,8 @@ impl eframe::App for McadApp {
                         &self.viewport,
                         &mut self.document,
                         &mut self.select_tool,
+                        self.snap_enabled,
+                        &mut self.snap_marker,
                         &mut self.status,
                         now,
                     );
@@ -916,6 +976,9 @@ fn handle_tool_shortcut_keys(
     if let Some(kind) = requested {
         *tool_kind = kind;
         *tool = kind.spawn();
+        // ツール切替は進行中の配置モード（Ctrl+D 複製等）を解除する。Select のままの
+        // 再選択（S）でも配置を確定させずに畳む（DESIGN.md 設計判断2）。
+        select_tool.cancel_placement();
         // 作図ツールへ移るときは選択を解除する（Select のままなら選択は保持）。
         if kind != ToolKind::Select {
             select_tool.clear_selection();
@@ -1180,9 +1243,42 @@ fn handle_select_input(
     viewport: &Viewport,
     document: &mut Document,
     select_tool: &mut SelectTool,
+    snap_enabled: bool,
+    snap_marker: &mut Option<snap::SnapResult>,
     status: &mut Option<StatusMessage>,
     now: f64,
 ) {
+    // 配置モード中は専用経路が入力を占有し、通常の選択・編集入力へは進ませない。
+    if select_tool.is_placing() {
+        handle_placement_input(
+            ui,
+            response,
+            rect,
+            viewport,
+            document,
+            select_tool,
+            snap_enabled,
+            snap_marker,
+            status,
+            now,
+        );
+        return;
+    }
+
+    // 配置モードでない選択・編集入力はスナップを効かせない。マーカーを消す。
+    *snap_marker = None;
+
+    // M（修飾キーなし）: 選択集合の移動配置モードへ入る（Ctrl+D 複製と同じ2クリック配置）。
+    // 選択が空なら案内メッセージを出すだけ。以降のクリックは次フレームから配置経路が受け取る。
+    if ui.input(|i| !i.modifiers.command && i.key_pressed(Key::M)) {
+        if select_tool.start_move() {
+            set_status(status, now, "Move: click base point");
+        } else {
+            set_status(status, now, "Select entities to move");
+        }
+        return;
+    }
+
     // ピック許容量（px）をワールド単位へ換算する。
     let tol = PICK_TOLERANCE_PX / viewport.zoom;
 
@@ -1197,7 +1293,8 @@ fn handle_select_input(
         }
     }
 
-    // Esc: 進行中のドラッグだけ破棄する（選択集合は変えない）。
+    // Esc: 進行中のドラッグがあればそれだけ破棄（選択維持）、無ければ選択を全解除する
+    // （2段階挙動は SelectTool::on_cancel 側に集約）。
     if ui.input(|i| i.key_pressed(Key::Escape)) {
         select_tool.on_cancel();
     }
@@ -1212,19 +1309,111 @@ fn handle_select_input(
     if let Some(pos) = pointer {
         let world = world_at(pos);
         if response.drag_started_by(egui::PointerButton::Primary) {
-            select_tool.on_drag_start(document, world, tol);
+            select_tool.on_drag_start(world);
         } else if response.dragged_by(egui::PointerButton::Primary) {
             select_tool.on_drag(world);
         } else if response.drag_stopped_by(egui::PointerButton::Primary) {
-            if let Some(cmd) = select_tool.on_drag_end(document, world) {
-                // 移動の確定。ロックレイヤー混在時は Batch 原子性で全体が失敗し、
-                // 何も動かない。失敗理由はステータスバーへ表示する。
-                if let Err(err) = document.apply(cmd) {
-                    set_status(status, now, format!("Move failed: {err}"));
+            // ドラッグは矩形選択専用。選択集合を書き換えるだけで Document は変更しない。
+            select_tool.on_drag_end(document, world);
+        } else if response.clicked_by(egui::PointerButton::Primary) {
+            let shift = ui.input(|i| i.modifiers.shift);
+            select_tool.on_click(document, world, tol, shift);
+        }
+    }
+}
+
+/// 配置モード（Ctrl+D 複製・M 移動の「基準点→配置先」2クリック）のキャンバス入力を処理する。
+///
+/// [`handle_select_input`] が配置モード中のみ呼ぶ。通常の選択・矩形選択・削除とは
+/// 排他（入力ゲート済み）。両クリックにスナップを効かせ、`snap_marker` を更新する。
+///
+/// - `Esc`: 配置モードを解除（Document は変更しない）。
+/// - カーソル移動: プレビュー追従とスナップマーカー更新。
+/// - `Space` 押下中の左ドラッグ: パン用なので配置クリックとしては扱わない。
+/// - 単発クリック: 1発目=基準点、2発目=配置先。確定コマンドは `Document::apply` し、
+///   種別に応じた後処理を行う（複製は `NewIds.entities` を新選択にして "Duplicated N"、
+///   移動は選択維持で "Moved N"）。失敗（レイヤーロック等）は Batch 原子性で全体が失敗し、
+///   ステータスバーへ表示する。
+#[allow(clippy::too_many_arguments)]
+fn handle_placement_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    rect: Rect,
+    viewport: &Viewport,
+    document: &mut Document,
+    select_tool: &mut SelectTool,
+    snap_enabled: bool,
+    snap_marker: &mut Option<snap::SnapResult>,
+    status: &mut Option<StatusMessage>,
+    now: f64,
+) {
+    // Esc: 配置モードを解除する（Document は変更しない）。
+    if ui.input(|i| i.key_pressed(Key::Escape)) {
+        select_tool.cancel_placement();
+        *snap_marker = None;
+        return;
+    }
+
+    // スナップ用パラメータ（作図ツールと同じ換算）。
+    let radius = SNAP_RADIUS_PX / viewport.zoom;
+    let grid_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
+    // 確定判定のゼロ変位しきい値はピック許容量基準。
+    let tol = PICK_TOLERANCE_PX / viewport.zoom;
+
+    // カーソル追従（プレビュー用）とスナップマーカー更新。
+    if let Some(pos) = response.hover_pos() {
+        let raw = viewport.screen_to_world(rect, pos);
+        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid_step, &[]);
+        *snap_marker = marker;
+        select_tool.placement_move(world);
+    } else {
+        *snap_marker = None;
+    }
+
+    // Space 押下中の左ドラッグはパン。配置クリックとは扱わない。
+    if ui.input(|i| i.key_down(Key::Space)) {
+        return;
+    }
+
+    // 単発クリックで基準点／配置先を確定する（ドラッグではない）。
+    if response.clicked_by(egui::PointerButton::Primary)
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let raw = viewport.screen_to_world(rect, pos);
+        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid_step, &[]);
+        match select_tool.placement_click(document, world, tol) {
+            PlacementOutcome::Continue => {}
+            PlacementOutcome::Cancelled(msg) => {
+                *snap_marker = None;
+                set_status(status, now, msg);
+            }
+            PlacementOutcome::Commit { kind, cmd } => {
+                *snap_marker = None;
+                // ロックレイヤー混在時は Batch 原子性で全体が失敗し、位置も選択も変わらない。
+                match document.apply(cmd) {
+                    Ok(new_ids) => match kind {
+                        // 複製: 新しい ID 群（コマンド順）を選択にして件数を表示する。
+                        PlacementKind::Duplicate => {
+                            let n = new_ids.entities.len();
+                            select_tool.set_selection(new_ids.entities);
+                            set_status(status, now, format!("Duplicated {n} entities"));
+                        }
+                        // 移動: ID は不変なので選択はそのまま維持する。
+                        PlacementKind::Move => {
+                            let n = select_tool.selection().len();
+                            set_status(status, now, format!("Moved {n} entities"));
+                        }
+                    },
+                    Err(err) => match kind {
+                        PlacementKind::Duplicate => {
+                            set_status(status, now, format!("Duplicate failed: {err}"));
+                        }
+                        PlacementKind::Move => {
+                            set_status(status, now, format!("Move failed: {err}"));
+                        }
+                    },
                 }
             }
-        } else if response.clicked_by(egui::PointerButton::Primary) {
-            select_tool.on_click(document, world, tol);
         }
     }
 }
@@ -1330,7 +1519,7 @@ fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewp
     }
 }
 
-/// 選択ハイライトと、ドラッグ中のプレビュー（矩形選択枠・移動の仮表示）を描画する。
+/// 選択ハイライトと、進行中のプレビュー（矩形選択枠・複製/移動配置の仮表示）を描画する。
 ///
 /// `draw_entities` の後に呼び、選択エンティティを強調色で上書きする（[`draw_shape`] 再利用）。
 fn draw_selection(
@@ -1341,22 +1530,40 @@ fn draw_selection(
     select_tool: &SelectTool,
 ) {
     let highlight = Stroke::new(SELECTION_WIDTH, SELECTION_COLOR);
-    match select_tool.drag_preview() {
-        Some(DragPreview::Move { delta }) => {
-            // 移動中: 元の位置は draw_entities が通常色で描くので、ここでは移動後の
-            // 位置を強調色で仮表示する（元＝ゴースト、プレビュー＝ハイライト）。
-            for &id in select_tool.selection() {
-                if let Some(entity) = document.entity(id) {
-                    draw_shape(
-                        painter,
-                        rect,
-                        viewport,
-                        &entity.geom.translated(delta),
-                        highlight,
-                    );
-                }
+
+    // 選択集合を `delta` 平行移動した位置に強調色で仮表示する（複製先・移動先のプレビュー）。
+    let draw_translated = |delta| {
+        for &id in select_tool.selection() {
+            if let Some(entity) = document.entity(id) {
+                draw_shape(
+                    painter,
+                    rect,
+                    viewport,
+                    &entity.geom.translated(delta),
+                    highlight,
+                );
             }
         }
+    };
+
+    // 配置モード（Ctrl+D 複製・M 移動）中は、変位ぶん平行移動したプレビューを描く
+    // （Document は変更しない）。配置モードは通常のドラッグと排他なので、こちらを優先する。
+    match select_tool.placement_preview() {
+        // 複製: 元の選択を強調したまま、複製先を重ねて仮表示する。
+        Some(PlacementPreview::Duplicate { delta }) => {
+            draw_selected(painter, rect, document, viewport, select_tool, highlight);
+            draw_translated(delta);
+            return;
+        }
+        // 移動: 元の位置は draw_entities が通常色で描く（ゴースト）。移動先だけを強調表示する。
+        Some(PlacementPreview::Move { delta }) => {
+            draw_translated(delta);
+            return;
+        }
+        None => {}
+    }
+
+    match select_tool.drag_preview() {
         Some(DragPreview::Rect { start, current }) => {
             // 矩形選択中: 現在の選択はそのまま強調しつつ、ドラッグ矩形を描く。
             draw_selected(painter, rect, document, viewport, select_tool, highlight);
@@ -1940,5 +2147,88 @@ mod tests {
         assert!(aabb.max.x >= 8.0);
         assert!(aabb.min.y <= -5.0);
         assert!(aabb.max.y >= 5.0);
+    }
+
+    // --- 配置モードの解除経路（Codex 敵対的レビュー指摘1・2の回帰） ---
+
+    /// カレントレイヤーに水平線分を1本追加し、その [`mcad_core::EntityId`] を返す。
+    fn add_line(app: &mut McadApp, x: f64) -> mcad_core::EntityId {
+        let layer = app.document.current_layer();
+        app.document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(x, 0.0), Point2::new(x + 1.0, 0.0))),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0]
+    }
+
+    #[test]
+    fn after_history_change_cancels_placement_and_retains_selection() {
+        // 指摘1回帰: 配置モード進行中（基準点確定後〜配置先クリック前）に undo/redo が
+        // 起きたら配置を解除する。放置すると生き残った部分集合だけが無警告で複製される。
+        let mut app = McadApp::new();
+        let a = add_line(&mut app, 0.0);
+        let b = add_line(&mut app, 10.0);
+        app.select_tool.set_selection(vec![a, b]);
+
+        assert!(app.select_tool.start_duplicate());
+        // 基準点を確定して配置先待ちにする。
+        assert_eq!(
+            app.select_tool
+                .placement_click(&app.document, Point2::new(0.0, 0.0), 0.1),
+            PlacementOutcome::Continue
+        );
+        assert!(app.select_tool.is_placing());
+
+        // undo 相当: 直近の AddEntity(b) を巻き戻してから後始末する（ui() の undo 経路）。
+        assert!(app.document.undo());
+        app.after_history_change();
+
+        // 配置モードは解除され、死んだ ID は選択から掃除されている。
+        assert!(!app.select_tool.is_placing());
+        assert!(app.snap_marker.is_none());
+        assert_eq!(app.select_tool.selection(), &[a]);
+    }
+
+    #[test]
+    fn cancel_placement_for_file_op_disarms_mode_but_keeps_selection() {
+        // 指摘2回帰: 保存系（confirm_state 不変）やキャンセルされたファイル選択でも配置
+        // モードが残らないよう、全ファイル操作の入口で呼ぶ解除ヘルパー。
+        let mut app = McadApp::new();
+        let a = add_line(&mut app, 0.0);
+        app.select_tool.set_selection(vec![a]);
+
+        assert!(app.select_tool.start_duplicate());
+        assert!(app.select_tool.is_placing());
+
+        app.cancel_placement_for_file_op();
+
+        assert!(!app.select_tool.is_placing());
+        assert!(app.snap_marker.is_none());
+        // 選択そのものは変えない（ファイル操作の本体が別途処理する）。
+        assert_eq!(app.select_tool.selection(), &[a]);
+    }
+
+    #[test]
+    fn request_new_document_when_not_dirty_disarms_placement() {
+        // ファイル操作入口の解除が実際の経路（Ctrl+N・非 dirty・rfd を開かない）でも
+        // 効くこと。dirty なら確認モーダル経由の解除に委ねる（別テストで担保済み）。
+        let mut app = McadApp::new();
+        let a = add_line(&mut app, 0.0);
+        app.select_tool.set_selection(vec![a]);
+        // saved_generation を現在に合わせて未 dirty にし、即時新規文書の経路へ入れる。
+        app.saved_generation = app.document.generation();
+        assert!(!app.is_dirty());
+
+        assert!(app.select_tool.start_duplicate());
+        assert!(app.select_tool.is_placing());
+
+        app.request_new_document(0.0);
+
+        // 新規文書経路（reset_transient_ui_state 含む）で配置も選択も畳まれる。
+        assert!(!app.select_tool.is_placing());
+        assert!(app.select_tool.selection().is_empty());
     }
 }

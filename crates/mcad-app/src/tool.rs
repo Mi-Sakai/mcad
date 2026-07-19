@@ -582,21 +582,45 @@ pub enum DragPreview {
 /// 移動（[`PlacementKind::Move`]）も複製と同じ2クリック配置に統一している。掴み判定の
 /// 厳しいドラッグ移動をやめ、移動にも基準点・配置先の両クリックでスナップを効かせる
 /// （2026-07-19、設計判断2 の追記）。
+///
+/// 回転（[`PlacementKind::Rotate`]）・鏡映（[`PlacementKind::Mirror`]）も同じ機構を共有する
+/// （M5 タスク19、設計判断4）。回転は pivot→基準点→回転先の3クリック、鏡映は軸2点の
+/// 2クリックで、いずれも確定は選択集合の [`Command::ModifyEntity`] を 1 バッチにまとめる
+/// （移動と同じく ID・選択は不変）。クリック数が種別で異なる（回転のみ3クリック）ため、
+/// 進行段階は [`PlacementStage`] が最大3点まで表せるよう一般化してある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementKind {
-    /// 複製配置（Ctrl+D）。基準点→配置先の変位ぶん平行移動した複製を追加する。
+    /// 複製配置（Ctrl+D）。基準点→配置先の変位ぶん平行移動した複製を追加する（2クリック）。
     Duplicate,
-    /// 移動配置（M）。基準点→配置先の変位ぶん、選択集合の幾何を平行移動する。
+    /// 移動配置（M）。基準点→配置先の変位ぶん、選択集合の幾何を平行移動する（2クリック）。
     Move,
+    /// 回転（R）。pivot（回転中心）→基準点→回転先の3クリック。回転角は
+    /// `angle(pivot→回転先) − angle(pivot→基準点)` の相対角（設計判断4）。
+    Rotate,
+    /// 鏡映（Shift+M）。軸点A→軸点B の2クリックで、その2点を通る直線に対して鏡映する。
+    Mirror,
 }
 
-/// 2段階クリックの進行段階。
+/// 2段階／3段階クリックの進行段階。点は種別ごとに意味が変わる:
+///
+/// - 複製・移動: `p1`=基準点、`p2`=配置先（`WaitingP2` で確定、2クリック）。
+/// - 鏡映: `p1`=軸点A、`p2`=軸点B（`WaitingP2` で確定、2クリック）。
+/// - 回転: `p1`=pivot、`p2`=基準点、`p3`=回転先（`WaitingP3` で確定、3クリック）。
+///
+/// `cursor` は最後に確定した点の次に来るクリック候補で、プレビュー追従に使う。
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PlacementStage {
-    /// 1クリック目（基準点）待ち。プレビューはまだ描かない。
-    WaitingBase,
-    /// 2クリック目（確定点）待ち。`base` は確定済み、`cursor` でプレビュー追従する。
-    WaitingTarget { base: Point2, cursor: Point2 },
+    /// 1クリック目（`p1`）待ち。プレビューはまだ描かない。
+    WaitingP1,
+    /// 2クリック目（`p2`）待ち。`p1` は確定済み、`cursor` でプレビュー追従する。
+    WaitingP2 { p1: Point2, cursor: Point2 },
+    /// 3クリック目（`p3`）待ち（回転のみ）。`p1`・`p2` は確定済み、`cursor` で
+    /// プレビュー追従する。
+    WaitingP3 {
+        p1: Point2,
+        p2: Point2,
+        cursor: Point2,
+    },
 }
 
 /// 進行中の配置モード（種別＋段階）。
@@ -616,9 +640,10 @@ pub enum PlacementOutcome {
     Cancelled(&'static str),
     /// 確定コマンド。呼び出し側が `Document::apply` したうえで、`kind` に応じた後処理を
     /// 行う（複製は返る `NewIds.entities` を [`SelectTool::set_selection`] で新選択にし、
-    /// 移動は ID 不変なので選択をそのまま維持する）。`kind` はステータス文言の出し分けにも使う。
+    /// 移動・回転・鏡映は ID 不変なので選択をそのまま維持する）。`kind` はステータス文言の
+    /// 出し分けにも使う。
     Commit {
-        /// どの配置操作の確定か（複製／移動）。
+        /// どの配置操作の確定か（複製／移動／回転／鏡映）。
         kind: PlacementKind,
         /// `Document::apply` に渡す確定コマンド。
         cmd: Command,
@@ -632,11 +657,36 @@ pub enum PlacementPreview {
     Duplicate { delta: Vec2 },
     /// 移動プレビュー（選択集合をこの変位ぶん平行移動した先を仮表示する）。
     Move { delta: Vec2 },
+    /// 回転プレビュー（選択集合を `pivot` 中心に `angle` ラジアン回転した先を仮表示する）。
+    Rotate { pivot: Point2, angle: f64 },
+    /// 鏡映プレビュー（選択集合を `axis_a`→`axis_b` の直線で鏡映した先を仮表示する）。
+    Mirror { axis_a: Point2, axis_b: Point2 },
+}
+
+/// 回転の相対角がこの値（ラジアン）未満なら no-op として確定を拒否するしきい値。
+///
+/// pivot からの基準方向と回転先方向のなす角が実質ゼロのとき、確定しても見た目は
+/// 変わらないのに ModifyEntity バッチと undo 履歴だけが増える。それを防ぐための下限。
+/// `1e-6 rad ≈ 5.7e-5 度` は、実用上のどのズーム・半径でも人が知覚できない微小回転で、
+/// かつ f64 の角度計算誤差より十分大きい（安全に「効果なし」と見なせる）。同一 ray 上の
+/// 半径ちがい（外積ゼロ → 相対角ちょうど 0）も確実にこのゲートで弾ける。
+const ROTATE_MIN_ANGLE: f64 = 1e-6;
+
+/// `pivot` を中心に、`from` 方向から `to` 方向へ回すのに必要な符号付き相対角を返す。
+///
+/// `atan2(cross, dot)` で求めるため、結果は正規化済みの `(-π, π]`。生の
+/// `angle(to−pivot) − angle(from−pivot)` と違い ±π 境界をまたいでも安定し、各ベクトルの
+/// 長さ（pivot からの距離）に依存せず**方向のみ**で決まる。回転先が同一 ray 上（外積ゼロ、
+/// 内積正）なら 0 を、真反対（内積負、外積ゼロ）なら π を返す。
+fn relative_angle(pivot: Point2, from: Point2, to: Point2) -> f64 {
+    let a = from - pivot;
+    let b = to - pivot;
+    a.cross(b).atan2(a.dot(b))
 }
 
 /// 選択・編集ツール。単一選択（クリック）・矩形選択（ドラッグ）・移動（M、2クリック
-/// 配置）・複製（Ctrl+D、2クリック配置）・削除（Delete/Backspace）を担う。設計判断の
-/// 詳細は [`DragState`] と [`Placement`] の doc を参照。
+/// 配置）・複製（Ctrl+D、2クリック配置）・回転（R、3クリック）・鏡映（Shift+M、軸2点）・
+/// 削除（Delete/Backspace）を担う。設計判断の詳細は [`DragState`] と [`Placement`] の doc を参照。
 #[derive(Debug, Default)]
 pub struct SelectTool {
     /// 現在の選択集合（アプリ UI 状態。ドキュメント履歴には積まない）。
@@ -811,7 +861,7 @@ impl SelectTool {
         self.drag = None;
         self.placement = Some(Placement {
             kind,
-            stage: PlacementStage::WaitingBase,
+            stage: PlacementStage::WaitingP1,
         });
         true
     }
@@ -827,33 +877,57 @@ impl SelectTool {
         self.start_placement(PlacementKind::Move)
     }
 
-    /// 配置モードのカーソル位置を更新する（プレビュー追従用）。基準点クリック前
-    /// （`WaitingBase`）や非配置中は何もしない。
+    /// R: 回転モードを開始する（[`SelectTool::start_placement`] 参照）。pivot→基準点→回転先の
+    /// 3クリックで、選択集合を pivot 中心に相対角ぶん回転する（設計判断4）。
+    pub fn start_rotate(&mut self) -> bool {
+        self.start_placement(PlacementKind::Rotate)
+    }
+
+    /// Shift+M: 鏡映モードを開始する（[`SelectTool::start_placement`] 参照）。軸点A→軸点B の
+    /// 2クリックで、その2点を通る直線に対して選択集合を鏡映する（設計判断4）。
+    pub fn start_mirror(&mut self) -> bool {
+        self.start_placement(PlacementKind::Mirror)
+    }
+
+    /// 配置モードのカーソル位置を更新する（プレビュー追従用）。1クリック目待ち
+    /// （`WaitingP1`）や非配置中は何もしない。
     pub fn placement_move(&mut self, world: Point2) {
-        if let Some(Placement {
-            stage: PlacementStage::WaitingTarget { cursor, .. },
-            ..
-        }) = &mut self.placement
-        {
-            *cursor = world;
+        match &mut self.placement {
+            Some(Placement {
+                stage: PlacementStage::WaitingP2 { cursor, .. },
+                ..
+            })
+            | Some(Placement {
+                stage: PlacementStage::WaitingP3 { cursor, .. },
+                ..
+            }) => *cursor = world,
+            _ => {}
         }
     }
 
     /// 配置モードでのクリック確定を1つ進める。
     ///
-    /// - 1クリック目（`WaitingBase`）: `world` を基準点として確定し、配置先待ちへ。
-    /// - 2クリック目（`WaitingTarget`）: `delta = world - base` を変位として確定する。
-    ///   基準点と配置先がほぼ同一（`|delta| <= tol`、ピック許容量基準）なら、見えない
-    ///   重複コピーを防ぐためモードをキャンセルする。
+    /// - 1クリック目（`WaitingP1`）: `world` を `p1` として確定し、次のクリック待ちへ。
+    /// - 回転の2クリック目（`WaitingP2`）: `world` を基準点として確定し、回転先待ち
+    ///   （`WaitingP3`）へ進む。基準点が pivot とほぼ同一（`<= tol`）なら基準方向が
+    ///   定まらないためモードをキャンセルする（絶対角に化けるのを防ぐ）。
+    /// - 複製・移動の2クリック目（`WaitingP2`）: `delta = world - p1` を変位として確定する。
+    ///   基準点と配置先がほぼ同一（`<= tol`）なら見えない結果を防ぐためキャンセルする。
+    /// - 鏡映の2クリック目（`WaitingP2`）: `p1`→`world` を軸として確定する。軸2点が
+    ///   ほぼ同一（`<= tol`）なら軸が定まらないためキャンセルする。
+    /// - 回転の3クリック目（`WaitingP3`）: 回転先を確定し、`angle(pivot→回転先) −
+    ///   angle(pivot→基準点)` を回転角とする。回転先が基準点とほぼ同一（`<= tol`、回転角
+    ///   実質ゼロ）ならキャンセルする。
     ///
     /// 確定コマンドは種別による:
     /// - 複製（[`PlacementKind::Duplicate`]）: 選択中の各エンティティのレイヤー・スタイルを
     ///   複製し、幾何のみ `translated(delta)` に置き換えた `AddEntity` の [`Command::Batch`]。
-    /// - 移動（[`PlacementKind::Move`]）: 選択中の各エンティティの幾何を `translated(delta)`
+    /// - 移動・回転・鏡映: 選択中の各エンティティの幾何を `translated`／`rotated`／`mirrored`
     ///   に置き換える `ModifyEntity` の [`Command::Batch`]（ID は不変）。
     ///
     /// 呼び出し側が `Document::apply` する（レイヤーロック時は Batch 原子性で全体が失敗し、
-    /// 位置も選択も変わらない）。
+    /// 位置も選択も変わらない）。同一点入力でのキャンセルは Document を変更せず、undo 履歴も
+    /// 作らない（設計判断4）。
     #[must_use]
     pub fn placement_click(
         &mut self,
@@ -866,42 +940,95 @@ impl SelectTool {
             return PlacementOutcome::Continue;
         };
         match placement.stage {
-            PlacementStage::WaitingBase => {
+            PlacementStage::WaitingP1 => {
                 self.placement = Some(Placement {
                     kind: placement.kind,
-                    stage: PlacementStage::WaitingTarget {
-                        base: world,
+                    stage: PlacementStage::WaitingP2 {
+                        p1: world,
                         cursor: world,
                     },
                 });
                 PlacementOutcome::Continue
             }
-            PlacementStage::WaitingTarget { base, .. } => {
-                let delta = world - base;
-                if delta.length() <= tol {
+            PlacementStage::WaitingP2 { p1, .. } => {
+                // 回転は基準点を確定して3クリック目へ進むだけ（まだ確定しない）。
+                if placement.kind == PlacementKind::Rotate {
+                    if p1.distance(world) <= tol {
+                        self.placement = None;
+                        return PlacementOutcome::Cancelled(
+                            "Reference equals pivot - rotate cancelled",
+                        );
+                    }
+                    self.placement = Some(Placement {
+                        kind: placement.kind,
+                        stage: PlacementStage::WaitingP3 {
+                            p1,
+                            p2: world,
+                            cursor: world,
+                        },
+                    });
+                    return PlacementOutcome::Continue;
+                }
+                // 複製・移動・鏡映は2クリック目で確定する。
+                if p1.distance(world) <= tol {
                     self.placement = None;
                     return PlacementOutcome::Cancelled(match placement.kind {
                         PlacementKind::Duplicate => "Zero displacement - duplicate cancelled",
                         PlacementKind::Move => "Zero displacement - move cancelled",
+                        PlacementKind::Mirror => "Zero-length axis - mirror cancelled",
+                        PlacementKind::Rotate => unreachable!("rotate handled above"),
                     });
                 }
+                let delta = world - p1;
                 let cmd = match placement.kind {
                     PlacementKind::Duplicate => self.build_duplicate_command(document, delta),
-                    PlacementKind::Move => self.build_move_command(document, delta),
+                    PlacementKind::Move => {
+                        self.build_modify_command(document, |g| g.translated(delta))
+                    }
+                    PlacementKind::Mirror => {
+                        self.build_modify_command(document, |g| g.mirrored(p1, world))
+                    }
+                    PlacementKind::Rotate => unreachable!("rotate handled above"),
                 };
-                self.placement = None;
-                match cmd {
-                    Some(cmd) => PlacementOutcome::Commit {
-                        kind: placement.kind,
-                        cmd,
-                    },
-                    // 選択が全て死んだ ID だった等でコマンドが空。静かにキャンセルする。
-                    None => PlacementOutcome::Cancelled(match placement.kind {
-                        PlacementKind::Duplicate => "Nothing to duplicate",
-                        PlacementKind::Move => "Nothing to move",
-                    }),
-                }
+                self.finish_commit(placement.kind, cmd)
             }
+            PlacementStage::WaitingP3 { p1, p2, .. } => {
+                // 回転3クリック目: pivot=p1, 基準点=p2, 回転先=world。
+                //
+                // ゲートは「回転として意味を持つか」で判定し、距離ではなく方向・角度で見る:
+                // 1. 回転先 ≈ pivot なら pivot からの方向が定義不能（ゼロベクトルの角度で
+                //    任意の角度を作ってしまう）ため拒否する。
+                // 2. 正規化相対角（`relative_angle`）がほぼゼロなら、no-op の ModifyEntity
+                //    バッチと空の undo 履歴を作らないよう拒否する。同一 ray・半径ちがい
+                //    （距離は大きいが実角度ゼロ）もこれで確実に弾ける。
+                if p1.distance(world) <= tol {
+                    self.placement = None;
+                    return PlacementOutcome::Cancelled("Target equals pivot - rotate cancelled");
+                }
+                let angle = relative_angle(p1, p2, world);
+                if angle.abs() < ROTATE_MIN_ANGLE {
+                    self.placement = None;
+                    return PlacementOutcome::Cancelled("Zero rotation angle - rotate cancelled");
+                }
+                let cmd = self.build_modify_command(document, |g| g.rotated(p1, angle));
+                self.finish_commit(placement.kind, cmd)
+            }
+        }
+    }
+
+    /// 生成した確定コマンドを畳んで [`PlacementOutcome`] にする共通処理。配置モードを解除し、
+    /// コマンドがあれば `Commit`、選択が全て死んだ ID 等で空なら `Cancelled` を返す。
+    fn finish_commit(&mut self, kind: PlacementKind, cmd: Option<Command>) -> PlacementOutcome {
+        self.placement = None;
+        match cmd {
+            Some(cmd) => PlacementOutcome::Commit { kind, cmd },
+            // 選択が全て死んだ ID だった等でコマンドが空。静かにキャンセルする。
+            None => PlacementOutcome::Cancelled(match kind {
+                PlacementKind::Duplicate => "Nothing to duplicate",
+                PlacementKind::Move => "Nothing to move",
+                PlacementKind::Rotate => "Nothing to rotate",
+                PlacementKind::Mirror => "Nothing to mirror",
+            }),
         }
     }
 
@@ -911,21 +1038,40 @@ impl SelectTool {
         self.placement = None;
     }
 
-    /// 配置モードのプレビュー情報。配置先待ちでなければ `None`。
+    /// 配置モードのプレビュー情報。プレビュー対象の段階でなければ `None`。
+    ///
+    /// - 複製・移動・鏡映: 1点確定後（`WaitingP2`）からカーソル追従でプレビューする。
+    /// - 回転: 基準点まで確定した後（`WaitingP3`）からプレビューする（設計判断4:
+    ///   「2クリック目以降」＝基準点確定後に相対角ゴーストを描く）。基準点選択中
+    ///   （`WaitingP2`）はまだ回転角が定まらないためゴーストを描かない。
     #[must_use]
     pub fn placement_preview(&self) -> Option<PlacementPreview> {
-        let Some(Placement {
-            kind,
-            stage: PlacementStage::WaitingTarget { base, cursor },
-        }) = self.placement
-        else {
-            return None;
-        };
-        let delta = cursor - base;
-        Some(match kind {
-            PlacementKind::Duplicate => PlacementPreview::Duplicate { delta },
-            PlacementKind::Move => PlacementPreview::Move { delta },
-        })
+        match self.placement? {
+            Placement {
+                kind: PlacementKind::Duplicate,
+                stage: PlacementStage::WaitingP2 { p1, cursor },
+            } => Some(PlacementPreview::Duplicate { delta: cursor - p1 }),
+            Placement {
+                kind: PlacementKind::Move,
+                stage: PlacementStage::WaitingP2 { p1, cursor },
+            } => Some(PlacementPreview::Move { delta: cursor - p1 }),
+            Placement {
+                kind: PlacementKind::Mirror,
+                stage: PlacementStage::WaitingP2 { p1, cursor },
+            } => Some(PlacementPreview::Mirror {
+                axis_a: p1,
+                axis_b: cursor,
+            }),
+            Placement {
+                kind: PlacementKind::Rotate,
+                stage: PlacementStage::WaitingP3 { p1, p2, cursor },
+            } => Some(PlacementPreview::Rotate {
+                pivot: p1,
+                // 確定と同じ正規化相対角でゴーストを回し、±π 境界での飛びをなくす。
+                angle: relative_angle(p1, p2, cursor),
+            }),
+            _ => None,
+        }
     }
 
     /// 選択中の各エンティティを `delta` 平行移動した複製の `AddEntity` を 1 バッチに
@@ -950,17 +1096,21 @@ impl SelectTool {
         }
     }
 
-    /// 選択中の各エンティティの幾何を `delta` 平行移動する `ModifyEntity` を 1 バッチに
-    /// まとめる（ID は不変）。生存している選択物が無ければ `None`。複製の
-    /// [`SelectTool::build_duplicate_command`] と対になる移動版。
-    fn build_move_command(&self, document: &Document, delta: Vec2) -> Option<Command> {
+    /// 選択中の各エンティティの幾何を `transform` で変換する `ModifyEntity` を 1 バッチに
+    /// まとめる（ID は不変）。生存している選択物が無ければ `None`。移動（`translated`）・
+    /// 回転（`rotated`）・鏡映（`mirrored`）が共有する、複製（`AddEntity`）と対になる編集版。
+    fn build_modify_command(
+        &self,
+        document: &Document,
+        transform: impl Fn(&Shape) -> Shape,
+    ) -> Option<Command> {
         let subs: Vec<Command> = self
             .selection
             .iter()
             .filter_map(|&id| {
                 document.entity(id).map(|e| Command::ModifyEntity {
                     id,
-                    new_geom: e.geom.translated(delta),
+                    new_geom: transform(&e.geom),
                 })
             })
             .collect();
@@ -2104,5 +2254,492 @@ mod tests {
         assert!(tool.start_move());
         assert!(tool.is_placing());
         assert!(tool.drag_preview().is_none());
+    }
+
+    // --- 配置モード（R 回転） ---
+
+    /// `PlacementOutcome::Commit { cmd: Batch(..), .. }` から `ModifyEntity` の `(id, new_geom)`
+    /// 群を取り出す（テスト専用）。想定外の形なら panic する。
+    fn modify_pairs(outcome: &PlacementOutcome) -> Vec<(EntityId, Shape)> {
+        match outcome {
+            PlacementOutcome::Commit {
+                cmd: Command::Batch(subs),
+                ..
+            } => subs
+                .iter()
+                .map(|c| match c {
+                    Command::ModifyEntity { id, new_geom } => (*id, new_geom.clone()),
+                    other => panic!("expected ModifyEntity, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected Commit(Batch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_rotate_requires_nonempty_selection() {
+        let mut doc = Document::new();
+        let _a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+
+        // 空選択では回転モードに入らない（呼び出し側が案内メッセージを出す）。
+        assert!(!tool.start_rotate());
+        assert!(!tool.is_placing());
+
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+        assert!(tool.start_rotate());
+        assert!(tool.is_placing());
+    }
+
+    #[test]
+    fn rotate_three_click_flow_commits_rotated_geometry() {
+        // pivot=(0,0), 基準点=(1,0)（角度 0）, 回転先=(0,1)（角度 π/2）→ 相対角 +π/2。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0); // 線分 (0,0)-(1,0)
+        let before_a = doc.entity(a).unwrap().geom.clone();
+
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+        assert_eq!(tool.selection(), &[a]);
+        let selection_before = tool.selection().to_vec();
+
+        assert!(tool.start_rotate());
+        // 1クリック目=pivot。プレビューはまだ無い（角度未定）。
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1),
+            PlacementOutcome::Continue
+        );
+        assert!(tool.placement_preview().is_none());
+        // 2クリック目=基準点。ここで初めて回転先待ちへ進む。
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1),
+            PlacementOutcome::Continue
+        );
+        // 基準点確定後はカーソル追従で相対角ゴーストが出る。
+        tool.placement_move(Point2::new(0.0, 1.0));
+        match tool.placement_preview() {
+            Some(PlacementPreview::Rotate { pivot, angle }) => {
+                assert_eq!(pivot, Point2::new(0.0, 0.0));
+                assert!((angle - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+            }
+            other => panic!("expected Rotate preview, got {other:?}"),
+        }
+
+        // 3クリック目=回転先(0,1)。相対角 +π/2 の ModifyEntity バッチを返す。
+        let angle = std::f64::consts::FRAC_PI_2;
+        let outcome = tool.placement_click(&doc, Point2::new(0.0, 1.0), 0.1);
+        let PlacementOutcome::Commit { kind, .. } = &outcome else {
+            panic!("expected Commit, got {outcome:?}");
+        };
+        assert_eq!(*kind, PlacementKind::Rotate);
+        let pairs = modify_pairs(&outcome);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, a);
+        assert_eq!(pairs[0].1, before_a.rotated(Point2::new(0.0, 0.0), angle));
+
+        // ID 不変なので選択は維持される。
+        assert!(!tool.is_placing());
+        assert_eq!(tool.selection(), selection_before.as_slice());
+    }
+
+    #[test]
+    fn rotate_apply_and_undo_is_single_unit() {
+        // 検収シナリオ: 選択 → R → 3クリック → apply、undo 1 回で回転が全て戻る。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let b = add_hline(&mut doc, 10.0);
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let before_b = doc.entity(b).unwrap().geom.clone();
+
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(Point2::new(-1.0, -1.0));
+        tool.on_drag_end(&doc, Point2::new(12.0, 1.0));
+        assert_eq!(tool.selection().len(), 2);
+
+        assert!(tool.start_rotate());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1); // pivot
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1); // 基準点
+        let outcome = tool.placement_click(&doc, Point2::new(0.0, 1.0), 0.1); // 回転先
+        let PlacementOutcome::Commit { cmd, .. } = outcome else {
+            panic!("expected Commit, got {outcome:?}");
+        };
+        doc.apply(cmd).unwrap();
+
+        let angle = std::f64::consts::FRAC_PI_2;
+        let pivot = Point2::new(0.0, 0.0);
+        assert_eq!(doc.entity(a).unwrap().geom, before_a.rotated(pivot, angle));
+        assert_eq!(doc.entity(b).unwrap().geom, before_b.rotated(pivot, angle));
+
+        // 1 バッチなので undo 1 回で両方元へ戻る。
+        assert!(doc.undo());
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+        assert_eq!(doc.entity(b).unwrap().geom, before_b);
+    }
+
+    #[test]
+    fn rotate_reference_equal_to_pivot_cancels() {
+        // 基準点が pivot とほぼ同一だと基準方向が定まらない（絶対角に化ける）ため拒否する。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+
+        assert!(tool.start_rotate());
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(5.0, 5.0), 0.1),
+            PlacementOutcome::Continue
+        );
+        // 基準点が pivot(5,5) と tol=0.1 以内。
+        let outcome = tool.placement_click(&doc, Point2::new(5.05, 5.0), 0.1);
+        assert_eq!(
+            outcome,
+            PlacementOutcome::Cancelled("Reference equals pivot - rotate cancelled")
+        );
+        assert!(!tool.is_placing());
+        // Document は変わらない（履歴も作らない）。
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+    }
+
+    #[test]
+    fn rotate_zero_angle_cancels() {
+        // 回転先が基準点とほぼ同一 → 回転角ゼロ。見えない結果を防いで拒否する。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+
+        assert!(tool.start_rotate());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1); // pivot
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1), // 基準点
+            PlacementOutcome::Continue
+        );
+        // 回転先が基準点(1,0) と tol=0.1 以内。
+        let outcome = tool.placement_click(&doc, Point2::new(1.05, 0.0), 0.1);
+        assert_eq!(
+            outcome,
+            PlacementOutcome::Cancelled("Zero rotation angle - rotate cancelled")
+        );
+        assert!(!tool.is_placing());
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+    }
+
+    #[test]
+    fn rotate_target_equal_to_pivot_cancels() {
+        // 回転先が pivot とほぼ同一だと pivot からの方向が定義不能。基準点が pivot から
+        // 遠くてもゼロベクトルの角度で任意の角を作らないよう、方向定義不能として拒否する。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let gen_before = doc.generation();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+
+        assert!(tool.start_rotate());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1); // pivot
+        // 基準点は pivot から遠い（(2,0)）ので基準点ゲートは通過する。
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(2.0, 0.0), 0.1),
+            PlacementOutcome::Continue
+        );
+        // 回転先が pivot(0,0) と tol=0.1 以内。
+        let outcome = tool.placement_click(&doc, Point2::new(0.05, 0.0), 0.1);
+        assert_eq!(
+            outcome,
+            PlacementOutcome::Cancelled("Target equals pivot - rotate cancelled")
+        );
+        assert!(!tool.is_placing());
+        // Document も undo 履歴（世代）も変化しない。
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+        assert_eq!(doc.generation(), gen_before);
+    }
+
+    #[test]
+    fn rotate_same_ray_different_radius_cancels() {
+        // 回転先が基準点と同一 ray（同方向）で半径だけ違うと、2点間距離は tol を大きく
+        // 超えるが実相対角はゼロ。距離ではなく正規化相対角で判定するので no-op を弾ける。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let gen_before = doc.generation();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+
+        assert!(tool.start_rotate());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1); // pivot
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1), // 基準点（+x ray, 半径1）
+            PlacementOutcome::Continue
+        );
+        // 回転先は同じ +x ray 上の半径5（距離4、tol を大きく超える）だが相対角はゼロ。
+        let outcome = tool.placement_click(&doc, Point2::new(5.0, 0.0), 0.1);
+        assert_eq!(
+            outcome,
+            PlacementOutcome::Cancelled("Zero rotation angle - rotate cancelled")
+        );
+        assert!(!tool.is_placing());
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+        assert_eq!(doc.generation(), gen_before);
+    }
+
+    #[test]
+    fn rotate_pi_boundary_commits() {
+        // 相対角 π ちょうど（真反対の ray）でも生の角度差ではなく atan2 で安定に求まり、
+        // ±π 境界で破綻せず確定する。線分 (0,0)-(1,0) を原点まわり π 回転 → (0,0)-(-1,0)。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0); // (0,0)-(1,0)
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+
+        assert!(tool.start_rotate());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1); // pivot
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1); // 基準点（+x）
+        // 回転先は真反対の -x ray。相対角は +π。
+        let outcome = tool.placement_click(&doc, Point2::new(-1.0, 0.0), 0.1);
+        let pairs = modify_pairs(&outcome);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].1,
+            before_a.rotated(Point2::new(0.0, 0.0), std::f64::consts::PI)
+        );
+    }
+
+    #[test]
+    fn rotate_near_pivot_large_angle_commits() {
+        // pivot 近傍（小半径）だと基準点と回転先の距離は tol 以内になりうるが、角度差は
+        // 大きい。距離ゲートなら誤って拒否するところを、角度ゲートは正しく確定させる。
+        // tol=0.1、半径 0.11（>tol）で基準点(0.11,0) と回転先を約 50 度離す。
+        let mut doc = Document::new();
+        add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+
+        let pivot = Point2::new(0.0, 0.0);
+        let reference = Point2::new(0.11, 0.0);
+        // 半径 0.11・角度 50 度の点。基準点との弦長 ≈ 0.093 < tol=0.1（距離ゲールなら誤拒否）。
+        let (s, c) = (50.0_f64).to_radians().sin_cos();
+        let target = Point2::new(0.11 * c, 0.11 * s);
+        // 前提の確認: 両点とも pivot から tol 超、かつ2点間は tol 以内。
+        assert!(pivot.distance(reference) > 0.1);
+        assert!(pivot.distance(target) > 0.1);
+        assert!(reference.distance(target) <= 0.1);
+
+        assert!(tool.start_rotate());
+        let _ = tool.placement_click(&doc, pivot, 0.1);
+        assert_eq!(
+            tool.placement_click(&doc, reference, 0.1),
+            PlacementOutcome::Continue
+        );
+        let outcome = tool.placement_click(&doc, target, 0.1);
+        // 誤拒否されず確定し、実角度 ≈ 50 度の回転になる。
+        let pairs = modify_pairs(&outcome);
+        assert_eq!(pairs.len(), 1);
+        // (0,0)-(1,0) を原点まわり 50 度回転 → (0,0)-(cos50, sin50)。1ulp の角度差に
+        // 依存しないよう端点を近似比較する。
+        match &pairs[0].1 {
+            Shape::Line(l) => {
+                assert!(l.a.distance(Point2::ORIGIN) < 1e-9);
+                assert!(l.b.distance(Point2::new(c, s)) < 1e-9);
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rotate_touching_locked_layer_fails_atomically() {
+        // ロックレイヤーのエンティティが混ざると Batch 原子性で回転全体が失敗し、何も動かない。
+        let mut doc = Document::new();
+        let unlocked = add_hline(&mut doc, 0.0);
+        let locked_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "locked",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let locked_entity = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))),
+                locked_layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut props = doc.layer(locked_layer).unwrap().clone();
+        props.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: locked_layer,
+            props,
+        })
+        .unwrap();
+
+        let before_unlocked = doc.entity(unlocked).unwrap().geom.clone();
+        let before_locked = doc.entity(locked_entity).unwrap().geom.clone();
+
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(Point2::new(-1.0, -1.0));
+        tool.on_drag_end(&doc, Point2::new(2.0, 1.0));
+        assert_eq!(tool.selection().len(), 2);
+
+        assert!(tool.start_rotate());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1);
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+        let outcome = tool.placement_click(&doc, Point2::new(0.0, 1.0), 0.1);
+        let PlacementOutcome::Commit { cmd, .. } = outcome else {
+            panic!("expected Commit, got {outcome:?}");
+        };
+        assert!(doc.apply(cmd).is_err());
+        assert_eq!(doc.entity(unlocked).unwrap().geom, before_unlocked);
+        assert_eq!(doc.entity(locked_entity).unwrap().geom, before_locked);
+    }
+
+    // --- 配置モード（Shift+M 鏡映） ---
+
+    #[test]
+    fn start_mirror_requires_nonempty_selection() {
+        let mut doc = Document::new();
+        let _a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+
+        assert!(!tool.start_mirror());
+        assert!(!tool.is_placing());
+
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+        assert!(tool.start_mirror());
+        assert!(tool.is_placing());
+    }
+
+    #[test]
+    fn mirror_two_click_flow_commits_mirrored_geometry() {
+        // 軸を x 軸（(0,0)→(1,0)）にすると、y 座標が反転する。
+        let mut doc = Document::new();
+        // 水平線分ではなく y!=0 の線分を使い、鏡映の効果が見えるようにする。
+        let layer = doc.current_layer();
+        let a = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(0.0, 2.0), Point2::new(1.0, 3.0))),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let before_a = doc.entity(a).unwrap().geom.clone();
+
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 2.5), 0.2, false);
+        assert_eq!(tool.selection(), &[a]);
+        let selection_before = tool.selection().to_vec();
+
+        assert!(tool.start_mirror());
+        // 1クリック目=軸点A。以降カーソル追従で鏡映プレビュー。
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1),
+            PlacementOutcome::Continue
+        );
+        tool.placement_move(Point2::new(1.0, 0.0));
+        match tool.placement_preview() {
+            Some(PlacementPreview::Mirror { axis_a, axis_b }) => {
+                assert_eq!(axis_a, Point2::new(0.0, 0.0));
+                assert_eq!(axis_b, Point2::new(1.0, 0.0));
+            }
+            other => panic!("expected Mirror preview, got {other:?}"),
+        }
+
+        // 2クリック目=軸点B(1,0)。x 軸に対する鏡映の ModifyEntity バッチを返す。
+        let outcome = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+        let PlacementOutcome::Commit { kind, .. } = &outcome else {
+            panic!("expected Commit, got {outcome:?}");
+        };
+        assert_eq!(*kind, PlacementKind::Mirror);
+        let pairs = modify_pairs(&outcome);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, a);
+        assert_eq!(
+            pairs[0].1,
+            before_a.mirrored(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))
+        );
+
+        assert!(!tool.is_placing());
+        assert_eq!(tool.selection(), selection_before.as_slice());
+    }
+
+    #[test]
+    fn mirror_apply_and_undo_is_single_unit() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let a = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(0.0, 2.0), Point2::new(1.0, 3.0))),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let before_a = doc.entity(a).unwrap().geom.clone();
+
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 2.5), 0.2, false);
+
+        assert!(tool.start_mirror());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1);
+        let outcome = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+        let PlacementOutcome::Commit { cmd, .. } = outcome else {
+            panic!("expected Commit, got {outcome:?}");
+        };
+        doc.apply(cmd).unwrap();
+        assert_eq!(
+            doc.entity(a).unwrap().geom,
+            before_a.mirrored(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))
+        );
+
+        assert!(doc.undo());
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+    }
+
+    #[test]
+    fn mirror_zero_length_axis_cancels() {
+        // 軸2点がほぼ同一だと軸が定まらないため拒否する。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+
+        assert!(tool.start_mirror());
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(5.0, 5.0), 0.1),
+            PlacementOutcome::Continue
+        );
+        let outcome = tool.placement_click(&doc, Point2::new(5.05, 5.0), 0.1);
+        assert_eq!(
+            outcome,
+            PlacementOutcome::Cancelled("Zero-length axis - mirror cancelled")
+        );
+        assert!(!tool.is_placing());
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+    }
+
+    #[test]
+    fn cancel_placement_during_rotate_keeps_selection_and_document() {
+        // Esc・ツール切替・ファイル操作からの解除経路を回転（3クリックの途中）でも確認する。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let before_a = doc.entity(a).unwrap().geom.clone();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+
+        assert!(tool.start_rotate());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1); // pivot
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1); // 基準点（回転先待ち）
+        assert!(tool.is_placing());
+
+        tool.cancel_placement();
+        assert!(!tool.is_placing());
+        assert!(tool.placement_preview().is_none());
+        assert_eq!(tool.selection(), &[a]);
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
     }
 }

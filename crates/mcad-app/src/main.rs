@@ -1308,13 +1308,35 @@ fn handle_select_input(
     // 配置モードでない選択・編集入力はスナップを効かせない。マーカーを消す。
     *snap_marker = None;
 
-    // M（修飾キーなし）: 選択集合の移動配置モードへ入る（Ctrl+D 複製と同じ2クリック配置）。
-    // 選択が空なら案内メッセージを出すだけ。以降のクリックは次フレームから配置経路が受け取る。
-    if ui.input(|i| !i.modifiers.command && i.key_pressed(Key::M)) {
+    // M（Ctrl/Shift なし）: 選択集合の移動配置モードへ入る（Ctrl+D 複製と同じ2クリック配置）。
+    // Shift+M は鏡映に使うため `!shift` ガードを付け、Shift+M で移動が誤起動しないようにする
+    // （設計判断4）。選択が空なら案内メッセージを出すだけ。以降のクリックは次フレームから
+    // 配置経路が受け取る。
+    if ui.input(|i| !i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::M)) {
         if select_tool.start_move() {
             set_status(status, now, "Move: click base point");
         } else {
             set_status(status, now, "Select entities to move");
+        }
+        return;
+    }
+
+    // Shift+M（Ctrl なし）: 選択集合の鏡映モードへ入る（軸点A→軸点B の2クリック指定）。
+    if ui.input(|i| !i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::M)) {
+        if select_tool.start_mirror() {
+            set_status(status, now, "Mirror: click first axis point");
+        } else {
+            set_status(status, now, "Select entities to mirror");
+        }
+        return;
+    }
+
+    // R（Ctrl なし）: 選択集合の回転モードへ入る（pivot→基準点→回転先の3クリック相対角）。
+    if ui.input(|i| !i.modifiers.command && i.key_pressed(Key::R)) {
+        if select_tool.start_rotate() {
+            set_status(status, now, "Rotate: click pivot point");
+        } else {
+            set_status(status, now, "Select entities to rotate");
         }
         return;
     }
@@ -1438,10 +1460,18 @@ fn handle_placement_input(
                             select_tool.set_selection(new_ids.entities);
                             set_status(status, now, format!("Duplicated {n} entities"));
                         }
-                        // 移動: ID は不変なので選択はそのまま維持する。
+                        // 移動・回転・鏡映: ID は不変なので選択はそのまま維持する。
                         PlacementKind::Move => {
                             let n = select_tool.selection().len();
                             set_status(status, now, format!("Moved {n} entities"));
+                        }
+                        PlacementKind::Rotate => {
+                            let n = select_tool.selection().len();
+                            set_status(status, now, format!("Rotated {n} entities"));
+                        }
+                        PlacementKind::Mirror => {
+                            let n = select_tool.selection().len();
+                            set_status(status, now, format!("Mirrored {n} entities"));
                         }
                     },
                     Err(err) => match kind {
@@ -1450,6 +1480,12 @@ fn handle_placement_input(
                         }
                         PlacementKind::Move => {
                             set_status(status, now, format!("Move failed: {err}"));
+                        }
+                        PlacementKind::Rotate => {
+                            set_status(status, now, format!("Rotate failed: {err}"));
+                        }
+                        PlacementKind::Mirror => {
+                            set_status(status, now, format!("Mirror failed: {err}"));
                         }
                     },
                 }
@@ -1571,33 +1607,36 @@ fn draw_selection(
 ) {
     let highlight = Stroke::new(SELECTION_WIDTH, SELECTION_COLOR);
 
-    // 選択集合を `delta` 平行移動した位置に強調色で仮表示する（複製先・移動先のプレビュー）。
-    let draw_translated = |delta| {
+    // 選択集合を `transform` で変換した先を強調色で仮表示する（配置先ゴースト）。
+    let draw_ghost = |transform: &dyn Fn(&Shape) -> Shape| {
         for &id in select_tool.selection() {
             if let Some(entity) = document.entity(id) {
-                draw_shape(
-                    painter,
-                    rect,
-                    viewport,
-                    &entity.geom.translated(delta),
-                    highlight,
-                );
+                draw_shape(painter, rect, viewport, &transform(&entity.geom), highlight);
             }
         }
     };
 
-    // 配置モード（Ctrl+D 複製・M 移動）中は、変位ぶん平行移動したプレビューを描く
-    // （Document は変更しない）。配置モードは通常のドラッグと排他なので、こちらを優先する。
+    // 配置モード（Ctrl+D 複製・M 移動・R 回転・Shift+M 鏡映）中は、変換後のプレビューを
+    // 描く（Document は変更しない）。配置モードは通常のドラッグと排他なので、こちらを優先する。
     match select_tool.placement_preview() {
         // 複製: 元の選択を強調したまま、複製先を重ねて仮表示する。
         Some(PlacementPreview::Duplicate { delta }) => {
             draw_selected(painter, rect, document, viewport, select_tool, highlight);
-            draw_translated(delta);
+            draw_ghost(&|g| g.translated(delta));
             return;
         }
-        // 移動: 元の位置は draw_entities が通常色で描く（ゴースト）。移動先だけを強調表示する。
+        // 移動・回転・鏡映: 元の位置は draw_entities が通常色で描く（ゴースト）。
+        // 変換後だけを強調表示する。
         Some(PlacementPreview::Move { delta }) => {
-            draw_translated(delta);
+            draw_ghost(&|g| g.translated(delta));
+            return;
+        }
+        Some(PlacementPreview::Rotate { pivot, angle }) => {
+            draw_ghost(&|g| g.rotated(pivot, angle));
+            return;
+        }
+        Some(PlacementPreview::Mirror { axis_a, axis_b }) => {
+            draw_ghost(&|g| g.mirrored(axis_a, axis_b));
             return;
         }
         None => {}

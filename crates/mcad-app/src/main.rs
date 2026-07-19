@@ -971,7 +971,15 @@ fn handle_tool_input(
     // 描画のために記録する（ホバーしていなければマーカーを消す）。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid_step);
+        let extra_points = active.snap_points();
+        let (world, marker) = apply_snap(
+            document,
+            snap_enabled,
+            raw,
+            radius,
+            grid_step,
+            &extra_points,
+        );
         *snap_marker = marker;
         let _ = active.on_input(&ctx, InputEvent::Move(world));
     } else {
@@ -987,7 +995,15 @@ fn handle_tool_input(
         && let Some(pos) = response.interact_pointer_pos()
     {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid_step);
+        let extra_points = active.snap_points();
+        let (world, _) = apply_snap(
+            document,
+            snap_enabled,
+            raw,
+            radius,
+            grid_step,
+            &extra_points,
+        );
         result = active.on_input(&ctx, InputEvent::Click(world));
     }
 
@@ -1001,13 +1017,23 @@ fn handle_tool_input(
     match result {
         ToolResult::Commit(cmd) => {
             // ドキュメント側のレイヤーロックなどで失敗することがある（例: カレント
-            // レイヤーがロック中の AddEntity）。失敗はステータスバーへ表示し、
-            // ツール状態はリセットして操作を続行可能にしておく。dirty 状態は世代カウンタ
-            // が自動で表すため、成功時に明示的なフラグ操作は不要。
-            if let Err(err) = document.apply(cmd) {
-                set_status(status, now, format!("Commit failed: {err}"));
+            // レイヤーがロック中の AddEntity）。dirty 状態は世代カウンタが自動で
+            // 表すため、成功時に明示的なフラグ操作は不要。
+            //
+            // 成功時はツールを respawn しない: 各作図ツール（Point/Line/Circle/
+            // Arc/Polyline）は確定のたびに自分で次の入力へ備えた状態にする設計
+            // であり（例: Line は連続線分モードとして終点を次の始点へ引き継ぐ）、
+            // ここで無条件に spawn() し直すとその引き継ぎ状態を消してしまう。
+            //
+            // 失敗時のみ spawn() でリセットする: 確定できなかった中途状態を
+            // 次のクリックへ持ち越さないため。
+            match document.apply(cmd) {
+                Ok(_) => {}
+                Err(err) => {
+                    set_status(status, now, format!("Commit failed: {err}"));
+                    *tool = tool_kind.spawn();
+                }
             }
-            *tool = tool_kind.spawn();
         }
         ToolResult::Cancel => {
             *tool_kind = ToolKind::Select;
@@ -1106,17 +1132,21 @@ fn layer_panel(
 
 /// 素のカーソル位置 `raw` にスナップを掛ける。有効かつ候補が見つかれば
 /// `(スナップ先, Some(結果))`、無効または候補なしなら `(raw, None)` を返す。
+///
+/// `extra_points` はアクティブな作図ツールの未確定頂点（[`Tool::snap_points`]）。
+/// 作図中ツールを持たない呼び出し箇所（選択・配置モード等）は `&[]` を渡す。
 fn apply_snap(
     document: &Document,
     enabled: bool,
     raw: Point2,
     radius: f64,
     grid_step: f64,
+    extra_points: &[Point2],
 ) -> (Point2, Option<snap::SnapResult>) {
     if !enabled {
         return (raw, None);
     }
-    match snap::snap(document, raw, radius, grid_step) {
+    match snap::snap(document, raw, radius, grid_step, extra_points) {
         Some(result) => (result.point, Some(result)),
         None => (raw, None),
     }
@@ -1125,12 +1155,23 @@ fn apply_snap(
 /// 選択・編集モード（`tool_kind == Select`）のキャンバス入力を [`SelectTool`] へ渡す。
 ///
 /// egui 組み込みのクリック/ドラッグ判定を利用し、単発クリック（＝選択）と
-/// ドラッグ（＝矩形選択 or 移動）を振り分ける。移動・削除の確定コマンドは
-/// [`Document::apply`] で適用する（`Batch` の原子性・undo/redo 結線はコア側に従う）。
+/// ドラッグ（＝矩形選択）を振り分ける。ドラッグは矩形選択専用で、選択集合を書き換える
+/// だけ（Document は変更しない）。移動は `M`、複製は `Ctrl+D` の2クリック配置で行う。
+/// 削除の確定コマンドは [`Document::apply`] で適用する（`Batch` の原子性・undo/redo 結線は
+/// コア側に従う）。
 ///
 /// - `Delete`/`Backspace`: 選択エンティティを 1 バッチで削除。適用成功時のみ選択を解除する。
-/// - `Esc`: 進行中のドラッグを破棄（選択は変えない）。
+/// - `M`: 選択集合の移動配置モードへ入る（基準点→配置先の2クリック、スナップ対応）。
+/// - `Esc`: 進行中のドラッグ（または配置モード）を破棄（選択は変えない）。
 /// - `Space` 押下中の左ドラッグはパン用なので、選択操作としては扱わない。
+///
+/// # 配置モード（Ctrl+D 複製・M 移動）の優先
+///
+/// 配置モードがアクティブ（[`SelectTool::is_placing`]）な間は、通常のクリック選択・
+/// 矩形選択・削除を一切行わず、基準点→配置先の2クリックだけを受け取る（入力ゲート）。
+/// 作図ツールと同様にどちらのクリックにもスナップを効かせ、`snap_marker` を更新する。
+/// 配置モードでないときは、選択・編集はスナップ対象外なのでマーカーを消す
+/// （設計判断は [`handle_tool_input`] の doc を参照）。
 #[allow(clippy::too_many_arguments)]
 fn handle_select_input(
     ui: &egui::Ui,

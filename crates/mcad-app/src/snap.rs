@@ -83,18 +83,28 @@ pub struct SnapResult {
 /// - `cursor`: カーソルのワールド座標。
 /// - `radius`: 探索半径（ワールド単位。呼び出し側で `半径px / zoom` に換算済み）。
 /// - `grid_step`: グリッド間隔（ワールド単位）。`0` 以下・非有限ならグリッド候補なし。
+/// - `extra_points`: 作図中（未確定）ツールの頂点列（[`crate::tool::Tool::snap_points`]）。
+///   `Document` にまだ存在しない点だが、[`SnapKind::Endpoint`]（最優先）候補として
+///   他の端点と同じ優先度・最近傍規則で扱う。ポリライン作図中に自分自身の始点へ
+///   スナップして自動クローズできるようにするための拡張。
 #[must_use]
 pub fn snap(
     document: &Document,
     cursor: Point2,
     radius: f64,
     grid_step: f64,
+    extra_points: &[Point2],
 ) -> Option<SnapResult> {
     if !radius.is_finite() || radius <= 0.0 {
         return None;
     }
     let r2 = radius * radius;
     let mut best = Best::default();
+
+    // 作図中(未確定)ツールの頂点: Document にはまだ無いが端点として最優先で扱う。
+    for &p in extra_points {
+        best.consider(SnapKind::Endpoint, p, cursor, r2);
+    }
 
     // 端点・中点・中心: 可視レイヤーの全エンティティを走査（O(n)）。
     for (_, entity) in document.entities() {
@@ -231,9 +241,9 @@ mod tests {
         Shape::Line(LineSeg::new(Point2::new(ax, ay), Point2::new(bx, by)))
     }
 
-    /// グリッド無効（`grid_step = 0`）でスナップする短縮版。
+    /// グリッド無効（`grid_step = 0`）・`extra_points` 無しでスナップする短縮版。
     fn snap_no_grid(doc: &Document, cursor: Point2, radius: f64) -> Option<SnapResult> {
-        snap(doc, cursor, radius, 0.0)
+        snap(doc, cursor, radius, 0.0, &[])
     }
 
     #[test]
@@ -306,7 +316,7 @@ mod tests {
 
         // カーソル (0.1,0.1): 最寄りグリッド交点(0,0)まで ≈0.14、中心(0.3,0.3)まで ≈0.28。
         // グリッドの方が近いが、優先度で中心が勝つ。
-        let r = snap(&doc, Point2::new(0.1, 0.1), 0.5, 1.0).unwrap();
+        let r = snap(&doc, Point2::new(0.1, 0.1), 0.5, 1.0, &[]).unwrap();
         assert_eq!(r.kind, SnapKind::Center);
         assert_eq!(r.point, Point2::new(0.3, 0.3));
     }
@@ -315,7 +325,7 @@ mod tests {
     fn grid_is_fallback_when_nothing_else_in_range() {
         // エンティティのない空ドキュメントでもグリッドにはスナップする。
         let doc = Document::new();
-        let r = snap(&doc, Point2::new(0.2, -0.1), 0.5, 1.0).unwrap();
+        let r = snap(&doc, Point2::new(0.2, -0.1), 0.5, 1.0, &[]).unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
         assert_eq!(r.point, Point2::new(0.0, 0.0));
     }
@@ -374,7 +384,7 @@ mod tests {
 
         // カーソルを交点から半径ちょうど（距離 3.0、半径 3.0）離しても交点にスナップする。
         let cursor = Point2::new(103.0, 100.0);
-        let r = snap(&doc, cursor, 3.0, 0.0).unwrap();
+        let r = snap(&doc, cursor, 3.0, 0.0, &[]).unwrap();
         assert_eq!(r.kind, SnapKind::Intersection);
         assert_eq!(r.point, Point2::new(100.0, 100.0));
     }
@@ -388,6 +398,27 @@ mod tests {
         add(&mut doc, line(100.0, 70.0, 100.0, 110.0));
 
         // カーソル (0,0): 交点まで距離 ≈141。半径 3 では何にもスナップしない。
-        assert_eq!(snap(&doc, Point2::new(0.0, 0.0), 3.0, 0.0), None);
+        assert_eq!(snap(&doc, Point2::new(0.0, 0.0), 3.0, 0.0, &[]), None);
+    }
+
+    #[test]
+    fn extra_point_within_radius_snaps_as_endpoint() {
+        // Document は空でグリッドのみ候補になる状況で、extra_points（作図中ツールの
+        // 未確定頂点）を渡すと、より優先度の高い端点として選ばれる。
+        let doc = Document::new();
+        let extra = [Point2::new(0.05, 0.0)];
+        let r = snap(&doc, Point2::new(0.0, 0.0), 0.5, 1.0, &extra).unwrap();
+        assert_eq!(r.kind, SnapKind::Endpoint);
+        assert_eq!(r.point, Point2::new(0.05, 0.0));
+    }
+
+    #[test]
+    fn extra_point_outside_radius_is_ignored() {
+        let doc = Document::new();
+        let extra = [Point2::new(10.0, 10.0)];
+        // 半径外なので extra_points は候補にならず、グリッドにフォールバックする。
+        let r = snap(&doc, Point2::new(0.1, -0.1), 0.5, 1.0, &extra).unwrap();
+        assert_eq!(r.kind, SnapKind::Grid);
+        assert_eq!(r.point, Point2::new(0.0, 0.0));
     }
 }

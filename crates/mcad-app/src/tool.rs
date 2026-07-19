@@ -93,6 +93,13 @@ pub trait Tool {
 
     /// 未確定の途中経過（クリック済み点・マウス追従中の線など）をプレビュー描画する。
     fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport);
+
+    /// 作図中（未確定）の頂点列。スナップエンジン（`crate::snap::snap`）が端点
+    /// （最優先）候補として扱う。まだ `Document` に存在しない自分自身の頂点へも
+    /// スナップできるようにするための拡張で、既定では空（対象なし）。
+    fn snap_points(&self) -> Vec<Point2> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -140,7 +147,12 @@ enum LineState {
     WaitingSecond(Point2),
 }
 
-/// 線分ツール。クリック2回（始点・終点）で [`Shape::Line`] を確定する。
+/// 線分ツール（連続線分モード）。クリック2回（始点・終点）で1本目の
+/// [`Shape::Line`] を確定した後は、その終点を次の線分の始点として引き継ぎ、
+/// 以降はクリックのたびに独立した線分エンティティを1本ずつ確定し続ける
+/// （AutoCAD の LINE コマンドと同様の挙動）。ポリラインと異なり、各辺は
+/// 個別のエンティティとして選択・編集できる。Escで連続モードを終了する
+/// （`WaitingFirst` へ戻り、次のクリックは新しい始点として扱われる）。
 /// 1点目クリック後はマウス位置までのプレビュー線を表示する。
 #[derive(Debug, Default)]
 pub struct LineTool {
@@ -166,7 +178,8 @@ impl Tool for LineTool {
                         ctx.layer,
                         ctx.style,
                     ));
-                    self.state = LineState::WaitingFirst;
+                    // 連続線分モード: 今確定した終点を次の線分の始点として引き継ぐ。
+                    self.state = LineState::WaitingSecond(p);
                     ToolResult::Commit(cmd)
                 }
             },
@@ -187,6 +200,13 @@ impl Tool for LineTool {
                 &Shape::Line(LineSeg::new(*first, cursor)),
                 preview_stroke(),
             );
+        }
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            LineState::WaitingFirst => Vec::new(),
+            LineState::WaitingSecond(first) => vec![first],
         }
     }
 }
@@ -252,6 +272,13 @@ impl Tool for CircleTool {
                 &Shape::Circle(mcad_geom::Circle::new(*center, radius)),
                 preview_stroke(),
             );
+        }
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            CircleState::WaitingCenter => Vec::new(),
+            CircleState::WaitingRadiusPoint(center) => vec![center],
         }
     }
 }
@@ -361,6 +388,14 @@ impl Tool for ArcTool {
             _ => {}
         }
     }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            ArcState::WaitingP1 => Vec::new(),
+            ArcState::WaitingP2(p1) => vec![p1],
+            ArcState::WaitingP3(p1, p2) => vec![p1, p2],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -369,11 +404,25 @@ impl Tool for ArcTool {
 
 /// ポリラインツール。クリックで頂点を追加し、Enterキーで確定する（2点以上必要）。
 /// Escでキャンセル。ダブルクリックでの確定は実装しない（Enterのみ）。
+///
+/// # 始点クリックによる自動クローズ
+///
+/// 頂点が3つ以上ある状態で、クリック位置が最初の頂点とほぼ一致（距離 `<= 1e-9`）
+/// すれば、その点を新しい頂点として追加せず、`closed = true` のポリラインとして
+/// 即座に確定する（`Enter` を押さなくてよい）。頂点が2つ以下の場合は退化形状の
+/// 自動確定を避けるため、通常どおり頂点として追加する。距離の判定はスナップで
+/// 始点に吸着した場合は厳密一致になる前提なので、スナップ無効（F3 オフ）時は
+/// クリックがちょうど始点に一致することは実質なく、自動クローズは発動しない
+/// （これは仕様として許容する）。
 #[derive(Debug, Default)]
 pub struct PolylineTool {
     vertices: Vec<Point2>,
     cursor: Option<Point2>,
 }
+
+/// 自動クローズの一致判定に使う距離しきい値（ワールド単位）。スナップで始点に
+/// 吸着した場合は厳密一致になるため、浮動小数点誤差を吸収できれば十分小さい値でよい。
+const AUTO_CLOSE_EPSILON: f64 = 1e-9;
 
 impl Tool for PolylineTool {
     fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
@@ -383,6 +432,15 @@ impl Tool for PolylineTool {
                 ToolResult::Continue
             }
             InputEvent::Click(p) => {
+                if self.vertices.len() >= 3 && self.vertices[0].distance(p) <= AUTO_CLOSE_EPSILON {
+                    // 始点クリックで自動クローズ。始点の重複頂点は作らない。
+                    let vertices = std::mem::take(&mut self.vertices);
+                    return ToolResult::Commit(Command::AddEntity(Entity::new(
+                        Shape::Polyline(Polyline::new(vertices, true)),
+                        ctx.layer,
+                        ctx.style,
+                    )));
+                }
                 self.vertices.push(p);
                 ToolResult::Continue
             }
@@ -424,6 +482,10 @@ impl Tool for PolylineTool {
             &Shape::Polyline(Polyline::new(preview_vertices, false)),
             preview_stroke(),
         );
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        self.vertices.clone()
     }
 }
 
@@ -732,21 +794,21 @@ mod tests {
     }
 
     #[test]
-    fn line_tool_resets_after_commit_for_next_line() {
+    fn line_tool_chains_next_segment_from_previous_endpoint() {
+        // 連続線分モード: 1本目確定後、追加クリックなしで次のクリックが即座に
+        // 前の終点始まりの線分として確定する（2本目に2クリック不要）。
         let (_doc, ctx) = ctx();
         let mut tool = LineTool::default();
-        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
-        tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0)));
-        // 1本目確定後、2本目もちゃんと2クリックで確定できる（状態がリセットされている）。
-        assert_eq!(
-            tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 5.0))),
-            ToolResult::Continue
-        );
-        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(6.0, 5.0)));
-        assert_eq!(
-            shape_of(result),
-            Shape::Line(LineSeg::new(Point2::new(5.0, 5.0), Point2::new(6.0, 5.0)))
-        );
+        let a = Point2::new(0.0, 0.0);
+        let b = Point2::new(1.0, 0.0);
+        let c = Point2::new(5.0, 5.0);
+        tool.on_input(&ctx, InputEvent::Click(a));
+        let result_ab = tool.on_input(&ctx, InputEvent::Click(b));
+        assert_eq!(shape_of(result_ab), Shape::Line(LineSeg::new(a, b)));
+
+        // 追加クリックなしで C をクリックすると B→C の線分が即座に確定する。
+        let result_bc = tool.on_input(&ctx, InputEvent::Click(c));
+        assert_eq!(shape_of(result_bc), Shape::Line(LineSeg::new(b, c)));
     }
 
     #[test]
@@ -759,6 +821,26 @@ mod tests {
         assert_eq!(
             tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 9.0))),
             ToolResult::Continue
+        );
+    }
+
+    #[test]
+    fn line_tool_cancel_ends_continuous_mode() {
+        // 連続線分モード中に Esc を押すと Cancel が返り、状態が WaitingFirst に
+        // 戻る（次のクリックは新しい始点として扱われ、2クリック必要になる）。
+        let (_doc, ctx) = ctx();
+        let mut tool = LineTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0)));
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 9.0))),
+            ToolResult::Continue
+        );
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(10.0, 9.0)));
+        assert_eq!(
+            shape_of(result),
+            Shape::Line(LineSeg::new(Point2::new(9.0, 9.0), Point2::new(10.0, 9.0)))
         );
     }
 
@@ -914,6 +996,67 @@ mod tests {
             tool.on_input(&ctx, InputEvent::Confirm),
             ToolResult::Continue
         );
+    }
+
+    #[test]
+    fn polyline_tool_click_on_start_point_with_three_vertices_auto_closes() {
+        let (_doc, ctx) = ctx();
+        let mut tool = PolylineTool::default();
+        let a = Point2::new(0.0, 0.0);
+        let b = Point2::new(1.0, 0.0);
+        let c = Point2::new(1.0, 1.0);
+        tool.on_input(&ctx, InputEvent::Click(a));
+        tool.on_input(&ctx, InputEvent::Click(b));
+        tool.on_input(&ctx, InputEvent::Click(c));
+        // 4回目のクリックが始点 a とちょうど同座標（スナップで吸着した想定）。
+        let result = tool.on_input(&ctx, InputEvent::Click(a));
+        match shape_of(result) {
+            Shape::Polyline(pl) => {
+                assert!(pl.closed, "始点クリックで自動クローズするはず");
+                // 始点の重複頂点は作らない（頂点数は3のまま）。
+                assert_eq!(pl.vertices, vec![a, b, c]);
+            }
+            other => panic!("expected Polyline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn polyline_tool_click_on_start_point_with_two_vertices_adds_vertex() {
+        let (_doc, ctx) = ctx();
+        let mut tool = PolylineTool::default();
+        let a = Point2::new(0.0, 0.0);
+        let b = Point2::new(1.0, 0.0);
+        tool.on_input(&ctx, InputEvent::Click(a));
+        tool.on_input(&ctx, InputEvent::Click(b));
+        // 頂点2つ（3未満）では自動クローズせず、始点と同座標でも頂点として追加する。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(a)),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.snap_points(), vec![a, b, a]);
+    }
+
+    #[test]
+    fn polyline_tool_snap_points_reflects_clicked_vertices() {
+        let (_doc, ctx) = ctx();
+        let mut tool = PolylineTool::default();
+        assert_eq!(tool.snap_points(), Vec::<Point2>::new());
+        let a = Point2::new(0.0, 0.0);
+        let b = Point2::new(1.0, 0.0);
+        tool.on_input(&ctx, InputEvent::Click(a));
+        assert_eq!(tool.snap_points(), vec![a]);
+        tool.on_input(&ctx, InputEvent::Click(b));
+        assert_eq!(tool.snap_points(), vec![a, b]);
+    }
+
+    #[test]
+    fn line_tool_snap_points_reflects_first_click() {
+        let (_doc, ctx) = ctx();
+        let mut tool = LineTool::default();
+        assert_eq!(tool.snap_points(), Vec::<Point2>::new());
+        let a = Point2::new(2.0, 3.0);
+        tool.on_input(&ctx, InputEvent::Click(a));
+        assert_eq!(tool.snap_points(), vec![a]);
     }
 
     // --- Select / 編集 ---

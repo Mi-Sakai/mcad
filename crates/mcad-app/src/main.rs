@@ -739,16 +739,18 @@ impl eframe::App for McadApp {
                     if self.snap_enabled { "ON" } else { "OFF" }
                 ));
                 ui.separator();
+                // ステータスメッセージ（動的な成否通知）はヘルプ文字列より優先度が高いため、
+                // 幅が狭くヘルプ文字列がクリップされてもステータスは見える位置に置く。
+                if let Some(msg) = &self.status {
+                    ui.colored_label(STATUS_MESSAGE_COLOR, &msg.text);
+                    ui.separator();
+                }
                 ui.label(
                     "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
                      Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo  \
                      Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As  \
                      Ctrl+Shift+O=Import DXF  Ctrl+E=Export DXF",
                 );
-                if let Some(msg) = &self.status {
-                    ui.separator();
-                    ui.colored_label(STATUS_MESSAGE_COLOR, &msg.text);
-                }
             });
         });
 

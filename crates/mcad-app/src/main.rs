@@ -236,6 +236,13 @@ struct McadApp {
     /// （空の`.mcad`/DXF）はフィット対象がないため、このフラグは立てず代わりに
     /// その場で `Viewport::new()` の既定ビューへ戻す。
     pending_zoom_fit: bool,
+    /// このセッション中に最後にファイルダイアログ（開く/名前を付けて保存/DXFインポート/
+    /// DXFエクスポート）でユーザーがパスを確定したときの、そのディレクトリ。
+    ///
+    /// ダイアログを開く際の初期ディレクトリに使う（[`McadApp::dialog_start_dir`]）。
+    /// アプリ再起動をまたぐ永続化はロードマップM8「設定保存」の範囲であり、ここでは
+    /// 行わない。
+    last_dialog_dir: Option<PathBuf>,
 }
 
 /// ステータスバーに一時表示するメッセージ。
@@ -289,6 +296,7 @@ impl McadApp {
             current_path: None,
             confirm_state: ConfirmState::Idle,
             pending_zoom_fit: false,
+            last_dialog_dir: None,
         }
     }
 
@@ -330,6 +338,28 @@ impl McadApp {
     fn cancel_placement_for_file_op(&mut self) {
         self.select_tool.cancel_placement();
         self.snap_marker = None;
+    }
+
+    /// ファイルダイアログを開く際の初期ディレクトリを決める。
+    ///
+    /// 優先順位: このセッション中に最後にダイアログで確定したディレクトリ
+    /// （[`McadApp::last_dialog_dir`]）→ 現在開いているファイルの親ディレクトリ
+    /// （[`McadApp::current_path`]）→ どちらもなければ `None`（rfd の既定に任せる）。
+    fn dialog_start_dir(&self) -> Option<PathBuf> {
+        self.last_dialog_dir.clone().or_else(|| {
+            self.current_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+    }
+
+    /// ファイルダイアログでユーザーが確定したパスから、その親ディレクトリを
+    /// [`McadApp::last_dialog_dir`] へ記憶する。キャンセル時は呼ばない。
+    fn remember_dialog_dir(&mut self, path: &Path) {
+        if let Some(dir) = path.parent() {
+            self.last_dialog_dir = Some(dir.to_path_buf());
+        }
     }
 
     /// ファイル読込（`.mcad`/DXF共通）直後に呼ぶ。M4タスク13（起動状態とズームフィット）。
@@ -426,12 +456,14 @@ impl McadApp {
     /// または確認モーダルの「破棄して続行」選択）が確認済みであることを前提とする。
     /// 読込失敗時は現在のドキュメントを一切変更せず、理由をステータスバーへ表示する。
     fn open_document(&mut self, now: f64) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("mcad", &[MCAD_EXTENSION])
-            .pick_file()
-        else {
+        let mut dialog = rfd::FileDialog::new().add_filter("mcad", &[MCAD_EXTENSION]);
+        if let Some(dir) = self.dialog_start_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else {
             return;
         };
+        self.remember_dialog_dir(&path);
         match load_mcad(&path) {
             Ok(doc) => {
                 self.document = doc;
@@ -462,12 +494,14 @@ impl McadApp {
     /// `save_document` → `save_document_as` 経由で「名前を付けて`.mcad`保存」ダイアログへ
     /// 誘導され、元の DXF ファイルは上書きされない。
     fn open_dxf(&mut self, now: f64) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("dxf", &[DXF_EXTENSION])
-            .pick_file()
-        else {
+        let mut dialog = rfd::FileDialog::new().add_filter("dxf", &[DXF_EXTENSION]);
+        if let Some(dir) = self.dialog_start_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else {
             return;
         };
+        self.remember_dialog_dir(&path);
         match load_dxf(&path) {
             Ok(summary) => self.apply_imported_dxf(summary, now),
             Err(err) => {
@@ -518,13 +552,16 @@ impl McadApp {
                 || DEFAULT_DXF_FILE_NAME.to_string(),
                 |stem| format!("{stem}.{DXF_EXTENSION}"),
             );
-        let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("dxf", &[DXF_EXTENSION])
-            .set_file_name(&default_name)
-            .save_file()
-        else {
+            .set_file_name(&default_name);
+        if let Some(dir) = self.dialog_start_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
             return;
         };
+        self.remember_dialog_dir(&path);
         let path = ensure_dxf_extension(path);
         match save_dxf(&self.document, &path) {
             Ok(()) => {
@@ -557,13 +594,16 @@ impl McadApp {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or(DEFAULT_FILE_NAME);
-        let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("mcad", &[MCAD_EXTENSION])
-            .set_file_name(default_name)
-            .save_file()
-        else {
+            .set_file_name(default_name);
+        if let Some(dir) = self.dialog_start_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
             return;
         };
+        self.remember_dialog_dir(&path);
         // ネイティブダイアログ（特に Linux の xdg-portal 経由）は必ずしも拡張子を
         // 自動付与しないため、`.mcad` 以外（無し含む）なら明示的に付け直す。
         let path = ensure_mcad_extension(path);
@@ -2230,5 +2270,36 @@ mod tests {
         // 新規文書経路（reset_transient_ui_state 含む）で配置も選択も畳まれる。
         assert!(!app.select_tool.is_placing());
         assert!(app.select_tool.selection().is_empty());
+    }
+
+    #[test]
+    fn dialog_start_dir_prefers_last_dialog_dir_over_current_path() {
+        let mut app = McadApp::new();
+        // 両方 None なら None（rfd 既定に任せる）。
+        assert_eq!(app.dialog_start_dir(), None);
+
+        // current_path のみあれば、その親ディレクトリへフォールバックする。
+        app.current_path = Some(PathBuf::from("/tmp/some/dir/drawing.mcad"));
+        assert_eq!(app.dialog_start_dir(), Some(PathBuf::from("/tmp/some/dir")));
+
+        // last_dialog_dir があれば、current_path の親より優先する。
+        app.last_dialog_dir = Some(PathBuf::from("/tmp/other/dir"));
+        assert_eq!(
+            app.dialog_start_dir(),
+            Some(PathBuf::from("/tmp/other/dir"))
+        );
+    }
+
+    #[test]
+    fn remember_dialog_dir_stores_parent_of_confirmed_path() {
+        let mut app = McadApp::new();
+        assert_eq!(app.last_dialog_dir, None);
+
+        app.remember_dialog_dir(Path::new("/home/user/project/output.dxf"));
+
+        assert_eq!(
+            app.last_dialog_dir,
+            Some(PathBuf::from("/home/user/project"))
+        );
     }
 }

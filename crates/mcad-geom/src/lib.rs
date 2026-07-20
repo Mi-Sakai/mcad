@@ -25,7 +25,7 @@ pub use aabb::Aabb;
 pub use intersect::intersect;
 pub use point::Point2;
 pub use primitives::{
-    Arc, Circle, LineSeg, Polyline, Shape, circumcircle, closest_point, distance_to,
+    Arc, Circle, LineSeg, OffsetError, Polyline, Shape, circumcircle, closest_point, distance_to,
 };
 pub use vec2::Vec2;
 

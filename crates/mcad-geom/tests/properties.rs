@@ -275,6 +275,53 @@ proptest! {
         prop_assert!(shape_approx(&shape, &back), "shape={shape:?} back={back:?}");
     }
 
+    /// 通過点方式のオフセット（線分）は、通過点を通る結果を作る。
+    /// `distance = distance_to(shape, p)` でオフセットすると、結果への `p` の最短距離は 0。
+    ///
+    /// 通過点は「セグメント内部の垂足から法線方向へ離れた点」として構成する。
+    /// セグメント端で最近点がクランプされる場合、`distance_to` は垂線距離ではなく
+    /// 端点距離になり、平行移動オフセットは通過点を通らない（無限直線ではなく線分の
+    /// 仕様どおり）。この不変性は垂足がセグメント内部にあるときのみ成り立つため。
+    #[test]
+    fn line_offset_through_point_lies_on_result(
+        a in point(),
+        b in point(),
+        t in 0.15f64..0.85f64,
+        sign in prop::bool::ANY,
+        dist in 0.5f64..500.0f64,
+    ) {
+        prop_assume!(a.distance(b) > 1e-3);
+        let dir = (b - a).normalize().unwrap();
+        let normal = dir.perp() * if sign { 1.0 } else { -1.0 };
+        let foot = a.lerp(b, t);
+        let p = foot + normal * dist;
+        let shape = Shape::Line(LineSeg::new(a, b));
+        let d = mcad_geom::distance_to(&shape, p);
+        // 垂足がセグメント内部なので distance_to は垂線距離 dist に一致する。
+        prop_assert!((d - dist).abs() < TOL, "d={d} dist={dist}");
+        let off = shape.offset(d, p).expect("non-degenerate line offset");
+        prop_assert!(mcad_geom::distance_to(&off, p) < TOL, "off={off:?} p={p:?}");
+    }
+
+    /// 通過点方式のオフセット（円）は、通過点を通る結果を作る（外側・内側どちらでも）。
+    #[test]
+    fn circle_offset_through_point_lies_on_result(
+        center in point(),
+        radius in radius(),
+        p in point(),
+    ) {
+        // 中心近傍は内側オフセットで半径が消滅するため除外。
+        prop_assume!(p.distance(center) > 1e-3);
+        let shape = Shape::Circle(Circle::new(center, radius));
+        let d = mcad_geom::distance_to(&shape, p);
+        prop_assume!(d > 1e-3);
+        let off = shape.offset(d, p).expect("non-degenerate circle offset");
+        prop_assert!(
+            mcad_geom::distance_to(&off, p) < TOL * radius.max(1.0),
+            "off={off:?} p={p:?}"
+        );
+    }
+
     /// 半径不変性: `Circle`/`Arc` は回転・鏡映の前後で半径が変わらない。
     #[test]
     fn rotate_and_mirror_preserve_radius(

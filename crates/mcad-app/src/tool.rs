@@ -38,7 +38,9 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{Command, Document, Entity, EntityId, LayerId, Style};
-use mcad_geom::{Aabb, Arc, LineSeg, Point2, Polyline, Shape, Vec2, circumcircle, distance_to};
+use mcad_geom::{
+    Aabb, Arc, LineSeg, OffsetError, Point2, Polyline, Shape, Vec2, circumcircle, distance_to,
+};
 
 use crate::draw_shape;
 use crate::viewport::Viewport;
@@ -684,6 +686,96 @@ fn relative_angle(pivot: Point2, from: Point2, to: Point2) -> f64 {
     a.cross(b).atan2(a.dot(b))
 }
 
+// ---------------------------------------------------------------------
+// オフセットモード（単一エンティティに対する1クリック操作）
+// ---------------------------------------------------------------------
+
+/// 進行中のオフセットモード（M5 タスク20、設計判断5）。
+///
+/// # なぜ [`Placement`] とは別機構にするのか
+///
+/// 複製・移動・回転・鏡映（[`PlacementKind`]）は「選択集合全体を 2〜3 クリックの
+/// 変位／角度／軸で変換する」操作で、[`PlacementStage`] の `delta`/`angle` 意味論を
+/// 共有できる。一方オフセットは本質的に異なる:
+///
+/// - **対象は単一エンティティ**（起動時にちょうど1個だったもの）で、選択集合の一括
+///   変換ではない。
+/// - **1クリックで確定**する（基準点→配置先のような多段クリックではない）。
+/// - **距離入力欄**（アプリUI側の文字列）と連動し、値があれば距離固定＋クリックは側の
+///   決定のみ、空なら通過点方式、という分岐を持つ。
+/// - **確定は元を変えず結果を `AddEntity`** で追加し、選択は元エンティティのまま維持する
+///   （複製の「新IDを選択」とも、移動などの「同一IDを変換」とも違う）。
+/// - 退化拒否がオフセット固有（半径消滅・ゼロ長・距離ゼロ）で、幾何は
+///   [`Shape::offset`] が [`OffsetError`] で返す。
+///
+/// これらを [`PlacementKind`] に押し込むと、クリック数・対象数・後処理・入力欄連携の
+/// すべてに種別分岐が必要になり、せっかく揃った配置ステート機械の意味論を汚す。そこで
+/// オフセットは独立した小さなステート（本型 1 個）として持ち、[`SelectTool::is_placing`]
+/// と同じ入力ゲート思想（[`SelectTool::is_offsetting`]）だけを踏襲する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OffsetState {
+    /// オフセット対象。起動時にちょうど1個だった選択エンティティの ID。
+    target: EntityId,
+    /// カーソル位置（プレビュー追従用）。起動直後は原点で、最初の [`SelectTool::offset_move`]
+    /// で実カーソルへ更新される。
+    cursor: Point2,
+}
+
+/// [`SelectTool::offset_click`] の結果。呼び出し側（`McadApp`）が確定・キャンセルを処理する。
+#[derive(Debug, Clone, PartialEq)]
+pub enum OffsetOutcome {
+    /// 退化入力でモードをキャンセルした。ASCII メッセージを表示する（undo 履歴は作らない）。
+    Cancelled(&'static str),
+    /// 確定コマンド（オフセット結果の `AddEntity`）。呼び出し側が `Document::apply` する。
+    /// 元エンティティは変更せず、レイヤー・スタイルを複製して幾何のみ差し替えた複製を追加する。
+    Commit(Command),
+}
+
+/// 通過点方式での、通過点 `reference` から対象 `geom` までのオフセット距離（設計判断5）。
+///
+/// # 円・円弧は放射方向で定義する
+///
+/// 円・円弧は距離を `| |reference − center| − r |`（放射距離）、側を中心との内外で定義する。
+/// これは [`Shape::offset`]（[`mcad_geom::Circle::offset`] / [`mcad_geom::Arc::offset`]）が
+/// 「中心・角度を保った同心円/同心弧へ半径を ± d する」規則と一致するため、通過点が確実に
+/// 結果上へ載る。有限弧への最近点距離（[`distance_to`]）を使うと、クリック角が掃引範囲外の
+/// ときに最近点が端点になって接線方向成分が距離へ混入し、「通過点を通る」契約と矛盾する。
+/// なお掃引範囲外をクリックした場合、結果は同心弧なので通過点（の角度）は結果の弧には
+/// 載らない（放射距離は正しく取れるが弧の角度範囲外）。これは仕様として許容する。
+///
+/// 線分・ポリラインは最近点までの垂線距離（[`distance_to`]）をそのまま使う。
+fn through_point_distance(geom: &Shape, reference: Point2) -> f64 {
+    match geom {
+        Shape::Circle(c) => (reference.distance(c.center) - c.radius).abs(),
+        Shape::Arc(a) => (reference.distance(a.center) - a.radius).abs(),
+        _ => distance_to(geom, reference),
+    }
+}
+
+/// オフセットの距離と側の参照点を、距離入力欄の状態から決める（設計判断5）。
+///
+/// - `fixed_distance` が `Some(d)`（正の有限値）: 距離は `d`、側は `reference`（クリック／
+///   カーソル）で決める（数値入力方式）。
+/// - `None`: `reference` を通過点とみなし、距離 = [`through_point_distance`]（円・円弧は
+///   放射距離、それ以外は最短距離）、側 = `reference`（通過点方式）。
+fn offset_params(geom: &Shape, reference: Point2, fixed_distance: Option<f64>) -> (f64, Point2) {
+    match fixed_distance {
+        Some(d) => (d, reference),
+        None => (through_point_distance(geom, reference), reference),
+    }
+}
+
+/// [`OffsetError`] を ASCII ステータスメッセージへ対応付ける（egui 既定フォントは CJK 非対応
+/// のため可視文字列は ASCII 限定）。文言は geom 側に持たせず UI 側で決める。
+fn offset_error_message(err: OffsetError) -> &'static str {
+    match err {
+        OffsetError::NonPositiveDistance => "Zero offset distance - offset cancelled",
+        OffsetError::RadiusCollapse => "Distance too large for inner offset - cancelled",
+        OffsetError::Degenerate => "Zero-length target - offset cancelled",
+        OffsetError::Unsupported => "Cannot offset a point",
+    }
+}
+
 /// 選択・編集ツール。単一選択（クリック）・矩形選択（ドラッグ）・移動（M、2クリック
 /// 配置）・複製（Ctrl+D、2クリック配置）・回転（R、3クリック）・鏡映（Shift+M、軸2点）・
 /// 削除（Delete/Backspace）を担う。設計判断の詳細は [`DragState`] と [`Placement`] の doc を参照。
@@ -696,6 +788,9 @@ pub struct SelectTool {
     /// 進行中の配置モード（複製・移動など2段階クリック）。無ければ `None`。
     /// アクティブな間は通常のクリック選択・矩形選択より優先される（入力ゲート）。
     placement: Option<Placement>,
+    /// 進行中のオフセットモード（`O`、単一エンティティ対象の1クリック操作）。無ければ `None`。
+    /// 配置モードと同様、アクティブな間は通常の選択入力より優先される（入力ゲート）。
+    offset: Option<OffsetState>,
 }
 
 /// エンティティの所属レイヤーが可視か（非表示レイヤーは描画・ヒットテスト対象外）。
@@ -859,6 +954,8 @@ impl SelectTool {
             return false;
         }
         self.drag = None;
+        // オフセットモードとは排他（同時には進行しない）。
+        self.offset = None;
         self.placement = Some(Placement {
             kind,
             stage: PlacementStage::WaitingP1,
@@ -1036,6 +1133,112 @@ impl SelectTool {
     /// Document は一切変更しない。選択集合も変えない。
     pub fn cancel_placement(&mut self) {
         self.placement = None;
+    }
+
+    // --- オフセットモード（O、単一エンティティ1クリック。設計判断5） ---
+
+    /// `O`: オフセットモードを開始する。選択が**ちょうど1個**のときだけ起動して `true`。
+    /// 空・複数のときは何もせず `false`（呼び出し側が ASCII ステータスメッセージを出す）。
+    ///
+    /// 通過点1点に対して複数対象の距離が一意に定まらないため、対象は単一に限定する
+    /// （AutoCAD も1対象ずつ）。進行中のドラッグ・配置モードは両立しないため破棄する。
+    pub fn start_offset(&mut self) -> bool {
+        if self.selection.len() != 1 {
+            return false;
+        }
+        self.drag = None;
+        self.placement = None;
+        self.offset = Some(OffsetState {
+            target: self.selection[0],
+            cursor: Point2::ORIGIN,
+        });
+        true
+    }
+
+    /// オフセットモードが進行中か。`McadApp` はこれで通常のクリック選択・矩形選択を
+    /// ゲートし、オフセット用の入力経路だけを通す（[`SelectTool::is_placing`] と同じ思想）。
+    #[must_use]
+    pub fn is_offsetting(&self) -> bool {
+        self.offset.is_some()
+    }
+
+    /// オフセットのプレビュー用カーソル位置を更新する。非オフセット中は何もしない。
+    pub fn offset_move(&mut self, world: Point2) {
+        if let Some(state) = &mut self.offset {
+            state.cursor = world;
+        }
+    }
+
+    /// オフセットモードを解除する（Esc・ツール切替・ファイル操作・モーダル表示から呼ぶ）。
+    /// Document は一切変更しない。選択集合も変えない。
+    pub fn cancel_offset(&mut self) {
+        self.offset = None;
+    }
+
+    /// オフセットのプレビュー形状（いま確定した場合の結果ゴースト）。退化して結果を
+    /// 作れない・対象が消えている・オフセット中でない場合は `None`（ゴーストを描かない）。
+    ///
+    /// `fixed_distance` は距離入力欄の解析値（`Some(正の有限値)` なら固定距離＋カーソル側、
+    /// `None` ならカーソルを通過点とみなす通過点方式。[`offset_params`] 参照）。
+    #[must_use]
+    pub fn offset_preview(
+        &self,
+        document: &Document,
+        fixed_distance: Option<f64>,
+    ) -> Option<Shape> {
+        let state = self.offset?;
+        let entity = document.entity(state.target)?;
+        let (distance, toward) = offset_params(&entity.geom, state.cursor, fixed_distance);
+        entity.geom.offset(distance, toward).ok()
+    }
+
+    /// オフセットモードでのクリック確定。単一クリックで結果を確定するかキャンセルする
+    /// （多段クリックではないので `Continue` は返さない）。確定・キャンセルいずれでも
+    /// オフセットモードは解除する。選択集合は元エンティティのまま維持する（設計判断5:
+    /// 同一元からの等間隔連続オフセットを `O` 再押下で繰り返しやすくするため）。
+    ///
+    /// - `fixed_distance` が `None`（通過点方式）で通過点が対象上（ピック許容量 `tol` 内）
+    ///   なら、距離ゼロの no-op を防ぐためキャンセルする。
+    /// - それ以外は [`Shape::offset`] を呼び、`Ok` なら元のレイヤー・スタイルを複製して
+    ///   幾何のみ差し替えた `AddEntity` を返し、`Err`（半径消滅・ゼロ長など）は
+    ///   ASCII メッセージでキャンセルする。
+    #[must_use]
+    pub fn offset_click(
+        &mut self,
+        document: &Document,
+        world: Point2,
+        tol: f64,
+        fixed_distance: Option<f64>,
+    ) -> OffsetOutcome {
+        let Some(state) = self.offset else {
+            return OffsetOutcome::Cancelled("No offset in progress");
+        };
+        // 対象が（undo 等で）消えていれば静かに終了する。
+        let Some(entity) = document.entity(state.target) else {
+            self.offset = None;
+            return OffsetOutcome::Cancelled("Offset target missing");
+        };
+        // 通過点方式で通過点が対象上（ピック許容量内）なら距離ゼロの no-op を拒否する。
+        // 距離は側の判定と同じ [`through_point_distance`]（円・円弧は放射距離）で測るので、
+        // 弧の半径上を掃引外にクリックした場合（放射距離ほぼゼロ）もここで確実に弾ける。
+        // geom の EPS(1e-9) より粗いピック許容量で先に弾く（設計判断5）。
+        if fixed_distance.is_none() && through_point_distance(&entity.geom, world) <= tol {
+            self.offset = None;
+            return OffsetOutcome::Cancelled("Zero offset distance - offset cancelled");
+        }
+        let (distance, toward) = offset_params(&entity.geom, world, fixed_distance);
+        let result = entity.geom.offset(distance, toward);
+        // クリックで必ずモードを抜ける（成功でもキャンセルでも）。
+        self.offset = None;
+        match result {
+            Ok(geom) => {
+                // 元エンティティのレイヤー・スタイルを丸ごと複製し、幾何のみ差し替える。
+                let mut copy = entity.clone();
+                copy.geom = geom;
+                OffsetOutcome::Commit(Command::AddEntity(copy))
+            }
+            Err(err) => OffsetOutcome::Cancelled(offset_error_message(err)),
+        }
     }
 
     /// 配置モードのプレビュー情報。プレビュー対象の段階でなければ `None`。
@@ -2741,5 +2944,268 @@ mod tests {
         assert!(tool.placement_preview().is_none());
         assert_eq!(tool.selection(), &[a]);
         assert_eq!(doc.entity(a).unwrap().geom, before_a);
+    }
+
+    // --- オフセットモード（O、単一エンティティ。設計判断5） ---
+
+    /// カレントレイヤー上に円を追加して [`EntityId`] を返すヘルパー。
+    fn add_circle(doc: &mut Document, center: Point2, radius: f64) -> EntityId {
+        let layer = doc.current_layer();
+        let entity = Entity::new(
+            Shape::Circle(mcad_geom::Circle::new(center, radius)),
+            layer,
+            Style::inherited(),
+        );
+        doc.apply(Command::AddEntity(entity)).unwrap().entities[0]
+    }
+
+    /// カレントレイヤー上に円弧を追加して [`EntityId`] を返すヘルパー。
+    fn add_arc(doc: &mut Document, center: Point2, radius: f64, start: f64, end: f64) -> EntityId {
+        let layer = doc.current_layer();
+        let entity = Entity::new(
+            Shape::Arc(Arc::new(center, radius, start, end)),
+            layer,
+            Style::inherited(),
+        );
+        doc.apply(Command::AddEntity(entity)).unwrap().entities[0]
+    }
+
+    #[test]
+    fn offset_arc_through_point_uses_radial_distance_within_sweep() {
+        use std::f64::consts::FRAC_PI_2;
+        // 中心原点・半径5・第1象限(0〜90°)の弧。掃引内の点 (10,10)(角度45°)を通過点に。
+        let mut doc = Document::new();
+        let arc = add_arc(&mut doc, Point2::ORIGIN, 5.0, 0.0, FRAC_PI_2);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![arc]);
+        assert!(tool.start_offset());
+
+        let p = Point2::new(10.0, 10.0); // 半径 sqrt(200)≈14.142, 放射距離≈9.142, 外側
+        let outcome = tool.offset_click(&doc, p, 0.1, None);
+        let OffsetOutcome::Commit(Command::AddEntity(entity)) = outcome else {
+            panic!("expected Commit(AddEntity), got {outcome:?}");
+        };
+        match entity.geom {
+            Shape::Arc(a) => {
+                // 放射距離ぶん外へ → 新半径 = 元の |p−center|。角度・中心は不変。
+                assert!((a.radius - p.distance(Point2::ORIGIN)).abs() < 1e-9);
+                assert!(a.center.distance(Point2::ORIGIN) < 1e-9);
+                assert!((a.start_angle - 0.0).abs() < 1e-9);
+                assert!((a.end_angle - FRAC_PI_2).abs() < 1e-9);
+                // 掃引内なので結果は通過点を通る。
+                assert!(mcad_geom::distance_to(&entity.geom, p) < 1e-6);
+            }
+            other => panic!("expected offset arc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offset_arc_through_point_out_of_sweep_uses_radial_not_endpoint() {
+        use std::f64::consts::FRAC_PI_2;
+        // 第1象限の弧。掃引範囲外（第2象限、角度180°）の点 (-8,0) を通過点に。
+        // 放射距離 = |8−5| = 3(外側)。距離が有限弧の最近点(端点)距離ではなく放射距離で
+        // 決まることを確認する（distance_to だと端点までで ~9.4 になり別の半径になる）。
+        let mut doc = Document::new();
+        let arc = add_arc(&mut doc, Point2::ORIGIN, 5.0, 0.0, FRAC_PI_2);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![arc]);
+        assert!(tool.start_offset());
+
+        let outcome = tool.offset_click(&doc, Point2::new(-8.0, 0.0), 0.1, None);
+        let OffsetOutcome::Commit(Command::AddEntity(entity)) = outcome else {
+            panic!("expected Commit(AddEntity), got {outcome:?}");
+        };
+        match entity.geom {
+            Shape::Arc(a) => {
+                assert!((a.radius - 8.0).abs() < 1e-9, "radius {} != 8", a.radius);
+            }
+            other => panic!("expected offset arc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offset_arc_through_point_on_radius_out_of_sweep_is_zero_distance() {
+        use std::f64::consts::FRAC_PI_2;
+        // 掃引外だが弧の半径上（(-5,0)、放射距離0）→ 距離ゼロ no-op として拒否する。
+        // 有限弧の最近点距離（端点まで ~7）を使っていたら誤って確定してしまうケース。
+        let mut doc = Document::new();
+        let arc = add_arc(&mut doc, Point2::ORIGIN, 5.0, 0.0, FRAC_PI_2);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![arc]);
+        assert!(tool.start_offset());
+
+        let outcome = tool.offset_click(&doc, Point2::new(-5.0, 0.0), 0.1, None);
+        assert_eq!(
+            outcome,
+            OffsetOutcome::Cancelled("Zero offset distance - offset cancelled")
+        );
+        assert!(!tool.is_offsetting());
+    }
+
+    #[test]
+    fn start_offset_requires_exactly_one_selection() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let b = add_hline(&mut doc, 5.0);
+        let mut tool = SelectTool::default();
+
+        // 空 → 起動しない。
+        assert!(!tool.start_offset());
+        assert!(!tool.is_offsetting());
+
+        // 単一 → 起動する。
+        tool.set_selection(vec![a]);
+        assert!(tool.start_offset());
+        assert!(tool.is_offsetting());
+        tool.cancel_offset();
+
+        // 複数 → 起動しない。
+        tool.set_selection(vec![a, b]);
+        assert!(!tool.start_offset());
+        assert!(!tool.is_offsetting());
+    }
+
+    #[test]
+    fn offset_through_point_commits_and_keeps_original_selection() {
+        // 水平線分 (0,0)-(1,0) を、上方 (0.5,5) を通過点にオフセット → y=5 の線分。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a]);
+        assert!(tool.start_offset());
+
+        // 通過点方式（距離入力なし）。
+        let outcome = tool.offset_click(&doc, Point2::new(0.5, 5.0), 0.1, None);
+        let OffsetOutcome::Commit(Command::AddEntity(entity)) = outcome else {
+            panic!("expected Commit(AddEntity), got {outcome:?}");
+        };
+        match entity.geom {
+            Shape::Line(l) => {
+                assert!(l.a.distance(Point2::new(0.0, 5.0)) < 1e-9);
+                assert!(l.b.distance(Point2::new(1.0, 5.0)) < 1e-9);
+            }
+            other => panic!("expected offset line, got {other:?}"),
+        }
+        // 確定後: モード解除、選択は元エンティティのまま維持（設計判断5）。
+        assert!(!tool.is_offsetting());
+        assert_eq!(tool.selection(), &[a]);
+    }
+
+    #[test]
+    fn offset_fixed_distance_uses_input_and_click_side() {
+        // 距離入力欄に 2 が入っている場合、クリックは側の決定のみに使う。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a]);
+        assert!(tool.start_offset());
+
+        // 下側 (0.5,-5) をクリック、固定距離 2 → y=-2 の線分。
+        let outcome = tool.offset_click(&doc, Point2::new(0.5, -5.0), 0.1, Some(2.0));
+        let OffsetOutcome::Commit(Command::AddEntity(entity)) = outcome else {
+            panic!("expected Commit(AddEntity), got {outcome:?}");
+        };
+        match entity.geom {
+            Shape::Line(l) => {
+                assert!(l.a.distance(Point2::new(0.0, -2.0)) < 1e-9);
+                assert!(l.b.distance(Point2::new(1.0, -2.0)) < 1e-9);
+            }
+            other => panic!("expected offset line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offset_through_point_on_target_is_cancelled() {
+        // 通過点が対象上（ピック許容量内）→ 距離ゼロの no-op を拒否。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a]);
+        assert!(tool.start_offset());
+
+        let outcome = tool.offset_click(&doc, Point2::new(0.5, 0.0), 0.1, None);
+        assert_eq!(
+            outcome,
+            OffsetOutcome::Cancelled("Zero offset distance - offset cancelled")
+        );
+        assert!(!tool.is_offsetting());
+    }
+
+    #[test]
+    fn offset_circle_inner_collapse_is_cancelled() {
+        // 円 (中心原点・半径5) の内側へ距離5以上 → 半径消滅で拒否。
+        let mut doc = Document::new();
+        let c = add_circle(&mut doc, Point2::ORIGIN, 5.0);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![c]);
+        assert!(tool.start_offset());
+
+        let outcome = tool.offset_click(&doc, Point2::ORIGIN, 0.1, Some(5.0));
+        assert_eq!(
+            outcome,
+            OffsetOutcome::Cancelled("Distance too large for inner offset - cancelled")
+        );
+        assert!(!tool.is_offsetting());
+        // Document は変更されていない（元の円だけ）。
+        assert_eq!(doc.entities().count(), 1);
+    }
+
+    #[test]
+    fn offset_preview_reflects_side_and_degeneracy() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a]);
+        assert!(tool.start_offset());
+
+        // カーソルが対象上（通過点方式で距離ほぼ0）→ 退化してゴーストなし。
+        tool.offset_move(Point2::new(0.5, 0.0));
+        assert!(tool.offset_preview(&doc, None).is_none());
+
+        // カーソルを上方へ → ゴーストは y=3 の線分。
+        tool.offset_move(Point2::new(0.5, 3.0));
+        match tool.offset_preview(&doc, None) {
+            Some(Shape::Line(l)) => {
+                assert!(l.a.distance(Point2::new(0.0, 3.0)) < 1e-9);
+                assert!(l.b.distance(Point2::new(1.0, 3.0)) < 1e-9);
+            }
+            other => panic!("expected line ghost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_offset_keeps_selection_and_document() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let before = doc.entity(a).unwrap().geom.clone();
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a]);
+        assert!(tool.start_offset());
+        assert!(tool.is_offsetting());
+
+        tool.cancel_offset();
+        assert!(!tool.is_offsetting());
+        assert_eq!(tool.selection(), &[a]);
+        assert_eq!(doc.entity(a).unwrap().geom, before);
+    }
+
+    #[test]
+    fn start_offset_disarms_placement_and_vice_versa() {
+        // オフセットと配置モードは排他。
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a]);
+
+        assert!(tool.start_duplicate());
+        assert!(tool.is_placing());
+        // オフセット開始で配置が畳まれる。
+        assert!(tool.start_offset());
+        assert!(tool.is_offsetting());
+        assert!(!tool.is_placing());
+        // 逆向き: 配置開始でオフセットが畳まれる。
+        assert!(tool.start_move());
+        assert!(tool.is_placing());
+        assert!(!tool.is_offsetting());
     }
 }

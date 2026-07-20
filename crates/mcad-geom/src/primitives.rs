@@ -30,6 +30,56 @@ fn mirror_point(p: Point2, axis_a: Point2, axis_b: Point2) -> Point2 {
     axis_a + (p - axis_a).reflected(axis_b - axis_a)
 }
 
+/// オフセット（[`Shape::offset`] および各プリミティブの `offset`）が退化して結果を
+/// 作れない理由。
+///
+/// geom は GUI 非依存なので、ここでは理由の列挙のみを返し、ユーザー向け文言は持たない
+/// （UI 側 mcad-app が ASCII ステータスメッセージへ対応付ける）。退化仕様は DESIGN.md
+/// M5 設計判断5 に従う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetError {
+    /// オフセット距離が正の有限値でない（0・負・NaN・∞）。距離ゼロの no-op を含む。
+    NonPositiveDistance,
+    /// 円・円弧の内側オフセットで距離が半径以上（半径が消滅・反転する）。
+    RadiusCollapse,
+    /// 対象が退化（ゼロ長線分・全頂点が同一のポリライン）で法線が定義不能。
+    Degenerate,
+    /// オフセットを定義できない対象（点）。
+    Unsupported,
+}
+
+/// 距離が「正の有限値」か。オフセット距離の共通ガード（距離ゼロ・負・非有限を弾く）。
+#[inline]
+fn valid_offset_distance(distance: f64) -> bool {
+    distance > 0.0 && distance.is_finite()
+}
+
+/// 無限直線どうしの交点。`p1` を通り方向 `d1` の直線と、`p2` を通り方向 `d2` の直線。
+///
+/// 2 方向がほぼ平行（`|d1 × d2| <= EPS·|d1|·|d2|`、= なす角の sin が EPS 未満）だと
+/// 交点が無限遠へ飛び数値的に不安定なため `None` を返す（平行判定は他の幾何述語と
+/// 同じ相対 EPS 基準。[`crate::EPS`] の doc 参照）。ポリラインのオフセットで、平行移動
+/// した隣接セグメントのマイター交点を求めるのに使う。
+#[must_use]
+fn line_intersection(p1: Point2, d1: Vec2, p2: Point2, d2: Vec2) -> Option<Point2> {
+    let denom = d1.cross(d2);
+    if denom.abs() <= crate::EPS * d1.length() * d2.length() {
+        return None;
+    }
+    // p1 + t·d1 = p2 + u·d2 を d2 との外積で解く（u を消去）。
+    let t = (p2 - p1).cross(d2) / denom;
+    Some(p1 + d1 * t)
+}
+
+/// ポリラインオフセットのマイター上限（頂点→マイター交点の距離 ÷ オフセット距離）。
+///
+/// 浅い角では平行判定（`sin(角) <= EPS`）をわずかに超えただけでもマイター交点がオフセット
+/// 距離の数百万倍へ飛び、有限値なので検証を通過して確定され、fit で図面が見かけ上空になる。
+/// これを防ぐため、マイター長が `MITER_LIMIT × distance` を超えたらベベルへフォールバックする。
+/// 値 4.0 は SVG/Canvas の `stroke-miterlimit` 既定と同じ（内角およそ 29° 以下でベベル化）で、
+/// 実用的な角では鋭いマイター角を保ちつつ、スパイクだけを抑える定番のしきい値。
+const MITER_LIMIT: f64 = 4.0;
+
 /// 線分。始点 `a` と終点 `b`。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LineSeg {
@@ -113,6 +163,33 @@ impl LineSeg {
             mirror_point(self.b, axis_a, axis_b),
         )
     }
+
+    /// 距離 `distance`（正の有限値）だけ、参照点 `toward` のある側へ法線平行移動した線分。
+    ///
+    /// 側は「線分を含む無限直線に対して `toward` がどちら側にあるか」で決める（最近点
+    /// → `toward` の向き。DESIGN.md M5 設計判断5）。両端点を同じ単位法線ベクトルで
+    /// 平行移動するため、長さと向きは保存される。
+    ///
+    /// # Errors
+    ///
+    /// - [`OffsetError::NonPositiveDistance`] — `distance` が正の有限値でない。
+    /// - [`OffsetError::Degenerate`] — 長さ 0 の線分で法線が定義できない。
+    pub fn offset(self, distance: f64, toward: Point2) -> Result<LineSeg, OffsetError> {
+        if !valid_offset_distance(distance) {
+            return Err(OffsetError::NonPositiveDistance);
+        }
+        let Some(normal) = self.direction().perp().normalize() else {
+            return Err(OffsetError::Degenerate);
+        };
+        // `toward` のある側を向く単位法線に符号を合わせる（perp は左法線）。
+        let unit = if (toward - self.a).dot(normal) >= 0.0 {
+            normal
+        } else {
+            -normal
+        };
+        let off = unit * distance;
+        Ok(LineSeg::new(self.a + off, self.b + off))
+    }
 }
 
 /// 円。中心 `center` と半径 `radius`。
@@ -185,6 +262,32 @@ impl Circle {
     #[must_use]
     pub fn mirrored(self, axis_a: Point2, axis_b: Point2) -> Circle {
         Circle::new(mirror_point(self.center, axis_a, axis_b), self.radius)
+    }
+
+    /// 距離 `distance`（正の有限値）だけ半径を増減したオフセット円。中心は不変。
+    ///
+    /// `toward` が中心より外側（中心からの距離 >= 半径）なら外側オフセット
+    /// （`radius + distance`）、内側なら内側オフセット（`radius − distance`）とする
+    /// （DESIGN.md M5 設計判断5）。
+    ///
+    /// # Errors
+    ///
+    /// - [`OffsetError::NonPositiveDistance`] — `distance` が正の有限値でない。
+    /// - [`OffsetError::RadiusCollapse`] — 内側オフセットで `distance >= radius`（半径が消滅・反転する）。
+    pub fn offset(self, distance: f64, toward: Point2) -> Result<Circle, OffsetError> {
+        if !valid_offset_distance(distance) {
+            return Err(OffsetError::NonPositiveDistance);
+        }
+        let outward = (toward - self.center).length() >= self.radius;
+        let new_radius = if outward {
+            self.radius + distance
+        } else if distance >= self.radius {
+            // 内側で半径以上のオフセットは半径が 0 以下になり退化するため拒否する。
+            return Err(OffsetError::RadiusCollapse);
+        } else {
+            self.radius - distance
+        };
+        Ok(Circle::new(self.center, new_radius))
     }
 }
 
@@ -344,9 +447,25 @@ impl Arc {
     /// `new_start = reflect_angle(end_angle)`、`new_end = reflect_angle(start_angle)`。
     /// これにより「元の弧が start→end へ CCW に掃引する」なら「鏡映後の弧も
     /// new_start→new_end へ CCW に掃引する」ことが保証される。
+    ///
+    /// # 退化軸のガード
+    ///
+    /// 軸 2 点がほぼ同一（`|axis_b − axis_a| <= EPS`）だと軸の向きが定まらず、
+    /// `alpha = (axis_b − axis_a).angle()` が `atan2(0, 0) = 0` に化ける。すると
+    /// 中心は [`mirror_point`]（内部で [`Vec2::reflected`] が退化軸を恒等写像として
+    /// 扱う）により不変のまま、開始/終了角だけが「x 軸に対する反射」で反転してしまい、
+    /// 中心と角度が食い違った不整合な弧になる。これを避けるため、退化軸では無変換で
+    /// `self` のクローンをそのまま返す（他プリミティブの `mirrored` は
+    /// [`Vec2::reflected`] のガードにより退化軸で自動的に恒等になるが、`Arc` は角度の
+    /// 反射を別途行うため明示的にガードする。geom は tcad からも直接使われるので防御
+    /// する。DESIGN.md M5 設計判断5）。
     #[inline]
     #[must_use]
     pub fn mirrored(self, axis_a: Point2, axis_b: Point2) -> Arc {
+        // 退化軸（2 点がほぼ同一）は無変換で自身を返す（上記 doc 参照）。
+        if (axis_b - axis_a).length() <= crate::EPS {
+            return self;
+        }
         let alpha = (axis_b - axis_a).angle();
         let reflect_angle = |theta: f64| 2.0 * alpha - theta;
         Arc::new(
@@ -355,6 +474,35 @@ impl Arc {
             reflect_angle(self.end_angle),
             reflect_angle(self.start_angle),
         )
+    }
+
+    /// 距離 `distance`（正の有限値）だけ半径を増減したオフセット円弧。中心・開始/終了角は
+    /// 不変（同心の弧）。
+    ///
+    /// 半径の増減は台円（[`Arc::circle`]）の [`Circle::offset`] に委譲する（外側／内側の
+    /// 判定・退化ガードを共有する）。中心・角度が不変なので、掃引の向きや角度範囲は
+    /// そのまま保存される（DESIGN.md M5 設計判断5）。
+    ///
+    /// # 通過点方式との関係
+    ///
+    /// 内外の側は `toward` の中心からの放射方向（`|toward − center|` と `radius` の大小）で
+    /// 決まり、`toward` の角度は結果に影響しない。したがって通過点方式では距離も放射距離
+    /// `| |toward − center| − radius |` を渡すこと（UI 側 `through_point_distance` が担当）。
+    /// `toward` の角度が掃引範囲外でも同心弧を返すが、その場合は結果の弧が通過点を通らない
+    /// （放射方向には正しく載るが弧の角度範囲外になる）。これは仕様として許容する。
+    ///
+    /// # Errors
+    ///
+    /// [`Circle::offset`] と同じ（[`OffsetError::NonPositiveDistance`] /
+    /// [`OffsetError::RadiusCollapse`]）。
+    pub fn offset(self, distance: f64, toward: Point2) -> Result<Arc, OffsetError> {
+        let base = self.circle().offset(distance, toward)?;
+        Ok(Arc::new(
+            base.center,
+            base.radius,
+            self.start_angle,
+            self.end_angle,
+        ))
     }
 }
 
@@ -452,6 +600,138 @@ impl Polyline {
             self.closed,
         )
     }
+
+    /// 距離 `distance`（正の有限値）だけ、参照点 `toward` のある側へオフセットした
+    /// ポリライン（DESIGN.md M5 設計判断3・設計判断5 の「単純方式」）。
+    ///
+    /// # アルゴリズム
+    ///
+    /// 1. **側の決定**: `toward` に最も近い非退化セグメントの左法線符号で、全体の
+    ///    オフセット方向（符号付き距離 `s`）を1つ決める。ポリライン全体を一貫した
+    ///    側へずらすため、側はセグメントごとではなく1回だけ決める。
+    /// 2. **各セグメントの平行移動**: セグメント `i` を左法線 `perp(dir_i)` 方向へ
+    ///    `s` だけ平行移動する（`s` は全セグメント共通なので、パスに沿って一貫した
+    ///    側になる）。
+    /// 3. **頂点の再構成（マイター接続）**: 各元頂点を、そこで交わる「平行移動後の
+    ///    隣接2セグメントを含む無限直線」の交点へ置き換える（閉じている場合は末尾↔先頭も
+    ///    接続する。開いている場合の両端頂点は、唯一隣接するセグメントの平行移動先を使う）。
+    /// 4. **ベベルへのフォールバック**: 次のいずれかならマイターを諦めてベベルにする:
+    ///    (a) 隣接セグメントがほぼ平行で交点が数値的に不安定（[`line_intersection`] が `None`）、
+    ///    (b) マイター長（頂点→交点の距離）が `MITER_LIMIT × distance` を超える（浅い角の
+    ///    スパイク防止）。**ベベルは平行移動後の2端点を両方出力する**（頂点は 1→2 個に増える。
+    ///    「頂点数維持」は仕様から撤回）。直線継続（2端点がほぼ一致）のときのみ 1 頂点に畳む。
+    ///    2端点の中点1点への畳み込みは、180°折り返しで法線が正反対になり中点が元頂点へ退化して
+    ///    「オフセットでもベベルでもない」形状になるため採らない（設計判断5 の 2026-07-19 追記）。
+    ///
+    /// **出力頂点数は元と一致しない**（角の数だけベベルで増えうる）。自己交差は仕様として
+    /// 許容する（設計判断3）。
+    ///
+    /// # Errors
+    ///
+    /// - [`OffsetError::NonPositiveDistance`] — `distance` が正の有限値でない。
+    /// - [`OffsetError::Degenerate`] — 頂点が2未満、または全セグメントがゼロ長で法線が定義できない。
+    pub fn offset(&self, distance: f64, toward: Point2) -> Result<Polyline, OffsetError> {
+        if !valid_offset_distance(distance) {
+            return Err(OffsetError::NonPositiveDistance);
+        }
+        let n = self.vertices.len();
+        if n < 2 {
+            return Err(OffsetError::Degenerate);
+        }
+        let segs: Vec<LineSeg> = self.segments().collect();
+        // 各セグメントの左法線単位ベクトル。ゼロ長セグメントは `None`。
+        let normals: Vec<Option<Vec2>> = segs
+            .iter()
+            .map(|s| s.direction().perp().normalize())
+            .collect();
+
+        // 側の符号を、`toward` に最も近い非退化セグメントの左法線で決める。
+        let mut best: Option<(f64, usize)> = None;
+        for (i, s) in segs.iter().enumerate() {
+            if normals[i].is_none() {
+                continue;
+            }
+            let d2 = toward.distance_squared(s.closest_point(toward));
+            if best.is_none_or(|(bd, _)| d2 < bd) {
+                best = Some((d2, i));
+            }
+        }
+        let Some((_, ci)) = best else {
+            // 非退化セグメントが1本もない（全頂点が同一点）。
+            return Err(OffsetError::Degenerate);
+        };
+        let closest_normal = normals[ci].expect("closest index is non-degenerate");
+        let signed_distance = if (toward - segs[ci].a).dot(closest_normal) >= 0.0 {
+            distance
+        } else {
+            -distance
+        };
+
+        // 各セグメントのオフセット変位（左法線 × 符号付き距離）。退化は `None`。
+        let offs: Vec<Option<Vec2>> = normals
+            .iter()
+            .map(|nrm| nrm.map(|u| u * signed_distance))
+            .collect();
+
+        // 頂点 `j` に接続する「入る側／出る側」のセグメント index を返す。
+        //   入る側 = 終点が v_j のセグメント、出る側 = 始点が v_j のセグメント。
+        let seg_count = segs.len();
+        let incident = |j: usize| -> (Option<usize>, Option<usize>) {
+            if self.closed {
+                // 閉: seg_count == n。v_j へ入るのは seg (j+n-1)%n、出るのは seg j。
+                (Some((j + n - 1) % n), Some(j % seg_count))
+            } else {
+                // 開: seg_count == n-1。両端頂点は片側のみ。
+                let inc = j.checked_sub(1).filter(|&i| i < seg_count);
+                let out = (j < seg_count).then_some(j);
+                (inc, out)
+            }
+        };
+
+        // 平行移動後の「オフセット直線」を (直線上の1点, 方向) で表す。退化セグメントは None。
+        let offset_line = |seg_idx: usize, vertex: Point2| -> Option<(Point2, Vec2)> {
+            offs[seg_idx].map(|o| (vertex + o, segs[seg_idx].direction()))
+        };
+
+        // 出力頂点はベベルで増えうるので下限のみ確保する。
+        let mut out_vertices = Vec::with_capacity(n);
+        for j in 0..n {
+            let v = self.vertices[j];
+            let (inc, out) = incident(j);
+            let inc_line = inc.and_then(|i| offset_line(i, v));
+            let out_line = out.and_then(|i| offset_line(i, v));
+            match (inc_line, out_line) {
+                (Some((pi, di)), Some((po, dou))) => {
+                    // マイター交点。ただし平行（交点なし）か、マイター長が上限超（浅い角の
+                    // スパイク）ならベベルへフォールバックする。
+                    let miter = line_intersection(pi, di, po, dou)
+                        .filter(|q| v.distance(*q) <= MITER_LIMIT * distance);
+                    match miter {
+                        Some(q) => out_vertices.push(q),
+                        None => {
+                            // ベベル。平行移動後の端点 `pi`（入る側）・`po`（出る側）は、
+                            // 直線継続なら同じ側でほぼ一致するので1頂点に畳む。折返し・鋭角
+                            // （法線が逆向き）は中点だと元頂点へ退化するため2端点を両方残す。
+                            // 同側判定は変位の内積符号で行う（`perp` は内積を保つので、変位の
+                            // 内積符号 = 隣接セグメント方向の内積符号 = 折返しかどうか）。
+                            if (pi - v).dot(po - v) >= 0.0 {
+                                out_vertices.push(pi);
+                            } else {
+                                out_vertices.push(pi);
+                                out_vertices.push(po);
+                            }
+                        }
+                    }
+                }
+                // 片側のみ（開ポリラインの端点、または隣が退化）: その平行移動先を使う。
+                (Some((pi, _)), None) => out_vertices.push(pi),
+                (None, Some((po, _))) => out_vertices.push(po),
+                // 両隣とも退化: 元頂点をそのまま残す（最善努力）。
+                (None, None) => out_vertices.push(v),
+            }
+        }
+        Ok(Polyline::new(out_vertices, self.closed))
+    }
 }
 
 /// エンティティの幾何を表す列挙型。mcad-core の `Entity { geom: Shape, .. }` が使う。
@@ -540,6 +820,29 @@ impl Shape {
             Shape::Circle(c) => Shape::Circle(c.mirrored(axis_a, axis_b)),
             Shape::Arc(a) => Shape::Arc(a.mirrored(axis_a, axis_b)),
             Shape::Polyline(pl) => Shape::Polyline(pl.mirrored(axis_a, axis_b)),
+        }
+    }
+
+    /// 形状全体を距離 `distance` だけ、参照点 `toward` のある側へオフセットした新しい
+    /// 形状を返す純関数（DESIGN.md M5 設計判断5）。
+    ///
+    /// 各プリミティブの `offset` へ委譲する: 線分＝法線平行移動、円・円弧＝半径 ± d、
+    /// ポリライン＝各セグメント平行移動＋隣接無限直線の交点接続。オフセット結果は
+    /// 選択エンティティの複製（`Command::AddEntity`、レイヤー・スタイルは元を複製）に
+    /// 載せる幾何として使う。[`Shape::translated`] と同じく GUI 非依存の再利用可能な
+    /// 幾何演算として mcad-geom 側に置く（app 層での座標いじりを禁止する）。
+    ///
+    /// # Errors
+    ///
+    /// 対象・距離が退化して結果を作れない場合に [`OffsetError`]。[`Shape::Point`] は
+    /// オフセットを定義できないため常に [`OffsetError::Unsupported`]。
+    pub fn offset(&self, distance: f64, toward: Point2) -> Result<Shape, OffsetError> {
+        match self {
+            Shape::Point(_) => Err(OffsetError::Unsupported),
+            Shape::Line(s) => s.offset(distance, toward).map(Shape::Line),
+            Shape::Circle(c) => c.offset(distance, toward).map(Shape::Circle),
+            Shape::Arc(a) => a.offset(distance, toward).map(Shape::Arc),
+            Shape::Polyline(pl) => pl.offset(distance, toward).map(Shape::Polyline),
         }
     }
 
@@ -990,6 +1293,250 @@ mod tests {
     fn rotated_by_zero_is_identity() {
         let arc = Shape::Arc(Arc::new(Point2::new(1.0, 2.0), 3.0, 0.5, 2.0));
         assert_eq!(arc.rotated(Point2::new(5.0, -1.0), 0.0), arc);
+    }
+
+    #[test]
+    fn arc_mirror_degenerate_axis_returns_self() {
+        // 軸 2 点がほぼ同一なら無変換で自身を返す（退化軸ガード、設計判断5）。
+        let arc = Arc::new(Point2::new(1.0, 2.0), 3.0, 0.5, 2.0);
+        let p = Point2::new(4.0, 4.0);
+        assert_eq!(arc.mirrored(p, p), arc);
+        // EPS 未満のわずかな差でも自身を返す。
+        let q = Point2::new(4.0 + 1e-12, 4.0);
+        assert_eq!(arc.mirrored(p, q), arc);
+    }
+
+    // --- オフセット（M5 設計判断5） ---
+
+    #[test]
+    fn line_offset_moves_by_normal_on_click_side() {
+        let s = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        // 上側（y>0）をクリック → +2 平行移動。
+        let up = s.offset(2.0, Point2::new(5.0, 5.0)).unwrap();
+        assert!(approx(up.a, Point2::new(0.0, 2.0)));
+        assert!(approx(up.b, Point2::new(10.0, 2.0)));
+        // 下側（y<0）をクリック → −2 平行移動。
+        let down = s.offset(2.0, Point2::new(5.0, -5.0)).unwrap();
+        assert!(approx(down.a, Point2::new(0.0, -2.0)));
+        assert!(approx(down.b, Point2::new(10.0, -2.0)));
+    }
+
+    #[test]
+    fn line_offset_through_point_passes_through_it() {
+        // 通過点方式: distance = 対象までの最短距離。結果は通過点を通る。
+        let s = LineSeg::new(Point2::new(-3.0, 1.0), Point2::new(4.0, 6.0));
+        let p = Point2::new(9.0, -2.0);
+        let d = distance_to(&Shape::Line(s), p);
+        let off = Shape::Line(s).offset(d, p).unwrap();
+        assert!(distance_to(&off, p) < 1e-9);
+    }
+
+    #[test]
+    fn line_offset_degenerate_and_zero_distance_rejected() {
+        let zero = LineSeg::new(Point2::new(2.0, 2.0), Point2::new(2.0, 2.0));
+        assert_eq!(
+            zero.offset(1.0, Point2::new(5.0, 5.0)),
+            Err(OffsetError::Degenerate)
+        );
+        let s = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        assert_eq!(
+            s.offset(0.0, Point2::new(5.0, 5.0)),
+            Err(OffsetError::NonPositiveDistance)
+        );
+        assert_eq!(
+            s.offset(-1.0, Point2::new(5.0, 5.0)),
+            Err(OffsetError::NonPositiveDistance)
+        );
+        assert_eq!(
+            s.offset(f64::NAN, Point2::new(5.0, 5.0)),
+            Err(OffsetError::NonPositiveDistance)
+        );
+    }
+
+    #[test]
+    fn circle_offset_outward_and_inward() {
+        let c = Circle::new(Point2::ORIGIN, 5.0);
+        // 外（中心より遠い点）→ r+d。
+        let out = c.offset(2.0, Point2::new(10.0, 0.0)).unwrap();
+        assert!((out.radius - 7.0).abs() < T);
+        assert!(approx(out.center, Point2::ORIGIN));
+        // 内（中心より近い点）→ r−d。
+        let inn = c.offset(2.0, Point2::new(1.0, 0.0)).unwrap();
+        assert!((inn.radius - 3.0).abs() < T);
+    }
+
+    #[test]
+    fn circle_offset_inner_collapse_rejected() {
+        let c = Circle::new(Point2::ORIGIN, 5.0);
+        // 内側で d == r → 半径 0 になるため拒否。
+        assert_eq!(
+            c.offset(5.0, Point2::new(0.0, 0.0)),
+            Err(OffsetError::RadiusCollapse)
+        );
+        // 内側で d > r も拒否。
+        assert_eq!(
+            c.offset(6.0, Point2::new(1.0, 0.0)),
+            Err(OffsetError::RadiusCollapse)
+        );
+        // 外側は d > r でも問題ない。
+        assert!(c.offset(6.0, Point2::new(10.0, 0.0)).is_ok());
+    }
+
+    #[test]
+    fn arc_offset_preserves_center_and_angles() {
+        use std::f64::consts::FRAC_PI_2;
+        let a = Arc::new(Point2::ORIGIN, 5.0, 0.0, FRAC_PI_2);
+        let out = a.offset(2.0, Point2::new(10.0, 10.0)).unwrap();
+        assert!(approx(out.center, Point2::ORIGIN));
+        assert!((out.radius - 7.0).abs() < T);
+        assert!((out.start_angle - 0.0).abs() < T);
+        assert!((out.end_angle - FRAC_PI_2).abs() < T);
+        // 内側。
+        let inn = a.offset(2.0, Point2::new(1.0, 1.0)).unwrap();
+        assert!((inn.radius - 3.0).abs() < T);
+    }
+
+    #[test]
+    fn polyline_offset_closed_square_inward_and_outward() {
+        // CCW の正方形。左法線は内向き。
+        let sq = Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+                Point2::new(10.0, 10.0),
+                Point2::new(0.0, 10.0),
+            ],
+            true,
+        );
+        // 内側（中心 (5,5)）をクリック → 各辺が内へ 2 → [2,8]^2 の正方形。
+        let inn = sq.offset(2.0, Point2::new(5.0, 5.0)).unwrap();
+        assert_eq!(inn.vertices.len(), 4);
+        assert!(inn.closed);
+        assert!(approx(inn.vertices[0], Point2::new(2.0, 2.0)));
+        assert!(approx(inn.vertices[1], Point2::new(8.0, 2.0)));
+        assert!(approx(inn.vertices[2], Point2::new(8.0, 8.0)));
+        assert!(approx(inn.vertices[3], Point2::new(2.0, 8.0)));
+        // 外側（下辺の外 (5,-5)）をクリック → 各辺が外へ 2 → [-2,12]^2。
+        let out = sq.offset(2.0, Point2::new(5.0, -5.0)).unwrap();
+        assert!(approx(out.vertices[0], Point2::new(-2.0, -2.0)));
+        assert!(approx(out.vertices[1], Point2::new(12.0, -2.0)));
+        assert!(approx(out.vertices[2], Point2::new(12.0, 12.0)));
+        assert!(approx(out.vertices[3], Point2::new(-2.0, 12.0)));
+    }
+
+    #[test]
+    fn polyline_offset_open_l_miters_interior_corner() {
+        // L 字（開）。角 (10,0) を平行移動後の隣接直線の交点で接続する。
+        let l = Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+                Point2::new(10.0, 10.0),
+            ],
+            false,
+        );
+        let off = l.offset(2.0, Point2::new(5.0, 5.0)).unwrap();
+        assert_eq!(off.vertices.len(), 3);
+        assert!(!off.closed);
+        // 端点は片側セグメントの平行移動先、中央はマイター交点 (8,2)。
+        assert!(approx(off.vertices[0], Point2::new(0.0, 2.0)));
+        assert!(approx(off.vertices[1], Point2::new(8.0, 2.0)));
+        assert!(approx(off.vertices[2], Point2::new(8.0, 10.0)));
+    }
+
+    #[test]
+    fn polyline_offset_collinear_stays_single_vertex() {
+        // 一直線（中央頂点が共線）。隣接が平行なのでマイター交点は取れず、直線継続の
+        // ベベル（2端点が一致）で1頂点に畳む。結果は素直に平行移動した3頂点になる。
+        let straight = Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(5.0, 0.0),
+                Point2::new(10.0, 0.0),
+            ],
+            false,
+        );
+        let off = straight.offset(2.0, Point2::new(5.0, 5.0)).unwrap();
+        assert_eq!(off.vertices.len(), 3);
+        assert!(approx(off.vertices[0], Point2::new(0.0, 2.0)));
+        assert!(approx(off.vertices[1], Point2::new(5.0, 2.0)));
+        assert!(approx(off.vertices[2], Point2::new(10.0, 2.0)));
+    }
+
+    #[test]
+    fn polyline_offset_shallow_angle_bevels_instead_of_spiking() {
+        // 浅い角（掃引が 180° 近く）。マイター交点はオフセット距離の何倍も遠くへ飛ぶが、
+        // MITER_LIMIT でベベルへ切り替え、頂点は元頂点近傍（<= MITER_LIMIT × distance）に
+        // 収まる。両回転方向（+y 側／−y 側の折れ）で確認する。
+        let distance = 1.0;
+        let apex = Point2::new(10.0, 0.0);
+        for tip_y in [0.174_f64, -0.174_f64] {
+            // seg1 の方向を +x から約 170°/190° へ向け、鋭いくさびを作る。
+            let tip = Point2::new(9.015, tip_y);
+            let wedge = Polyline::new(vec![Point2::new(0.0, 0.0), apex, tip], false);
+            let off = wedge
+                .offset(distance, Point2::new(5.0, 10.0 * tip_y.signum()))
+                .unwrap();
+
+            // マイターがそのまま採用されていれば頂点が遠方へ飛ぶ。ベベル化で 2 頂点に増え、
+            // いずれも apex 近傍にとどまることを確認する。
+            assert_eq!(off.vertices.len(), 4, "apex should bevel into 2 vertices");
+            for v in &off.vertices {
+                assert!(v.x.is_finite() && v.y.is_finite());
+            }
+            let apex_bevels = &off.vertices[1..3];
+            for v in apex_bevels {
+                assert!(
+                    apex.distance(*v) <= MITER_LIMIT * distance + 1e-6,
+                    "bevel vertex {v:?} spiked away from apex {apex:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn polyline_offset_hairpin_fold_keeps_two_bevel_points() {
+        // 180° 折返し（seg1 が seg0 と真逆）。中点1点に畳むと元頂点へ退化するため、
+        // 平行移動後の2端点を両方残す。上側 (5,5) をクリック → +1 オフセット。
+        let fold = Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+                Point2::new(1.0, 0.0),
+            ],
+            false,
+        );
+        let off = fold.offset(1.0, Point2::new(5.0, 5.0)).unwrap();
+        assert_eq!(off.vertices.len(), 4);
+        // 端点。
+        assert!(approx(off.vertices[0], Point2::new(0.0, 1.0)));
+        assert!(approx(off.vertices[3], Point2::new(1.0, -1.0)));
+        // 折返し頂点は (10,0) の中点退化 (10,0) ではなく、両側の (10,1)・(10,-1)。
+        assert!(approx(off.vertices[1], Point2::new(10.0, 1.0)));
+        assert!(approx(off.vertices[2], Point2::new(10.0, -1.0)));
+    }
+
+    #[test]
+    fn polyline_offset_degenerate_rejected() {
+        // 頂点1個。
+        assert_eq!(
+            Polyline::new(vec![Point2::new(1.0, 1.0)], false).offset(1.0, Point2::ORIGIN),
+            Err(OffsetError::Degenerate)
+        );
+        // 全頂点が同一（全セグメントがゼロ長）。
+        let same = Polyline::new(vec![Point2::new(1.0, 1.0), Point2::new(1.0, 1.0)], false);
+        assert_eq!(
+            same.offset(1.0, Point2::ORIGIN),
+            Err(OffsetError::Degenerate)
+        );
+    }
+
+    #[test]
+    fn shape_offset_point_is_unsupported() {
+        assert_eq!(
+            Shape::Point(Point2::new(1.0, 1.0)).offset(1.0, Point2::ORIGIN),
+            Err(OffsetError::Unsupported)
+        );
     }
 
     #[test]

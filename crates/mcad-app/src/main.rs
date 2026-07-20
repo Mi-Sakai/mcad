@@ -20,8 +20,9 @@ use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use tool::{
-    ArcTool, CircleTool, DragPreview, InputEvent, LineTool, PlacementKind, PlacementOutcome,
-    PlacementPreview, PointTool, PolylineTool, SelectTool, Tool, ToolCtx, ToolResult,
+    ArcTool, CircleTool, DragPreview, InputEvent, LineTool, OffsetOutcome, PlacementKind,
+    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, Tool, ToolCtx,
+    ToolResult,
 };
 use viewport::Viewport;
 
@@ -102,6 +103,9 @@ const SELECTION_WIDTH: f32 = 2.5;
 const RECT_FILL_COLOR: Color32 = Color32::from_rgba_premultiplied(30, 60, 90, 60);
 /// 矩形選択プレビューの枠線色。
 const RECT_OUTLINE_COLOR: Color32 = Color32::from_rgb(80, 160, 255);
+/// オフセット結果ゴーストのプレビュー色（暖色。作図ツールのプレビューと同系統で、
+/// 選択ハイライト（寒色）と区別しやすい。オフセット中は元＝ハイライト、結果＝この色）。
+const OFFSET_PREVIEW_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 
 /// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O の3経路で共有）。
 ///
@@ -243,6 +247,12 @@ struct McadApp {
     /// アプリ再起動をまたぐ永続化はロードマップM8「設定保存」の範囲であり、ここでは
     /// 行わない。
     last_dialog_dir: Option<PathBuf>,
+    /// オフセット距離入力欄の文字列（設計判断5）。空・0・非数なら通過点方式へ
+    /// フォールバックし、正の有限値なら距離固定＋クリックは側の決定のみに使う
+    /// （[`parse_offset_distance`]）。欄はオフセットモード中のみ上部パネルに表示するが、
+    /// 文字列自体はセッション中保持し、`O` 再押下での等間隔連続オフセットに使い回せる
+    /// （新規・読込では [`McadApp::reset_transient_ui_state`] でクリア）。
+    offset_distance_input: String,
 }
 
 /// ステータスバーに一時表示するメッセージ。
@@ -297,6 +307,7 @@ impl McadApp {
             confirm_state: ConfirmState::Idle,
             pending_zoom_fit: false,
             last_dialog_dir: None,
+            offset_distance_input: String::new(),
         }
     }
 
@@ -310,6 +321,9 @@ impl McadApp {
         self.tool = None;
         self.select_tool.clear_selection();
         self.select_tool.cancel_placement();
+        self.select_tool.cancel_offset();
+        // 読込前の距離入力は持ち越さない（別図面では意味が変わるため）。
+        self.offset_distance_input.clear();
         self.snap_marker = None;
     }
 
@@ -323,6 +337,9 @@ impl McadApp {
     fn after_history_change(&mut self) {
         self.select_tool.retain_alive(&self.document);
         self.select_tool.cancel_placement();
+        // オフセットモードも解除する（対象が undo/redo で消えたり、選択の意図が崩れたら
+        // 宙ぶらりんのオフセットを残さない。設計判断2 と同じ思想）。
+        self.select_tool.cancel_offset();
         self.snap_marker = None;
     }
 
@@ -337,6 +354,7 @@ impl McadApp {
     /// その後のキャンバスクリックで意図しない複製が確定するのを防ぐ。
     fn cancel_placement_for_file_op(&mut self) {
         self.select_tool.cancel_placement();
+        self.select_tool.cancel_offset();
         self.snap_marker = None;
     }
 
@@ -666,15 +684,35 @@ fn document_aabb(document: &Document) -> Option<Aabb> {
         .reduce(|acc, bb| acc.union(&bb))
 }
 
+/// アプリのグローバルキーボードショートカット（undo/redo・ファイル操作・Ctrl+D 複製・
+/// ツール切替・Delete 等）を処理してよいか。
+///
+/// - 未保存確認モーダル表示中（`confirm_state != Idle`）は、裏でドキュメントが変わる副作用を
+///   防ぐため抑止する。
+/// - テキスト入力欄にフォーカスがある間（オフセット距離入力欄の編集中など）は抑止する。
+///   タイプした `Ctrl+Z` がドキュメントを undo する、`d` でツールが切り替わる、といった
+///   テキスト入力とショートカットの競合を防ぐ（DESIGN.md M5 設計判断5 の 2026-07-19 追記）。
+///
+/// egui のフォーカス判定を `bool` で受け取り、この方針を GUI なしで単体テストできるようにする。
+fn app_shortcuts_enabled(confirm_state: ConfirmState, text_focused: bool) -> bool {
+    confirm_state == ConfirmState::Idle && !text_focused
+}
+
 impl eframe::App for McadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = ui.input(|i| i.time);
+
+        // テキスト入力欄（オフセット距離入力欄など）にフォーカスがあるか。egui のフォーカスは
+        // フレームをまたいで保持されるので、パネル描画より前のここで前フレームの状態を読めば、
+        // 編集中のショートカット競合を全経路まとめて抑止できる（`app_shortcuts_enabled`）。
+        let text_focused = ui.memory(|m| m.focused().is_some());
 
         // 未保存確認モーダル表示中（`confirm_state != Idle`）は、履歴操作・ファイル
         // 操作ショートカットを一切処理しない。モーダル表示中に Ctrl+N 等が先に走ると、
         // 例えば「閉じる」確認中に `confirm_state` が `ConfirmingNew` へ上書きされ、
         // モーダルの文言が終了確認から新規文書確認へすり替わってしまうため。
-        if self.confirm_state == ConfirmState::Idle {
+        // 加えて、テキスト入力欄の編集中も全ショートカットを抑止する（上記フォーカスゲート）。
+        if app_shortcuts_enabled(self.confirm_state, text_focused) {
             // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y で undo/redo。ツール切替キーより先に処理する
             // （handle_tool_shortcut_keys は修飾キー付きの入力を無視するので衝突はしないが、
             // 「履歴操作が最優先」という意図を並び順でも示す）。undo/redo はエンティティを
@@ -748,8 +786,11 @@ impl eframe::App for McadApp {
         // 配置ステートを残さない（DESIGN.md 設計判断2: モーダル表示は配置モードを解除）。
         // Ctrl+N/Ctrl+O 等でモーダルを開いたのがこのフレームでも、上のショートカット処理で
         // `confirm_state` が更新済みなので同フレームで確実に解除できる。
-        if self.confirm_state != ConfirmState::Idle && self.select_tool.is_placing() {
+        if self.confirm_state != ConfirmState::Idle
+            && (self.select_tool.is_placing() || self.select_tool.is_offsetting())
+        {
             self.select_tool.cancel_placement();
+            self.select_tool.cancel_offset();
             self.snap_marker = None;
         }
 
@@ -800,22 +841,26 @@ impl eframe::App for McadApp {
                 "mcad - {file_label}{dirty_marker}"
             )));
 
-        // モーダル表示中はツール切替（S/1/L/C/A/P）や F3（スナップ切替）も処理しない。
-        // 特にツール切替はモーダルの裏で作図ツールが起動してしまう副作用があるため。
-        if self.confirm_state == ConfirmState::Idle {
+        // モーダル表示中・テキスト欄フォーカス中はツール切替（S/1/L/C/A/P）を処理しない。
+        // ツール切替はモーダルの裏で作図ツールが起動する副作用があり、また距離入力欄の編集中に
+        // 素の文字キーでツールが切り替わりオフセットモードが解除されるのを防ぐ
+        // （AGENTS.md「テキスト入力欄がない前提」はオフセット距離欄の追加で崩れるため、
+        // `app_shortcuts_enabled` の共通ゲートで抑止する）。
+        if app_shortcuts_enabled(self.confirm_state, text_focused) {
             handle_tool_shortcut_keys(
                 ui,
                 &mut self.tool_kind,
                 &mut self.tool,
                 &mut self.select_tool,
             );
+        }
 
-            // F3 でスナップの有効/無効をトグルする（作図時の吸着を一時的に切りたい場面用）。
-            if ui.input(|i| i.key_pressed(Key::F3)) {
-                self.snap_enabled = !self.snap_enabled;
-                if !self.snap_enabled {
-                    self.snap_marker = None;
-                }
+        // F3 でスナップの有効/無効をトグルする（作図時の吸着を一時的に切りたい場面用）。
+        // ファンクションキーはテキスト入力と競合しないので、モーダル非表示中なら常に効かせる。
+        if self.confirm_state == ConfirmState::Idle && ui.input(|i| i.key_pressed(Key::F3)) {
+            self.snap_enabled = !self.snap_enabled;
+            if !self.snap_enabled {
+                self.snap_marker = None;
             }
         }
 
@@ -839,6 +884,18 @@ impl eframe::App for McadApp {
                     if self.snap_enabled { "ON" } else { "OFF" }
                 ));
                 ui.separator();
+                // オフセット距離入力欄（設計判断5）。モーダルにせず上部パネルへ常設だが、
+                // 画面を圧迫しないようオフセットモード中のみ表示する。空欄なら通過点方式
+                // （hint の "through"）、正の有限値なら距離固定＋クリックは側の決定のみ。
+                if self.select_tool.is_offsetting() {
+                    ui.label("Offset dist:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.offset_distance_input)
+                            .desired_width(56.0)
+                            .hint_text("through"),
+                    );
+                    ui.separator();
+                }
                 // ステータスメッセージ（動的な成否通知）はヘルプ文字列より優先度が高いため、
                 // 幅が狭くヘルプ文字列がクリップされてもステータスは見える位置に置く。
                 if let Some(msg) = &self.status {
@@ -879,6 +936,9 @@ impl eframe::App for McadApp {
             // などを一切ツール・選択処理へ渡さない。素通りさせると、モーダルの裏で
             // エンティティが削除・作図確定されてしまう（Delete/Enter は egui::Modal が
             // 消費しないため）。パン/ズームは見るだけの操作なので許容する。
+            // 距離入力欄の解析値（正の有限値のみ Some、それ以外は通過点方式へ
+            // フォールバック）。入力処理とゴースト描画で同じ値を使う。
+            let offset_distance = parse_offset_distance(&self.offset_distance_input);
             if self.confirm_state == ConfirmState::Idle {
                 if self.tool_kind == ToolKind::Select {
                     handle_select_input(
@@ -892,6 +952,7 @@ impl eframe::App for McadApp {
                         &mut self.snap_marker,
                         &mut self.status,
                         now,
+                        offset_distance,
                     );
                 } else {
                     handle_tool_input(
@@ -921,6 +982,7 @@ impl eframe::App for McadApp {
                 &self.document,
                 &self.viewport,
                 &self.select_tool,
+                offset_distance,
             );
             if let Some(tool) = &self.tool {
                 tool.draw_preview(&painter, rect, &self.viewport);
@@ -1016,9 +1078,10 @@ fn handle_tool_shortcut_keys(
     if let Some(kind) = requested {
         *tool_kind = kind;
         *tool = kind.spawn();
-        // ツール切替は進行中の配置モード（Ctrl+D 複製等）を解除する。Select のままの
-        // 再選択（S）でも配置を確定させずに畳む（DESIGN.md 設計判断2）。
+        // ツール切替は進行中の配置モード（Ctrl+D 複製等）・オフセットモードを解除する。
+        // Select のままの再選択（S）でも確定させずに畳む（DESIGN.md 設計判断2・5）。
         select_tool.cancel_placement();
+        select_tool.cancel_offset();
         // 作図ツールへ移るときは選択を解除する（Select のままなら選択は保持）。
         if kind != ToolKind::Select {
             select_tool.clear_selection();
@@ -1287,7 +1350,26 @@ fn handle_select_input(
     snap_marker: &mut Option<snap::SnapResult>,
     status: &mut Option<StatusMessage>,
     now: f64,
+    offset_distance: Option<f64>,
 ) {
+    // オフセットモード中は専用経路が入力を占有する（配置モードと同じ入力ゲート思想）。
+    if select_tool.is_offsetting() {
+        handle_offset_input(
+            ui,
+            response,
+            rect,
+            viewport,
+            document,
+            select_tool,
+            snap_enabled,
+            snap_marker,
+            status,
+            now,
+            offset_distance,
+        );
+        return;
+    }
+
     // 配置モード中は専用経路が入力を占有し、通常の選択・編集入力へは進ませない。
     if select_tool.is_placing() {
         handle_placement_input(
@@ -1337,6 +1419,23 @@ fn handle_select_input(
             set_status(status, now, "Rotate: click pivot point");
         } else {
             set_status(status, now, "Select entities to rotate");
+        }
+        return;
+    }
+
+    // O（Ctrl なし）: オフセットモードへ入る（単一エンティティ限定、設計判断5）。
+    // Ctrl+O（開く）・Ctrl+Shift+O（DXF インポート）は上部のショートカット処理が先に
+    // 消費するので、ここへ来る `O` は素の押下のみ。以降のクリックは次フレームから
+    // オフセット経路が受け取る。
+    if ui.input(|i| !i.modifiers.command && i.key_pressed(Key::O)) {
+        if select_tool.start_offset() {
+            set_status(
+                status,
+                now,
+                "Offset: click through point (or type distance)",
+            );
+        } else {
+            set_status(status, now, "Select exactly one entity to offset");
         }
         return;
     }
@@ -1494,6 +1593,96 @@ fn handle_placement_input(
     }
 }
 
+/// オフセット距離入力欄の文字列を解析する。**正の有限値のみ** `Some` を返す。
+///
+/// 空・0・負・非数は `None`（呼び出し側は通過点方式のフォールバックとして扱う。
+/// 設計判断5: 「欄が空・0・非数なら通過点方式へフォールバックする」）。
+fn parse_offset_distance(text: &str) -> Option<f64> {
+    let value: f64 = text.trim().parse().ok()?;
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+/// オフセットモード（`O`、単一エンティティ1クリック。設計判断5）のキャンバス入力を処理する。
+///
+/// [`handle_select_input`] がオフセットモード中のみ呼ぶ。通常の選択・矩形選択・削除とは
+/// 排他（入力ゲート済み）。クリックにスナップを効かせ、`snap_marker` を更新する。
+///
+/// - `Esc`: オフセットモードを解除（Document は変更しない）。ただし距離入力欄を編集中
+///   （`wants_keyboard_input`）は欄側のフォーカス解除に譲り、モードは畳まない。
+/// - カーソル移動: プレビュー追従（ゴースト）とスナップマーカー更新。
+/// - `Space` 押下中の左ドラッグ: パン用なのでオフセットクリックとしては扱わない。
+/// - 単発クリック: [`SelectTool::offset_click`] で確定／キャンセル。確定コマンドは
+///   `Document::apply`（元は不変・結果を `AddEntity`。レイヤーロック時はステータス表示）。
+#[allow(clippy::too_many_arguments)]
+fn handle_offset_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    rect: Rect,
+    viewport: &Viewport,
+    document: &mut Document,
+    select_tool: &mut SelectTool,
+    snap_enabled: bool,
+    snap_marker: &mut Option<snap::SnapResult>,
+    status: &mut Option<StatusMessage>,
+    now: f64,
+    offset_distance: Option<f64>,
+) {
+    // 距離入力欄を編集中はキーボードを欄が占有しているとみなし、Esc はモード解除ではなく
+    // 欄のフォーカス解除に譲る（マウスのクリック確定・プレビューは以降そのまま処理する）。
+    // egui のキーボードフォーカス（TextEdit にフォーカスがあれば `Some`）で判定する。
+    let typing = ui.memory(|m| m.focused().is_some());
+
+    // Esc: オフセットモードを解除する（Document は変更しない）。
+    if !typing && ui.input(|i| i.key_pressed(Key::Escape)) {
+        select_tool.cancel_offset();
+        *snap_marker = None;
+        return;
+    }
+
+    // スナップ用パラメータ（作図・配置ツールと同じ換算）。
+    let radius = SNAP_RADIUS_PX / viewport.zoom;
+    let grid_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
+    // 通過点方式で「通過点が対象上」を判定するゼロ距離しきい値はピック許容量基準。
+    let tol = PICK_TOLERANCE_PX / viewport.zoom;
+
+    // カーソル追従（プレビュー用ゴースト）とスナップマーカー更新。
+    if let Some(pos) = response.hover_pos() {
+        let raw = viewport.screen_to_world(rect, pos);
+        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid_step, &[]);
+        *snap_marker = marker;
+        select_tool.offset_move(world);
+    } else {
+        *snap_marker = None;
+    }
+
+    // Space 押下中の左ドラッグはパン。オフセットクリックとは扱わない。
+    if ui.input(|i| i.key_down(Key::Space)) {
+        return;
+    }
+
+    // 単発クリックで確定する（通過点／側の指定）。
+    if response.clicked_by(egui::PointerButton::Primary)
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let raw = viewport.screen_to_world(rect, pos);
+        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid_step, &[]);
+        match select_tool.offset_click(document, world, tol, offset_distance) {
+            OffsetOutcome::Cancelled(msg) => {
+                *snap_marker = None;
+                set_status(status, now, msg);
+            }
+            OffsetOutcome::Commit(cmd) => {
+                *snap_marker = None;
+                // 元エンティティは不変。結果を AddEntity で追加する（ロック時は失敗を表示）。
+                match document.apply(cmd) {
+                    Ok(_) => set_status(status, now, "Offset created"),
+                    Err(err) => set_status(status, now, format!("Offset failed: {err}")),
+                }
+            }
+        }
+    }
+}
+
 /// 中ボタンドラッグ、または Space キー押下中の左ドラッグでパンする。
 fn handle_pan_input(ui: &egui::Ui, response: &egui::Response, viewport: &mut Viewport) {
     let space_down = ui.input(|i| i.key_down(Key::Space));
@@ -1604,8 +1793,22 @@ fn draw_selection(
     document: &Document,
     viewport: &Viewport,
     select_tool: &SelectTool,
+    offset_distance: Option<f64>,
 ) {
     let highlight = Stroke::new(SELECTION_WIDTH, SELECTION_COLOR);
+
+    // オフセットモード中は、元エンティティを強調表示したまま、確定結果のゴーストを
+    // プレビュー色で重ねる（Document は変更しない）。退化して結果が作れないカーソル
+    // 位置ではゴーストを描かない（設計判断5）。オフセットは通常の配置・矩形選択とは
+    // 排他なので、こちらを最優先で処理する。
+    if select_tool.is_offsetting() {
+        draw_selected(painter, rect, document, viewport, select_tool, highlight);
+        if let Some(ghost) = select_tool.offset_preview(document, offset_distance) {
+            let preview = Stroke::new(SELECTION_WIDTH, OFFSET_PREVIEW_COLOR);
+            draw_shape(painter, rect, viewport, &ghost, preview);
+        }
+        return;
+    }
 
     // 選択集合を `transform` で変換した先を強調色で仮表示する（配置先ゴースト）。
     let draw_ghost = |transform: &dyn Fn(&Shape) -> Shape| {
@@ -2016,6 +2219,31 @@ mod tests {
         assert!(ConfirmState::ConfirmingNew.prompt().is_some());
         assert!(ConfirmState::ConfirmingOpen.prompt().is_some());
         assert!(ConfirmState::ConfirmingOpenDxf.prompt().is_some());
+    }
+
+    #[test]
+    fn app_shortcuts_gated_by_modal_and_text_focus() {
+        // モーダル非表示かつテキスト欄フォーカスなしのときだけショートカットを処理する。
+        assert!(app_shortcuts_enabled(ConfirmState::Idle, false));
+        // 距離入力欄などテキスト欄フォーカス中は、undo/redo・ファイル操作・Ctrl+D・
+        // ツール切替を一括で抑止する（Ctrl+Z がドキュメントを undo する等の競合防止）。
+        assert!(!app_shortcuts_enabled(ConfirmState::Idle, true));
+        // 未保存確認モーダル表示中は（フォーカス有無に関わらず）抑止する。
+        assert!(!app_shortcuts_enabled(ConfirmState::ConfirmingClose, false));
+        assert!(!app_shortcuts_enabled(ConfirmState::ConfirmingNew, true));
+    }
+
+    #[test]
+    fn parse_offset_distance_accepts_only_positive_finite() {
+        assert_eq!(parse_offset_distance("2.5"), Some(2.5));
+        assert_eq!(parse_offset_distance("  3 "), Some(3.0));
+        // 空・0・負・非数・非有限は None（通過点方式へフォールバック）。
+        assert_eq!(parse_offset_distance(""), None);
+        assert_eq!(parse_offset_distance("0"), None);
+        assert_eq!(parse_offset_distance("-1"), None);
+        assert_eq!(parse_offset_distance("abc"), None);
+        assert_eq!(parse_offset_distance("inf"), None);
+        assert_eq!(parse_offset_distance("NaN"), None);
     }
 
     #[test]

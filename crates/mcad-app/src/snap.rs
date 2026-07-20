@@ -34,7 +34,7 @@
 //! ある以上その所属エンティティも実質的に画面内なので、絞り込みの有無で結果は
 //! 変わらない。
 
-use mcad_core::{Document, Entity};
+use mcad_core::{Document, Entity, EntityGeom};
 use mcad_geom::{Aabb, Point2, Shape, intersect};
 
 /// スナップ候補の種別。優先度は Endpoint > Intersection > Midpoint > Center > Grid
@@ -111,9 +111,12 @@ pub fn snap(
         if !layer_visible(document, entity) {
             continue;
         }
-        // M6: スナップ源は Shape 系のみ（Text の anchor スナップ等は後続タスク）。
-        if let Some(shape) = entity.geom.as_shape() {
-            enumerate_features(shape, cursor, r2, &mut best);
+        match &entity.geom {
+            EntityGeom::Shape(shape) => enumerate_features(shape, cursor, r2, &mut best),
+            // Text はアンカー点のみをスナップ源にする（端点扱い。DESIGN.md M6 L386）。
+            EntityGeom::Text(text) => best.consider(SnapKind::Endpoint, text.anchor, cursor, r2),
+            // 寸法はスナップ源にしない（DESIGN.md M6 L386）。
+            EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {}
         }
     }
 
@@ -414,6 +417,29 @@ mod tests {
         let r = snap(&doc, Point2::new(0.0, 0.0), 0.5, 1.0, &extra).unwrap();
         assert_eq!(r.kind, SnapKind::Endpoint);
         assert_eq!(r.point, Point2::new(0.05, 0.0));
+    }
+
+    #[test]
+    fn text_anchor_snaps_as_endpoint() {
+        use mcad_core::TextGeom;
+        // Text エンティティのアンカーだけが端点候補になる（DESIGN.md M6 L386）。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::new(2.0, 3.0),
+                content: "abc".to_owned(),
+                height: 1.0,
+                angle: 0.0,
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let r = snap_no_grid(&doc, Point2::new(2.1, 3.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Endpoint);
+        assert_eq!(r.point, Point2::new(2.0, 3.0));
     }
 
     #[test]

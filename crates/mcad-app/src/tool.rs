@@ -102,6 +102,22 @@ pub trait Tool {
     fn snap_points(&self) -> Vec<Point2> {
         Vec::new()
     }
+
+    /// テキストツールがアンカーを確定して文字入力待ち（パネル編集中）のとき、その
+    /// アンカー座標を返す。それ以外のツール・状態では `None`（既定）。
+    ///
+    /// # なぜ Tool トレイトに置くのか
+    ///
+    /// テキストの文字列・高さの入力欄と確定（`AddEntity`）は app 層が担う
+    /// （文字列は egui の `TextEdit`、確定は Enter 検出とレイヤーロック時のステータス表示を
+    /// 伴い、[`Tool::on_input`] の `Move`/`Click`/`Confirm`/`Cancel` と `ToolResult` では
+    /// 表現しきれないため。オフセットが `SelectTool` 側で独自の入力欄を持つのと同じ事情）。
+    /// app 層は「テキストツールがアンカー確定済みか・どこか」だけ分かれば入力欄の表示・
+    /// プレビュー描画・確定ができる。`Box<dyn Tool>` からその 1 点を取り出すための、
+    /// [`Tool::snap_points`] と同様の既定実装つき拡張点。
+    fn pending_text_anchor(&self) -> Option<Point2> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -492,6 +508,92 @@ impl Tool for PolylineTool {
 }
 
 // ---------------------------------------------------------------------
+// Text
+// ---------------------------------------------------------------------
+
+/// テキストツールの進行段階。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum TextState {
+    /// アンカー未確定。次のクリックでアンカーを置く。
+    #[default]
+    WaitingAnchor,
+    /// アンカー確定済み・文字入力待ち。文字列／高さの入力欄は app 層のパネルが出し、
+    /// Enter で `AddEntity` を確定、Esc で `WaitingAnchor` へ戻る。
+    Editing(Point2),
+}
+
+/// テキストツール（`T`）。クリックでアンカー（ベースライン左端）を置き、app 層の
+/// パネル入力欄で文字列と高さ（ワールド単位）を入力して Enter で確定する。角度は 0 で
+/// 作成し、向きは既存の回転（`R`）で変える（DESIGN.md M6 設計判断6）。
+///
+/// # 確定を app 層に委ねる理由
+///
+/// 文字列（IME 入力可の `TextEdit`）・高さ欄・確定失敗のステータス表示は egui の UI と
+/// 密接で、純粋な [`Tool`] 状態機械（[`InputEvent`]／[`ToolResult`]）には収まらない。
+/// 本ツールはアンカーのクリック確定と、確定待ちアンカーの公開（[`Tool::pending_text_anchor`]）
+/// だけを担い、入力欄と `AddEntity` は app 層が行う。オフセットが [`SelectTool`] 側で独自の
+/// 入力欄を持つのと同じ役割分担。
+#[derive(Debug, Default)]
+pub struct TextTool {
+    state: TextState,
+    /// アンカー未確定時のカーソル位置（配置プレビュー用）。
+    cursor: Option<Point2>,
+}
+
+impl Tool for TextTool {
+    fn on_input(&mut self, _ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => {
+                // アンカー未確定のクリックだけ受け付ける。入力待ち中のクリックは
+                // （パネル編集を邪魔しないよう）アンカーを動かさず無視する。
+                if matches!(self.state, TextState::WaitingAnchor) {
+                    self.state = TextState::Editing(p);
+                }
+                ToolResult::Continue
+            }
+            // 確定（Enter による `AddEntity`）は app 層が担う。ここでは何もしない。
+            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Cancel => match self.state {
+                // 入力待ち中の Esc はアンカーを捨てて未確定へ戻る（ツールは維持）。
+                TextState::Editing(_) => {
+                    self.state = TextState::WaitingAnchor;
+                    ToolResult::Continue
+                }
+                // 未確定の Esc は作図をやめる（app 層が Select へ戻す）。
+                TextState::WaitingAnchor => ToolResult::Cancel,
+            },
+        }
+    }
+
+    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+        // アンカー確定後はその位置に小さな十字マーカーを描く（文字列プレビューは
+        // 文字列・高さを持つ app 層が別途描く）。未確定時はカーソルにマーカーを描く。
+        let mark = match self.state {
+            TextState::Editing(anchor) => Some(anchor),
+            TextState::WaitingAnchor => self.cursor,
+        };
+        if let Some(p) = mark {
+            let c = viewport.world_to_screen(rect, p);
+            let s = 5.0;
+            let stroke = preview_stroke();
+            painter.line_segment([c + egui::vec2(-s, 0.0), c + egui::vec2(s, 0.0)], stroke);
+            painter.line_segment([c + egui::vec2(0.0, -s), c + egui::vec2(0.0, s)], stroke);
+        }
+    }
+
+    fn pending_text_anchor(&self) -> Option<Point2> {
+        match self.state {
+            TextState::Editing(anchor) => Some(anchor),
+            TextState::WaitingAnchor => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Select / 編集（単一選択・矩形選択・移動・削除）
 // ---------------------------------------------------------------------
 
@@ -835,11 +937,16 @@ impl SelectTool {
             if !layer_visible(document, entity) {
                 continue;
             }
-            // M6: ヒットテストは Shape 系のみ（Text の aabb ピックは後続タスク）。
-            let Some(shape) = entity.geom.as_shape() else {
-                continue;
+            // ヒット距離: Shape は実形状への最近距離、Text は近似 aabb への符号なし距離
+            // （DESIGN.md M6 L429 の割り切り。内部なら 0、外部なら境界までのユークリッド距離。
+            // これにより tol 内なら枠のすぐ外側も拾えるし、枠内の空白よりも実形状が近ければ
+            // そちらを優先できる）。寸法エンティティはまだ作図ツールが無く選択対象にしない
+            // （panic せず読み飛ばす）。
+            let d = match &entity.geom {
+                EntityGeom::Shape(shape) => distance_to(shape, world),
+                EntityGeom::Text(_) => entity.geom.aabb().distance_to_point(world),
+                EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => continue,
             };
-            let d = distance_to(shape, world);
             if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, id));
             }
@@ -1339,7 +1446,7 @@ impl SelectTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcad_core::Document;
+    use mcad_core::{Document, TextGeom};
 
     fn ctx() -> (Document, ToolCtx) {
         let doc = Document::new();
@@ -3222,5 +3329,173 @@ mod tests {
         assert!(tool.start_move());
         assert!(tool.is_placing());
         assert!(!tool.is_offsetting());
+    }
+
+    // --- Text ツール / Text ヒットテスト ---
+
+    /// カレントレイヤーに Text エンティティを追加して [`EntityId`] を返す。
+    fn add_text(doc: &mut Document, anchor: Point2, content: &str, height: f64) -> EntityId {
+        let layer = doc.current_layer();
+        let entity = Entity::new(
+            EntityGeom::Text(TextGeom {
+                anchor,
+                content: content.to_owned(),
+                height,
+                angle: 0.0,
+            }),
+            layer,
+            Style::inherited(),
+        );
+        doc.apply(Command::AddEntity(entity)).unwrap().entities[0]
+    }
+
+    #[test]
+    fn pick_hits_text_inside_approx_aabb() {
+        // Text "Ab"（ASCII 2 文字）高さ 2、アンカー原点。近似 aabb は x∈[0,2.2], y∈[0,2]。
+        let mut doc = Document::new();
+        let t = add_text(&mut doc, Point2::ORIGIN, "Ab", 2.0);
+
+        // aabb 内をクリックすれば選択される（tol は小さくても内側は距離 0 扱いで拾える）。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(1.0, 1.0), 0.01, false);
+        assert_eq!(tool.selection(), &[t]);
+
+        // aabb 外（右上に大きく離れた点）は拾わない。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(10.0, 10.0), 0.01, false);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn pick_prefers_text_hit_over_far_shape() {
+        // Text の aabb 内はクリック点の距離 0 として扱うため、tol 内の遠い線分より優先される。
+        let mut doc = Document::new();
+        let t = add_text(&mut doc, Point2::ORIGIN, "Ab", 2.0);
+        let _line = add_hline(&mut doc, 0.0); // 線分 (0,0)-(1,0) は aabb と重なる
+
+        let mut tool = SelectTool::default();
+        // (0.5, 0.5): Text aabb 内（距離 0）、線分からは 0.5。距離 0 の Text が勝つ。
+        tool.on_click(&doc, Point2::new(0.5, 0.5), 1.0, false);
+        assert_eq!(tool.selection(), &[t]);
+    }
+
+    #[test]
+    fn pick_hits_text_outside_approx_aabb_within_tol() {
+        // aabb は x∈[0,2.2], y∈[0,2]。境界から x 方向へ 0.1 外側の点は、符号なし
+        // 距離 0.1 として扱われるため、tol がそれ以上ならヒットする（旧実装は
+        // aabb の外側を即座に不採用にしていたため、tol を尊重できていなかった）。
+        let mut doc = Document::new();
+        let t = add_text(&mut doc, Point2::ORIGIN, "Ab", 2.0);
+
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(2.3, 1.0), 0.15, false);
+        assert_eq!(tool.selection(), &[t]);
+
+        // tol が距離未満なら依然ヒットしない。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(2.3, 1.0), 0.05, false);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn pick_prefers_real_shape_over_text_blank_space_on_tie() {
+        // Text の近似 aabb は文字の描かれていない空白にも及ぶ。そこにちょうど
+        // 重なる実形状（Shape）があれば、Shape 側も距離 0 で先に見つかっているため
+        // 後から見つかる Text の近似距離 0 には上書きされない（`d < bd` の厳密比較で
+        // 先着優先）。旧実装は aabb 内側を無条件に距離 0 扱いしていたため、
+        // Shape の実距離に関わらず常に Text が勝っていた。
+        let mut doc = Document::new();
+        let line = add_hline(&mut doc, 0.0); // 線分 (0,0)-(1,0)。Shape を先に追加する。
+        let _t = add_text(&mut doc, Point2::ORIGIN, "Ab", 2.0); // aabb x∈[0,2.2], y∈[0,2] が重なる
+
+        let mut tool = SelectTool::default();
+        // (0.5, 0.0): 線分上（距離 0）かつ Text aabb 内（距離 0）。先着の Shape を優先する。
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.01, false);
+        assert_eq!(tool.selection(), &[line]);
+    }
+
+    #[test]
+    fn pick_respects_tol_for_rotated_text_aabb() {
+        // 90 度回転した Text は近似 aabb が縦長に広がる
+        // （局所 (width,height) の四隅を回転 → x∈[-2.0,0.0], y∈[0.0,2.2]）。
+        // 回転後も符号なし距離 + tol 判定は一貫して機能する。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let entity = Entity::new(
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::ORIGIN,
+                content: "Ab".to_owned(),
+                height: 2.0,
+                angle: std::f64::consts::FRAC_PI_2,
+            }),
+            layer,
+            Style::inherited(),
+        );
+        let t = doc.apply(Command::AddEntity(entity)).unwrap().entities[0];
+
+        // aabb 境界 (x = -2.0) から 0.1 外側。tol 0.15 ならヒットする。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(-2.1, 1.0), 0.15, false);
+        assert_eq!(tool.selection(), &[t]);
+
+        // tol が距離未満なら依然ヒットしない。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(-2.1, 1.0), 0.05, false);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn text_tool_click_sets_anchor_and_enters_editing() {
+        let (_doc, ctx) = ctx();
+        let mut tool = TextTool::default();
+        assert_eq!(tool.pending_text_anchor(), None);
+
+        // クリックでアンカー確定・入力待ちへ（Commit はまだ返さない = app 層が確定する）。
+        let anchor = Point2::new(3.0, 4.0);
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(anchor)),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.pending_text_anchor(), Some(anchor));
+
+        // 入力待ち中の追加クリックはアンカーを動かさない。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 9.0)));
+        assert_eq!(tool.pending_text_anchor(), Some(anchor));
+    }
+
+    #[test]
+    fn text_tool_esc_behavior_by_state() {
+        let (_doc, ctx) = ctx();
+        let mut tool = TextTool::default();
+
+        // 入力待ち中の Esc はアンカーを捨てて未確定へ戻る（ツールは維持 = Continue）。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0)));
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Cancel),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.pending_text_anchor(), None);
+
+        // 未確定の Esc は作図終了（app 層が Select へ戻す）= Cancel。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+    }
+
+    #[test]
+    fn offset_rejects_text_entity() {
+        // Text は選択できるようになったが、オフセット対象外（DESIGN.md M6 L385）。
+        // start_offset は選択数 1 で起動するが、確定クリックで明示的に拒否される。
+        let mut doc = Document::new();
+        let t = add_text(&mut doc, Point2::ORIGIN, "Ab", 2.0);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![t]);
+
+        assert!(tool.start_offset());
+        // プレビューは描かない（結果を作れない）。
+        assert!(tool.offset_preview(&doc, None).is_none());
+        let outcome = tool.offset_click(&doc, Point2::new(1.0, 1.0), 0.1, None);
+        assert!(matches!(outcome, OffsetOutcome::Cancelled(_)));
+        assert!(!tool.is_offsetting());
+        // Document は不変（Text は消えも増えもしない）。
+        assert_eq!(doc.entity_count(), 1);
     }
 }

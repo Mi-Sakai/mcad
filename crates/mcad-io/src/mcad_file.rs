@@ -479,6 +479,36 @@ mod tests {
     }
 
     #[test]
+    fn text_entity_round_trips_with_cjk_content() {
+        use mcad_core::TextGeom;
+        // M6: v2 フォーマットで Text エンティティ（CJK 文字列含む）が JSON 往復で保たれる。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let text = EntityGeom::Text(TextGeom {
+            anchor: Point2::new(1.5, -2.5),
+            content: "日本語ABC 123".to_owned(),
+            height: 3.5,
+            angle: 0.75,
+        });
+        doc.apply(Command::AddEntity(Entity::new(
+            text.clone(),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        // JSON 文字列を経由しても意味的に一致する（UTF-8 の CJK がそのまま保たれる）。
+        let json = to_json(&doc).unwrap();
+        assert!(json.contains("日本語"), "JSON に CJK 文字列が含まれるべき");
+        let loaded = from_json(&json).unwrap();
+        assert_eq!(export_document(&loaded), export_document(&doc));
+
+        // 幾何が Text として復元されている。
+        let (_, entity) = loaded.entities().next().unwrap();
+        assert_eq!(entity.geom, text);
+    }
+
+    #[test]
     fn unknown_version_via_json_is_rejected() {
         // from_json はバージョン先読みで未知バージョンを弾く（v1/v2 以外）。
         let json = r#"{"version": 99, "layers": [], "current_layer": 0, "entities": []}"#;

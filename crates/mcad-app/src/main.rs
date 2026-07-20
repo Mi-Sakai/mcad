@@ -7,6 +7,7 @@
 //! クリック/Enter/Escで確定・キャンセルできるようにする。後続タスクで
 //! 選択・編集ツールとスナップエンジンを追加する。
 
+mod fonts;
 mod snap;
 mod tool;
 mod viewport;
@@ -15,14 +16,14 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
-use mcad_core::{Command, Document, EntityGeom, Layer, LayerId, Rgb, Style};
+use mcad_core::{Command, Document, Entity, EntityGeom, Layer, LayerId, Rgb, Style, TextGeom};
 use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use tool::{
     ArcTool, CircleTool, DragPreview, InputEvent, LineTool, OffsetOutcome, PlacementKind,
-    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, Tool, ToolCtx,
-    ToolResult,
+    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, TextTool, Tool,
+    ToolCtx, ToolResult,
 };
 use viewport::Viewport;
 
@@ -107,6 +108,16 @@ const RECT_OUTLINE_COLOR: Color32 = Color32::from_rgb(80, 160, 255);
 /// 選択ハイライト（寒色）と区別しやすい。オフセット中は元＝ハイライト、結果＝この色）。
 const OFFSET_PREVIEW_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 
+/// Text ツールの入力中プレビュー色（作図プレビューと同系統の暖色）。
+const TEXT_PREVIEW_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
+
+/// Text 描画時の最小フォントサイズ（px, ワールド高さ×zoom）。これ未満は判読不能として
+/// 描画しない（極小ガリー生成のコストと 0 近傍を避ける）。
+const MIN_TEXT_PX: f64 = 1.0;
+/// Text 描画時の最大フォントサイズ（px）。過大ズームでフォントアトラスが肥大するのを
+/// 防ぐため、描画サイズをここで頭打ちにする（ワールド固定サイズの近似上限）。
+const MAX_TEXT_PX: f64 = 4096.0;
+
 /// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O の3経路で共有）。
 ///
 /// いずれの経路も、ネイティブの確認ダイアログ（`rfd::MessageDialog`）を同期表示すると
@@ -166,6 +177,7 @@ enum ToolKind {
     Circle,
     Arc,
     Polyline,
+    Text,
 }
 
 impl ToolKind {
@@ -180,6 +192,7 @@ impl ToolKind {
             ToolKind::Circle => Some(Box::new(CircleTool::default())),
             ToolKind::Arc => Some(Box::new(ArcTool::default())),
             ToolKind::Polyline => Some(Box::new(PolylineTool::default())),
+            ToolKind::Text => Some(Box::new(TextTool::default())),
         }
     }
 
@@ -192,6 +205,7 @@ impl ToolKind {
             ToolKind::Circle => "Circle",
             ToolKind::Arc => "Arc",
             ToolKind::Polyline => "Polyline",
+            ToolKind::Text => "Text",
         }
     }
 }
@@ -253,7 +267,19 @@ struct McadApp {
     /// 文字列自体はセッション中保持し、`O` 再押下での等間隔連続オフセットに使い回せる
     /// （新規・読込では [`McadApp::reset_transient_ui_state`] でクリア）。
     offset_distance_input: String,
+    /// Text ツールの文字列入力欄（M6 タスク23）。アンカー確定後に上部パネルへ表示し、
+    /// Enter で `AddEntity` 確定。CJK（IME 入力）可。確定・キャンセルのたびにクリアする。
+    text_content_input: String,
+    /// Text ツールの高さ入力欄（ワールド単位）。**前回値を保持**して次のテキストの既定に
+    /// 使うため、確定してもクリアしない（DESIGN.md M6 設計判断6）。
+    text_height_input: String,
+    /// 直前フレームで Text 入力欄を表示していたか。false→true の遷移フレームで文字列欄へ
+    /// フォーカスを移すのに使う（アンカー確定直後すぐタイプできるように）。
+    text_field_shown: bool,
 }
+
+/// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
+const DEFAULT_TEXT_HEIGHT: &str = "20";
 
 /// ステータスバーに一時表示するメッセージ。
 struct StatusMessage {
@@ -308,6 +334,9 @@ impl McadApp {
             pending_zoom_fit: false,
             last_dialog_dir: None,
             offset_distance_input: String::new(),
+            text_content_input: String::new(),
+            text_height_input: DEFAULT_TEXT_HEIGHT.to_owned(),
+            text_field_shown: false,
         }
     }
 
@@ -324,6 +353,10 @@ impl McadApp {
         self.select_tool.cancel_offset();
         // 読込前の距離入力は持ち越さない（別図面では意味が変わるため）。
         self.offset_distance_input.clear();
+        // Text 入力欄も初期化する（文字列はクリア、高さは既定へ戻す）。
+        self.text_content_input.clear();
+        self.text_height_input = DEFAULT_TEXT_HEIGHT.to_owned();
+        self.text_field_shown = false;
         self.snap_marker = None;
     }
 
@@ -447,6 +480,67 @@ impl McadApp {
         } else {
             set_status(&mut self.status, now, "Select entities to duplicate");
         }
+    }
+
+    /// Text ツールの確定（`AddEntity`）。アンカー（クリック済み）と入力欄の文字列・高さから
+    /// [`EntityGeom::Text`] を組み、検証してからカレントレイヤーへ追加する。角度は 0 固定
+    /// （向きは回転ツールで変える。DESIGN.md M6 設計判断6）。
+    ///
+    /// 成功したら文字列欄をクリアしてアンカーを未確定へ戻し（連続作図。高さは保持）、`true`。
+    /// 高さが不正・文字列が空・レイヤーロック等で失敗したらステータスへ ASCII で理由を出し、
+    /// アンカー・入力はそのまま残して `false`（再入力・レイヤー変更でリトライできる）。
+    fn commit_text(&mut self, anchor: Point2, now: f64) -> bool {
+        let Some(height) = parse_text_height(&self.text_height_input) else {
+            set_status(
+                &mut self.status,
+                now,
+                "Invalid text height - enter a positive number",
+            );
+            return false;
+        };
+        let geom = EntityGeom::Text(TextGeom {
+            anchor,
+            content: self.text_content_input.clone(),
+            height,
+            angle: 0.0,
+        });
+        // 空文字列・非有限などは validate が ASCII の理由で弾く（規約: 可視文字列は ASCII）。
+        if let Err(reason) = geom.validate() {
+            set_status(&mut self.status, now, format!("Cannot add text: {reason}"));
+            return false;
+        }
+        let cmd = Command::AddEntity(Entity::new(
+            geom,
+            self.document.current_layer(),
+            Style::inherited(),
+        ));
+        match self.document.apply(cmd) {
+            Ok(_) => {
+                set_status(&mut self.status, now, "Text added");
+                // 連続作図: アンカーを未確定へ戻し、文字列だけクリア（高さは既定として保持）。
+                // 入力欄の表示フラグ（text_field_shown）はパネル側の set_text_field_shown が
+                // 管理するのでここでは触らない。
+                self.text_content_input.clear();
+                self.tool = ToolKind::Text.spawn();
+                true
+            }
+            Err(err) => {
+                set_status(&mut self.status, now, format!("Add text failed: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Text 入力欄の表示状態を更新する。**表示→非表示へ転じたフレームで入力中の
+    /// 文字列を捨てる**（Esc でのアンカー破棄・ツール切替・確定後など、どの経路で
+    /// 非表示になっても前回入力が次のテキストへ持ち越されないようにする）。
+    ///
+    /// GUI なしで検証できるよう、この遷移ロジックだけを純関数的に切り出している。
+    fn set_text_field_shown(&mut self, shown: bool) {
+        if self.text_field_shown && !shown {
+            self.text_content_input.clear();
+        }
+        self.text_field_shown = shown;
     }
 
     /// 真に空の新規ドキュメントへ置き換える（サンプルエンティティは一切追加しない。
@@ -886,41 +980,82 @@ impl eframe::App for McadApp {
         }
 
         egui::Panel::top("tool_status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("File: {file_label}{dirty_marker}"));
-                ui.separator();
-                ui.label(format!("Tool: {}", self.tool_kind.label()));
-                ui.separator();
-                ui.label(format!(
-                    "Snap: {}",
-                    if self.snap_enabled { "ON" } else { "OFF" }
-                ));
-                ui.separator();
-                // オフセット距離入力欄（設計判断5）。モーダルにせず上部パネルへ常設だが、
-                // 画面を圧迫しないようオフセットモード中のみ表示する。空欄なら通過点方式
-                // （hint の "through"）、正の有限値なら距離固定＋クリックは側の決定のみ。
-                if self.select_tool.is_offsetting() {
-                    ui.label("Offset dist:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.offset_distance_input)
-                            .desired_width(56.0)
-                            .hint_text("through"),
-                    );
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("File: {file_label}{dirty_marker}"));
                     ui.separator();
-                }
-                // ステータスメッセージ（動的な成否通知）はヘルプ文字列より優先度が高いため、
-                // 幅が狭くヘルプ文字列がクリップされてもステータスは見える位置に置く。
-                if let Some(msg) = &self.status {
-                    ui.colored_label(STATUS_MESSAGE_COLOR, &msg.text);
+                    ui.label(format!("Tool: {}", self.tool_kind.label()));
                     ui.separator();
-                }
-                ui.label(
-                    "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
+                    ui.label(format!(
+                        "Snap: {}",
+                        if self.snap_enabled { "ON" } else { "OFF" }
+                    ));
+                    ui.separator();
+                    // オフセット距離入力欄（設計判断5）。モーダルにせず上部パネルへ常設だが、
+                    // 画面を圧迫しないようオフセットモード中のみ表示する。空欄なら通過点方式
+                    // （hint の "through"）、正の有限値なら距離固定＋クリックは側の決定のみ。
+                    if self.select_tool.is_offsetting() {
+                        ui.label("Offset dist:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.offset_distance_input)
+                                .desired_width(56.0)
+                                .hint_text("through"),
+                        );
+                        ui.separator();
+                    }
+                    // Text ツールの文字列・高さ入力欄（M6 タスク23）。アンカー確定後のみ表示し、
+                    // Enter で AddEntity。文字列欄は IME 入力（CJK）可。フォーカス管理・
+                    // ショートカット抑止は既存の `app_shortcuts_enabled`（text_focused）を流用。
+                    let text_anchor = if self.tool_kind == ToolKind::Text {
+                        self.tool.as_ref().and_then(|t| t.pending_text_anchor())
+                    } else {
+                        None
+                    };
+                    // アンカー確定直後の初回表示（false→true 遷移）で文字列欄へフォーカスを移す。
+                    let first_show = text_anchor.is_some() && !self.text_field_shown;
+                    if let Some(anchor) = text_anchor {
+                        ui.label("Text:");
+                        let content_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.text_content_input)
+                                .desired_width(160.0)
+                                .hint_text("type text, Enter to place"),
+                        );
+                        if first_show {
+                            content_resp.request_focus();
+                        }
+                        ui.label("H:");
+                        let height_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.text_height_input)
+                                .desired_width(48.0),
+                        );
+                        ui.separator();
+                        // いずれかの欄で Enter を押したら確定（egui では Enter で欄がフォーカスを失う）。
+                        let submit = (content_resp.lost_focus() || height_resp.lost_focus())
+                            && ui.input(|i| i.key_pressed(Key::Enter));
+                        if submit && !self.commit_text(anchor, now) {
+                            // 確定失敗（空文字列・不正な高さ等）は入力を残し、文字列欄へ再フォーカス。
+                            content_resp.request_focus();
+                        }
+                    }
+                    // 表示状態を更新し、非表示に転じたフレームでは入力中の文字列を捨てる
+                    // （Esc キャンセル・ツール切替・確定後など。[`McadApp::set_text_field_shown`]）。
+                    self.set_text_field_shown(text_anchor.is_some());
+                    // ステータスメッセージ（動的な成否通知）はキーバインド凡例を2行目へ分離した
+                    // ことで、このフレーム内で幅を奪い合う相手がなくなり常に見える。
+                    if let Some(msg) = &self.status {
+                        ui.colored_label(STATUS_MESSAGE_COLOR, &msg.text);
+                        ui.separator();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(
+                        "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  T=Text  \
                      M=Move  R=Rotate  Shift+M=Mirror  O=Offset  Ctrl+D=Duplicate  \
                      Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo  \
                      Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As  \
                      Ctrl+Shift+O=Import DXF  Ctrl+E=Export DXF",
-                );
+                    );
+                });
             });
         });
 
@@ -998,6 +1133,21 @@ impl eframe::App for McadApp {
             );
             if let Some(tool) = &self.tool {
                 tool.draw_preview(&painter, rect, &self.viewport);
+            }
+            // Text ツールでアンカー確定後は、入力中の文字列を実サイズ・実位置でプレビューする
+            // （文字列・高さを持つ app 層でしか描けないため、tool.draw_preview とは別にここで）。
+            if self.tool_kind == ToolKind::Text
+                && let Some(anchor) = self.tool.as_ref().and_then(|t| t.pending_text_anchor())
+                && let Some(height) = parse_text_height(&self.text_height_input)
+                && !self.text_content_input.is_empty()
+            {
+                let preview = TextGeom {
+                    anchor,
+                    content: self.text_content_input.clone(),
+                    height,
+                    angle: 0.0,
+                };
+                draw_text(&painter, rect, &self.viewport, &preview, TEXT_PREVIEW_COLOR);
             }
             if let Some(marker) = &self.snap_marker {
                 draw_snap_marker(&painter, rect, &self.viewport, marker);
@@ -1085,6 +1235,8 @@ fn handle_tool_shortcut_keys(
             requested = Some(ToolKind::Arc);
         } else if i.key_pressed(Key::P) {
             requested = Some(ToolKind::Polyline);
+        } else if i.key_pressed(Key::T) {
+            requested = Some(ToolKind::Text);
         }
     });
     if let Some(kind) = requested {
@@ -1440,7 +1592,21 @@ fn handle_select_input(
     // 消費するので、ここへ来る `O` は素の押下のみ。以降のクリックは次フレームから
     // オフセット経路が受け取る。
     if ui.input(|i| !i.modifiers.command && i.key_pressed(Key::O)) {
-        if select_tool.start_offset() {
+        // Text・寸法はオフセット対象外（DESIGN.md M6 L385）。pick() の汎用化で Text も
+        // 選択できるようになったため、単一 Text 選択で O を押してもモードに入らないよう
+        // ここで明示的に拒否する（`offset_click` 側の拒否と二重の防御）。
+        let sel = select_tool.selection();
+        let unsupported_single = sel.len() == 1
+            && document
+                .entity(sel[0])
+                .is_some_and(|e| e.geom.as_shape().is_none());
+        if unsupported_single {
+            set_status(
+                status,
+                now,
+                "Offset supports lines, circles, arcs, and polylines only",
+            );
+        } else if select_tool.start_offset() {
             set_status(
                 status,
                 now,
@@ -1610,6 +1776,13 @@ fn handle_placement_input(
 /// 空・0・負・非数は `None`（呼び出し側は通過点方式のフォールバックとして扱う。
 /// 設計判断5: 「欄が空・0・非数なら通過点方式へフォールバックする」）。
 fn parse_offset_distance(text: &str) -> Option<f64> {
+    let value: f64 = text.trim().parse().ok()?;
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+/// Text ツールの高さ入力欄（ワールド単位）を解析する。**正の有限値のみ** `Some`。
+/// 空・0・負・非数は `None`（確定は拒否し、プレビューは描かない）。
+fn parse_text_height(text: &str) -> Option<f64> {
     let value: f64 = text.trim().parse().ok()?;
     (value.is_finite() && value > 0.0).then_some(value)
 }
@@ -1790,13 +1963,16 @@ fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewp
         if !entity.geom.aabb().intersects(&visible) {
             continue;
         }
-        // M6: 描画は Shape 系のみ（Text/寸法の描画は後続タスク）。
-        let Some(shape) = entity.geom.as_shape() else {
-            continue;
-        };
-        let color = entity.style.effective_color(layer.color);
-        let stroke = Stroke::new(entity.style.width.max(1.0), to_color32(color));
-        draw_shape(painter, rect, viewport, shape, stroke);
+        let color = to_color32(entity.style.effective_color(layer.color));
+        match &entity.geom {
+            EntityGeom::Shape(shape) => {
+                let stroke = Stroke::new(entity.style.width.max(1.0), color);
+                draw_shape(painter, rect, viewport, shape, stroke);
+            }
+            EntityGeom::Text(text) => draw_text(painter, rect, viewport, text, color),
+            // 寸法の描画は後続タスク24。
+            EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {}
+        }
     }
 }
 
@@ -1827,13 +2003,18 @@ fn draw_selection(
     }
 
     // 選択集合を `transform` で変換した先を強調色で仮表示する（配置先ゴースト）。
-    // M6: 変換は EntityGeom 全体に効くが、描画は Shape 系のみ（Text/寸法ゴーストは後続タスク）。
+    // Text も変換（移動・回転・鏡映・複製）に追従してゴースト表示する。寸法は後続タスク。
     let draw_ghost = |transform: &dyn Fn(&EntityGeom) -> EntityGeom| {
         for &id in select_tool.selection() {
             if let Some(entity) = document.entity(id) {
-                let ghost = transform(&entity.geom);
-                if let Some(shape) = ghost.as_shape() {
-                    draw_shape(painter, rect, viewport, shape, highlight);
+                match transform(&entity.geom) {
+                    EntityGeom::Shape(shape) => {
+                        draw_shape(painter, rect, viewport, &shape, highlight);
+                    }
+                    EntityGeom::Text(text) => {
+                        draw_text(painter, rect, viewport, &text, highlight.color);
+                    }
+                    EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {}
                 }
             }
         }
@@ -1894,12 +2075,35 @@ fn draw_selected(
 ) {
     for &id in select_tool.selection() {
         if let Some(entity) = document.entity(id) {
-            // M6: 描画は Shape 系のみ（Text/寸法の描画は後続タスク）。
-            if let Some(shape) = entity.geom.as_shape() {
-                draw_shape(painter, rect, viewport, shape, stroke);
+            match &entity.geom {
+                EntityGeom::Shape(shape) => draw_shape(painter, rect, viewport, shape, stroke),
+                EntityGeom::Text(text) => {
+                    // 文字を強調色で上書きし、加えて近似 aabb の枠を描く（ヒットテストが
+                    // aabb 近似であることを可視化し、選択が分かりやすいように）。
+                    draw_text(painter, rect, viewport, text, stroke.color);
+                    draw_aabb_outline(painter, rect, viewport, &entity.geom.aabb(), stroke);
+                }
+                EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {}
             }
         }
     }
+}
+
+/// AABB の枠線をスクリーンへ描く（Text 選択の可視化などに使う）。
+fn draw_aabb_outline(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    aabb: &Aabb,
+    stroke: Stroke,
+) {
+    let a = viewport.world_to_screen(rect, aabb.min);
+    let b = viewport.world_to_screen(rect, aabb.max);
+    let r = Rect::from_two_pos(a, b);
+    painter.line_segment([r.left_top(), r.right_top()], stroke);
+    painter.line_segment([r.right_top(), r.right_bottom()], stroke);
+    painter.line_segment([r.right_bottom(), r.left_bottom()], stroke);
+    painter.line_segment([r.left_bottom(), r.left_top()], stroke);
 }
 
 /// スナップ先にマーカーを描画する。候補種別ごとに形を変えて、どの種別に吸着したか
@@ -1990,6 +2194,47 @@ fn draw_shape(
     }
 }
 
+/// テキスト 1 つを Painter へ描画する（M6 タスク23、[`epaint::TextShape`] 使用）。
+///
+/// # フォントサイズ
+///
+/// `height（ワールド） × zoom` を px として毎フレーム計算し、ズームで文字も拡大縮小する
+/// （ワールド固定サイズ = CAD の期待動作。DESIGN.md M6 設計判断3）。判読不能な極小は描かず、
+/// 過大サイズはフォントアトラス肥大を防ぐため [`MAX_TEXT_PX`] で頭打ちにする。
+///
+/// # 位置と角度
+///
+/// アンカー（ベースライン左端）にガリー下端左を合わせる（M6 の近似。降り部は無視）。
+/// egui の `TextShape` はガリー左上 `pos` まわりに回すため、下端左がアンカーに載るよう
+/// `pos` をずらす。角度はワールド CCW θ をスクリーン（y 下向き）用に `a = −θ` へ符号反転する。
+fn draw_text(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    text: &TextGeom,
+    color: Color32,
+) {
+    if text.content.is_empty() {
+        return;
+    }
+    let font_px = text.height * viewport.zoom;
+    if !font_px.is_finite() || font_px < MIN_TEXT_PX {
+        return;
+    }
+    let font_px = font_px.min(MAX_TEXT_PX) as f32;
+    let anchor = viewport.world_to_screen(rect, text.anchor);
+    let font_id = egui::FontId::new(font_px, egui::FontFamily::Proportional);
+    let galley = painter.layout_no_wrap(text.content.clone(), font_id, color);
+    let h = galley.size().y;
+    // ワールド CCW 角 θ → スクリーン egui 角 a = −θ。
+    let a = -(text.angle as f32);
+    let (sin_a, cos_a) = a.sin_cos();
+    // pos = anchor − Rot(a)·(0, h)。Rot(a)·(0, h) = (−h·sin_a, h·cos_a)。
+    let pos = anchor - egui::vec2(-h * sin_a, h * cos_a);
+    let shape = egui::epaint::TextShape::new(pos, galley, color).with_angle(a);
+    painter.add(egui::Shape::Text(shape));
+}
+
 /// 円弧を開始角〜終了角まで [`ARC_SEGMENTS`] 分割のポリラインで近似描画する。
 fn draw_arc(painter: &egui::Painter, rect: Rect, viewport: &Viewport, arc: &Arc, stroke: Stroke) {
     let sweep = arc.sweep();
@@ -2031,7 +2276,12 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "mcad",
         native_options,
-        Box::new(|_cc| Ok(Box::new(McadApp::new()))),
+        Box::new(|cc| {
+            // 文書内 Text の CJK グリフ用に、既定フォントの後ろへ Noto Sans JP を追加する
+            // （UI 文字列は ASCII のまま。M6 タスク23）。
+            fonts::install_fallback_fonts(&cc.egui_ctx);
+            Ok(Box::new(McadApp::new()))
+        }),
     )
     .map_err(|err| anyhow::anyhow!("failed to run mcad-app: {err}"))
 }
@@ -2477,6 +2727,70 @@ mod tests {
         assert!(aabb.max.x >= 8.0);
         assert!(aabb.min.y <= -5.0);
         assert!(aabb.max.y >= 5.0);
+    }
+
+    #[test]
+    fn hiding_text_field_clears_pending_content() {
+        // Esc でアンカーをキャンセルした等で入力欄が非表示に転じたら、入力中の文字列を
+        // 捨てる（次にアンカーを置いたとき前回入力が残らない。coordinator 指摘の回帰）。
+        let mut app = McadApp::new();
+        app.text_content_input = "abc".to_owned();
+        app.text_field_shown = true;
+
+        app.set_text_field_shown(false);
+        assert!(app.text_content_input.is_empty());
+        assert!(!app.text_field_shown);
+    }
+
+    #[test]
+    fn text_field_content_survives_while_shown() {
+        // 表示が続いている間（入力中）は文字列を消さない。
+        let mut app = McadApp::new();
+        app.text_content_input = "abc".to_owned();
+
+        // 非表示→表示（初回表示）はクリアしない。
+        app.set_text_field_shown(true);
+        assert_eq!(app.text_content_input, "abc");
+        // 表示継続でもクリアしない。
+        app.set_text_field_shown(true);
+        assert_eq!(app.text_content_input, "abc");
+    }
+
+    #[test]
+    fn reset_transient_ui_state_restores_default_text_height() {
+        // 新規作成・読込の直後（reset_transient_ui_state）は、別図面へ切り替わるため
+        // 前図面で変更した高さ入力を持ち越してはいけない（Codex 指摘の回帰）。
+        let mut app = McadApp::new();
+        app.text_height_input = "99".to_owned();
+        app.text_content_input = "abc".to_owned();
+
+        app.reset_transient_ui_state();
+
+        assert_eq!(app.text_height_input, DEFAULT_TEXT_HEIGHT);
+        assert!(app.text_content_input.is_empty());
+    }
+
+    #[test]
+    fn document_aabb_includes_text_bounds() {
+        // zoom fit（document_aabb）が Text の近似 aabb も合算に含めること（M6 タスク23 item5）。
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        // 遠く離れたアンカーの Text だけを置く。document_aabb がその範囲を包めば成功。
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::Text(TextGeom {
+                    anchor: Point2::new(100.0, 200.0),
+                    content: "hello".to_owned(),
+                    height: 5.0,
+                    angle: 0.0,
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        let aabb = document_aabb(&document).expect("document has a text entity");
+        assert!(aabb.min.x <= 100.0 && aabb.max.x >= 100.0);
+        assert!(aabb.min.y <= 200.0 && aabb.max.y >= 205.0);
     }
 
     // --- 配置モードの解除経路（Codex 敵対的レビュー指摘1・2の回帰） ---

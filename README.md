@@ -4,7 +4,7 @@ Rust + egui で開発している2D CADソフトウェアです。現在 **v0.5.
 
 ## 主な機能
 
-- **作図**: 点・線分・円・円弧（始点/通過点/終点の3点指定）・ポリライン
+- **作図**: 点・線分・円・円弧（始点/通過点/終点の3点指定）・ポリライン・テキスト（CJK 対応）
 - **編集**: 選択（クリック/矩形/累積選択）・移動・複製・回転・ミラー・オフセット・削除
 - **スナップ**: 端点・交点・中点・中心・グリッドを優先度付きで候補選択、種別ごとのマーカー表示
 - **レイヤー**: 色変更・表示/非表示・ロック、専用パネルで管理
@@ -39,6 +39,7 @@ cargo run -p mcad-app
 | `O` | 選択エンティティをオフセット（単一対象、通過点クリックまたは距離入力） |
 | `1` | 点ツール |
 | `L` / `C` / `A` / `P` | 線分 / 円 / 円弧 / ポリライン |
+| `T` | テキスト（アンカーをクリック後、上部パネルで文字列・高さを入力し `Enter` で確定。`Esc` でキャンセル） |
 | `Enter` | ポリライン確定（2点以上、開いたまま確定。始点クリックなら閉じて即確定） |
 | `Del` / `Backspace` | 選択エンティティを削除 |
 | `Esc` | 作図・配置モードのキャンセル / 矩形ドラッグ破棄 / 選択全解除 |
@@ -100,6 +101,21 @@ cargo fmt --all --check                      # 整形チェック
 CI（`.github/workflows/ci.yml`）もこの3チェック（fmt / clippy / test）を実行します。すべての変更はこれらが通ってからコミットしてください。
 
 GUI に関わる変更（ダイアログ・ビューポート・パネル等）は自動テストできないため、実ウィンドウでの手動スモークテストが必要です。
+
+## フォント / ライセンス帰属
+
+文書内のテキスト（Text エンティティ）で日本語などの CJK グリフを表示するため、
+[Noto Sans JP](https://fonts.google.com/noto/specimen/Noto+Sans+JP) Regular をバイナリへ
+埋め込んでいます。egui の既定フォントの後ろにフォールバックとして追加しているため、
+UI ラベルや英数字の見た目は変わりません（egui の UI 可視文字列は ASCII 限定の方針を維持）。
+
+Noto Sans JP は SIL Open Font License 1.1 で提供されています。ライセンス全文は
+[`crates/mcad-app/assets/fonts/LICENSE-OFL.txt`](./crates/mcad-app/assets/fonts/LICENSE-OFL.txt)
+に同梱しています。
+
+> Noto Sans JP is licensed under the SIL Open Font License, Version 1.1.
+> © 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+> "Noto" is a trademark of Google LLC.
 
 ## ドキュメント
 

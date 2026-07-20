@@ -136,6 +136,18 @@ impl Aabb {
             max: self.max + m,
         }
     }
+
+    /// 点 `p` から AABB までの符号なし距離。内部（境界上を含む）なら `0.0`。
+    ///
+    /// ピック処理で近似形状（Text の境界枠など）を実形状と同じ「許容量以内で
+    /// 最も近い」比較にかけるために使う。
+    #[inline]
+    #[must_use]
+    pub fn distance_to_point(&self, p: Point2) -> f64 {
+        let dx = (self.min.x - p.x).max(0.0).max(p.x - self.max.x);
+        let dy = (self.min.y - p.y).max(0.0).max(p.y - self.max.y);
+        (dx * dx + dy * dy).sqrt()
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +205,22 @@ mod tests {
         let e = a.expanded(1.0);
         assert_eq!(e.min, Point2::new(-1.0, -1.0));
         assert_eq!(e.max, Point2::new(3.0, 3.0));
+    }
+
+    #[test]
+    fn distance_to_point_inside_and_outside() {
+        let a = Aabb::from_corners(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
+
+        // 内部・境界上は 0。
+        assert_eq!(a.distance_to_point(Point2::new(5.0, 5.0)), 0.0);
+        assert_eq!(a.distance_to_point(Point2::new(0.0, 0.0)), 0.0);
+        assert_eq!(a.distance_to_point(Point2::new(10.0, 5.0)), 0.0);
+
+        // 軸方向に直線的に離れている場合はその距離そのもの。
+        assert_eq!(a.distance_to_point(Point2::new(15.0, 5.0)), 5.0);
+        assert_eq!(a.distance_to_point(Point2::new(5.0, -3.0)), 3.0);
+
+        // 斜め（コーナー外）は 3-4-5 のユークリッド距離。
+        assert_eq!(a.distance_to_point(Point2::new(13.0, 14.0)), 5.0);
     }
 }

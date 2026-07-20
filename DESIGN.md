@@ -361,9 +361,16 @@ M9 は独立テーマではなく 1.0 前の安定化バッファとして扱い
 1. **Text・寸法は mcad-core の新設 `EntityGeom` に置き、mcad-geom の `Shape` は変更しない**:
    - `Shape` へのバリアント追加は、mcad 内 15 箇所以上の exhaustive match に加えて
      **tcad の `EntityKind::of()`(tcad-kit/src/selector.rs)を直接壊す**(調査済み。`#[non_exhaustive]` なし)。
-     一方 tcad は `Shape` のみを使い **`Entity` / `Command`(mcad-core)を一切使っていない**ため、
-     core 側の拡張なら tcad 影響ゼロ。ロードマップの「core の Text エンティティ追加は tcad 互換を確認」は
-     「tcad で `cargo test --workspace` が通ること」を完了条件として満たす(Shape 不変なので通る見込み)
+     `Shape` を不変に保てば、tcad が `Shape` のみを消費する箇所は無傷。ただし
+     **tcad は `mcad_core::Entity` / `Command` も実際に使っている**(`BlueprintDoc::select`・
+     `TcadSnapshot::capture` 等が `Entity.geom` を直接参照)ため、`Entity.geom: Shape → EntityGeom`
+     化そのものは tcad 側のコード修正を要した(タスク22 実装時に判明。当初「Entity/Command 不使用」
+     としていたのは誤り)。実際の対応: `BlueprintDoc::select` は非 Shape エンティティを
+     黙ってフィルタ、`TcadSnapshot::capture` は `Result<Self, SnapshotError>` 化して
+     `SnapshotError::UnsupportedGeom` で明示的に拒否(黙って capture すると保存時に
+     無警告でデータが消えるため。Codex アドバーサリアルレビューで指摘・修正)。
+     ロードマップの「core の Text エンティティ追加は tcad 互換を確認」は
+     「tcad で `cargo test --workspace` が通ること」を完了条件として満たした
    - `Entity.geom: Shape` を `Entity.geom: EntityGeom` へ変更する:
      `EntityGeom::{ Shape(Shape), Text(TextGeom), DimLinear(DimLinear), DimRadial(DimRadial) }`。
      `Command::ModifyEntity` の `new_geom` も `EntityGeom` 化する(core 内の公開 API 変更だが tcad 不使用)

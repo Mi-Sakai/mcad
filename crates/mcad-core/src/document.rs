@@ -18,9 +18,7 @@
 
 use slotmap::SlotMap;
 
-use mcad_geom::Shape;
-
-use crate::{Command, CoreError, Entity, EntityId, Layer, LayerId, Rgb};
+use crate::{Command, CoreError, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb};
 
 /// 実行済みコマンドの逆操作可能な記録（内部専用）。
 ///
@@ -39,8 +37,8 @@ enum Applied {
     },
     ModifyEntity {
         id: EntityId,
-        before: Shape,
-        after: Shape,
+        before: EntityGeom,
+        after: EntityGeom,
     },
     AddLayer {
         id: LayerId,
@@ -651,7 +649,7 @@ impl Document {
     }
 
     /// 生存エンティティの幾何のみ差し替える。生存を前提とする。
-    fn set_entity_geom(&mut self, id: EntityId, geom: Shape) {
+    fn set_entity_geom(&mut self, id: EntityId, geom: EntityGeom) {
         self.live_entity_mut(id).geom = geom;
     }
 }
@@ -666,14 +664,17 @@ impl Default for Document {
 mod tests {
     use super::*;
     use crate::Style;
-    use mcad_geom::{LineSeg, Point2};
+    use mcad_geom::{LineSeg, Point2, Shape};
 
-    fn line(x: f64) -> Shape {
-        Shape::Line(LineSeg::new(Point2::new(x, 0.0), Point2::new(x, 1.0)))
+    fn line(x: f64) -> EntityGeom {
+        EntityGeom::Shape(Shape::Line(LineSeg::new(
+            Point2::new(x, 0.0),
+            Point2::new(x, 1.0),
+        )))
     }
 
     /// カレントレイヤー上に、指定幾何のエンティティを追加するコマンドを作る。
-    fn add_line(doc: &Document, geom: Shape) -> Command {
+    fn add_line(doc: &Document, geom: EntityGeom) -> Command {
         Command::AddEntity(Entity::new(geom, doc.current_layer(), Style::inherited()))
     }
 
@@ -1431,11 +1432,11 @@ mod tests {
     }
 
     /// NaN 座標を持つ、幾何として不正な線分。
-    fn invalid_line() -> Shape {
-        Shape::Line(LineSeg::new(
+    fn invalid_line() -> EntityGeom {
+        EntityGeom::Shape(Shape::Line(LineSeg::new(
             Point2::new(f64::NAN, 0.0),
             Point2::new(1.0, 1.0),
-        ))
+        )))
     }
 
     #[test]

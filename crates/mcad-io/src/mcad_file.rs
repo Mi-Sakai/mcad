@@ -9,7 +9,9 @@
 //! - レイヤー参照は `LayerId` ではなく **`layers` 配列へのインデックス**（安定な
 //!   ファイル ID）。
 //! - 生存中のレイヤー・エンティティのみを列挙する。undo/redo 履歴・墓標は保存しない。
-//! - `version` フィールド必須（現行は `1`）。未知バージョンは読込を拒否する。
+//! - `version` フィールド必須（現行は `2`）。書き出しは常に v2。読込は v1（幾何が
+//!   [`Shape`] のみ）を後方互換で受理し（[`from_json`] が [`EntityGeom::Shape`] へ変換）、
+//!   それ以外の未知バージョンは拒否する。
 //!
 //! # import の再構築
 //!
@@ -39,15 +41,19 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use mcad_core::{Command, Document, Entity, Layer, LayerId, Style};
+use mcad_core::{Command, Document, Entity, EntityGeom, Layer, LayerId, Style};
 use mcad_geom::Shape;
 
 use crate::IoError;
 
 /// 現行のファイルフォーマットバージョン。
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v2（M6）で [`FileEntity::geom`] を [`EntityGeom`]（テキスト・寸法を含む）へ拡張した。
+/// v1 ファイル（幾何が [`Shape`] のみ）は [`from_json`] が後方互換で読み込む（
+/// [`FileDocumentV1`] 参照）。書き出しは常に v2。
+pub const FORMAT_VERSION: u32 = 2;
 
-/// `.mcad` ファイル全体を表すポータブルな DTO。
+/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v2）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDocument {
     /// フォーマットバージョン。[`FORMAT_VERSION`] 以外は読込を拒否する。
@@ -61,7 +67,7 @@ pub struct FileDocument {
     pub entities: Vec<FileEntity>,
 }
 
-/// `.mcad` ファイル内のエンティティ 1 件。
+/// `.mcad` ファイル内のエンティティ 1 件（現行 v2）。
 ///
 /// [`mcad_core::Entity`] と違い、所属レイヤーを `LayerId` ではなく
 /// [`FileDocument::layers`] へのインデックスで参照する。
@@ -71,8 +77,47 @@ pub struct FileEntity {
     pub layer: usize,
     /// 描画スタイル。
     pub style: Style,
-    /// 幾何形状。
-    pub geom: Shape,
+    /// 幾何形状（v2 でテキスト・寸法を含む [`EntityGeom`] へ拡張）。
+    pub geom: EntityGeom,
+}
+
+/// v1 ファイル全体を表す DTO（後方互換読込専用）。v2 との差は [`FileEntityV1`] の
+/// `geom` が [`Shape`] であること。[`from_json`] が `version == 1` を検出したときのみ使う。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct FileDocumentV1 {
+    version: u32,
+    layers: Vec<Layer>,
+    current_layer: usize,
+    entities: Vec<FileEntityV1>,
+}
+
+/// v1 ファイル内のエンティティ 1 件（`geom` が [`Shape`]）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct FileEntityV1 {
+    layer: usize,
+    style: Style,
+    geom: Shape,
+}
+
+impl FileDocumentV1 {
+    /// v1 DTO を現行の v2 [`FileDocument`] へ変換する（各 `Shape` を
+    /// [`EntityGeom::Shape`] で包む。バージョンは [`FORMAT_VERSION`] に更新）。
+    fn into_v2(self) -> FileDocument {
+        FileDocument {
+            version: FORMAT_VERSION,
+            layers: self.layers,
+            current_layer: self.current_layer,
+            entities: self
+                .entities
+                .into_iter()
+                .map(|e| FileEntity {
+                    layer: e.layer,
+                    style: e.style,
+                    geom: EntityGeom::Shape(e.geom),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// ドキュメントをポータブルな [`FileDocument`] へ変換する。
@@ -134,7 +179,7 @@ pub fn import_document(file: &FileDocument) -> Result<Document, IoError> {
                 layer: entity.layer,
             });
         }
-        if let Err(reason) = validate_shape(&entity.geom) {
+        if let Err(reason) = entity.geom.validate() {
             return Err(IoError::InvalidGeometry { index, reason });
         }
     }
@@ -197,13 +242,36 @@ pub fn to_json(doc: &Document) -> Result<String, IoError> {
 
 /// `.mcad` の JSON 文字列からドキュメントを再構築する。
 ///
+/// # バージョン互換
+///
+/// 先頭でフォーマットバージョンだけを読み、`version == 1` なら旧 DTO（[`FileDocumentV1`]、
+/// 幾何は [`Shape`]）としてパースして [`EntityGeom::Shape`] へ変換し、`version == 2`
+/// （[`FORMAT_VERSION`]）なら現行 DTO としてパースする。それ以外は
+/// [`IoError::UnsupportedVersion`] を返す。書き出しは常に v2。
+///
 /// # Errors
 ///
-/// JSON 構文・型の不一致は [`IoError::Json`]、フォーマット上の異常は
+/// JSON 構文・型の不一致は [`IoError::Json`]、未知バージョンは
+/// [`IoError::UnsupportedVersion`]、その他フォーマット上の異常は
 /// [`import_document`] と同じ [`IoError`] を返す。
 pub fn from_json(json: &str) -> Result<Document, IoError> {
-    let file: FileDocument = serde_json::from_str(json)?;
-    import_document(&file)
+    /// バージョンだけを先読みするための最小 DTO。
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        version: u32,
+    }
+    let probe: VersionProbe = serde_json::from_str(json)?;
+    match probe.version {
+        1 => {
+            let v1: FileDocumentV1 = serde_json::from_str(json)?;
+            import_document(&v1.into_v2())
+        }
+        FORMAT_VERSION => {
+            let file: FileDocument = serde_json::from_str(json)?;
+            import_document(&file)
+        }
+        other => Err(IoError::UnsupportedVersion(other)),
+    }
 }
 
 /// ドキュメントを `.mcad` ファイルへ保存する。
@@ -225,14 +293,16 @@ pub fn load_mcad(path: impl AsRef<Path>) -> Result<Document, IoError> {
     from_json(&fs::read_to_string(path)?)
 }
 
-/// ジオメトリが io 境界の妥当性条件を満たすか検証する。
+/// [`Shape`] が io 境界の妥当性条件を満たすか検証する。
 ///
 /// 判定条件の実体は [`Shape::validate`]（mcad-geom、DESIGN.md M4 タスク15）に
 /// 引き上げ済み。ここは io 側の呼び出し規約（`pub(crate)`、`Result<(), String>`）
 /// を保つだけの薄いラッパー。
 ///
-/// `pub(crate)`: DXF import（[`crate::dxf_file`]）でも同じ判定基準を再利用する
-/// ため（ロジックの重複・divergence を避ける）。
+/// `pub(crate)`: DXF import（[`crate::dxf_file`]）が `Shape` を直接検証するのに使う。
+/// `.mcad` import（[`import_document`]）は [`EntityGeom::validate`] を呼ぶが、`Shape`
+/// バリアントは同じく [`Shape::validate`] へ委譲するので判定基準は一致する
+/// （ロジックの重複・divergence を避ける）。
 pub(crate) fn validate_shape(shape: &Shape) -> Result<(), String> {
     shape.validate()
 }
@@ -365,11 +435,56 @@ mod tests {
 
     #[test]
     fn unsupported_version_fails() {
+        // 現行は v2。未知の将来バージョン（3）は拒否する。
         let mut file = export_document(&Document::new());
-        file.version = 2;
+        file.version = 3;
         assert!(matches!(
             import_document(&file),
-            Err(IoError::UnsupportedVersion(2))
+            Err(IoError::UnsupportedVersion(3))
+        ));
+    }
+
+    #[test]
+    fn v1_file_is_read_with_backward_compat() {
+        // v0.5.0 以前の v1 ファイル。幾何は Shape が直下に来る（v2 の "Shape" ラッパーなし）。
+        let v1_json = r#"{
+          "version": 1,
+          "layers": [
+            {"name": "0", "color": {"r": 255, "g": 255, "b": 255}, "visible": true, "locked": false}
+          ],
+          "current_layer": 0,
+          "entities": [
+            {"layer": 0, "style": {"color": null, "width": 1.0},
+             "geom": {"Line": {"a": {"x": 0.0, "y": 0.0}, "b": {"x": 3.0, "y": 4.0}}}}
+          ]
+        }"#;
+
+        let doc = from_json(v1_json).expect("v1 ファイルは後方互換で読み込めるべき");
+        assert_eq!(doc.entity_count(), 1);
+        let (_, entity) = doc.entities().next().unwrap();
+        // v1 の Shape は EntityGeom::Shape へ包まれて受理される。
+        assert_eq!(
+            entity.geom,
+            EntityGeom::Shape(Shape::Line(LineSeg::new(
+                Point2::new(0.0, 0.0),
+                Point2::new(3.0, 4.0),
+            )))
+        );
+
+        // 読込後の書き出しは常に v2。往復しても内容が保たれる。
+        let reexported = export_document(&doc);
+        assert_eq!(reexported.version, FORMAT_VERSION);
+        let reimported = import_document(&reexported).unwrap();
+        assert_eq!(export_document(&reimported), reexported);
+    }
+
+    #[test]
+    fn unknown_version_via_json_is_rejected() {
+        // from_json はバージョン先読みで未知バージョンを弾く（v1/v2 以外）。
+        let json = r#"{"version": 99, "layers": [], "current_layer": 0, "entities": []}"#;
+        assert!(matches!(
+            from_json(json),
+            Err(IoError::UnsupportedVersion(99))
         ));
     }
 
@@ -396,7 +511,7 @@ mod tests {
         file.entities.push(FileEntity {
             layer: 9,
             style: Style::inherited(),
-            geom: Shape::Point(Point2::new(0.0, 0.0)),
+            geom: EntityGeom::Shape(Shape::Point(Point2::new(0.0, 0.0))),
         });
         assert!(matches!(
             import_document(&file),
@@ -418,7 +533,7 @@ mod tests {
             file.entities.push(FileEntity {
                 layer: 0,
                 style: Style::inherited(),
-                geom: geom.clone(),
+                geom: EntityGeom::Shape(geom.clone()),
             });
             assert!(
                 matches!(

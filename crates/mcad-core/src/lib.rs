@@ -25,6 +25,7 @@
 mod command;
 mod document;
 mod entity;
+mod entity_geom;
 mod error;
 mod id;
 mod layer;
@@ -33,6 +34,7 @@ mod style;
 pub use command::Command;
 pub use document::{Document, NewIds};
 pub use entity::Entity;
+pub use entity_geom::{DimLinear, DimRadial, EntityGeom, TextGeom};
 pub use error::CoreError;
 pub use id::{EntityId, LayerId};
 pub use layer::Layer;

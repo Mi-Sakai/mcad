@@ -354,4 +354,90 @@ M9 は独立テーマではなく 1.0 前の安定化バッファとして扱い
 
 **→ 全項目 v0.5.0 で達成済み(2026-07-20、タスク17〜20完了)。手動スモークテストは実施済み(タスク19・20 Codex adversarial review 対応含む)。**
 
-M6 以降の詳細設計は、各マイルストーン着手時に本章へ追記する(M4 までと同じ運用)。
+### M6: テキストと寸法(v0.6.0)の設計(2026-07-20 策定、実装未着手)
+
+#### 設計判断
+
+1. **Text・寸法は mcad-core の新設 `EntityGeom` に置き、mcad-geom の `Shape` は変更しない**:
+   - `Shape` へのバリアント追加は、mcad 内 15 箇所以上の exhaustive match に加えて
+     **tcad の `EntityKind::of()`(tcad-kit/src/selector.rs)を直接壊す**(調査済み。`#[non_exhaustive]` なし)。
+     一方 tcad は `Shape` のみを使い **`Entity` / `Command`(mcad-core)を一切使っていない**ため、
+     core 側の拡張なら tcad 影響ゼロ。ロードマップの「core の Text エンティティ追加は tcad 互換を確認」は
+     「tcad で `cargo test --workspace` が通ること」を完了条件として満たす(Shape 不変なので通る見込み)
+   - `Entity.geom: Shape` を `Entity.geom: EntityGeom` へ変更する:
+     `EntityGeom::{ Shape(Shape), Text(TextGeom), DimLinear(DimLinear), DimRadial(DimRadial) }`。
+     `Command::ModifyEntity` の `new_geom` も `EntityGeom` 化する(core 内の公開 API 変更だが tcad 不使用)
+   - `TextGeom`: `anchor: Point2`、`content: String`、`height: f64`(ワールド単位)、`angle: f64`(rad)。
+     **フォント指定は持たない**(M6 は埋め込み 1 書体のみ。per-entity フォントが必要になったら
+     フォーマット版数を上げてフィールド追加する)
+   - `EntityGeom` に `translated` / `rotated` / `mirrored` / `aabb` / `validate` を実装(Shape へは委譲)。
+     Text の変換規則: 平行移動・回転は anchor と angle を素直に変換。**ミラーは anchor のみ鏡映し、
+     文字は鏡像化しない**(グリフ反転は egui で不可能。AutoCAD の MIRRTEXT=0 相当。angle は
+     ベースライン方向を鏡映した角度とする)。Text の aabb は文字数×高さの近似
+     (CJK≈1.0×height、ASCII≈0.55×height。zoom fit 用途の近似と明記し、正確な選択判定は app 層で行う)
+   - Text・寸法はオフセット(`O`)の対象外(ステータスメッセージで拒否)。交差・最近点計算の対象外。
+     スナップ源は Text の anchor のみ(寸法はスナップ源にしない)
+   - validate: 空文字列・`height <= 0`・非有限値は拒否(既存の Shape validate と同じ境界で防ぐ)
+2. **寸法は非関連(non-associative)の静的寸法**: 計測対象エンティティへの参照は持たず、作成時に
+   座標・数値を採取して独立させる(関連寸法・拘束追従は M10 以降のスコープ)。
+   - `DimLinear`: `p1, p2: Point2`(計測 2 点)、`offset: f64`(計測線から寸法線までの符号付き距離)。
+     表示値は保存せず描画時に `|p2 − p1|` を計算(点自体が編集されれば値も追従する)
+   - `DimRadial`: `center: Point2`、`radius: f64`、`leader_angle: f64`(引出方向)。作成時に円/円弧から採取
+   - 表示書式は M6 では `{:.2}` 固定(桁数設定は M8 の設定永続化で扱う)。値の接頭辞は
+     半径寸法のみ `R`(例: `R12.50`)
+   - **矢印・寸法補助線・文字配置の展開(寸法ジオメトリ生成)は app 層の純関数 helper に分離**して
+     単体テストで固定する。mcad-geom には入れない。ロードマップ表の「app 層に閉じる」は
+     「geom 層に入れない」の意であり、永続化・undo の都合上**データ型は core に置く**と明確化する
+3. **フォントは Noto Sans JP Regular を同梱し、egui のフォールバックに追加する**:
+   - `include_bytes!` でバイナリへ埋め込み(実行ファイル +約 5〜6MB は デスクトップ用途で許容)。
+     SIL OFL ライセンスのため、フォントファイルと同じディレクトリ(`crates/mcad-app/assets/`)に
+     ライセンス全文を同梱し、README に帰属表記を追加する
+   - `FontDefinitions` で**既定フォントの後ろ**に fallback として追加する。UI の見た目は不変で、
+     既定フォントにないグリフ(CJK)のみ Noto で描画される
+   - **egui UI 文字列の ASCII 規約は維持する**(規約の理由はフォントだけでなく UI の一貫性のため)。
+     CJK が現れるのは文書内の Text エンティティと寸法値のみ
+   - Text 描画は `epaint::TextShape`(angle 対応)を使う。フォントサイズは
+     `height(ワールド) × zoom` を毎フレーム計算して px 指定する(ワールド固定サイズ =
+     ズームで文字も拡大縮小、が CAD の期待動作)
+4. **.mcad フォーマットは v2 へ**: `FileEntity.geom` を `EntityGeom` 対応にする。
+   - `version: 1` のファイルは旧 DTO で読み、`EntityGeom::Shape` へ変換して受理する(**後方互換読込**。
+     v1 ファイルのラウンドトリップテストを追加)。書き出しは常に v2
+   - 旧バイナリ(v0.5.0 以前)が v2 ファイルを拒否するのは既存バージョンチェックの想定どおり
+5. **DXF は TEXT export のみ M6 で対応**: 位置・高さ・回転を `TEXT` エンティティで出力する
+   (1 書体のため STYLE は既定のまま)。**寸法は DXF 非対応**とし、既存のスキップ機構で件数を
+   ステータス表示する。TEXT / DIMENSION の **import は M9**(ロードマップどおり)
+6. **ツール UX**(いずれも既存 `Tool` トレイトの作図ツールとして実装。Select 系ではない):
+   - **Text**: `T` → anchor をクリック(スナップ適用)→ ツールパネルの入力欄(single-line、
+     IME 入力可)へ文字列、数値欄へ高さ(ワールド単位、既定値は前回値を保持)→ Enter で
+     `AddEntity` 確定、Esc でキャンセル。M6 では回転角 0 で作成し、向きは既存の回転(`R`)で変える
+   - **長さ寸法**: `D` → 計測点 p1 → p2 → 寸法線位置(offset 決定)の 3 クリック。2 クリック目以降は
+     カーソル追従プレビュー。p1 ≈ p2(ピック許容量内)は拒否
+   - **半径寸法**: `Shift+D` → 円または円弧をクリック(ヒットテスト。それ以外は ASCII メッセージで
+     拒否)→ 引出方向クリック。カーソル追従プレビュー
+   - `T` / `D` は未使用キーであることを確認済み(現状: ツール S/1/L/C/A/P、Select 内 M/Shift+M/R/O、
+     Ctrl 系ファイル・履歴)。入力欄フォーカス中の全ショートカット抑止は M5 タスク 20 の
+     `app_shortcuts_enabled` 機構をそのまま使う
+   - Esc・ツール切替・ファイル操作・モーダル表示で状態解除、確定失敗(レイヤーロック)は
+     ステータスバー表示 — いずれも既存規約に従う
+   - Text の選択ヒットテストは aabb 近似(クリック点が近似 aabb 内)で可とする(M6 の割り切り)
+
+#### タスク分割
+
+| # | タスク | 内容 | 担当 | 依存 |
+|---|---|---|---|---|
+| 22 | core データモデル + 永続化 | `EntityGeom` 新設(Shape 包含 + TextGeom + DimLinear/DimRadial)、`Command::ModifyEntity` の EntityGeom 化、validate、.mcad v2(v1 後方互換読込 + テスト)、tcad `cargo test --workspace` 通過確認 | implement-opus | — |
+| 23 | フォント埋め込み + Text ツール | Noto Sans JP 同梱(ライセンス同梱・README 帰属)、TextShape 描画(角度・zoom 追従)、選択/スナップ/zoom fit 統合、`T` ツール(anchor クリック + パネル入力欄) | implement-opus | 22 |
+| 24 | 寸法ツール | 寸法展開描画の純関数 helper(矢印・補助線・文字配置、単体テスト)、`D`(3 クリック長さ寸法)/ `Shift+D`(半径寸法)ツール、プレビュー | implement-opus | 22, 23 |
+| 25 | DXF TEXT export | Text → DXF TEXT 出力、寸法のスキップ件数表示、往復テスト(export のみ) | implement-sonnet | 22 |
+| 26 | ドキュメント整合 | README(キーバインド・フォント帰属)・DESIGN・CHANGELOG 更新、v0.6.0 リリース | haiku-assistant | 22-25 |
+
+#### 検収基準(M6完了の定義)
+
+- CJK を含む Text を作図でき、移動・回転・複製・保存/読込・undo(1 回で消える)が既存操作と同じ規約で動く
+- v0.5.0 以前の `.mcad`(v1)ファイルがそのまま読み込める(後方互換テストで固定)
+- 長さ寸法・半径寸法が正しい値を表示し、寸法展開ロジックは単体テストで固定されている
+- DXF export で TEXT が出力され、寸法はスキップ件数がステータスに出る
+- `../tcad` の `cargo test --workspace` が通る(Shape 不変の確認)
+- fmt / clippy / workspace test 通過、GUI 変更は手動スモークテストを記録する
+
+M7 以降の詳細設計は、各マイルストーン着手時に本章へ追記する(M4 までと同じ運用)。

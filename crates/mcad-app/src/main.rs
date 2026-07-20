@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
-use mcad_core::{Command, Document, Layer, LayerId, Rgb, Style};
+use mcad_core::{Command, Document, EntityGeom, Layer, LayerId, Rgb, Style};
 use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
@@ -582,8 +582,20 @@ impl McadApp {
         self.remember_dialog_dir(&path);
         let path = ensure_dxf_extension(path);
         match save_dxf(&self.document, &path) {
-            Ok(()) => {
+            Ok(0) => {
                 set_status(&mut self.status, now, "Exported DXF file");
+            }
+            Ok(skipped) => {
+                // Text・寸法は DXF 未対応でスキップされる。黙って消えるとデータロスに
+                // 気づけないため、件数をステータスへ出す（import 側メッセージと同書式）。
+                set_status(
+                    &mut self.status,
+                    now,
+                    format!(
+                        "Exported DXF file: {skipped} entity(ies) skipped \
+                         (text/dimension not supported)"
+                    ),
+                );
             }
             Err(err) => {
                 set_status(&mut self.status, now, format!("DXF export failed: {err}"));
@@ -1778,9 +1790,13 @@ fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewp
         if !entity.geom.aabb().intersects(&visible) {
             continue;
         }
+        // M6: 描画は Shape 系のみ（Text/寸法の描画は後続タスク）。
+        let Some(shape) = entity.geom.as_shape() else {
+            continue;
+        };
         let color = entity.style.effective_color(layer.color);
         let stroke = Stroke::new(entity.style.width.max(1.0), to_color32(color));
-        draw_shape(painter, rect, viewport, &entity.geom, stroke);
+        draw_shape(painter, rect, viewport, shape, stroke);
     }
 }
 
@@ -1811,10 +1827,14 @@ fn draw_selection(
     }
 
     // 選択集合を `transform` で変換した先を強調色で仮表示する（配置先ゴースト）。
-    let draw_ghost = |transform: &dyn Fn(&Shape) -> Shape| {
+    // M6: 変換は EntityGeom 全体に効くが、描画は Shape 系のみ（Text/寸法ゴーストは後続タスク）。
+    let draw_ghost = |transform: &dyn Fn(&EntityGeom) -> EntityGeom| {
         for &id in select_tool.selection() {
             if let Some(entity) = document.entity(id) {
-                draw_shape(painter, rect, viewport, &transform(&entity.geom), highlight);
+                let ghost = transform(&entity.geom);
+                if let Some(shape) = ghost.as_shape() {
+                    draw_shape(painter, rect, viewport, shape, highlight);
+                }
             }
         }
     };
@@ -1874,7 +1894,10 @@ fn draw_selected(
 ) {
     for &id in select_tool.selection() {
         if let Some(entity) = document.entity(id) {
-            draw_shape(painter, rect, viewport, &entity.geom, stroke);
+            // M6: 描画は Shape 系のみ（Text/寸法の描画は後続タスク）。
+            if let Some(shape) = entity.geom.as_shape() {
+                draw_shape(painter, rect, viewport, shape, stroke);
+            }
         }
     }
 }

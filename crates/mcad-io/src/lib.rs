@@ -6,8 +6,9 @@
 //!   [`to_json`] / [`from_json`]（文字列）、
 //!   [`export_document`] / [`import_document`]（DTO [`FileDocument`] との相互変換）
 //! - DXF: [`save_dxf`] / [`load_dxf`]（ファイル）、
-//!   [`export_dxf`] / [`import_dxf`]（`dxf::Drawing` との相互変換）、
-//!   結果は [`ImportSummary`]（未対応エンティティの無視件数を含む）
+//!   [`export_dxf`] / [`import_dxf`]（`dxf::Drawing` との相互変換）。
+//!   import 結果は [`ImportSummary`]、export 結果は [`ExportSummary`]（いずれも
+//!   未対応エンティティの無視件数を含む）
 //! - エラー: [`IoError`]
 //!
 //! ファイル形式の設計（ポータブル DTO・ファイル ID 方式・バリデーション）は
@@ -18,7 +19,7 @@ mod dxf_file;
 mod error;
 mod mcad_file;
 
-pub use dxf_file::{ImportSummary, export_dxf, import_dxf, load_dxf, save_dxf};
+pub use dxf_file::{ExportSummary, ImportSummary, export_dxf, import_dxf, load_dxf, save_dxf};
 pub use error::IoError;
 pub use mcad_file::{
     FORMAT_VERSION, FileDocument, FileEntity, export_document, from_json, import_document,

@@ -37,7 +37,7 @@
 
 use egui::{Color32, Painter, Rect, Stroke};
 
-use mcad_core::{Command, Document, Entity, EntityId, LayerId, Style};
+use mcad_core::{Command, Document, Entity, EntityGeom, EntityId, LayerId, Style};
 use mcad_geom::{
     Aabb, Arc, LineSeg, OffsetError, Point2, Polyline, Shape, Vec2, circumcircle, distance_to,
 };
@@ -835,7 +835,11 @@ impl SelectTool {
             if !layer_visible(document, entity) {
                 continue;
             }
-            let d = distance_to(&entity.geom, world);
+            // M6: ヒットテストは Shape 系のみ（Text の aabb ピックは後続タスク）。
+            let Some(shape) = entity.geom.as_shape() else {
+                continue;
+            };
+            let d = distance_to(shape, world);
             if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, id));
             }
@@ -1188,8 +1192,10 @@ impl SelectTool {
     ) -> Option<Shape> {
         let state = self.offset?;
         let entity = document.entity(state.target)?;
-        let (distance, toward) = offset_params(&entity.geom, state.cursor, fixed_distance);
-        entity.geom.offset(distance, toward).ok()
+        // M6: オフセット対象は Shape 系のみ（テキスト・寸法はオフセット対象外）。
+        let shape = entity.geom.as_shape()?;
+        let (distance, toward) = offset_params(shape, state.cursor, fixed_distance);
+        shape.offset(distance, toward).ok()
     }
 
     /// オフセットモードでのクリック確定。単一クリックで結果を確定するかキャンセルする
@@ -1218,23 +1224,28 @@ impl SelectTool {
             self.offset = None;
             return OffsetOutcome::Cancelled("Offset target missing");
         };
+        // M6: オフセット対象は Shape 系のみ。テキスト・寸法は非対応としてキャンセルする。
+        let Some(shape) = entity.geom.as_shape() else {
+            self.offset = None;
+            return OffsetOutcome::Cancelled("Offset not supported for this entity");
+        };
         // 通過点方式で通過点が対象上（ピック許容量内）なら距離ゼロの no-op を拒否する。
         // 距離は側の判定と同じ [`through_point_distance`]（円・円弧は放射距離）で測るので、
         // 弧の半径上を掃引外にクリックした場合（放射距離ほぼゼロ）もここで確実に弾ける。
         // geom の EPS(1e-9) より粗いピック許容量で先に弾く（設計判断5）。
-        if fixed_distance.is_none() && through_point_distance(&entity.geom, world) <= tol {
+        if fixed_distance.is_none() && through_point_distance(shape, world) <= tol {
             self.offset = None;
             return OffsetOutcome::Cancelled("Zero offset distance - offset cancelled");
         }
-        let (distance, toward) = offset_params(&entity.geom, world, fixed_distance);
-        let result = entity.geom.offset(distance, toward);
+        let (distance, toward) = offset_params(shape, world, fixed_distance);
+        let result = shape.offset(distance, toward);
         // クリックで必ずモードを抜ける（成功でもキャンセルでも）。
         self.offset = None;
         match result {
             Ok(geom) => {
                 // 元エンティティのレイヤー・スタイルを丸ごと複製し、幾何のみ差し替える。
                 let mut copy = entity.clone();
-                copy.geom = geom;
+                copy.geom = EntityGeom::Shape(geom);
                 OffsetOutcome::Commit(Command::AddEntity(copy))
             }
             Err(err) => OffsetOutcome::Cancelled(offset_error_message(err)),
@@ -1305,7 +1316,7 @@ impl SelectTool {
     fn build_modify_command(
         &self,
         document: &Document,
-        transform: impl Fn(&Shape) -> Shape,
+        transform: impl Fn(&EntityGeom) -> EntityGeom,
     ) -> Option<Command> {
         let subs: Vec<Command> = self
             .selection
@@ -1341,7 +1352,10 @@ mod tests {
 
     fn shape_of(result: ToolResult) -> Shape {
         match result {
-            ToolResult::Commit(Command::AddEntity(entity)) => entity.geom,
+            ToolResult::Commit(Command::AddEntity(entity)) => match entity.geom {
+                EntityGeom::Shape(shape) => shape,
+                other => panic!("expected Shape geom, got {other:?}"),
+            },
             other => panic!("expected Commit(AddEntity(..)), got {other:?}"),
         }
     }
@@ -2463,7 +2477,7 @@ mod tests {
 
     /// `PlacementOutcome::Commit { cmd: Batch(..), .. }` から `ModifyEntity` の `(id, new_geom)`
     /// 群を取り出す（テスト専用）。想定外の形なら panic する。
-    fn modify_pairs(outcome: &PlacementOutcome) -> Vec<(EntityId, Shape)> {
+    fn modify_pairs(outcome: &PlacementOutcome) -> Vec<(EntityId, EntityGeom)> {
         match outcome {
             PlacementOutcome::Commit {
                 cmd: Command::Batch(subs),
@@ -2742,7 +2756,7 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         // (0,0)-(1,0) を原点まわり 50 度回転 → (0,0)-(cos50, sin50)。1ulp の角度差に
         // 依存しないよう端点を近似比較する。
-        match &pairs[0].1 {
+        match pairs[0].1.as_shape().expect("rotate produces a Shape") {
             Shape::Line(l) => {
                 assert!(l.a.distance(Point2::ORIGIN) < 1e-9);
                 assert!(l.b.distance(Point2::new(c, s)) < 1e-9);
@@ -2985,7 +2999,8 @@ mod tests {
         let OffsetOutcome::Commit(Command::AddEntity(entity)) = outcome else {
             panic!("expected Commit(AddEntity), got {outcome:?}");
         };
-        match entity.geom {
+        let shape = entity.geom.as_shape().expect("offset produces a Shape");
+        match shape {
             Shape::Arc(a) => {
                 // 放射距離ぶん外へ → 新半径 = 元の |p−center|。角度・中心は不変。
                 assert!((a.radius - p.distance(Point2::ORIGIN)).abs() < 1e-9);
@@ -2993,7 +3008,7 @@ mod tests {
                 assert!((a.start_angle - 0.0).abs() < 1e-9);
                 assert!((a.end_angle - FRAC_PI_2).abs() < 1e-9);
                 // 掃引内なので結果は通過点を通る。
-                assert!(mcad_geom::distance_to(&entity.geom, p) < 1e-6);
+                assert!(mcad_geom::distance_to(shape, p) < 1e-6);
             }
             other => panic!("expected offset arc, got {other:?}"),
         }
@@ -3015,7 +3030,7 @@ mod tests {
         let OffsetOutcome::Commit(Command::AddEntity(entity)) = outcome else {
             panic!("expected Commit(AddEntity), got {outcome:?}");
         };
-        match entity.geom {
+        match entity.geom.as_shape().expect("offset produces a Shape") {
             Shape::Arc(a) => {
                 assert!((a.radius - 8.0).abs() < 1e-9, "radius {} != 8", a.radius);
             }
@@ -3079,7 +3094,7 @@ mod tests {
         let OffsetOutcome::Commit(Command::AddEntity(entity)) = outcome else {
             panic!("expected Commit(AddEntity), got {outcome:?}");
         };
-        match entity.geom {
+        match entity.geom.as_shape().expect("offset produces a Shape") {
             Shape::Line(l) => {
                 assert!(l.a.distance(Point2::new(0.0, 5.0)) < 1e-9);
                 assert!(l.b.distance(Point2::new(1.0, 5.0)) < 1e-9);
@@ -3105,7 +3120,7 @@ mod tests {
         let OffsetOutcome::Commit(Command::AddEntity(entity)) = outcome else {
             panic!("expected Commit(AddEntity), got {outcome:?}");
         };
-        match entity.geom {
+        match entity.geom.as_shape().expect("offset produces a Shape") {
             Shape::Line(l) => {
                 assert!(l.a.distance(Point2::new(0.0, -2.0)) < 1e-9);
                 assert!(l.b.distance(Point2::new(1.0, -2.0)) < 1e-9);

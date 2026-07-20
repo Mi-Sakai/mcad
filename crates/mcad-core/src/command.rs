@@ -1,8 +1,6 @@
 //! ドキュメントを変更する唯一の手段である [`Command`]。
 
-use mcad_geom::Shape;
-
-use crate::{Entity, EntityId, Layer, LayerId};
+use crate::{Entity, EntityGeom, EntityId, Layer, LayerId};
 
 /// ドキュメントへの変更を表すコマンド。
 ///
@@ -30,7 +28,7 @@ pub enum Command {
         /// 対象エンティティ。
         id: EntityId,
         /// 差し替え後の幾何。
-        new_geom: Shape,
+        new_geom: EntityGeom,
     },
 
     /// レイヤーを追加する。

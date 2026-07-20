@@ -123,6 +123,23 @@ pub struct ImportSummary {
     pub skipped_entities: usize,
 }
 
+/// DXF export の結果。
+///
+/// M6 で `Entity.geom` が [`mcad_core::EntityGeom`] 化され、Text・寸法（非 Shape
+/// バリアント）を持てるようになった。これらは DXF 未対応（TEXT export はロードマップ上
+/// 後続、寸法は非対応）で export 時にスキップされるが、黙って消えると呼び出し側が
+/// データロスに気づけない。[`ImportSummary`] と対称に、スキップ件数を返して
+/// ステータス表示できるようにする。
+///
+/// `dxf::Drawing` は `Debug` を導出しているが、対称性と将来の拡張余地のためこの構造体は
+/// `Debug` を導出しない（[`ImportSummary`] と同じ扱い）。
+pub struct ExportSummary {
+    /// 生成した図面。
+    pub drawing: Drawing,
+    /// DXF 非対応でスキップしたエンティティ数（Text・寸法）。
+    pub skipped_entities: usize,
+}
+
 /// 2 色間の二乗距離（近似色検索に使う）。
 fn color_distance_sq(a: Rgb, b: Rgb) -> i32 {
     let dr = i32::from(a.r) - i32::from(b.r);
@@ -257,8 +274,10 @@ fn dxf_entity_to_shape(specific: &EntityType) -> Option<Shape> {
 /// `Document` を `dxf::Drawing` へ変換する。
 ///
 /// 生存中のレイヤー・エンティティのみを列挙する（undo/redo 履歴は含めない）。
+/// DXF 未対応の Text・寸法（[`mcad_core::EntityGeom`] の非 Shape バリアント）は
+/// スキップし、その件数を [`ExportSummary::skipped_entities`] に積む。
 #[must_use]
-pub fn export_dxf(doc: &Document) -> Drawing {
+pub fn export_dxf(doc: &Document) -> ExportSummary {
     let mut drawing = Drawing::new();
 
     // LWPOLYLINE（`EntityType::LwPolyline`）は AutoCAD R14 以降でしか書き出せない
@@ -289,18 +308,29 @@ pub fn export_dxf(doc: &Document) -> Drawing {
         drawing.header.current_layer = name.clone();
     }
 
+    let mut skipped_entities = 0usize;
     for (_, entity) in doc.entities() {
         let layer_name = layer_names
             .get(&entity.layer)
             .expect("Document invariant: entity's layer must be alive")
             .clone();
-        let mut dxf_entity = shape_to_dxf_entity(&entity.geom);
+        // M6: DXF は現状 Shape 系のみ export する（TEXT export は後続タスク、寸法は
+        // DXF 非対応）。Shape 以外（Text・寸法）はスキップし件数を数える。件数は
+        // 呼び出し側がステータス表示し、無警告のデータロスを防ぐ。
+        let Some(shape) = entity.geom.as_shape() else {
+            skipped_entities += 1;
+            continue;
+        };
+        let mut dxf_entity = shape_to_dxf_entity(shape);
         dxf_entity.common.layer = layer_name;
         dxf_entity.common.color = style_color_to_dxf(entity.style.color);
         drawing.add_entity(dxf_entity);
     }
 
-    drawing
+    ExportSummary {
+        drawing,
+        skipped_entities,
+    }
 }
 
 /// 未知のレイヤー名を解決する。既知なら既存 `LayerId` を返し、未知ならその場で
@@ -399,13 +429,19 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
 
 /// ドキュメントを DXF ファイルへ保存する。
 ///
+/// 戻り値は DXF 非対応でスキップしたエンティティ数（Text・寸法）で、呼び出し側が
+/// ステータス表示に使う（[`ExportSummary`] 参照）。
+///
 /// # Errors
 ///
 /// DXF への書き出し失敗時に [`IoError::Dxf`] を返す。
-pub fn save_dxf(doc: &Document, path: impl AsRef<Path>) -> Result<(), IoError> {
-    let drawing = export_dxf(doc);
+pub fn save_dxf(doc: &Document, path: impl AsRef<Path>) -> Result<usize, IoError> {
+    let ExportSummary {
+        drawing,
+        skipped_entities,
+    } = export_dxf(doc);
     drawing.save_file(path)?;
-    Ok(())
+    Ok(skipped_entities)
 }
 
 /// DXF ファイルからドキュメントを読み込む。
@@ -546,8 +582,9 @@ mod tests {
     #[test]
     fn round_trip_preserves_entities_and_layers() {
         let doc = full_document();
-        let drawing = export_dxf(&doc);
-        let summary = import_dxf(&drawing).unwrap();
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 0);
+        let summary = import_dxf(&export.drawing).unwrap();
         assert_eq!(summary.skipped_entities, 0);
         let imported = summary.document;
 
@@ -567,7 +604,10 @@ mod tests {
         let imp_entities: Vec<_> = imported.entities().collect();
         assert_eq!(orig_entities.len(), imp_entities.len());
         for ((_, oe), (_, ie)) in orig_entities.iter().zip(imp_entities.iter()) {
-            approx_shape(&oe.geom, &ie.geom);
+            // full_document は Shape 系のみを含む（DXF は Shape のみ往復対象）。
+            let os = oe.geom.as_shape().expect("Shape エンティティのはず");
+            let is = ie.geom.as_shape().expect("Shape エンティティのはず");
+            approx_shape(os, is);
             let oname = &doc.layer(oe.layer).unwrap().name;
             let iname = &imported.layer(ie.layer).unwrap().name;
             assert_eq!(oname, iname);
@@ -583,7 +623,7 @@ mod tests {
     #[test]
     fn import_leaves_history_empty() {
         let doc = full_document();
-        let summary = import_dxf(&export_dxf(&doc)).unwrap();
+        let summary = import_dxf(&export_dxf(&doc).drawing).unwrap();
         assert!(
             !summary.document.can_undo(),
             "読込直後に undo できてはならない"
@@ -594,8 +634,9 @@ mod tests {
     #[test]
     fn round_trip_empty_document() {
         let doc = Document::new();
-        let drawing = export_dxf(&doc);
-        let summary = import_dxf(&drawing).unwrap();
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 0);
+        let summary = import_dxf(&export.drawing).unwrap();
         assert_eq!(summary.skipped_entities, 0);
         assert_eq!(summary.document.entity_count(), 0);
         assert_eq!(summary.document.layer_count(), 1);
@@ -612,7 +653,7 @@ mod tests {
     #[test]
     fn unsupported_entity_is_skipped_and_counted() {
         let doc = full_document();
-        let mut drawing = export_dxf(&doc);
+        let mut drawing = export_dxf(&doc).drawing;
         let before = doc.entity_count();
 
         // TEXT は対応外の EntityType。無視されてカウントされることを確認する。
@@ -623,6 +664,58 @@ mod tests {
         let summary = import_dxf(&drawing).unwrap();
         assert_eq!(summary.skipped_entities, 1);
         assert_eq!(summary.document.entity_count(), before);
+    }
+
+    #[test]
+    fn export_skips_and_counts_text_and_dimension_entities() {
+        use mcad_core::{DimLinear, DimRadial, EntityGeom, TextGeom};
+
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        // Shape 1 件は DXF へ書き出される。
+        doc.apply(Command::AddEntity(Entity::new(
+            Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        // Text・長さ寸法・半径寸法は DXF 未対応でスキップされる（TEXT export は後続タスク）。
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::new(0.0, 0.0),
+                content: "hi".into(),
+                height: 1.0,
+                angle: 0.0,
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::new(0.0, 0.0),
+                p2: Point2::new(2.0, 0.0),
+                offset: 1.0,
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimRadial(DimRadial {
+                center: Point2::new(0.0, 0.0),
+                radius: 2.0,
+                leader_angle: 0.0,
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+        // 3 件（Text + 2 寸法）がスキップされ、Shape 1 件だけが図面へ入る。
+        assert_eq!(export.skipped_entities, 3);
+        assert_eq!(export.drawing.entities().count(), 1);
     }
 
     #[test]

@@ -22,13 +22,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
-use mcad_core::{Command, CoreError, Document, Entity, EntityId, Layer, Rgb, Style};
+use mcad_core::{Command, CoreError, Document, Entity, EntityGeom, EntityId, Layer, Rgb, Style};
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape, Vec2};
 use mcad_io::{load_dxf, load_mcad, save_dxf, save_mcad};
 
 /// 線分・円・円弧・ポリラインを最低1つずつカレントレイヤーに追加し、
-/// `(EntityId, 追加時点の Shape)` の一覧を追加順で返す。
-fn add_one_of_each_shape(doc: &mut Document) -> Vec<(EntityId, Shape)> {
+/// `(EntityId, 追加時点の EntityGeom)` の一覧を追加順で返す。
+fn add_one_of_each_shape(doc: &mut Document) -> Vec<(EntityId, EntityGeom)> {
     let layer = doc.current_layer();
     let shapes = vec![
         Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0))),
@@ -55,7 +55,7 @@ fn add_one_of_each_shape(doc: &mut Document) -> Vec<(EntityId, Shape)> {
                 )))
                 .unwrap();
             assert_eq!(new_ids.entities.len(), 1, "AddEntity は新規IDを1件発行する");
-            (new_ids.entities[0], shape)
+            (new_ids.entities[0], EntityGeom::Shape(shape))
         })
         .collect()
 }
@@ -148,7 +148,7 @@ fn layer_visibility_and_lock_are_enforced_and_persisted() {
     assert_eq!(
         doc.apply(Command::ModifyEntity {
             id: entity_id,
-            new_geom: Shape::Point(Point2::new(9.0, 9.0)),
+            new_geom: Shape::Point(Point2::new(9.0, 9.0)).into(),
         }),
         Err(CoreError::LayerLocked(hidden_locked))
     );
@@ -159,7 +159,7 @@ fn layer_visibility_and_lock_are_enforced_and_persisted() {
     // 拒否されたので状態は変わらない。
     assert_eq!(
         doc.entity(entity_id).unwrap().geom,
-        Shape::Point(Point2::new(1.0, 1.0))
+        EntityGeom::Shape(Shape::Point(Point2::new(1.0, 1.0)))
     );
 
     // 対比: デフォルトレイヤーは非表示でもロックでもないので、そちらのエンティティは
@@ -174,7 +174,7 @@ fn layer_visibility_and_lock_are_enforced_and_persisted() {
         .entities[0];
     doc.apply(Command::ModifyEntity {
         id: free_id,
-        new_geom: Shape::Point(Point2::new(2.0, 2.0)),
+        new_geom: Shape::Point(Point2::new(2.0, 2.0)).into(),
     })
     .unwrap();
     let default_layer_state = doc.layer(default_layer).unwrap();
@@ -253,12 +253,13 @@ fn entity_counts_by_layer(doc: &Document) -> BTreeMap<String, usize> {
 fn shape_kind_counts(doc: &Document) -> BTreeMap<&'static str, usize> {
     let mut map = BTreeMap::new();
     for (_, e) in doc.entities() {
-        let kind = match e.geom {
-            Shape::Point(_) => "point",
-            Shape::Line(_) => "line",
-            Shape::Circle(_) => "circle",
-            Shape::Arc(_) => "arc",
-            Shape::Polyline(_) => "polyline",
+        let kind = match e.geom.as_shape() {
+            Some(Shape::Point(_)) => "point",
+            Some(Shape::Line(_)) => "line",
+            Some(Shape::Circle(_)) => "circle",
+            Some(Shape::Arc(_)) => "arc",
+            Some(Shape::Polyline(_)) => "polyline",
+            None => "other",
         };
         *map.entry(kind).or_insert(0) += 1;
     }

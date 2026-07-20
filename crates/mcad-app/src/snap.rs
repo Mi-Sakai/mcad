@@ -111,7 +111,10 @@ pub fn snap(
         if !layer_visible(document, entity) {
             continue;
         }
-        enumerate_features(&entity.geom, cursor, r2, &mut best);
+        // M6: スナップ源は Shape 系のみ（Text の anchor スナップ等は後続タスク）。
+        if let Some(shape) = entity.geom.as_shape() {
+            enumerate_features(shape, cursor, r2, &mut best);
+        }
     }
 
     // 交点: カーソル近傍 AABB（カーソル±半径のボックス）と交差するエンティティのみを
@@ -122,7 +125,8 @@ pub fn snap(
         .entities()
         .filter(|(_, e)| layer_visible(document, e))
         .filter(|(_, e)| e.geom.aabb().intersects(&cursor_box))
-        .map(|(_, e)| &e.geom)
+        // M6: 交点計算は Shape 系のみを対象にする（寸法・テキストは交点源にしない）。
+        .filter_map(|(_, e)| e.geom.as_shape())
         .collect();
     for i in 0..near.len() {
         for j in (i + 1)..near.len() {

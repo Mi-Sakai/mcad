@@ -904,8 +904,8 @@ impl eframe::App for McadApp {
                 }
                 ui.label(
                     "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  \
-                     M=Move  Ctrl+D=Duplicate  Del=Delete  Esc=Cancel  F3=Snap  \
-                     Ctrl+Z=Undo  Ctrl+Y=Redo  \
+                     M=Move  R=Rotate  Shift+M=Mirror  O=Offset  Ctrl+D=Duplicate  \
+                     Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo  \
                      Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As  \
                      Ctrl+Shift+O=Import DXF  Ctrl+E=Export DXF",
                 );

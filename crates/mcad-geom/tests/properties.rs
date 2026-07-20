@@ -4,6 +4,10 @@
 //! - 実際に交わる 2 円の交点は、両円の境界上にある。
 //! - 交わる 2 線分の交点は、両線分上にある。
 //! - 線分×円の交点は、円周上かつ線分上にある。
+//! - 回転の往復不変性: `rotated(pivot, θ)→rotated(pivot, -θ)` で元に戻る。
+//! - 鏡映の往復不変性: 同一軸で 2 回鏡映すると元に戻る。
+//! - 通過点方式のオフセット（線分・円）は通過点を通る結果を作る。
+//! - 半径不変性: `Circle`/`Arc` は回転・鏡映前後で半径が変わらない。
 
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape, closest_point, intersect};
 use proptest::prelude::*;

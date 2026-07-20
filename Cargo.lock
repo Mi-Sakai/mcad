@@ -1872,7 +1872,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "mcad-app"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "mcad-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "mcad-geom",
  "serde",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "mcad-geom"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "serde",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "mcad-io"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "dxf",
  "mcad-core",

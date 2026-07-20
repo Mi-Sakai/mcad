@@ -23,7 +23,7 @@ GUI に関わる変更(ダイアログ・ビューポート・パネル等)は�
 
 ## アーキテクチャ不変条件(破らないこと)
 
-- **依存方向は一方向のみ**: `mcad-app` → `mcad-io` → `mcad-core` → `mcad-geom`。逆方向・飛び越しの依存を足さない。
+- **依存方向は一方向のみ**: レイヤー順は `mcad-app` → `mcad-io` → `mcad-core` → `mcad-geom`。上位クレートは下位クレートへ直接依存してよい(実際に `mcad-app` は `mcad-core`・`mcad-geom` にも依存)が、下位→上位の逆方向の依存は足さない。
 - **ワールド座標は f64**。egui へ描画する境界でのみ f32 へ変換する。viewport は y 軸を反転する(ワールドは y-up、スクリーンは y-down)。
 - **ドキュメントの変更は必ず `Document::apply(Command)` 経由**。フィールドの public 化や直接変更で回避しない。import のためだけに内部を公開しない(既存の DTO + Command 再構築を維持)。
 - **削除済み entity/layer は墓標として残る**(`SlotMap` の `Option<T>`)。undo/redo をまたいで `EntityId` / `LayerId` が安定するための設計。

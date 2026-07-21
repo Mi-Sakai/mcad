@@ -7,6 +7,7 @@
 //! クリック/Enter/Escで確定・キャンセルできるようにする。後続タスクで
 //! 選択・編集ツールとスナップエンジンを追加する。
 
+mod dimension;
 mod fonts;
 mod snap;
 mod tool;
@@ -16,14 +17,17 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
-use mcad_core::{Command, Document, Entity, EntityGeom, Layer, LayerId, Rgb, Style, TextGeom};
+use mcad_core::{
+    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, Layer, LayerId, Rgb, Style,
+    TextGeom,
+};
 use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use tool::{
-    ArcTool, CircleTool, DragPreview, InputEvent, LineTool, OffsetOutcome, PlacementKind,
-    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, TextTool, Tool,
-    ToolCtx, ToolResult,
+    ArcTool, CircleTool, DimLinearTool, DimRadialTool, DragPreview, InputEvent, LineTool,
+    OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolylineTool,
+    SelectTool, TextTool, Tool, ToolCtx, ToolResult,
 };
 use viewport::Viewport;
 
@@ -118,6 +122,13 @@ const MIN_TEXT_PX: f64 = 1.0;
 /// 防ぐため、描画サイズをここで頭打ちにする（ワールド固定サイズの近似上限）。
 const MAX_TEXT_PX: f64 = 4096.0;
 
+/// 寸法の矢先の長さ（スクリーンピクセル）。ワールド長へは `DIM_ARROW_PX / zoom` で換算する。
+/// 注釈（矢印・文字）は縮尺に関わらず読める大きさに保つため、ピック許容量と同じく
+/// スクリーン固定 px をズームで割る（DESIGN.md M6 設計判断2 の展開は純関数側、大きさは app 側）。
+const DIM_ARROW_PX: f64 = 12.0;
+/// 寸法値ラベルの文字高さ（スクリーンピクセル）。ワールド高さへは `DIM_TEXT_PX / zoom`。
+const DIM_TEXT_PX: f64 = 14.0;
+
 /// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O の3経路で共有）。
 ///
 /// いずれの経路も、ネイティブの確認ダイアログ（`rfd::MessageDialog`）を同期表示すると
@@ -178,6 +189,8 @@ enum ToolKind {
     Arc,
     Polyline,
     Text,
+    DimLinear,
+    DimRadial,
 }
 
 impl ToolKind {
@@ -193,6 +206,8 @@ impl ToolKind {
             ToolKind::Arc => Some(Box::new(ArcTool::default())),
             ToolKind::Polyline => Some(Box::new(PolylineTool::default())),
             ToolKind::Text => Some(Box::new(TextTool::default())),
+            ToolKind::DimLinear => Some(Box::new(DimLinearTool::default())),
+            ToolKind::DimRadial => Some(Box::new(DimRadialTool::default())),
         }
     }
 
@@ -206,6 +221,8 @@ impl ToolKind {
             ToolKind::Arc => "Arc",
             ToolKind::Polyline => "Polyline",
             ToolKind::Text => "Text",
+            ToolKind::DimLinear => "Linear Dim",
+            ToolKind::DimRadial => "Radial Dim",
         }
     }
 }
@@ -1050,6 +1067,7 @@ impl eframe::App for McadApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  T=Text  \
+                     D=Linear Dim  Shift+D=Radial Dim  \
                      M=Move  R=Rotate  Shift+M=Mirror  O=Offset  Ctrl+D=Duplicate  \
                      Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo  \
                      Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As  \
@@ -1223,7 +1241,15 @@ fn handle_tool_shortcut_keys(
         if i.modifiers.command {
             return;
         }
-        if i.key_pressed(Key::S) {
+        // D は修飾なしで長さ寸法、Shift 併用で半径寸法。Ctrl+D（複製）は上の
+        // command 早期 return で既に除かれているので、ここでは Shift の有無だけを見る。
+        if i.key_pressed(Key::D) {
+            requested = Some(if i.modifiers.shift {
+                ToolKind::DimRadial
+            } else {
+                ToolKind::DimLinear
+            });
+        } else if i.key_pressed(Key::S) {
             requested = Some(ToolKind::Select);
         } else if i.key_pressed(Key::Num1) {
             requested = Some(ToolKind::Point);
@@ -1286,6 +1312,11 @@ fn handle_tool_input(
         return;
     };
 
+    // ピック許容量（ワールド）。半径寸法ツールの円/円弧ヒットテスト（画面上のピック =
+    // ズーム依存）が選択のピック許容量と揃うようにする。寸法の退化判定はこれとは別に
+    // ツール側のスケール非依存な幾何許容値で行う（tool.rs の DIM_DEGENERATE_EPSILON）。
+    let pick_tol = PICK_TOLERANCE_PX / viewport.zoom;
+
     let ctx = ToolCtx {
         layer: document.current_layer(),
         style: Style::inherited(),
@@ -1325,16 +1356,27 @@ fn handle_tool_input(
         && let Some(pos) = response.interact_pointer_pos()
     {
         let raw = viewport.screen_to_world(rect, pos);
-        let extra_points = active.snap_points();
-        let (world, _) = apply_snap(
-            document,
-            snap_enabled,
-            raw,
-            radius,
-            grid_step,
-            &extra_points,
-        );
-        result = active.on_input(&ctx, InputEvent::Click(world));
+        if active.wants_circle_pick() {
+            // 半径寸法ツールの1クリック目: 円/円弧のヒットテストは Document を要するため
+            // app 層で行う（Tool は Document 非依存の設計。tool.rs 冒頭 doc 参照）。既存
+            // エンティティの実位置で当てるのでスナップは掛けず raw を使う。外したら状態は
+            // 据え置きで ASCII メッセージを出し、再クリックできるようにする。
+            match tool::pick_circle_or_arc(document, raw, pick_tol) {
+                Some(hit) => active.on_circle_pick(hit),
+                None => set_status(status, now, "Radial dim: click a circle or arc".to_string()),
+            }
+        } else {
+            let extra_points = active.snap_points();
+            let (world, _) = apply_snap(
+                document,
+                snap_enabled,
+                raw,
+                radius,
+                grid_step,
+                &extra_points,
+            );
+            result = active.on_input(&ctx, InputEvent::Click(world));
+        }
     }
 
     if matches!(result, ToolResult::Continue) && ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -1364,6 +1406,11 @@ fn handle_tool_input(
                     *tool = tool_kind.spawn();
                 }
             }
+        }
+        ToolResult::Rejected(reason) => {
+            // 退化クリック（寸法の p1≈p2・引出方向＝中心）。ツールは状態を据え置いて
+            // いるので respawn せず、理由だけステータスへ出して無反応に見えないようにする。
+            set_status(status, now, reason.to_string());
         }
         ToolResult::Cancel => {
             *tool_kind = ToolKind::Select;
@@ -1970,10 +2017,73 @@ fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewp
                 draw_shape(painter, rect, viewport, shape, stroke);
             }
             EntityGeom::Text(text) => draw_text(painter, rect, viewport, text, color),
-            // 寸法の描画は後続タスク24。
-            EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {}
+            EntityGeom::DimLinear(dim) => {
+                let stroke = Stroke::new(entity.style.width.max(1.0), color);
+                draw_dim_linear(painter, rect, viewport, dim, stroke);
+            }
+            EntityGeom::DimRadial(dim) => {
+                let stroke = Stroke::new(entity.style.width.max(1.0), color);
+                draw_dim_radial(painter, rect, viewport, dim, stroke);
+            }
         }
     }
+}
+
+/// 寸法の矢先の長さ・文字高さ（ワールド）。スクリーン固定 px をズームで割る
+/// （[`DIM_ARROW_PX`] / [`DIM_TEXT_PX`] の doc 参照）。
+fn dim_sizes(zoom: f64) -> (f64, f64) {
+    (DIM_ARROW_PX / zoom, DIM_TEXT_PX / zoom)
+}
+
+/// 長さ寸法を描画する（純関数 helper [`dimension::expand_linear`] の展開を Painter へ）。
+fn draw_dim_linear(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    dim: &DimLinear,
+    stroke: Stroke,
+) {
+    let (arrow_len, text_height) = dim_sizes(viewport.zoom);
+    let ex = dimension::expand_linear(dim, arrow_len, text_height);
+    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+}
+
+/// 半径寸法を描画する（純関数 helper [`dimension::expand_radial`] の展開を Painter へ）。
+fn draw_dim_radial(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    dim: &DimRadial,
+    stroke: Stroke,
+) {
+    let (arrow_len, text_height) = dim_sizes(viewport.zoom);
+    let ex = dimension::expand_radial(dim, arrow_len, text_height);
+    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+}
+
+/// 寸法の展開結果（線分・矢先・文字）を Painter へ描く。プレビュー（`tool.rs` の
+/// `draw_preview`）と確定描画・選択ハイライトが共有する（`crate::draw_dim_expansion`）。
+/// 矢先は `stroke.color` で塗りつぶし、文字は既存の [`draw_text`] を再利用する。
+fn draw_dim_expansion(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    ex: &dimension::DimExpansion,
+    stroke: Stroke,
+) {
+    for seg in &ex.segments {
+        let a = viewport.world_to_screen(rect, seg[0]);
+        let b = viewport.world_to_screen(rect, seg[1]);
+        painter.line_segment([a, b], stroke);
+    }
+    for tri in &ex.arrows {
+        let pts: Vec<Pos2> = tri
+            .iter()
+            .map(|p| viewport.world_to_screen(rect, *p))
+            .collect();
+        painter.add(egui::Shape::convex_polygon(pts, stroke.color, Stroke::NONE));
+    }
+    draw_text(painter, rect, viewport, &ex.text, stroke.color);
 }
 
 /// 選択ハイライトと、進行中のプレビュー（矩形選択枠・複製/移動配置の仮表示）を描画する。
@@ -2014,7 +2124,12 @@ fn draw_selection(
                     EntityGeom::Text(text) => {
                         draw_text(painter, rect, viewport, &text, highlight.color);
                     }
-                    EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {}
+                    EntityGeom::DimLinear(dim) => {
+                        draw_dim_linear(painter, rect, viewport, &dim, highlight);
+                    }
+                    EntityGeom::DimRadial(dim) => {
+                        draw_dim_radial(painter, rect, viewport, &dim, highlight);
+                    }
                 }
             }
         }
@@ -2083,7 +2198,8 @@ fn draw_selected(
                     draw_text(painter, rect, viewport, text, stroke.color);
                     draw_aabb_outline(painter, rect, viewport, &entity.geom.aabb(), stroke);
                 }
-                EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {}
+                EntityGeom::DimLinear(dim) => draw_dim_linear(painter, rect, viewport, dim, stroke),
+                EntityGeom::DimRadial(dim) => draw_dim_radial(painter, rect, viewport, dim, stroke),
             }
         }
     }

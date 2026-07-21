@@ -37,7 +37,9 @@
 
 use egui::{Color32, Painter, Rect, Stroke};
 
-use mcad_core::{Command, Document, Entity, EntityGeom, EntityId, LayerId, Style};
+use mcad_core::{
+    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, LayerId, Style,
+};
 use mcad_geom::{
     Aabb, Arc, LineSeg, OffsetError, Point2, Polyline, Shape, Vec2, circumcircle, distance_to,
 };
@@ -63,6 +65,29 @@ pub struct ToolCtx {
     pub style: Style,
 }
 
+/// 寸法の方向が定まるかを判定するスケール非依存の幾何許容値（ワールド単位）。
+///
+/// ピック許容量（`PICK_TOLERANCE_PX / zoom`、スクリーン基準でズーム依存）とは別物で、
+/// 「線分・引出方向が数学的に成立するか」だけを見る絶対値。ズームアウト時に有効な短い
+/// 寸法を誤って拒否しないよう、退化判定にはこちらを使う（[`PolylineTool`] の
+/// `AUTO_CLOSE_EPSILON` と同じ考え方）。長さ寸法の p1≈p2、半径寸法の引出クリック＝中心の
+/// 両方で共有する。
+const DIM_DEGENERATE_EPSILON: f64 = 1e-9;
+
+/// 半径寸法ツールの 1 クリック目で拾った円／円弧の採取値（中心・半径）。
+///
+/// 半径寸法は非関連（作成時に値を採取して独立する。DESIGN.md M6 設計判断2）なので、
+/// ヒットした [`EntityId`] は保持せず中心・半径だけを写し取る。ヒットテスト自体は
+/// [`Document`] を要するため app 層（[`pick_circle_or_arc`]）が行い、結果をこの型で
+/// ツールへ渡す（[`Tool::on_circle_pick`]）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CirclePick {
+    /// 円／円弧の中心。
+    pub center: Point2,
+    /// 円／円弧の半径。
+    pub radius: f64,
+}
+
 /// ツールへの入力。ワールド座標とキー操作のみからなる軽量な列挙型
 /// （GUIなしで単体テストできるようにするための設計）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,6 +109,11 @@ pub enum ToolResult {
     Continue,
     /// 確定した。呼び出し側は `Document::apply` でコマンドを適用する。
     Commit(Command),
+    /// 入力を退化として拒否した。ツールの状態は進めておらず（据え置き）、コマンドも
+    /// 作らない。呼び出し側は付随する ASCII 理由をステータスバーへ表示する。無反応に
+    /// 見えないよう理由を伝えるための結果で、`Continue` と違い「クリックは効いたが確定
+    /// できなかった」ことを app 層へ通知する（寸法ツールの退化クリックで使う）。
+    Rejected(&'static str),
     /// キャンセルされた。未確定の状態は破棄済み。
     Cancel,
 }
@@ -118,6 +148,29 @@ pub trait Tool {
     fn pending_text_anchor(&self) -> Option<Point2> {
         None
     }
+
+    /// 半径寸法ツールが「次のクリックで円／円弧をヒットテストする」段階にあるとき `true`
+    /// （1 クリック目）。app 層（`handle_tool_input`）はこのとき通常の
+    /// [`Tool::on_input`]`(Click)` の代わりにドキュメントをヒットテストし、結果を
+    /// [`Tool::on_circle_pick`] へ渡す。他ツール・他状態では `false`（既定）。
+    ///
+    /// # なぜ Tool トレイトに置くのか
+    ///
+    /// 作図ツールは [`Document`] を参照しない設計だが、半径寸法の 1 クリック目だけは既存の
+    /// 円／円弧を当てる必要があり、ヒットテストには [`Document`] が要る。そこで [`snap_points`]
+    /// / [`pending_text_anchor`] と同じ「既定実装つき拡張点」として、ヒットテストの実行だけを
+    /// app 層へ委ね（[`InputEvent`] は Document 非依存のまま汚さない）、結果を型で受け取る。
+    ///
+    /// [`snap_points`]: Tool::snap_points
+    /// [`pending_text_anchor`]: Tool::pending_text_anchor
+    fn wants_circle_pick(&self) -> bool {
+        false
+    }
+
+    /// [`Tool::wants_circle_pick`] が `true` のとき、app 層が当てた円／円弧を受け取り状態を
+    /// 進める。既定は何もしない（他ツールでは呼ばれない）。外した場合は app 層が本メソッドを
+    /// 呼ばずステータスへ拒否メッセージを出すため、状態は据え置きになる。
+    fn on_circle_pick(&mut self, _hit: CirclePick) {}
 }
 
 // ---------------------------------------------------------------------
@@ -594,6 +647,251 @@ impl Tool for TextTool {
 }
 
 // ---------------------------------------------------------------------
+// 長さ寸法（DimLinear）
+// ---------------------------------------------------------------------
+
+/// カーソル位置 `cursor` から計測線（`p1`→`p2`）への符号付きオフセットを求める
+/// （寸法線の位置決め用）。法線 `n = dir.perp()` 方向の投影量。計測 2 点がほぼ同一で
+/// 方向が定まらない場合は 0。
+fn linear_offset(p1: Point2, p2: Point2, cursor: Point2) -> f64 {
+    match (p2 - p1).normalize() {
+        Some(dir) => (cursor - p1).dot(dir.perp()),
+        None => 0.0,
+    }
+}
+
+/// 長さ寸法ツール（`D`）の状態。3 クリック（計測点 p1 → p2 → 寸法線位置）。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum DimLinearState {
+    /// 計測点 1（p1）待ち。
+    #[default]
+    WaitingP1,
+    /// 計測点 2（p2）待ち。`p1` 確定済み。
+    WaitingP2(Point2),
+    /// 寸法線位置（offset）のクリック待ち。`p1`・`p2` 確定済み。
+    WaitingLine(Point2, Point2),
+}
+
+/// 長さ寸法ツール（`D`）。計測点 p1 → p2 → 寸法線位置の 3 クリックで
+/// [`EntityGeom::DimLinear`] を確定する（DESIGN.md M6 設計判断6）。ArcTool と同じ
+/// 3 クリック状態機械。2 クリック目以降はカーソル追従プレビュー。p1≈p2（スケール非依存の
+/// 幾何許容値 [`DIM_DEGENERATE_EPSILON`] 内）は `Rejected` で理由を返し、2 クリック目を
+/// 待ち続ける（退化したゼロ長寸法を作らない）。
+#[derive(Debug, Default)]
+pub struct DimLinearTool {
+    state: DimLinearState,
+    cursor: Option<Point2>,
+}
+
+impl Tool for DimLinearTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                DimLinearState::WaitingP1 => {
+                    self.state = DimLinearState::WaitingP2(p);
+                    ToolResult::Continue
+                }
+                DimLinearState::WaitingP2(p1) => {
+                    // p1≈p2 は寸法線の方向（法線）が定まらずゼロ長寸法になる。判定はズーム
+                    // 非依存の幾何許容値で行い（ズームアウト時に有効な短い寸法まで拒否しない）、
+                    // 拒否理由を app 層へ伝える。状態は WaitingP2 のまま据え置き、2 点目を待ち続ける。
+                    if p1.distance(p) <= DIM_DEGENERATE_EPSILON {
+                        ToolResult::Rejected("Linear dim: measure points coincide")
+                    } else {
+                        self.state = DimLinearState::WaitingLine(p1, p);
+                        ToolResult::Continue
+                    }
+                }
+                DimLinearState::WaitingLine(p1, p2) => {
+                    let offset = linear_offset(p1, p2, p);
+                    let cmd = Command::AddEntity(Entity::new(
+                        EntityGeom::DimLinear(DimLinear { p1, p2, offset }),
+                        ctx.layer,
+                        ctx.style,
+                    ));
+                    self.state = DimLinearState::WaitingP1;
+                    ToolResult::Commit(cmd)
+                }
+            },
+            InputEvent::Cancel => {
+                self.state = DimLinearState::WaitingP1;
+                ToolResult::Cancel
+            }
+            InputEvent::Confirm => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+        match (self.state, self.cursor) {
+            // p2 待ち: 計測線の暫定（p1→カーソル）を細線で示す。
+            (DimLinearState::WaitingP2(p1), Some(cursor)) => {
+                draw_shape(
+                    painter,
+                    rect,
+                    viewport,
+                    &Shape::Line(LineSeg::new(p1, cursor)),
+                    preview_stroke(),
+                );
+            }
+            // 寸法線位置待ち: カーソルで決まる offset の寸法を丸ごとプレビューする。
+            (DimLinearState::WaitingLine(p1, p2), Some(cursor)) => {
+                let offset = linear_offset(p1, p2, cursor);
+                let dim = DimLinear { p1, p2, offset };
+                let (arrow_len, text_height) = crate::dim_sizes(viewport.zoom);
+                let ex = crate::dimension::expand_linear(&dim, arrow_len, text_height);
+                crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
+            }
+            _ => {}
+        }
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            DimLinearState::WaitingP1 => Vec::new(),
+            DimLinearState::WaitingP2(p1) => vec![p1],
+            DimLinearState::WaitingLine(p1, p2) => vec![p1, p2],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 半径寸法（DimRadial）
+// ---------------------------------------------------------------------
+
+/// 半径寸法ツール（`Shift+D`）の状態。円／円弧のヒットテスト → 引出方向の 2 段。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum DimRadialState {
+    /// 円／円弧のヒットテスト待ち（1 クリック目）。app 層が当てて [`Tool::on_circle_pick`]
+    /// で結果を渡す。
+    #[default]
+    WaitingCircle,
+    /// 引出方向のクリック待ち（2 クリック目）。中心・半径は採取済み。
+    WaitingLeader { center: Point2, radius: f64 },
+}
+
+/// 半径寸法ツール（`Shift+D`）。円／円弧をヒットテストで拾い（それ以外は app 層が
+/// ASCII メッセージで拒否）、引出方向のクリックで [`EntityGeom::DimRadial`] を確定する
+/// （DESIGN.md M6 設計判断6）。非関連寸法なので中心・半径を採取して独立させる。
+#[derive(Debug, Default)]
+pub struct DimRadialTool {
+    state: DimRadialState,
+    cursor: Option<Point2>,
+}
+
+impl Tool for DimRadialTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                // 1 クリック目は円ヒットテスト（app 層が on_circle_pick 経由で処理する）。
+                // ここへ来る Click は無い想定だが、来ても状態は変えない。
+                DimRadialState::WaitingCircle => ToolResult::Continue,
+                DimRadialState::WaitingLeader { center, radius } => {
+                    // 引出クリックが中心とほぼ一致すると方向が定まらない（`.angle()` が実質 0 rad
+                    // になり、ユーザーが指定していない右向き引出線が確定してしまう）。ズーム非依存の
+                    // 幾何許容値で退化を弾き、状態を据え置いて理由を app 層へ伝える。
+                    if p.distance(center) <= DIM_DEGENERATE_EPSILON {
+                        ToolResult::Rejected("Radial dim: leader direction undefined at center")
+                    } else {
+                        let leader_angle = (p - center).angle();
+                        let cmd = Command::AddEntity(Entity::new(
+                            EntityGeom::DimRadial(DimRadial {
+                                center,
+                                radius,
+                                leader_angle,
+                            }),
+                            ctx.layer,
+                            ctx.style,
+                        ));
+                        self.state = DimRadialState::WaitingCircle;
+                        ToolResult::Commit(cmd)
+                    }
+                }
+            },
+            InputEvent::Cancel => {
+                self.state = DimRadialState::WaitingCircle;
+                ToolResult::Cancel
+            }
+            InputEvent::Confirm => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+        if let (DimRadialState::WaitingLeader { center, radius }, Some(cursor)) =
+            (self.state, self.cursor)
+        {
+            // カーソルが中心とほぼ一致する間は方向不定なのでプレビューを描かない
+            // （確定時の退化拒否と同じ基準。誤った右向き引出線を見せない）。
+            if cursor.distance(center) <= DIM_DEGENERATE_EPSILON {
+                return;
+            }
+            let leader_angle = (cursor - center).angle();
+            let dim = DimRadial {
+                center,
+                radius,
+                leader_angle,
+            };
+            let (arrow_len, text_height) = crate::dim_sizes(viewport.zoom);
+            let ex = crate::dimension::expand_radial(&dim, arrow_len, text_height);
+            crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
+        }
+    }
+
+    fn wants_circle_pick(&self) -> bool {
+        matches!(self.state, DimRadialState::WaitingCircle)
+    }
+
+    fn on_circle_pick(&mut self, hit: CirclePick) {
+        if matches!(self.state, DimRadialState::WaitingCircle) {
+            self.state = DimRadialState::WaitingLeader {
+                center: hit.center,
+                radius: hit.radius,
+            };
+        }
+    }
+}
+
+/// クリック点 `world` から許容量 `tol`（ワールド）以内で最も近い可視な円／円弧の
+/// 中心・半径を返す。半径寸法ツールの 1 クリック目（[`Tool::wants_circle_pick`]）で app 層が
+/// 使う。ヒットテストは [`Document`] を要するため Tool ではなくここ（app 層）に置く。
+/// 判定は [`SelectTool::pick`] と同じく「実形状への最近距離 ≤ tol かつ最も近い」統一契約に従う。
+#[must_use]
+pub fn pick_circle_or_arc(document: &Document, world: Point2, tol: f64) -> Option<CirclePick> {
+    let mut best: Option<(f64, CirclePick)> = None;
+    for (_id, entity) in document.entities() {
+        if !layer_visible(document, entity) {
+            continue;
+        }
+        let Some(shape) = entity.geom.as_shape() else {
+            continue;
+        };
+        let pick = match shape {
+            Shape::Circle(c) => CirclePick {
+                center: c.center,
+                radius: c.radius,
+            },
+            Shape::Arc(a) => CirclePick {
+                center: a.center,
+                radius: a.radius,
+            },
+            _ => continue,
+        };
+        let d = distance_to(shape, world);
+        if d <= tol && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+            best = Some((d, pick));
+        }
+    }
+    best.map(|(_, pick)| pick)
+}
+
+// ---------------------------------------------------------------------
 // Select / 編集（単一選択・矩形選択・移動・削除）
 // ---------------------------------------------------------------------
 
@@ -940,12 +1238,14 @@ impl SelectTool {
             // ヒット距離: Shape は実形状への最近距離、Text は近似 aabb への符号なし距離
             // （DESIGN.md M6 L429 の割り切り。内部なら 0、外部なら境界までのユークリッド距離。
             // これにより tol 内なら枠のすぐ外側も拾えるし、枠内の空白よりも実形状が近ければ
-            // そちらを優先できる）。寸法エンティティはまだ作図ツールが無く選択対象にしない
-            // （panic せず読み飛ばす）。
+            // そちらを優先できる）。寸法は展開線分（寸法線・補助線・引出線）への最近距離
+            // （`dimension` の純関数）。いずれも「tol 以内で最も近いものを拾う」統一比較に
+            // 素直に載る連続距離で、2 値判定（線の上/外）にはしない（M6 タスク23 の教訓）。
             let d = match &entity.geom {
                 EntityGeom::Shape(shape) => distance_to(shape, world),
                 EntityGeom::Text(_) => entity.geom.aabb().distance_to_point(world),
-                EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => continue,
+                EntityGeom::DimLinear(dim) => crate::dimension::linear_distance(dim, world),
+                EntityGeom::DimRadial(dim) => crate::dimension::radial_distance(dim, world),
             };
             if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
                 best = Some((d, id));
@@ -3497,5 +3797,254 @@ mod tests {
         assert!(!tool.is_offsetting());
         // Document は不変（Text は消えも増えもしない）。
         assert_eq!(doc.entity_count(), 1);
+    }
+
+    // --- 長さ寸法ツール（DimLinear）---
+
+    /// Commit された [`EntityGeom`] を取り出す（それ以外なら panic）。
+    fn committed_geom(result: ToolResult) -> EntityGeom {
+        match result {
+            ToolResult::Commit(Command::AddEntity(entity)) => entity.geom,
+            other => panic!("expected Commit(AddEntity(..)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dim_linear_tool_three_clicks_commit() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+
+        // 1・2 クリック目は Continue。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0))),
+            ToolResult::Continue
+        );
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0))),
+            ToolResult::Continue
+        );
+        // 3 クリック目（寸法線位置 y=2）で確定。offset は計測線からの符号付き距離 +2。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert!(dim.p1.distance(Point2::new(0.0, 0.0)) < 1e-9);
+        assert!(dim.p2.distance(Point2::new(4.0, 0.0)) < 1e-9);
+        assert!((dim.offset - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dim_linear_tool_rejects_coincident_p1_p2_with_reason() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0)));
+        // p2 が p1 と（幾何許容値内で）一致 → 退化拒否。理由付きで状態は据え置き。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0))),
+            ToolResult::Rejected("Linear dim: measure points coincide")
+        );
+        // まだ p2 待ちなので、離れた点を打てば受理して寸法線待ちへ進む。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 1.0))),
+            ToolResult::Continue
+        );
+        // 次のクリックで確定できる = WaitingLine に居る。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(3.0, 3.0))));
+        assert!(matches!(geom, EntityGeom::DimLinear(_)));
+    }
+
+    #[test]
+    fn dim_linear_tool_accepts_short_but_valid_separation() {
+        // 退化判定はスケール非依存の幾何許容値（1e-9）で行うため、画面上の
+        // ピック許容量より短い（が方向は定まる）計測 2 点も受理する。旧実装は
+        // ズーム依存の pick_tol で判定しており、ズームアウト時にこうした有効な短い
+        // 寸法まで拒否していた（Codex 指摘2 の回帰確認）。
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        // 距離 0.001（1e-9 より十分大きい）は有効。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.001, 0.0))),
+            ToolResult::Continue
+        );
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0005, 1.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert!((dim.p2 - dim.p1).length() > 0.0);
+    }
+
+    #[test]
+    fn dim_linear_tool_cancel_resets_and_snap_points() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        assert!(tool.snap_points().is_empty());
+
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        assert_eq!(tool.snap_points(), vec![Point2::new(0.0, 0.0)]);
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        assert_eq!(
+            tool.snap_points(),
+            vec![Point2::new(0.0, 0.0), Point2::new(4.0, 0.0)]
+        );
+
+        // Esc で最初の状態へ戻る（snap 候補も消える）。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+        assert!(tool.snap_points().is_empty());
+    }
+
+    // --- 半径寸法ツール（DimRadial）---
+
+    #[test]
+    fn dim_radial_tool_wants_circle_pick_then_leader() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimRadialTool::default();
+
+        // 1 クリック目は円ヒットテスト段階。
+        assert!(tool.wants_circle_pick());
+        // 円ヒットが渡されると引出方向待ちへ。
+        tool.on_circle_pick(CirclePick {
+            center: Point2::new(1.0, 2.0),
+            radius: 5.0,
+        });
+        assert!(!tool.wants_circle_pick());
+
+        // 引出方向のクリックで確定。leader_angle は中心→クリックの角度（+x 方向 → 0）。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 2.0))));
+        let EntityGeom::DimRadial(dim) = geom else {
+            panic!("expected DimRadial, got {geom:?}");
+        };
+        assert!(dim.center.distance(Point2::new(1.0, 2.0)) < 1e-9);
+        assert!((dim.radius - 5.0).abs() < 1e-9);
+        assert!(dim.leader_angle.abs() < 1e-9);
+        // 確定後は円ヒットテスト段階へ戻る。
+        assert!(tool.wants_circle_pick());
+    }
+
+    #[test]
+    fn dim_radial_tool_rejects_leader_at_center() {
+        // 引出クリックが中心と（幾何許容値内で）一致 → 方向不定なので退化拒否。
+        // 理由付きで、状態は WaitingLeader のまま据え置き、Command を作らない。
+        let (_doc, ctx) = ctx();
+        let mut tool = DimRadialTool::default();
+        let center = Point2::new(1.0, 2.0);
+        tool.on_circle_pick(CirclePick {
+            center,
+            radius: 5.0,
+        });
+
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(center)),
+            ToolResult::Rejected("Radial dim: leader direction undefined at center")
+        );
+        // 円ヒットテスト段階へは戻っていない（引出方向をまだ待っている）。
+        assert!(!tool.wants_circle_pick());
+        // 続けて中心から外れた点を打てば正しく確定する。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 2.0))));
+        assert!(matches!(geom, EntityGeom::DimRadial(_)));
+    }
+
+    #[test]
+    fn dim_radial_tool_click_in_circle_stage_is_noop() {
+        // 円ヒットテスト段階では Click（通常経路）が来ても状態を変えない
+        // （app 層は on_circle_pick 経由でのみ前進させる）。
+        let (_doc, ctx) = ctx();
+        let mut tool = DimRadialTool::default();
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(3.0, 3.0))),
+            ToolResult::Continue
+        );
+        assert!(tool.wants_circle_pick());
+    }
+
+    // --- pick_circle_or_arc（app 層ヒットテスト）---
+
+    #[test]
+    fn pick_circle_or_arc_picks_nearest_circle_outline() {
+        let mut doc = Document::new();
+        add_circle(&mut doc, Point2::ORIGIN, 5.0);
+        add_hline(&mut doc, 0.0); // 線分は円ピック対象外
+
+        // 円周 (5,0) 付近（距離 0.05）を tol 0.1 で当てる。
+        let hit = pick_circle_or_arc(&doc, Point2::new(5.05, 0.0), 0.1).expect("circle hit");
+        assert!(hit.center.distance(Point2::ORIGIN) < 1e-9);
+        assert!((hit.radius - 5.0).abs() < 1e-9);
+
+        // 円周から遠い点（中心付近）は当たらない。
+        assert!(pick_circle_or_arc(&doc, Point2::ORIGIN, 0.1).is_none());
+    }
+
+    #[test]
+    fn pick_circle_or_arc_hits_arc_and_ignores_line() {
+        let mut doc = Document::new();
+        add_hline(&mut doc, 0.0); // 円/円弧ではないので対象外
+        add_arc(
+            &mut doc,
+            Point2::ORIGIN,
+            3.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        );
+
+        // 弧上の点 (3,0)（掃引の始点）付近。
+        let hit = pick_circle_or_arc(&doc, Point2::new(3.02, 0.0), 0.1).expect("arc hit");
+        assert!((hit.radius - 3.0).abs() < 1e-9);
+
+        // 線分上（(0.5,0)）は円/円弧ではないのでヒットしない。
+        assert!(pick_circle_or_arc(&doc, Point2::new(0.5, 0.0), 0.1).is_none());
+    }
+
+    // --- 寸法の選択（pick 経由）---
+
+    #[test]
+    fn pick_selects_linear_dimension_on_dimension_line() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let dim = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(0.0, 0.0),
+                    p2: Point2::new(4.0, 0.0),
+                    offset: 2.0,
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
+        // 寸法線 (0,2)-(4,2) 上をクリックすると選択される（DimLinear も選択対象）。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(2.0, 2.02), 0.1, false);
+        assert_eq!(tool.selection(), &[dim]);
+
+        // 寸法線から離れた点は拾わない。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(2.0, 5.0), 0.1, false);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn pick_selects_radial_dimension_on_leader() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let dim = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimRadial(DimRadial {
+                    center: Point2::ORIGIN,
+                    radius: 5.0,
+                    leader_angle: 0.0,
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
+        // 引出線 (0,0)-(5,0) 上をクリックすると選択される。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(2.0, 0.02), 0.1, false);
+        assert_eq!(tool.selection(), &[dim]);
     }
 }

@@ -2,9 +2,39 @@
 //!
 //! # 設計方針（DESIGN.md 3.3）
 //!
-//! `dxf` クレート（v0.6.1）で LINE / CIRCLE / ARC / LWPOLYLINE / POINT と
+//! `dxf` クレート（v0.6.1）で LINE / CIRCLE / ARC / LWPOLYLINE / POINT / TEXT と
 //! レイヤーテーブルを相互変換する。未対応エンティティは読み飛ばし、無視した件数を
 //! [`ImportSummary::skipped_entities`] として返す（エラーにしない）。
+//!
+//! TEXT（[`mcad_core::EntityGeom::Text`]）は M6 で export（タスク25）・import
+//! （タスク25b。当初 M9 予定だったが 2026-07-25 のユーザー判断で M6 へ前倒し）の
+//! 双方に対応した。寸法（DimLinear/DimRadial）は export も import も非対応
+//! （DXF の DIMENSION はブロック参照を伴い、対応するプリミティブがない設計判断。
+//! DESIGN.md M6 設計判断5、import 対応は M9 のまま）。
+//!
+//! # 文字列は UTF-8 で書く（ヘッダバージョン R2007）
+//!
+//! export のヘッダバージョンは **R2007**（[`export_dxf`] で `$ACADVER` を設定）。
+//! `dxf` クレート 0.6.1 の文字列 codec はここで分岐する:
+//!
+//! - `$ACADVER <= R2004`: ASCII 範囲外の文字をコードポイントごとに
+//!   `\U+XXXX`（4桁大文字16進）へエスケープして書き（`escape_unicode_to_ascii`）、
+//!   読込側は `$ACADVER < R2007` を WINDOWS_1252 と見なして
+//!   `un_escape_ascii_to_unicode` で戻す。
+//! - `$ACADVER >= R2007`: UTF-8 のまま書き、読込側も `read_as_utf8()` で
+//!   UTF-8 として読む（エスケープ経路を通らない）。
+//!
+//! 当初は R2000 を使っていたが、上記エスケープ codec に往復でデータを壊す欠陥が
+//! 3 つある（非BMP文字が化ける / 末尾バックスラッシュが消える / リテラル
+//! `\U+XXXX` が 1 文字に潰れる）ことが 2026-07-25 に判明したため R2007 へ
+//! 引き上げた。欠陥の詳細と、逆に R14 未満へ下げられない理由（LWPOLYLINE が
+//! 黙って落ちる）は [`export_dxf`] のコード内コメントにまとめてある。
+//!
+//! いずれの経路でも変換はクレート側が閉じて行うため、このモジュールに自前の
+//! エスケープ／アンエスケープは持たない。UTF-8 で書かれること自体は
+//! `tests::save_dxf_writes_cjk_text_as_utf8` が、往復一致は
+//! `tests::round_trip_preserves_cjk_and_ascii_text` と
+//! `tests::round_trip_preserves_pathological_text` が固定する。
 //!
 //! [`mcad_file`](crate::mcad_file) の `.mcad`（JSON）と違い、DXF はネイティブに
 //! レイヤー名参照・エンティティ種別を持つため、`.mcad` のようなポータブル DTO は
@@ -53,13 +83,21 @@
 //! `by_layer` 一色に潰れるより、基本色だけでも近い色が付く方が実用上親切だと
 //! 考え、(a) 側（固定パレットによる近似）を選んだ。
 //!
-//! # 未対応エンティティ・不正ジオメトリの扱い
+//! # 未対応エンティティ・不正ジオメトリの扱い（import）
 //!
-//! - `EntityType` のうち Line/Circle/Arc/LwPolyline/ModelPoint 以外（TEXT や
-//!   DIMENSION など）は無視し、`skipped_entities` としてカウントする。
-//! - 対応エンティティ種別であっても、非有限座標・負半径など
-//!   [`crate::mcad_file`] の `validate_shape` と同じ条件でジオメトリが不正な
-//!   ものは、**読込全体を失敗させず** 無視してカウントに含める。DXF は他の CAD
+//! - `EntityType` のうち Line/Circle/Arc/LwPolyline/ModelPoint/Text 以外
+//!   （DIMENSION・SPLINE・ELLIPSE・INSERT など）は無視し、`skipped_entities`
+//!   としてカウントする。DIMENSION の import 対応は M9 の予定（DESIGN.md M6
+//!   設計判断5）。
+//! - TEXT のうち位置基準（justification）が「水平 Left かつ垂直 Baseline」以外の
+//!   ものも無視してカウントする。この場合、文字位置は `location`（group code 10）
+//!   ではなく alignment point（group code 11）が持つが、mcad の
+//!   [`mcad_core::TextGeom`] は左寄せ・ベースライン基準の 1 点しか表現できず、
+//!   逆算にはフォントメトリクスが必要で io 層には無い。詳細と将来の対応方針は
+//!   [`is_text_justification_supported`] の doc を参照。
+//! - 対応エンティティ種別であっても、非有限座標・負半径・非正の文字高さ・空文字列
+//!   など [`mcad_core::EntityGeom::validate`] が拒否するジオメトリは、
+//!   **読込全体を失敗させず** 無視してカウントに含める。DXF は他の CAD
 //!   ソフトが吐き出したファイルであることも多く、壊れたエンティティ 1 件で
 //!   ファイル全体の import を失敗させたくないため。ただし DXF ファイル自体が
 //!   壊れている（構文が壊れている、テーブルが読めない等）場合は
@@ -79,16 +117,16 @@ use std::path::Path;
 
 use dxf::entities::{
     Arc as DxfArc, Circle as DxfCircle, Entity as DxfEntity, EntityType, Line as DxfLine,
-    LwPolyline, ModelPoint,
+    LwPolyline, ModelPoint, Text as DxfText,
 };
+use dxf::enums::{HorizontalTextJustification, VerticalTextJustification};
 use dxf::tables::Layer as DxfLayer;
 use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
-use mcad_core::{Command, Document, Entity, Layer, LayerId, Rgb, Style};
+use mcad_core::{Command, Document, Entity, EntityGeom, Layer, LayerId, Rgb, Style, TextGeom};
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
 use crate::IoError;
-use crate::mcad_file::validate_shape;
 
 /// DXF ACI の標準的な基本色パレット（1〜9）と、それぞれに割り当てる近似 RGB。
 ///
@@ -126,17 +164,18 @@ pub struct ImportSummary {
 /// DXF export の結果。
 ///
 /// M6 で `Entity.geom` が [`mcad_core::EntityGeom`] 化され、Text・寸法（非 Shape
-/// バリアント）を持てるようになった。これらは DXF 未対応（TEXT export はロードマップ上
-/// 後続、寸法は非対応）で export 時にスキップされるが、黙って消えると呼び出し側が
-/// データロスに気づけない。[`ImportSummary`] と対称に、スキップ件数を返して
-/// ステータス表示できるようにする。
+/// バリアント）を持てるようになった。Text（[`EntityGeom::Text`]）はタスク25で
+/// DXF `TEXT` エンティティとして export されるが、寸法（`DimLinear` / `DimRadial`）は
+/// DXF に対応するプリミティブがなく export 時にスキップされる。黙って消えると
+/// 呼び出し側がデータロスに気づけないため、[`ImportSummary`] と対称に、スキップ件数を
+/// 返してステータス表示できるようにする。
 ///
 /// `dxf::Drawing` は `Debug` を導出しているが、対称性と将来の拡張余地のためこの構造体は
 /// `Debug` を導出しない（[`ImportSummary`] と同じ扱い）。
 pub struct ExportSummary {
     /// 生成した図面。
     pub drawing: Drawing,
-    /// DXF 非対応でスキップしたエンティティ数（Text・寸法）。
+    /// DXF 非対応でスキップしたエンティティ数（寸法。Text はタスク25で export 対応済み）。
     pub skipped_entities: usize,
 }
 
@@ -240,52 +279,170 @@ fn shape_to_dxf_entity(shape: &Shape) -> DxfEntity {
     DxfEntity::new(specific)
 }
 
-/// DXF エンティティの `specific` を [`Shape`] へ変換する。
+/// DXF `TEXT` の位置基準（justification）が mcad の [`TextGeom`] で表現できるか判定する。
 ///
-/// 対応していない `EntityType`、または非有限座標・負半径など
-/// [`validate_shape`] が拒否する不正なジオメトリは `None` を返す
-/// （呼び出し側で「無視」としてカウントする）。
-fn dxf_entity_to_shape(specific: &EntityType) -> Option<Shape> {
-    let shape = match specific {
-        EntityType::ModelPoint(p) => Shape::Point(from_dxf_point(&p.location)),
+/// 受理するのは水平 = `Left`（group code 72 = 0）かつ垂直 = `Baseline`
+/// （group code 73 = 0）の組み合わせだけ。どちらも DXF の既定値であり、
+/// [`text_to_dxf_entity`] が書き出す mcad 自身の TEXT は常にこの組み合わせになる。
+/// それ以外は [`dxf_entity_to_geom`] が `None` を返し、呼び出し側が
+/// [`ImportSummary::skipped_entities`] に計上する。
+///
+/// # なぜ alignment point から逆算せず、スキップするのか
+///
+/// DXF TEXT の仕様では、水平 justification が `Left` 以外、または垂直
+/// justification が `Baseline` 以外のとき、**実際の文字位置は alignment point
+/// （group code 11 = [`DxfText::second_alignment_point`]）が持ち、`location`
+/// （group code 10）は意味を持たない**。そのため `location` をそのまま
+/// [`TextGeom::anchor`] へ入れると、外部 CAD が作った中央揃え・右揃え・非ベースライン
+/// 揃えの TEXT は**間違った位置に配置される**（mcad 自身の export は常に
+/// Left/Baseline なので、既存の往復テストではこの不整合を検出できない）。
+///
+/// では alignment point から `anchor` を逆算すればよい、とはならない。
+/// [`TextGeom`] は「左寄せ・ベースライン基準の 1 点（`anchor`）」しか持たないため、
+/// 例えば中央揃えの alignment point（描画される文字列の中央）から左端を求めるには
+/// **文字列の描画幅、すなわちフォントメトリクスが必要**になる。フォント
+/// （Noto Sans JP）を持つのは `mcad-app` であり、`mcad-io` はアーキテクチャ上の
+/// 依存方向（app → io → core → geom）から app を参照できない。つまり io 層では
+/// 原理的に正しい逆算ができない。「文字幅を係数で近似する」のは結局位置がずれる
+/// ので、黙って誤配置する現状と同じ問題を残すだけである。
+///
+/// 誤った位置に黙って置くより、既存のスキップ機構へ乗せて件数をユーザーへ通知する
+/// 方が「無警告のデータロスを防ぐ」方針（モジュール doc の「未対応エンティティ・
+/// 不正ジオメトリの扱い（import）」）に合う、と判断した。
+///
+/// 将来対応するなら、io 層は justification と alignment point を素通しし、
+/// フォントメトリクスを持つ app 層で `anchor` へ変換する構造が必要になる。
+fn is_text_justification_supported(text: &DxfText) -> bool {
+    matches!(
+        text.horizontal_text_justification,
+        HorizontalTextJustification::Left
+    ) && matches!(
+        text.vertical_text_justification,
+        VerticalTextJustification::Baseline
+    )
+}
+
+/// DXF エンティティの `specific` を [`EntityGeom`] へ変換する。
+///
+/// Shape 系（POINT / LINE / CIRCLE / ARC / LWPOLYLINE）に加え、TEXT を
+/// [`EntityGeom::Text`] へ変換する（タスク25b、[`text_to_dxf_entity`] の逆写像）。
+/// TEXT のうち位置基準が Left/Baseline 以外のものは変換せず `None` を返す
+/// （理由は [`is_text_justification_supported`] の doc）。
+///
+/// 対応していない `EntityType`、または非有限座標・負半径・非正の文字高さなど
+/// [`EntityGeom::validate`] が拒否する不正なジオメトリは `None` を返す
+/// （呼び出し側で「無視」としてカウントする）。`Shape` バリアントの判定基準は
+/// `.mcad` import（[`crate::mcad_file::import_document`]）と同一であり、
+/// `EntityGeom::validate` が `Shape::validate` へ委譲するため divergence しない。
+fn dxf_entity_to_geom(specific: &EntityType) -> Option<EntityGeom> {
+    let geom: EntityGeom = match specific {
+        EntityType::ModelPoint(p) => Shape::Point(from_dxf_point(&p.location)).into(),
         EntityType::Line(l) => {
-            Shape::Line(LineSeg::new(from_dxf_point(&l.p1), from_dxf_point(&l.p2)))
+            Shape::Line(LineSeg::new(from_dxf_point(&l.p1), from_dxf_point(&l.p2))).into()
         }
-        EntityType::Circle(c) => Shape::Circle(Circle::new(from_dxf_point(&c.center), c.radius)),
+        EntityType::Circle(c) => {
+            Shape::Circle(Circle::new(from_dxf_point(&c.center), c.radius)).into()
+        }
         EntityType::Arc(a) => Shape::Arc(Arc::new(
             from_dxf_point(&a.center),
             a.radius,
             a.start_angle.to_radians(),
             a.end_angle.to_radians(),
-        )),
+        ))
+        .into(),
         EntityType::LwPolyline(pl) => Shape::Polyline(Polyline::new(
             pl.vertices.iter().map(|v| Point2::new(v.x, v.y)).collect(),
             pl.is_closed(),
-        )),
+        ))
+        .into(),
+        // TEXT: text_to_dxf_entity の逆写像。`rotation` は度なのでラジアンへ戻す。
+        // 書体名（`text_style_name`）・各種寸法比は mcad の TextGeom に対応する
+        // フィールドがないため捨てる（DESIGN.md M6 設計判断5）。
+        //
+        // 位置基準（group code 72 / 73）が Left/Baseline 以外の TEXT は `location` が
+        // 文字位置を持たないため、そのまま anchor に入れると誤配置になる。io 層では
+        // 正しく逆算できないのでスキップする（is_text_justification_supported の doc）。
+        EntityType::Text(t) => {
+            if !is_text_justification_supported(t) {
+                return None;
+            }
+            EntityGeom::Text(TextGeom {
+                anchor: from_dxf_point(&t.location),
+                content: t.value.clone(),
+                height: t.text_height,
+                angle: t.rotation.to_radians(),
+            })
+        }
         _ => return None,
     };
-    if validate_shape(&shape).is_ok() {
-        Some(shape)
+    if geom.validate().is_ok() {
+        Some(geom)
     } else {
         None
     }
 }
 
+/// [`TextGeom`] を DXF `TEXT` エンティティへ変換する（タスク25）。
+///
+/// `anchor` → `location`、`height` → `text_height`、`angle`（ラジアン）→
+/// `rotation`（度）をそのままマッピングする。1 書体のみのため `text_style_name`
+/// は既定（`STANDARD`）のままにする（DESIGN.md M6 設計判断5）。逆写像は
+/// [`dxf_entity_to_geom`]。
+fn text_to_dxf_entity(text: &TextGeom) -> DxfEntity {
+    let specific = EntityType::Text(DxfText {
+        location: to_dxf_point(text.anchor),
+        text_height: text.height,
+        value: text.content.clone(),
+        rotation: text.angle.to_degrees(),
+        ..Default::default()
+    });
+    DxfEntity::new(specific)
+}
+
 /// `Document` を `dxf::Drawing` へ変換する。
 ///
 /// 生存中のレイヤー・エンティティのみを列挙する（undo/redo 履歴は含めない）。
-/// DXF 未対応の Text・寸法（[`mcad_core::EntityGeom`] の非 Shape バリアント）は
-/// スキップし、その件数を [`ExportSummary::skipped_entities`] に積む。
+/// Text（[`EntityGeom::Text`]）は DXF `TEXT` エンティティとして export する
+/// （タスク25）。寸法（[`EntityGeom`] の `DimLinear` / `DimRadial`）は DXF に
+/// 対応するプリミティブがなくスキップし、その件数を
+/// [`ExportSummary::skipped_entities`] に積む。
 #[must_use]
 pub fn export_dxf(doc: &Document) -> ExportSummary {
     let mut drawing = Drawing::new();
 
-    // LWPOLYLINE（`EntityType::LwPolyline`）は AutoCAD R14 以降でしか書き出せない
-    // （`dxf` クレートの既定バージョンは R12 で、それだと LWPOLYLINE は
-    // `save_file` 時に黙って読み飛ばされる）。R2000 は LWPOLYLINE 以降の主要な
-    // エンティティを広くサポートし、他の CAD ソフトとの互換性も高い一般的な
-    // バージョンなのでこれを使う。
-    drawing.header.version = dxf::enums::AcadVersion::R2000;
+    // ヘッダバージョンは R2007。下限が上下 2 つの理由から挟まれており、**下げてはいけない**。
+    //
+    // ## R14 未満では LWPOLYLINE が黙って落ちる
+    //
+    // LWPOLYLINE（`EntityType::LwPolyline`）は AutoCAD R14 以降のエンティティで、
+    // `dxf` クレートは書き出し時に `if version >= AcadVersion::R14` でガードしている
+    // （生成コード `build/entity_generator.rs`）。クレート既定の R12 のままだと
+    // ポリラインが **エラーにもならず消える**。
+    //
+    // ## R2004 以下では文字列 codec が往復でデータを壊す
+    //
+    // `dxf` 0.6.1 は `$ACADVER <= R2004` のとき文字列を `\U+XXXX`（4桁大文字16進）へ
+    // エスケープして書き（`escape_unicode_to_ascii`）、読込時は `$ACADVER < R2007` を
+    // WINDOWS_1252 と見なして `un_escape_ascii_to_unicode` でアンエスケープする。
+    // この codec には往復でデータを壊す欠陥が 3 つあり、いずれも実測で確認した
+    // （2026-07-25、Codex レビューの high 指摘が契機）:
+    //
+    // 1. **非BMP文字**: `😀`（U+1F600）は `\U+1F600` と書かれるが、デコーダが 16 進を
+    //    4 桁ちょうどしか消費しないため `ὠ`（U+1F60）+ `0` の 2 文字に化ける。
+    // 2. **末尾バックスラッシュ**: `path\` の末尾 `\` はエスケープ開始と誤認され、
+    //    未完のシーケンスが flush されないまま捨てられて消える。
+    // 3. **リテラル `\U+XXXX`**: 書き出し側がバックスラッシュを二重化しないため、
+    //    ユーザーが入力した 7 文字の `\U+0041` が読込で `A` 1 文字に化ける。
+    //
+    // ## R2007 を選ぶ理由
+    //
+    // `$ACADVER >= R2007` なら書き出しは `text_as_ascii = false`、読込は
+    // `read_as_utf8()` で UTF-8 経路に入り、上記エスケープを一切通らないため
+    // 3 ケースすべてが往復一致する（`tests::round_trip_preserves_pathological_text`
+    // で固定）。R2010 / R2013 / R2018 でも同じ UTF-8 経路だが、**UTF-8 経路に入る
+    // 最小のバージョン**を採るのが保守的（読める CAD ソフトの範囲が最も広い）と
+    // 判断して R2007 とする。DESIGN.md M6 設計判断5 参照。
+    drawing.header.version = dxf::enums::AcadVersion::R2007;
 
     // `Drawing::new()` が自動追加するレイヤー（モジュール doc 参照）をすべて
     // 取り除き、`Document` のレイヤーだけで組み直す。
@@ -314,14 +471,17 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
             .get(&entity.layer)
             .expect("Document invariant: entity's layer must be alive")
             .clone();
-        // M6: DXF は現状 Shape 系のみ export する（TEXT export は後続タスク、寸法は
-        // DXF 非対応）。Shape 以外（Text・寸法）はスキップし件数を数える。件数は
-        // 呼び出し側がステータス表示し、無警告のデータロスを防ぐ。
-        let Some(shape) = entity.geom.as_shape() else {
-            skipped_entities += 1;
-            continue;
+        // M6: Shape・Text は DXF エンティティへ変換する（タスク25で Text も対応）。
+        // 寸法（DimLinear/DimRadial）は DXF に対応するプリミティブがないためスキップし
+        // 件数を数える。件数は呼び出し側がステータス表示し、無警告のデータロスを防ぐ。
+        let mut dxf_entity = match &entity.geom {
+            EntityGeom::Shape(shape) => shape_to_dxf_entity(shape),
+            EntityGeom::Text(text) => text_to_dxf_entity(text),
+            EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {
+                skipped_entities += 1;
+                continue;
+            }
         };
-        let mut dxf_entity = shape_to_dxf_entity(shape);
         dxf_entity.common.layer = layer_name;
         dxf_entity.common.color = style_color_to_dxf(entity.style.color);
         drawing.add_entity(dxf_entity);
@@ -356,6 +516,9 @@ fn resolve_layer(
 /// [`Document::new`] から [`Command`] 列で組み立て、完了後
 /// [`Document::clear_history`] を呼ぶ。未対応エンティティ・不正ジオメトリは
 /// 無視して [`ImportSummary::skipped_entities`] に積む（モジュール doc 参照）。
+/// TEXT は [`EntityGeom::Text`] として復元する（タスク25b）。ただし位置基準が
+/// Left/Baseline 以外の TEXT はスキップ側に回る（理由は
+/// `is_text_justification_supported` の doc）。
 ///
 /// # Errors
 ///
@@ -403,7 +566,7 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
 
     let mut skipped_entities = 0usize;
     for entity in drawing.entities() {
-        let Some(shape) = dxf_entity_to_shape(&entity.specific) else {
+        let Some(geom) = dxf_entity_to_geom(&entity.specific) else {
             skipped_entities += 1;
             continue;
         };
@@ -412,7 +575,7 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
             color: dxf_color_to_style(&entity.common.color),
             ..Style::inherited()
         };
-        doc.apply(Command::AddEntity(Entity::new(shape, layer_id, style)))?;
+        doc.apply(Command::AddEntity(Entity::new(geom, layer_id, style)))?;
     }
 
     // ベストエフォート: $CLAYER に対応するレイヤーが見つかればカレントに設定する。
@@ -429,8 +592,9 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
 
 /// ドキュメントを DXF ファイルへ保存する。
 ///
-/// 戻り値は DXF 非対応でスキップしたエンティティ数（Text・寸法）で、呼び出し側が
-/// ステータス表示に使う（[`ExportSummary`] 参照）。
+/// 戻り値は DXF 非対応でスキップしたエンティティ数（寸法。Text はタスク25で
+/// export 対応済みのためスキップされない）で、呼び出し側がステータス表示に使う
+/// （[`ExportSummary`] 参照）。
 ///
 /// # Errors
 ///
@@ -458,7 +622,8 @@ pub fn load_dxf(path: impl AsRef<Path>) -> Result<ImportSummary, IoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dxf::entities::Text as DxfText;
+    use dxf::entities::RadialDimension;
+    use std::f64::consts::FRAC_PI_2;
     use std::fs;
 
     const EPS: f64 = 1e-9;
@@ -604,7 +769,8 @@ mod tests {
         let imp_entities: Vec<_> = imported.entities().collect();
         assert_eq!(orig_entities.len(), imp_entities.len());
         for ((_, oe), (_, ie)) in orig_entities.iter().zip(imp_entities.iter()) {
-            // full_document は Shape 系のみを含む（DXF は Shape のみ往復対象）。
+            // full_document は Shape 系のみを含む（Text の往復は
+            // round_trip_preserves_cjk_and_ascii_text が担当）。
             let os = oe.geom.as_shape().expect("Shape エンティティのはず");
             let is = ie.geom.as_shape().expect("Shape エンティティのはず");
             approx_shape(os, is);
@@ -650,24 +816,145 @@ mod tests {
         );
     }
 
+    /// 「未対応エンティティ種別はスキップして数える」機構の回帰テスト。
+    ///
+    /// タスク25b で TEXT が import 対応になったため、代表として引き続き未対応の
+    /// RADIALDIMENSION（DXF の DIMENSION 系。ブロック参照を伴い M9 予定、
+    /// DESIGN.md M6 設計判断5）を使う。
     #[test]
     fn unsupported_entity_is_skipped_and_counted() {
         let doc = full_document();
         let mut drawing = export_dxf(&doc).drawing;
         let before = doc.entity_count();
 
-        // TEXT は対応外の EntityType。無視されてカウントされることを確認する。
-        let mut text_entity = DxfEntity::new(EntityType::Text(DxfText::default()));
-        text_entity.common.layer = "0".to_string();
-        drawing.add_entity(text_entity);
+        let mut dim_entity =
+            DxfEntity::new(EntityType::RadialDimension(RadialDimension::default()));
+        dim_entity.common.layer = "0".to_string();
+        drawing.add_entity(dim_entity);
 
         let summary = import_dxf(&drawing).unwrap();
         assert_eq!(summary.skipped_entities, 1);
         assert_eq!(summary.document.entity_count(), before);
     }
 
+    /// 不正な TextGeom（空文字列・非正の文字高さ）も、Shape の不正ジオメトリと同じ
+    /// 規律で読込全体を失敗させずスキップしてカウントする。
+    ///
+    /// `DxfText::default()` は `value` が空文字列・`text_height` が 0.0 で、
+    /// [`EntityGeom::validate`] の両条件に触れる。
     #[test]
-    fn export_skips_and_counts_text_and_dimension_entities() {
+    fn invalid_text_entity_is_skipped_and_counted() {
+        let mut drawing = Drawing::new();
+        while drawing.remove_layer(0).is_some() {}
+        drawing.add_layer(DxfLayer {
+            name: "0".to_string(),
+            ..Default::default()
+        });
+
+        let mut empty_text = DxfEntity::new(EntityType::Text(DxfText::default()));
+        empty_text.common.layer = "0".to_string();
+        drawing.add_entity(empty_text);
+
+        // 内容はあるが文字高さが 0 の TEXT も不正。
+        let mut zero_height = DxfEntity::new(EntityType::Text(DxfText {
+            value: "ok".to_string(),
+            text_height: 0.0,
+            ..Default::default()
+        }));
+        zero_height.common.layer = "0".to_string();
+        drawing.add_entity(zero_height);
+
+        let summary = import_dxf(&drawing).unwrap();
+        assert_eq!(summary.skipped_entities, 2);
+        assert_eq!(summary.document.entity_count(), 0);
+    }
+
+    /// 位置基準（justification）が Left/Baseline 以外の TEXT は、`location`
+    /// （group code 10）が文字位置を持たないため import せずスキップして計上する。
+    ///
+    /// 誤配置を防ぐための意図的な取りこぼしであり、逆算にフォントメトリクスが必要で
+    /// io 層では実装できないという依存方向の制約が根拠（詳細は
+    /// [`is_text_justification_supported`] の doc）。mcad 自身の export は常に
+    /// Left/Baseline なので、この経路は**外部 CAD が作った DXF でしか通らない**。
+    /// そのため往復テストでは検出できず、`dxf::Drawing` へ直接エンティティを
+    /// 注入して確認する。
+    ///
+    /// 同じ図面に Left/Baseline の TEXT も混ぜ、そちらは従来どおり import され
+    /// 位置・内容が保たれることを同時に固定する（判定が広すぎて正常な TEXT まで
+    /// 落とす回帰を防ぐ）。
+    #[test]
+    fn text_with_unsupported_justification_is_skipped_and_counted() {
+        let mut drawing = Drawing::new();
+        while drawing.remove_layer(0).is_some() {}
+        drawing.add_layer(DxfLayer {
+            name: "0".to_string(),
+            ..Default::default()
+        });
+
+        // ジオメトリとしては有効（非空の value・正の text_height）にしておき、
+        // スキップの原因が justification だけであることを担保する。
+        let base = DxfText {
+            location: DxfPoint::new(1.0, 2.0, 0.0),
+            text_height: 1.5,
+            value: "label".to_string(),
+            ..Default::default()
+        };
+
+        // 水平 justification が Left 以外（Center / Right）。文字位置は
+        // second_alignment_point 側にあるので location は使えない。
+        for horizontal in [
+            HorizontalTextJustification::Center,
+            HorizontalTextJustification::Right,
+        ] {
+            let mut entity = DxfEntity::new(EntityType::Text(DxfText {
+                horizontal_text_justification: horizontal,
+                second_alignment_point: DxfPoint::new(10.0, 20.0, 0.0),
+                ..base.clone()
+            }));
+            entity.common.layer = "0".to_string();
+            drawing.add_entity(entity);
+        }
+
+        // 垂直 justification が Baseline 以外（Middle）。水平が Left でもスキップ対象。
+        let mut vertical_middle = DxfEntity::new(EntityType::Text(DxfText {
+            vertical_text_justification: VerticalTextJustification::Middle,
+            second_alignment_point: DxfPoint::new(10.0, 20.0, 0.0),
+            ..base.clone()
+        }));
+        vertical_middle.common.layer = "0".to_string();
+        drawing.add_entity(vertical_middle);
+
+        // 既定（Left / Baseline）の TEXT は従来どおり import される。
+        let mut supported = DxfEntity::new(EntityType::Text(base.clone()));
+        supported.common.layer = "0".to_string();
+        drawing.add_entity(supported);
+
+        let summary = import_dxf(&drawing).unwrap();
+        assert_eq!(
+            summary.skipped_entities, 3,
+            "Center / Right / 垂直 Middle の 3 件がスキップされるはず"
+        );
+        assert_eq!(
+            summary.document.entity_count(),
+            1,
+            "Left/Baseline の 1 件だけが復元されるはず"
+        );
+
+        let (_, entity) = summary.document.entities().next().unwrap();
+        let EntityGeom::Text(text) = &entity.geom else {
+            panic!("Text エンティティとして復元されるはず: {:?}", entity.geom);
+        };
+        assert_eq!(text.content, "label");
+        // alignment point ではなく location が anchor になる（Left/Baseline なので正しい）。
+        approx_point(text.anchor, Point2::new(1.0, 2.0));
+    }
+
+    /// タスク25: Text は DXF `TEXT` エンティティとして export され、長さ寸法・半径寸法は
+    /// DXF に対応するプリミティブがなくスキップされる（DESIGN.md M6 設計判断5・
+    /// タスク分割表#25）。ここは export 側のフィールドマッピングのみを見る
+    /// （往復は `round_trip_preserves_cjk_and_ascii_text`）。
+    #[test]
+    fn export_writes_text_entity_and_skips_dimensions() {
         use mcad_core::{DimLinear, DimRadial, EntityGeom, TextGeom};
 
         let mut doc = Document::new();
@@ -679,18 +966,19 @@ mod tests {
             Style::inherited(),
         )))
         .unwrap();
-        // Text・長さ寸法・半径寸法は DXF 未対応でスキップされる（TEXT export は後続タスク）。
+        // Text は DXF TEXT エンティティとして書き出される。
         doc.apply(Command::AddEntity(Entity::new(
             EntityGeom::Text(TextGeom {
-                anchor: Point2::new(0.0, 0.0),
+                anchor: Point2::new(3.0, 4.0),
                 content: "hi".into(),
-                height: 1.0,
-                angle: 0.0,
+                height: 2.5,
+                angle: FRAC_PI_2,
             }),
             layer,
             Style::inherited(),
         )))
         .unwrap();
+        // 長さ寸法・半径寸法は DXF 非対応でスキップされる。
         doc.apply(Command::AddEntity(Entity::new(
             EntityGeom::DimLinear(DimLinear {
                 p1: Point2::new(0.0, 0.0),
@@ -713,9 +1001,22 @@ mod tests {
         .unwrap();
 
         let export = export_dxf(&doc);
-        // 3 件（Text + 2 寸法）がスキップされ、Shape 1 件だけが図面へ入る。
-        assert_eq!(export.skipped_entities, 3);
-        assert_eq!(export.drawing.entities().count(), 1);
+        // 2 件（長さ寸法 + 半径寸法）がスキップされ、Shape 1 件 + TEXT 1 件が図面へ入る。
+        assert_eq!(export.skipped_entities, 2);
+        assert_eq!(export.drawing.entities().count(), 2);
+
+        let text_entity = export
+            .drawing
+            .entities()
+            .find_map(|e| match &e.specific {
+                EntityType::Text(t) => Some(t),
+                _ => None,
+            })
+            .expect("TEXT entity must be present in the exported drawing");
+        approx_point(from_dxf_point(&text_entity.location), Point2::new(3.0, 4.0));
+        assert!((text_entity.text_height - 2.5).abs() < EPS);
+        assert!((text_entity.rotation - 90.0).abs() < ANGLE_EPS);
+        assert_eq!(text_entity.value, "hi");
     }
 
     #[test]
@@ -785,6 +1086,241 @@ mod tests {
         assert_eq!(summary.skipped_entities, 0);
         assert_eq!(summary.document.entity_count(), doc.entity_count());
         assert_layers_match(&doc, &summary.document);
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// ヘッダバージョン（[`export_dxf`] 参照）が決める文字列 codec の実態を、
+    /// 生成された .dxf ファイルの**バイト列**で固定する。
+    ///
+    /// 往復（`round_trip_preserves_cjk_and_ascii_text`）だけでは「エンコード・
+    /// デコードが対称に働いた」ことしか分からず、ファイルに何が書かれるかは
+    /// 固定されない。他の CAD ソフトが読める形になっているかを担保するため、
+    /// ここでは生ファイルを直接見る。
+    ///
+    /// # 以前このテストが固定していたこと（R2000 時代）
+    ///
+    /// export が R2000 だった間は、`dxf` クレートが ASCII 範囲外の文字を
+    /// `\U+XXXX`（4桁大文字16進）へエスケープしていたため（`text_as_ascii =
+    /// header.version <= AcadVersion::R2004`）、このテストは
+    /// 「ファイル全体が純 ASCII であること」「`寸法テスト` が
+    /// `\U+5BF8\U+6CD5\U+30C6\U+30B9\U+30C8` として現れること」を固定していた。
+    ///
+    /// # 今固定していること（R2007）
+    ///
+    /// R2007 では UTF-8 のまま書かれ、エスケープ経路を通らない。この経路へ移した
+    /// 理由（R2004 以下の codec が往復でデータを壊す 3 欠陥）は [`export_dxf`] の
+    /// コメント、再発検知は `round_trip_preserves_pathological_text` を参照。
+    /// ここでは「group code 1 の値行に元の文字列がそのまま UTF-8 で現れる」ことと
+    /// 「`\U+` エスケープが使われていない」ことの両方を確認し、ヘッダを下げる
+    /// 変更があれば必ず落ちるようにする。
+    ///
+    /// # このテストの位置づけ（何を証明していないか）
+    ///
+    /// 保存は `dxf` 0.6.1 が行い、検証はその**生バイト列**に対して行う。したがって
+    /// 証明できるのは「このクレートがこのヘッダバージョンで期待どおりのバイトを
+    /// 書く」ことだけであり、**外部の DXF リーダーがこのファイルを受理することの
+    /// 証明ではない**。目的は codec 回帰（ヘッダを下げる・クレートを上げるなどで
+    /// エスケープ経路へ戻る変化）の検知であって、相互運用性の保証ではない。
+    /// 相互運用性は手動確認（LibreCAD 実機）で担保している
+    /// （DESIGN.md M6 設計判断5）。
+    #[test]
+    fn save_dxf_writes_cjk_text_as_utf8() {
+        let dir = std::env::temp_dir().join("mcad-io-test");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cjk_text.dxf");
+
+        const CONTENT: &str = "寸法テスト";
+
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::new(0.0, 0.0),
+                content: CONTENT.into(),
+                height: 1.0,
+                angle: 0.0,
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let skipped = save_dxf(&doc, &path).unwrap();
+        assert_eq!(skipped, 0);
+
+        // R2007 の DXF は UTF-8 テキストなので、そのままデコードできる。
+        let text = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+
+        // group code 1（TEXT の値）の直後の行が、エスケープされていない元の文字列。
+        let value_lines: Vec<&str> = text
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| w[0].trim() == "1")
+            .map(|w| w[1])
+            .collect();
+        assert!(
+            value_lines.contains(&CONTENT),
+            "group code 1 の値行に UTF-8 のままの {CONTENT:?} が見つからない: {value_lines:?}"
+        );
+
+        // `\U+XXXX` エスケープ経路（R2004 以下）に入っていないこと。ヘッダを
+        // 下げるとここで落ちる。
+        assert!(
+            !text.contains("\\U+"),
+            "R2007 では \\U+XXXX エスケープが使われてはならない"
+        );
+        assert_eq!(
+            export_dxf(&doc).drawing.header.version,
+            dxf::enums::AcadVersion::R2007,
+            "ヘッダバージョンは R2007（理由は export_dxf のコメント）"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `dxf` 0.6.1 の R2004 以下の文字列 codec が**実際に壊した** 4 ケースの
+    /// ファイル往復テスト。export のヘッダバージョンを R2007 未満へ下げると
+    /// **必ずこのテストが落ちる**（それが存在理由）。
+    ///
+    /// R2004 以下では書き出しが `escape_unicode_to_ascii`、読込が
+    /// `un_escape_ascii_to_unicode` を通る。それぞれの壊れ方（2026-07-25 実測）:
+    ///
+    /// 1. 非BMP文字 `😀`（U+1F600）: `\U+1F600` と書かれるが、デコーダが 16 進を
+    ///    4 桁ちょうどしか消費しないため `ὠ`（U+1F60）+ `0` の 2 文字に化ける。
+    /// 2. 末尾バックスラッシュ `path\`: 末尾の `\` がエスケープ開始と誤認され、
+    ///    未完のシーケンスが flush されずに消える。
+    /// 3. 中間のバックスラッシュ `C:\temp\a`: 上と同じ経路。単体では壊れなかったが
+    ///    エスケープ開始文字を含む代表ケースとして固定する。
+    /// 4. リテラル `\U+0041`（`\` + `U+0041` の 7 文字）: 書き出し側が
+    ///    バックスラッシュを二重化しないため、読込で `A` 1 文字に潰れる。
+    ///
+    /// R2007（UTF-8 経路）ではエスケープを通らないため 4 ケースすべてが完全一致する。
+    /// メモリ内往復（`export_dxf` → `import_dxf`）ではこの codec を通らないので、
+    /// **必ずファイル経由**で往復させること。
+    ///
+    /// # このテストの位置づけ（何を証明していないか）
+    ///
+    /// 書き出しも読み込みも同じ `dxf` 0.6.1 が行うため、証明できるのは
+    /// **同一ライブラリ内でエンコードとデコードが対称に働く**ことだけである。
+    /// **外部の DXF リーダーがこのファイルを受理することの証明ではない**
+    /// （対称に壊れれば往復は一致してしまう。それを補うため、ファイルに何が
+    /// 書かれるかは `save_dxf_writes_cjk_text_as_utf8` が生バイトで別途固定する）。
+    /// 目的は codec 回帰の検知であって相互運用性の保証ではなく、相互運用性は
+    /// 手動確認（LibreCAD 実機）で担保している（DESIGN.md M6 設計判断5）。
+    #[test]
+    fn round_trip_preserves_pathological_text() {
+        let dir = std::env::temp_dir().join("mcad-io-test");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pathological_text.dxf");
+
+        let contents = [
+            "OK 😀 done",  // 1. 非BMP（U+1F600）
+            "path\\",      // 2. 末尾バックスラッシュ
+            "C:\\temp\\a", // 3. 中間バックスラッシュ
+            "\\U+0041",    // 4. リテラル `\U+XXXX`（7 文字。`A` に化けてはいけない）
+        ];
+
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        for (i, content) in contents.iter().enumerate() {
+            doc.apply(Command::AddEntity(Entity::new(
+                EntityGeom::Text(TextGeom {
+                    anchor: Point2::new(i as f64, 0.0),
+                    content: (*content).into(),
+                    height: 1.0,
+                    angle: 0.0,
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        }
+
+        assert_eq!(save_dxf(&doc, &path).unwrap(), 0);
+        let summary = load_dxf(&path).unwrap();
+        assert_eq!(summary.skipped_entities, 0);
+        assert_eq!(summary.document.entity_count(), contents.len());
+
+        for (expected, (_, entity)) in contents.iter().zip(summary.document.entities()) {
+            let EntityGeom::Text(actual) = &entity.geom else {
+                panic!("Text エンティティとして復元されるはず: {:?}", entity.geom);
+            };
+            assert_eq!(
+                *expected, actual.content,
+                "文字列が往復で壊れた（ヘッダバージョンを下げていないか確認すること）"
+            );
+        }
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// タスク25b: TEXT の往復（CJK・ASCII の両方）。
+    ///
+    /// **ファイル経由**で往復させるのが要点。文字列のエンコード・デコードは
+    /// `dxf` クレートのコードペア書き出し・読み込みで起きるため、`export_dxf` →
+    /// `import_dxf` のメモリ内往復では codec をまったく通らず、CJK が正しく
+    /// 書かれ読み戻されるかを検証できない。境界ケース（非BMP・バックスラッシュ）は
+    /// `round_trip_preserves_pathological_text` が担当する。
+    #[test]
+    fn round_trip_preserves_cjk_and_ascii_text() {
+        let dir = std::env::temp_dir().join("mcad-io-test");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("text_roundtrip.dxf");
+
+        let texts = [
+            TextGeom {
+                anchor: Point2::new(1.5, -2.25),
+                content: "寸法テスト".into(),
+                height: 3.0,
+                angle: FRAC_PI_2,
+            },
+            TextGeom {
+                anchor: Point2::new(-4.0, 8.0),
+                content: "Ascii Label 123".into(),
+                height: 0.5,
+                angle: 0.0,
+            },
+        ];
+
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        for text in &texts {
+            doc.apply(Command::AddEntity(Entity::new(
+                EntityGeom::Text(text.clone()),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        }
+
+        assert_eq!(save_dxf(&doc, &path).unwrap(), 0);
+        let summary = load_dxf(&path).unwrap();
+        assert_eq!(summary.skipped_entities, 0);
+        assert_eq!(summary.document.entity_count(), texts.len());
+
+        for (expected, (_, entity)) in texts.iter().zip(summary.document.entities()) {
+            let EntityGeom::Text(actual) = &entity.geom else {
+                panic!("Text エンティティとして復元されるはず: {:?}", entity.geom);
+            };
+            assert_eq!(expected.content, actual.content);
+            approx_point(expected.anchor, actual.anchor);
+            assert!(
+                (expected.height - actual.height).abs() < EPS,
+                "height mismatch: {} vs {}",
+                expected.height,
+                actual.height
+            );
+            // angle はラジアン→度→ラジアンで往復するので丸め誤差を許容する。
+            assert!(
+                (expected.angle - actual.angle).abs() < ANGLE_EPS,
+                "angle mismatch: {} vs {}",
+                expected.angle,
+                actual.angle
+            );
+        }
 
         fs::remove_file(&path).ok();
     }

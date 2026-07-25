@@ -21,7 +21,7 @@ Rust + egui で作る2D CAD。v0.5.0 では以下の機能を実装済み。
 | 幾何計算 | 自前実装(f64) | ワールド座標はf64。描画時のみf32へ変換 |
 | ID管理 | `slotmap` | エンティティ・レイヤーのキー |
 | シリアライズ | `serde` + `serde_json` | 独自形式 `.mcad`(JSON)。将来バイナリ化可 |
-| DXF | `dxf` クレート | R2000相当のASCII DXFを対象 |
+| DXF | `dxf` クレート | ヘッダ R2007(`AC1021`)のテキスト DXF。文字列は UTF-8 のまま入出力(理由はM6設計判断5) |
 | エラー | `thiserror` / `anyhow` | core側はthiserror、app側はanyhow |
 
 ## 3. アーキテクチャ
@@ -59,7 +59,9 @@ mcad/
 ### 3.3 mcad-io
 
 - `.mcad`: Documentのserde JSON。バージョンフィールド必須(`"version": 1`)
-- DXF: `dxf`クレートで LINE / CIRCLE / ARC / LWPOLYLINE / POINT とレイヤーテーブルを相互変換。未対応エンティティは読み飛ばして件数を警告として返す
+- DXF: `dxf`クレートで LINE / CIRCLE / ARC / LWPOLYLINE / POINT / TEXT とレイヤーテーブルを相互変換。未対応エンティティは読み飛ばして件数を警告として返す
+  - export のヘッダバージョンは **R2007**(`$ACADVER` = `AC1021`)。文字列は UTF-8 のまま書き、読込も UTF-8 として読む(`\U+XXXX` エスケープ経路は通らない)。上下どちらにも動かせない理由はM6設計判断5
+  - 読み飛ばす対象は「未対応エンティティ種別(DIMENSION 等)」「`EntityGeom::validate` が拒否する不正ジオメトリ」「位置基準が Left/Baseline 以外の TEXT」の3種。3つ目は文字位置が alignment point(group code 11)側にあり、`TextGeom`(左寄せ・ベースライン基準の1点)への逆算に**フォントメトリクスが必要**で、依存方向(app → io)から io 層では実装できないため。誤配置するより件数を通知する方を選んだ
 
 ### 3.4 mcad-app
 
@@ -197,7 +199,7 @@ tcad の進行が必要とした時点で前倒しする**。app 層のみの仕
 | M6 | v0.6.0 | テキストと寸法 | Text エンティティ、長さ/半径寸法。フォント埋め込み(CJK対応)の設計判断を含む | tcad は寸法を独自実装(kit の採点と一体)のため app 層に閉じる。core の Text エンティティ追加は tcad 互換を確認 |
 | M7 | v0.7.0 | 修正系ジオメトリ演算 | トリム・延長・フィレット・分割。mcad-geom の交点計算を流用 | 演算本体は geom 層。tcad の将来パック(鉄道の接線連続等)の下地 |
 | M8 | v0.8.0 | 出力と設定永続化 | SVG/PDFエクスポート(印刷の代替)、線幅の画面反映、設定保存(グリッド間隔・スナップ・最近使ったファイル) | app 層のみ。tcad 無関係 |
-| M9 | v0.9.0 | 性能と互換性 | 空間インデックス導入(大規模図面)、DXF対応拡大(TEXT/DIMENSION import)、M5〜M8の残債解消 | 空間インデックスは geom/core 層なら tcad も恩恵 |
+| M9 | v0.9.0 | 性能と互換性 | 空間インデックス導入(大規模図面)、DXF対応拡大(**DIMENSION import**。TEXT import は 2026-07-25 に M6 タスク25b へ前倒し済み — M6 設計判断5参照)、M5〜M8の残債解消 | 空間インデックスは geom/core 層なら tcad も恩恵 |
 | M10 | v0.10.0 | 幾何拘束ソルバー | 水平/垂直/一致/距離拘束の最小セット。mcad-geom を GUI 非依存に保った布石の回収。最難関 | tcad は「検図=充足チェック」でソルバーを意図的に回避しており、mcad 専用機能。tcad を壊さない追加実装に限る |
 | — | (随時) | tcad 要請の geom 機能 | スプライン、接線連続判定、等距離オフセット等。tcad の追加パック(船舶・鉄道)着手時に geom へ追加 | 役割Aの本丸。tcad 側の要求仕様が出た時点で M5〜M9 に割り込み |
 
@@ -410,9 +412,97 @@ M9 は独立テーマではなく 1.0 前の安定化バッファとして扱い
    - `version: 1` のファイルは旧 DTO で読み、`EntityGeom::Shape` へ変換して受理する(**後方互換読込**。
      v1 ファイルのラウンドトリップテストを追加)。書き出しは常に v2
    - 旧バイナリ(v0.5.0 以前)が v2 ファイルを拒否するのは既存バージョンチェックの想定どおり
-5. **DXF は TEXT export のみ M6 で対応**: 位置・高さ・回転を `TEXT` エンティティで出力する
-   (1 書体のため STYLE は既定のまま)。**寸法は DXF 非対応**とし、既存のスキップ機構で件数を
-   ステータス表示する。TEXT / DIMENSION の **import は M9**(ロードマップどおり)
+5. **DXF は TEXT の export / import を M6 で対応**: 位置・高さ・回転を `TEXT` エンティティで
+   相互変換する(1 書体のため STYLE は既定のまま。import では書体名を捨てる)。
+   **寸法は DXF 非対応**とし、既存のスキップ機構で件数をステータス表示する。
+   - **(2026-07-25 追記、ユーザー判断で前倒し)** 当初は「TEXT / DIMENSION の import はどちらも
+     M9」という切り分けだった(ロードマップどおり)。しかし TEXT export をタスク25で入れた時点で
+     **export だけがあって読み戻せないのは往復不能な片道機能**であり、CJK の `\U+XXXX`
+     エスケープ(下記)が本当に無損失かも往復でしか確認できないと判断し、**TEXT import を M6 へ
+     前倒しした**(タスク25b)。実測の結果、逆変換は `dxf` クレートが読込経路で自動的に行うため
+     (`$ACADVER` < R2007 の文字列コードペアに `un_escape_ascii_to_unicode` が適用される)、
+     mcad 側に自前のアンエスケープは不要だった。
+     **※この段落は R2000 ヘッダ時点の記録**。次項でヘッダを R2007 へ引き上げたため、
+     現在の実装はエスケープ経路自体を通らない(UTF-8 のまま入出力する)。いずれの経路でも
+     mcad 側に自前のエスケープ処理を持たない点は変わらない。
+   - **(2026-07-25 追記、DXF ヘッダを R2000 → R2007 へ引き上げ)** 上記の「エスケープは無損失」
+     という結論は **CJK の範囲でしか成り立っていなかった**。Codex レビューの high 指摘を受けて
+     境界ケースを実測したところ、`dxf` 0.6.1 の `$ACADVER <= R2004` 用文字列 codec
+     (`escape_unicode_to_ascii` / `un_escape_ascii_to_unicode`)に **往復でデータを壊す欠陥が
+     3 つ**あることが判明した:
+     1. **非BMP文字**: `😀`(U+1F600)は `\U+1F600` と書かれるが、デコーダが 16 進を 4 桁ちょうど
+        しか消費しないため `ὠ`(U+1F60)+ `0` の 2 文字に化ける(実測: `OK 😀 done` → `OK ὠ0 done`)
+     2. **末尾バックスラッシュ**: `path\` の末尾 `\` がエスケープ開始と誤認され、未完のシーケンスが
+        flush されずに消える(実測: `path\` → `path`)
+     3. **リテラル `\U+XXXX`**: 書き出し側がバックスラッシュを二重化しないため、ユーザーが入力した
+        7 文字の `\U+0041` が読込で `A` 1 文字に潰れる(実測)
+     - **対策としてヘッダを R2007 へ引き上げた**。`$ACADVER >= R2007` なら書き出しは UTF-8 のまま、
+       読込も `read_as_utf8()` へ切り替わり、エスケープ経路を一切通らないため 3 ケースすべてが
+       往復一致する。R2010 以降でも同じ経路だが、**UTF-8 経路に入る最小のバージョン**を採るのが
+       保守的と判断して R2007 とした
+     - **下限は上下から挟まれている**: R2004 以下は上記 3 欠陥、R14 未満は LWPOLYLINE が黙って
+       落ちる(`dxf` クレートが `version >= R14` でガード)。ヘッダを下げる変更は必ずどちらかを
+       再発させるため、`export_dxf` のコメントと `round_trip_preserves_pathological_text` で固定した
+     - **「UTF-8 が必要なときだけ条件付きで R2007」案は却下**(2026-07-25、Codex レビューの推奨案)。
+       `path\`(末尾バックスラッシュ)は **ASCII のみの文字列だが R2000 では壊れる**ため、
+       「ASCII なら R2000 で安全」が成り立たない。条件分岐の判定条件は結局「壊れる文字列を
+       含むか」になり、以前に却下した「壊れる content を検出してスキップする案」と同じ
+       検出漏れリスクへ逆戻りする。よって **R2007 固定を維持する**
+     - **トレードオフと互換性の実測結果**: R2007 は 2007 年の仕様なので、それより古い CAD ソフト
+       (R2000 までしか読まない実装)では開けなくなる可能性がある。粒度を分けて記録する:
+       - **LibreCAD では実測済み**(ユーザーの実機、2026-07-25)。mcad が export した R2007 DXF を
+         開くと図形(線・円・ポリライン)は正しく表示され、ASCII の TEXT も読める。したがって
+         R2007 構造そのものは少なくとも LibreCAD で受理される(CJK TEXT のグリフ問題は
+         ヘッダバージョンとは無関係。後述の追記を参照)
+       - **R2000 までしか読まない古い CAD ソフトでの可否は依然として未検証**。手元に該当環境がない
+       - いずれにせよ、文字列が静かに壊れるより、読めない場合にユーザーが気づける方を選んだ
+     - **自動テストの位置づけ**: `round_trip_preserves_pathological_text` は `dxf` 0.6.1 自身で
+       保存・読込するため「同一ライブラリ内でエンコード・デコードが対称に働く」ことしか、
+       `save_dxf_writes_cjk_text_as_utf8` は「そのライブラリが期待どおりの生バイトを書く」ことしか
+       証明していない。**どちらも外部 DXF リーダーの受理を保証しない**。目的は codec 回帰の検知で
+       あり、相互運用性は上記の手動確認(LibreCAD)で担保する。外部パーサや golden fixture の
+       CI 導入は M6 のスコープ外とする
+   - **DIMENSION の import は M9 のまま**。DXF の DIMENSION はブロック参照(寸法展開図形を持つ
+     BLOCK)を伴い、mcad は export もしていないため往復テストが組めない。前倒しの判断材料
+     (片道機能の解消・エスケープ検証)がどちらも当てはまらないため、TEXT と同時には動かさない
+   - **(2026-07-25 追記、他 CAD ビューアでの CJK TEXT 表示を実測)** mcad が export した DXF を
+     LibreCAD で開くと、図形(線・円・ポリライン)と ASCII の TEXT は正しく表示されるが、
+     CJK の TEXT は「◇」(グリフ欠落時のフォールバック記号)になることを実機で確認した。
+     ASCII が読めることから STYLE 参照・文字位置・文字高さ・エンコーディングはいずれも正常で、
+     原因は**受け取り側のフォントにおけるグリフ不足**と特定できた(`$ACADVER` = `AC1021`(R2007)、
+     ファイルは有効な UTF-8 で CJK が生バイトのまま正しく入っていることも確認済み。
+     `$DWGCODEPAGE` は `ANSI_1252` のままだが R2007 以上では仕様上無視されるため無関係)。
+     STYLE テーブル(`STANDARD`)の `primary_font_file_name` を変えたバリアントを3種試作し
+     (LibreCAD 同梱 `unicode.lff` を狙った `unicode`、AutoCAD の CJK 慣習である
+     `txt` + `big_font_file_name = bigfont.shx`、TTF 名を直接指定した
+     `NotoSansJP-Regular.ttf`)検証したが、いずれも LibreCAD で CJK は ◇ のままだった。
+     **したがって export 側でフォント名を指定しても解決しない**ことを実測で確認した。
+     この結果を受けて、当初の判断「1 書体のため STYLE は既定のまま」は**維持する**。
+     ただし位置づけは「触らなくてよい」ではなく「**触っても解決しないことを実測した上で
+     維持する**」に変更する。DXF の TEXT はフォント名の参照(STYLE)しか持たず、SHX/LFF
+     フォント本体をファイルへ埋め込む手段がないため、CJK 表示は構造的に受け取り側の
+     フォント環境に依存する。mcad 内部の表示・往復は Noto Sans JP 埋め込みで完結しており、
+     この制約の影響を受けない。将来「他ビューアでも CJK を読ませたい」となった場合、
+     受け取り側にフォントを用意してもらう運用か、TEXT をジオメトリへ分解して export する
+     方式が必要になる見通しだが、これは新たな設計判断としてここでは確定させない。
+   - **(2026-07-25 追記、Codex adversarial review の指摘)** **非対応 justification の TEXT は
+     import せずスキップする**。DXF TEXT の仕様では、水平 justification(group code 72)が `Left` 以外、または垂直
+     justification(group code 73)が `Baseline` 以外のとき、**実際の文字位置は alignment point
+     (group code 11)が持ち、`location`(group code 10)は意味を持たない**。当初の実装は常に
+     `location` を `TextGeom::anchor` へ入れていたため、外部 CAD が作った中央揃え・右揃え・
+     非ベースライン揃えの TEXT が**間違った位置に配置される**バグになっていた
+     (mcad 自身の export は常に Left/Baseline なので、往復テストでは検出できなかった)。
+     - **alignment point から逆算する案は採らない**。`TextGeom` は左寄せ・ベースライン基準の
+       1 点しか持たないため、例えば中央揃えの alignment point から左端を求めるには
+       **描画される文字列の幅、すなわちフォントメトリクスが必要**になる。フォント
+       (Noto Sans JP)を持つのは `mcad-app` で、`mcad-io` は依存方向(app → io → core → geom)から
+       app を参照できない。つまり io 層では原理的に正しい逆算ができない
+     - したがって **水平 `Left` かつ垂直 `Baseline` のときのみ受理し、それ以外は既存のスキップ機構へ
+       回して件数をステータス表示する**。誤った位置に黙って配置するより、無警告のデータロスを
+       防ぐ方針に合わせた。判定と理由は `is_text_justification_supported` の doc コメントに置き、
+       回帰テストは `text_with_unsupported_justification_is_skipped_and_counted`
+     - 将来対応するなら、io 層は justification と alignment point を素通しし、フォントメトリクスを
+       持つ app 層で `anchor` へ変換する構造が必要になる(M6 では実装しない)
 6. **ツール UX**(いずれも既存 `Tool` トレイトの作図ツールとして実装。Select 系ではない):
    - **Text**: `T` → anchor をクリック(スナップ適用)→ ツールパネルの入力欄(single-line、
      IME 入力可)へ文字列、数値欄へ高さ(ワールド単位、既定値は前回値を保持)→ Enter で
@@ -435,15 +525,17 @@ M9 は独立テーマではなく 1.0 前の安定化バッファとして扱い
 | 22 | core データモデル + 永続化 | `EntityGeom` 新設(Shape 包含 + TextGeom + DimLinear/DimRadial)、`Command::ModifyEntity` の EntityGeom 化、validate、.mcad v2(v1 後方互換読込 + テスト)、tcad `cargo test --workspace` 通過確認 | implement-opus | — |
 | 23 | フォント埋め込み + Text ツール | Noto Sans JP 同梱(ライセンス同梱・README 帰属)、TextShape 描画(角度・zoom 追従)、選択/スナップ/zoom fit 統合、`T` ツール(anchor クリック + パネル入力欄) | implement-opus | 22 |
 | 24 | 寸法ツール | 寸法展開描画の純関数 helper(矢印・補助線・文字配置、単体テスト)、`D`(3 クリック長さ寸法)/ `Shift+D`(半径寸法)ツール、プレビュー | implement-opus | 22, 23 |
-| 25 | DXF TEXT export | Text → DXF TEXT 出力、寸法のスキップ件数表示、往復テスト(export のみ) | implement-sonnet | 22 |
-| 26 | ドキュメント整合 | README(キーバインド・フォント帰属)・DESIGN・CHANGELOG 更新、v0.6.0 リリース | haiku-assistant | 22-25 |
+| 25 | DXF TEXT export | Text → DXF TEXT 出力、寸法のスキップ件数表示、出力ファイル内容の検証テスト(ヘッダ R2007 化に伴い **CJK を UTF-8 のまま出力**することを生バイトで固定し、`\U+XXXX` エスケープが使われないことを禁止側で確認。往復を壊す境界ケースの pathological 回帰テストを追加) | implement-sonnet | 22 |
+| 25b | DXF TEXT import | DXF TEXT → `EntityGeom::Text` 復元(`dxf_entity_to_geom` へ汎用化)、CJK/ASCII のファイル往復テスト、未対応エンティティ回帰テストを DIMENSION 系へ差し替え、非対応 justification の TEXT はスキップ(設計判断5)。**M9 から前倒し**(設計判断5参照) | implement-opus | 25 |
+| 26 | ドキュメント整合 | README(キーバインド・フォント帰属)・DESIGN・CHANGELOG 更新、v0.6.0 リリース | haiku-assistant | 22-25b |
 
 #### 検収基準(M6完了の定義)
 
 - CJK を含む Text を作図でき、移動・回転・複製・保存/読込・undo(1 回で消える)が既存操作と同じ規約で動く
 - v0.5.0 以前の `.mcad`(v1)ファイルがそのまま読み込める(後方互換テストで固定)
 - 長さ寸法・半径寸法が正しい値を表示し、寸法展開ロジックは単体テストで固定されている
-- DXF export で TEXT が出力され、寸法はスキップ件数がステータスに出る
+- DXF で TEXT が export / import され(CJK 含めてファイル往復で content・位置・高さ・角度が一致する)、
+  寸法はスキップ件数がステータスに出る
 - `../tcad` の `cargo test --workspace` が通る(Shape 不変の確認)
 - fmt / clippy / workspace test 通過、GUI 変更は手動スモークテストを記録する
 

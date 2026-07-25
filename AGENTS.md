@@ -39,7 +39,7 @@ GUI に関わる変更(ダイアログ・ビューポート・パネル等)は�
 
 ## 外部クレートの既知の制約
 
-- **`dxf` クレート(0.6.1)**: Color は ACI インデックス(1〜255)のみで RGB 直接指定不可(9色パレットで近似)。`dxf::tables::Layer` にロックフィールドがない(往復でロック消失)。`Style::width` も変換していない(仕様として非保存)。ヘッダは R2000 — R12 だと LWPOLYLINE が黙って落ちる。`Drawing::new()` はレイヤー "0" を自動追加するので export 時に除去している。
+- **`dxf` クレート(0.6.1)**: Color は ACI インデックス(1〜255)のみで RGB 直接指定不可(9色パレットで近似)。`dxf::tables::Layer` にロックフィールドがない(往復でロック消失)。`Style::width` も変換していない(仕様として非保存)。**ヘッダは R2007 で、上下どちらにも動かせない**: R2004 以下だと文字列 codec(`\U+XXXX` エスケープ)が往復でデータを壊す(非BMP文字が化ける / 末尾バックスラッシュが消える / リテラル `\U+XXXX` が 1 文字に潰れる。3 件とも実測済み)、R14 未満だと LWPOLYLINE が黙って落ちる。R2007 以上は UTF-8 でそのまま書かれる。詳細は `export_dxf` のコメント、再発検知は `round_trip_preserves_pathological_text`。`Drawing::new()` はレイヤー "0" を自動追加するので export 時に除去している。**位置基準(justification)が「水平 Left かつ垂直 Baseline」以外の `TEXT` は import せずスキップする**(それ以外では文字位置を alignment point (group code 11) が持ち `location` (10) が無意味になるが、`TextGeom` への逆算にはフォントメトリクスが必要で、依存方向から io 層では実装できない)。alignment point を使う「改善」を入れないこと — 理由は `is_text_justification_supported` の doc にある。
 - **`rfd`(ネイティブダイアログ)**: フレームコールバック内で同期(ブロッキング)呼び出し。MVP としては許容だがプラットフォーム依存の癖があるため、変更時は手動確認する。
 
 ## リポジトリ運用

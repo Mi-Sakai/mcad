@@ -4,6 +4,30 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+### 追加
+
+- DXF export で Text エンティティを `TEXT` として出力(位置・高さ・回転をマッピング、1書体のため STYLE は既定のまま)。CJK を含む文字列も UTF-8 でそのまま出力できる(ヘッダ R2007 化。下記「変更」参照)— DESIGN.md M6タスク25
+- DXF export の寸法(長さ/半径)スキップ件数ステータス表示を既存の未対応エンティティ機構と統合(メッセージを「text/dimension」から「dimension」表記へ更新。Text は export 対応済みのため)
+- DXF import で `TEXT` を Text エンティティとして復元(位置・高さ・回転を逆マッピング)。**当初 M9 予定だったが、export だけでは往復不能な片道機能になるためユーザー判断で M6 へ前倒し** — DESIGN.md M6タスク25b。CJK を含む文字列も往復する(文字列のエンコード・デコードはどちらも dxf クレートが閉じて行うため、mcad 側の自前処理は不要)
+
+### 変更
+
+- **DXF export のヘッダバージョンを R2000 → R2007 へ引き上げ**(Codex レビューの high 指摘が契機)。`dxf` 0.6.1 は `$ACADVER <= R2004` のとき文字列を `\U+XXXX` へエスケープして書くが、この codec には往復でデータを壊す欠陥が3つあることを実測で確認した: 非BMP文字が化ける(`OK 😀 done` → `OK ὠ0 done`)、末尾バックスラッシュが消える(`path\` → `path`)、リテラル `\U+0041`(7文字)が `A` 1文字に潰れる。R2007 以上では UTF-8 のまま書かれ読込も UTF-8 経路になるため、3ケースすべてが往復一致する。ヘッダは**上下どちらにも動かせない**(R2004 以下は上記の文字列破損、R14 未満は LWPOLYLINE が黙って落ちる)ため、回帰テスト `round_trip_preserves_pathological_text` で固定した。「UTF-8 が必要なときだけ条件付きで R2007 にする」案は却下した(`path\` は ASCII のみでも R2000 で壊れるため「ASCII なら R2000 で安全」が成り立たず、判定条件が「壊れる文字列を含むか」になって検出漏れリスクへ逆戻りする) — DESIGN.md M6 設計判断5
+- DXF import のエンティティ変換を `Shape` 専用から `EntityGeom` 対応へ汎用化(`dxf_entity_to_shape` → `dxf_entity_to_geom`)。バリデーションも `Shape::validate` の薄いラッパー(`validate_shape`)経由から `EntityGeom::validate` へ統一し、`.mcad` import と判定基準を共有する
+
+### 修正
+
+- **DXF import で、中央揃え・右揃え・非ベースライン揃えの `TEXT` が間違った位置に配置されるのを修正**(Codex adversarial review の指摘)。DXF TEXT は水平 justification(group code 72)が `Left` 以外、または垂直 justification(group code 73)が `Baseline` 以外のとき、実際の文字位置を alignment point(group code 11)が持ち `location`(group code 10)は意味を持たない。従来は常に `location` を anchor に入れていたため、外部 CAD が作ったそれらの TEXT が誤配置されていた。mcad 自身の export は常に Left/Baseline なので往復テストでは検出できなかった。**現在は Left/Baseline 以外の TEXT をスキップして件数をステータス表示する**(下記「既知の制約」参照) — DESIGN.md M6 設計判断5
+
+### 既知の制約
+
+- DIMENSION の DXF import は M9 で対応予定。DXF の DIMENSION はブロック参照を伴い、mcad は export もしていないため往復テストが組めない。現状は他の未対応エンティティと同様にスキップされ、件数がステータスに出る
+- DXF import した TEXT は書体名(`text_style_name`)や各種文字寸法比を捨てる。mcad の `TextGeom` に対応するフィールドがなく、1 書体のみを前提とした設計のため
+- DXF import で、位置基準(justification)が「水平 `Left` かつ垂直 `Baseline`」以外の `TEXT` はスキップされ、件数がステータスに出る。この場合の文字位置は alignment point が持つが、mcad の `TextGeom` は左寄せ・ベースライン基準の1点しか表現できず、逆算には**フォントメトリクスが必要**で、依存方向(app → io)から `mcad-io` では実装できない。誤った位置に黙って配置するより件数を通知する方を選んだ。将来対応するには app 層で変換する構造が必要(DESIGN.md M6 設計判断5)
+- DXF export の R2007 形式について、互換性は次の粒度で確認済み: **LibreCAD では実測済み**(図形は正しく表示され、ASCII の TEXT も読める。R2007 構造自体が受理される)。一方 **R2000 までしか読まない古い CAD ソフトでの可否は依然として未検証**。文字列が静かに壊れるより、読めない場合にユーザーが気づける方を選んだ(DESIGN.md M6 設計判断5 のトレードオフ)
+- `round_trip_preserves_pathological_text` と `save_dxf_writes_cjk_text_as_utf8` は `dxf` 0.6.1 自身で保存・読込するため、**同一ライブラリ内の往復と生バイトの確認しか証明していない**(外部 DXF リーダーが受理することの証明ではない)。目的は codec 回帰の検知であり、相互運用性は手動確認(LibreCAD)で担保している。外部パーサや golden fixture の CI 導入は M6 のスコープ外
+- mcad が export した DXF の CJK TEXT は、他 CAD ビューア(LibreCAD で実測)では「◇」など文字化けで表示される場合がある。DXF の TEXT はフォント名の参照(STYLE)しか持たず、SHX/LFF フォント本体をファイルへ埋め込む手段がないため、CJK 表示は受け取り側のフォント環境に依存する。mcad 内部の表示・往復(Noto Sans JP 埋め込み)には影響しない(DESIGN.md M6 設計判断5参照)
+
 ## [0.5.0] - 2026-07-20 — M5「編集操作の充実」
 
 DESIGN.md タスク17〜20を完了し、M5 の検収基準をすべて満たした。GUI 変更は実ウィンドウでの手動スモークテストで確認済み。

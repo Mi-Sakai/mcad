@@ -293,20 +293,6 @@ pub fn load_mcad(path: impl AsRef<Path>) -> Result<Document, IoError> {
     from_json(&fs::read_to_string(path)?)
 }
 
-/// [`Shape`] が io 境界の妥当性条件を満たすか検証する。
-///
-/// 判定条件の実体は [`Shape::validate`]（mcad-geom、DESIGN.md M4 タスク15）に
-/// 引き上げ済み。ここは io 側の呼び出し規約（`pub(crate)`、`Result<(), String>`）
-/// を保つだけの薄いラッパー。
-///
-/// `pub(crate)`: DXF import（[`crate::dxf_file`]）が `Shape` を直接検証するのに使う。
-/// `.mcad` import（[`import_document`]）は [`EntityGeom::validate`] を呼ぶが、`Shape`
-/// バリアントは同じく [`Shape::validate`] へ委譲するので判定基準は一致する
-/// （ロジックの重複・divergence を避ける）。
-pub(crate) fn validate_shape(shape: &Shape) -> Result<(), String> {
-    shape.validate()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

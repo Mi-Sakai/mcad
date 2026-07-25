@@ -697,14 +697,15 @@ impl McadApp {
                 set_status(&mut self.status, now, "Exported DXF file");
             }
             Ok(skipped) => {
-                // Text・寸法は DXF 未対応でスキップされる。黙って消えるとデータロスに
-                // 気づけないため、件数をステータスへ出す（import 側メッセージと同書式）。
+                // 寸法（長さ/半径）は DXF 未対応でスキップされる（Text はタスク25で
+                // export 対応済み）。黙って消えるとデータロスに気づけないため、件数を
+                // ステータスへ出す（import 側メッセージと同書式）。
                 set_status(
                     &mut self.status,
                     now,
                     format!(
                         "Exported DXF file: {skipped} entity(ies) skipped \
-                         (text/dimension not supported)"
+                         (dimension not supported)"
                     ),
                 );
             }

@@ -309,6 +309,37 @@ struct McadApp {
 /// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
 const DEFAULT_TEXT_HEIGHT: &str = "20";
 
+/// ステータスバー2行目のキーバインド凡例。項目ごとに分けて `ui.horizontal_wrapped` へ
+/// 渡し、利用可能幅に応じて自動で折り返す（以前は1本の長い文字列で、標準的な
+/// ウィンドウ幅だと右端が画面外に切れていた）。
+const KEYBIND_LEGEND: &[&str] = &[
+    "S=Select",
+    "1=Point",
+    "L=Line",
+    "C=Circle",
+    "A=Arc",
+    "P=Polyline",
+    "T=Text",
+    "D=Linear Dim",
+    "Shift+D=Radial Dim",
+    "M=Move",
+    "R=Rotate",
+    "Shift+M=Mirror",
+    "O=Offset",
+    "Ctrl+D=Duplicate",
+    "Del=Delete",
+    "Esc=Cancel",
+    "F3=Snap",
+    "Ctrl+Z=Undo",
+    "Ctrl+Y=Redo",
+    "Ctrl+N=New",
+    "Ctrl+O=Open",
+    "Ctrl+S=Save",
+    "Ctrl+Shift+S=Save As",
+    "Ctrl+Shift+O=Import DXF",
+    "Ctrl+E=Export DXF",
+];
+
 /// ステータスバーに一時表示するメッセージ。
 struct StatusMessage {
     /// 表示する文言。
@@ -1098,15 +1129,13 @@ impl eframe::App for McadApp {
                         ui.separator();
                     }
                 });
-                ui.horizontal(|ui| {
-                    ui.label(
-                        "S=Select  1=Point  L=Line  C=Circle  A=Arc  P=Polyline  T=Text  \
-                     D=Linear Dim  Shift+D=Radial Dim  \
-                     M=Move  R=Rotate  Shift+M=Mirror  O=Offset  Ctrl+D=Duplicate  \
-                     Del=Delete  Esc=Cancel  F3=Snap  Ctrl+Z=Undo  Ctrl+Y=Redo  \
-                     Ctrl+N=New  Ctrl+O=Open  Ctrl+S=Save  Ctrl+Shift+S=Save As  \
-                     Ctrl+Shift+O=Import DXF  Ctrl+E=Export DXF",
-                    );
+                // キーバインド凡例: 1本の長い文字列だと標準的なウィンドウ幅で右端が
+                // 画面外に切れるため、項目ごとのラベルを `horizontal_wrapped` で並べて
+                // 幅が足りなければ自動的に複数行へ折り返す。
+                ui.horizontal_wrapped(|ui| {
+                    for binding in KEYBIND_LEGEND {
+                        ui.label(*binding);
+                    }
                 });
             });
         });

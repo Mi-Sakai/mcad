@@ -54,8 +54,17 @@ const SNAP_MARKER_COLOR: Color32 = Color32::from_rgb(60, 255, 120);
 /// スナップマーカーの基準サイズ（スクリーンピクセル。中心からの半幅相当）。
 const SNAP_MARKER_SIZE: f32 = 6.0;
 
-/// ステータスメッセージの表示時間（秒）。経過後は自動で消える。
-const STATUS_MESSAGE_SECS: f64 = 5.0;
+/// ステータスメッセージ（通常の操作フィードバック）の表示時間（秒）。経過後は自動で
+/// 消える。旧値は5.0秒で、手動スモークテストで「読む前に消える」との指摘を受けて
+/// 延長した。
+const STATUS_MESSAGE_SECS: f64 = 10.0;
+
+/// ステータスメッセージ（ファイル入出力の結果通知）の表示時間（秒）。
+///
+/// 開く/保存/DXFインポート・エクスポートの成否は、通常の操作フィードバック
+/// （[`STATUS_MESSAGE_SECS`]）より発生頻度が低く、かつ「N entity(ies) skipped」の
+/// ようなデータロスに関わる件数を含むことがあるため、確認する時間を長めに確保する。
+const STATUS_MESSAGE_SECS_IMPORTANT: f64 = 15.0;
 
 /// `.mcad` ファイルの拡張子（ファイルダイアログのフィルタ・拡張子補完の両方で使う）。
 const MCAD_EXTENSION: &str = "mcad";
@@ -243,7 +252,9 @@ struct McadApp {
     /// スナップしていない・作図ツール非アクティブ・スナップ無効のときは `None`。
     snap_marker: Option<snap::SnapResult>,
     /// ステータスバーに一時表示するメッセージ（主にコア操作のエラー通知）。
-    /// [`STATUS_MESSAGE_SECS`] 経過で自動的に消える。
+    /// メッセージごとに保持している表示時間（[`StatusMessage::duration_secs`]、通常は
+    /// [`STATUS_MESSAGE_SECS`]、ファイル入出力の結果は [`STATUS_MESSAGE_SECS_IMPORTANT`]）
+    /// 経過で自動的に消える。
     status: Option<StatusMessage>,
     /// 現在開いている `.mcad` ファイルのパス。`None` は「一度も保存/読込していない
     /// (Untitled)」を意味する。新規文書（Ctrl+N）で `None` に戻る。
@@ -304,13 +315,35 @@ struct StatusMessage {
     text: String,
     /// 表示を開始した時刻（`egui::InputState::time`、秒）。
     shown_at: f64,
+    /// このメッセージの表示時間（秒）。[`set_status`]（通常）と
+    /// [`set_status_important`]（ファイル入出力の結果）で異なる値を使う。
+    duration_secs: f64,
 }
 
-/// ステータスメッセージを設定する（既存の表示は上書き）。
+/// ステータスメッセージを設定する（既存の表示は上書き）。表示時間は通常の操作
+/// フィードバック向けの [`STATUS_MESSAGE_SECS`]。
 fn set_status(status: &mut Option<StatusMessage>, now: f64, text: impl Into<String>) {
+    set_status_with_duration(status, now, text, STATUS_MESSAGE_SECS);
+}
+
+/// ステータスメッセージを設定する（既存の表示は上書き）。ファイル入出力の結果通知
+/// （開く/保存/DXFインポート・エクスポートの成否）専用で、[`STATUS_MESSAGE_SECS_IMPORTANT`]
+/// のぶん通常より長く表示する。
+fn set_status_important(status: &mut Option<StatusMessage>, now: f64, text: impl Into<String>) {
+    set_status_with_duration(status, now, text, STATUS_MESSAGE_SECS_IMPORTANT);
+}
+
+/// [`set_status`] / [`set_status_important`] の共通実装。
+fn set_status_with_duration(
+    status: &mut Option<StatusMessage>,
+    now: f64,
+    text: impl Into<String>,
+    duration_secs: f64,
+) {
     *status = Some(StatusMessage {
         text: text.into(),
         shown_at: now,
+        duration_secs,
     });
 }
 
@@ -602,10 +635,10 @@ impl McadApp {
                 self.saved_generation = self.document.generation();
                 self.reset_transient_ui_state();
                 self.request_zoom_fit_after_load();
-                set_status(&mut self.status, now, "Opened file");
+                set_status_important(&mut self.status, now, "Opened file");
             }
             Err(err) => {
-                set_status(&mut self.status, now, format!("Open failed: {err}"));
+                set_status_important(&mut self.status, now, format!("Open failed: {err}"));
             }
         }
     }
@@ -634,7 +667,7 @@ impl McadApp {
         match load_dxf(&path) {
             Ok(summary) => self.apply_imported_dxf(summary, now),
             Err(err) => {
-                set_status(&mut self.status, now, format!("DXF import failed: {err}"));
+                set_status_important(&mut self.status, now, format!("DXF import failed: {err}"));
             }
         }
     }
@@ -660,7 +693,7 @@ impl McadApp {
         } else {
             "Imported DXF file; layer locks are not restored from DXF".to_string()
         };
-        set_status(&mut self.status, now, message);
+        set_status_important(&mut self.status, now, message);
     }
 
     /// Ctrl+E: ネイティブの保存ダイアログで選んだ先へ現在のドキュメントを DXF として
@@ -694,13 +727,13 @@ impl McadApp {
         let path = ensure_dxf_extension(path);
         match save_dxf(&self.document, &path) {
             Ok(0) => {
-                set_status(&mut self.status, now, "Exported DXF file");
+                set_status_important(&mut self.status, now, "Exported DXF file");
             }
             Ok(skipped) => {
                 // 寸法（長さ/半径）は DXF 未対応でスキップされる（Text はタスク25で
                 // export 対応済み）。黙って消えるとデータロスに気づけないため、件数を
                 // ステータスへ出す（import 側メッセージと同書式）。
-                set_status(
+                set_status_important(
                     &mut self.status,
                     now,
                     format!(
@@ -710,7 +743,7 @@ impl McadApp {
                 );
             }
             Err(err) => {
-                set_status(&mut self.status, now, format!("DXF export failed: {err}"));
+                set_status_important(&mut self.status, now, format!("DXF export failed: {err}"));
             }
         }
     }
@@ -760,10 +793,10 @@ impl McadApp {
                 self.current_path = Some(path.to_path_buf());
                 // 保存成功時点の世代を記録する。以後この世代と一致する限り未保存でない。
                 self.saved_generation = self.document.generation();
-                set_status(&mut self.status, now, "Saved");
+                set_status_important(&mut self.status, now, "Saved");
             }
             Err(err) => {
-                set_status(&mut self.status, now, format!("Save failed: {err}"));
+                set_status_important(&mut self.status, now, format!("Save failed: {err}"));
             }
         }
     }
@@ -992,7 +1025,7 @@ impl eframe::App for McadApp {
         if self
             .status
             .as_ref()
-            .is_some_and(|m| now - m.shown_at > STATUS_MESSAGE_SECS)
+            .is_some_and(|m| now - m.shown_at > m.duration_secs)
         {
             self.status = None;
         }

@@ -539,4 +539,6 @@ M9 は独立テーマではなく 1.0 前の安定化バッファとして扱い
 - `../tcad` の `cargo test --workspace` が通る(Shape 不変の確認)
 - fmt / clippy / workspace test 通過、GUI 変更は手動スモークテストを記録する
 
+**→ 全項目 v0.6.0 で達成済み(2026-07-26、タスク22〜25b完了)。手動スモークテスト実施済み: (1)CJK Text の作図・移動・回転・複製・保存/読込と、各操作が undo 1回で戻ることを実機確認(寸法エンティティも同様)。core レベルの変換・永続化は `text_translate_keeps_angle_moves_anchor` / `text_rotate_moves_anchor_and_adds_angle` / `text_entity_round_trips_with_cjk_content` で自動テスト済みだが、GUI 上の一連操作はこの実機確認で担保する。(2)LibreCAD で export した DXF を開き、図形(線・円・ポリライン)と ASCII TEXT が正しく表示、CJK TEXT は ◇(グリフ欠落。受け取り側フォント環境依存)。(3)寸法は DXF に出ないことを仕様確認。(4)ステータスメッセージ表示時間延長、キーバインド凡例の折り返し表示を確認。**
+
 M7 以降の詳細設計は、各マイルストーン着手時に本章へ追記する(M4 までと同じ運用)。

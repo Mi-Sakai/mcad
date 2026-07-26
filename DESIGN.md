@@ -541,4 +541,464 @@ M9 は独立テーマではなく 1.0 前の安定化バッファとして扱い
 
 **→ 全項目 v0.6.0 で達成済み(2026-07-26、タスク22〜25b完了)。手動スモークテスト実施済み: (1)CJK Text の作図・移動・回転・複製・保存/読込と、各操作が undo 1回で戻ることを実機確認(寸法エンティティも同様)。core レベルの変換・永続化は `text_translate_keeps_angle_moves_anchor` / `text_rotate_moves_anchor_and_adds_angle` / `text_entity_round_trips_with_cjk_content` で自動テスト済みだが、GUI 上の一連操作はこの実機確認で担保する。(2)LibreCAD で export した DXF を開き、図形(線・円・ポリライン)と ASCII TEXT が正しく表示、CJK TEXT は ◇(グリフ欠落。受け取り側フォント環境依存)。(3)寸法は DXF に出ないことを仕様確認。(4)ステータスメッセージ表示時間延長、キーバインド凡例の折り返し表示を確認。**
 
-M7 以降の詳細設計は、各マイルストーン着手時に本章へ追記する(M4 までと同じ運用)。
+### M7: 修正系ジオメトリ演算(v0.7.0)の設計(2026-07-26 策定、実装未着手)
+
+トリム・延長・フィレット・分割。mcad-geom の既存交点計算(`intersect.rs`)を流用し、
+演算本体は geom 層に置く(tcad の将来パック — 鉄道の接線連続等 — の下地。ロードマップ表参照)。
+
+#### 設計判断
+
+1. **対象範囲は Line と Arc を中心に限定し、Circle・Text・寸法は明示的にスコープ外とする**
+   (M5 のオフセット「対象を限定」方針を踏襲)。Polyline はトリム/延長/フィレットでは
+   対象外だが、**分割(split)のみ開いた Polyline を対象に含める**(2026-07-26 采配役確認事項4
+   で確定。詳細は設計判断1a)。理由を演算ごとに個別に記す:
+   - **トリム/延長のターゲット**: `LineSeg` / `Arc` のみ。`Shape::Polyline` は頂点配列の再構成
+     (セグメント差し替え・頂点挿入)が必要で複雑なため M7 では見送る(`OffsetError` と同様の
+     考え方で `Unsupported` を返す)。`Shape::Circle` は「トリムして円弧にする」「延長」自体が
+     意味を持つには追加の設計(後述)が要るため見送る。`Shape::Point` も対象外。
+   - **トリム/延長の境界(boundary)**: `Shape` 全種(Point 以外)を許容する。境界は
+     `mcad_geom::intersect::intersect()` へそのまま渡すだけで、境界側は Line/Circle/Arc/Polyline
+     いずれでも既存実装が扱える(境界を Polyline にしてポリラインの各辺で切る、は自然に動く)。
+   - **フィレット**: `LineSeg` × `LineSeg` のみ(2026-07-26 采配役確認事項3で確定。円弧×直線・
+     円弧×円弧は M7 対象外。AutoCAD 的にも直線同士が最頻出のユースケースで、接円の分岐選択
+     ロジックが直線×直線に比べ大幅に複雑になるため)。
+   - **分割**: `LineSeg` / `Arc` / **開いた `Polyline`**(2026-07-26 采配役確認事項4で拡大)。
+     `Shape::Circle` は 1 点で割ると [`Arc`] が表現できない全周弧になってしまう(`Arc` の doc に
+     明記済み: 「全周は `Circle` を使う」)ため対象外。**閉じた `Polyline`** は 1 点で割っても
+     "2 本の独立したポリライン" にならない(環を開くだけの別操作になり、分割＝2ピース化の
+     意味と食い違う)ため対象外とする(詳細な仕様は設計判断1a)。`Shape::Point` も対象外。
+   - いずれも `mcad-io`(DXF)・`Text`/`DimLinear`/`DimRadial` は対象外(そもそも
+     `EntityGeom::as_shape()` が `None` を返すため、app 層のヒットテストで機械的に除外できる)。
+
+1a. **分割(Polyline)の詳細仕様**(2026-07-26 采配役確認事項4への回答):
+   - **対象**: `closed == false` の `Polyline` のみ。`closed == true` は `SplitError::Unsupported`
+     を返す(環を1点で開いても2本の独立ポリラインにはならないため。「環を開く」は分割とは
+     別の操作として将来検討する)。
+   - **分割点の特定**: 対象の各セグメント(`Polyline::segments()`)に対し
+     `LineSeg::closest_point` で最近点を求め、最も近いセグメント(インデックス `i`)と
+     そのセグメント上のパラメータ `t ∈ [0,1]` を特定する(トリムと同じ「クリックに最も近い
+     要素を選ぶ」流儀)。
+   - **頂点配列の分割**: セグメント `i`(頂点 `v_i → v_{i+1}`)の内部(`0 < t < 1`、EPS 除外)で
+     割れた場合、`piece1.vertices = [v_0, …, v_i, split_point]`、
+     `piece2.vertices = [split_point, v_{i+1}, …, v_n]`(どちらも `closed = false`)。
+   - **既存頂点との近接**(分割点が `v_i` または `v_{i+1}` に、既存 geom の相対 EPS 運用
+     — `intersect.rs` の `dedup_points`/`prim_contains_point` と同じ `tol = EPS * (1.0 +
+     座標の大きさ)` 形の許容量 — 内で一致する場合。采配役確認事項B-3への回答: 絶対値ではなく
+     既存の相対 EPS 運用に合わせる。座標スケールに依存する CAD 図面で絶対許容量を使うと、
+     大縮尺の図面で許容が狭すぎたり小縮尺の図面で広すぎたりする既知の問題を避けるため):
+     **その頂点をそのまま分割点として採用し、新しい点を挿入しない**(`piece1`/`piece2` いずれか
+     の頂点数が1個少なくなるだけで、重複頂点によるゼロ長セグメントを作らない)。
+     理由: LineSeg/Arc の「端点近傍クリックは `TooCloseToEndpoint` で拒否」は
+     ***対象そのものの端点***(分割してもピースが作れない全体の始点・終点)に対する規約であり、
+     Polyline の***中間頂点***は分割してもどちらのピースも非退化になりうる(頂点で素直に
+     割れるだけ)ため、同列に拒否する理由がない。挿入コスト(重複点)を避けられる分、
+     素直な頂点分割の方が良い結果になる。
+   - **拒否条件(`SplitError::TooCloseToEndpoint`)**: 分割点が**全体の始点 `v_0` または
+     終点 `v_n`** に、上記と同じ相対 EPS 許容量内で一致する場合。この場合は一方のピースが
+     頂点1個(エンティティとして退化)になるため拒否する(LineSeg/Arc の
+     `TooCloseToEndpoint` も同じ相対 EPS 運用に統一する)。
+   - **不変条件**: 成功時は必ず `piece1.vertices.len() >= 2` かつ `piece2.vertices.len() >= 2`
+     を満たす(上記の拒否条件により、頂点2未満になるケースは呼び出し前に排除される)。
+   - **往復性**: `piece1` の末尾頂点と `piece2` の先頭頂点はどちらも分割点(またはそれに
+     一致する既存頂点)で一致し、`piece1.vertices[..-1] + piece2.vertices` が元の頂点列
+     (分割点が既存頂点に一致した場合は重複除去した形)に一致することを proptest で固定する。
+
+2. **交点計算の棚卸しと新設**:
+   - **既にある**: `mcad_geom::intersect::intersect(a: &Shape, b: &Shape) -> Vec<Point2>`
+     (線分×線分・線分×円/弧・円×円/弧・弧×弧・点×任意、Polyline は構成線分へ分解)。
+     **トリムはこれをそのまま使える**(対象・境界とも `[0,1]` にクランプされた形状の交点で足りる)。
+     `mcad_geom::closest_point(shape: &Shape, p: Point2) -> Point2`(`primitives.rs` で定義され
+     `lib.rs` が再エクスポート、既存API・実測確認済み)を分割点の対象上への射影に流用する。
+   - **新設が要る**: 延長(Extend)は対象を「無限に伸ばした状態」で境界と交わる点を探す必要があり、
+     既存 `intersect()` は対象側も `[0,1]` にクランプするため直接は使えない。2つのケースで対応が異なる:
+     - **`Arc` の延長**: 台円([`Arc::circle`])は元々「角度で区切られた曲線」であり、
+       `Circle` そのものは無限に伸びた曲線を表現している。したがって
+       `intersect(&Shape::Circle(arc.circle()), boundary)` を呼べば、対象側は無限扱いのまま
+       既存実装がそのまま使える(**新規の交点計算は不要**)。角度の選択は mod 2π の比較だけでは
+       「始点を少し逆向きに伸ばして届く交点」と「ほぼ一周してから届く交点」を区別できない
+       (Codex adversarial review 2026-07-26 指摘、A-2)ため、**符号付き・非畳み込み(unwrapped)の
+       角度差**で仕様を書く:
+       1. 延長する自由端(start 側/end 側)は、`start_point()`/`end_point()` のうちクリック点に
+          ユークリッド距離で近い方を採用する(直線延長の自由端選択と同じ基準)。
+       2. 各候補交点の角度 `theta_p = (p - center).angle()` に対し、まず
+          `d = wrap_2pi(theta_p - start_angle)` が `(EPS, sweep - EPS)` の範囲内(＝既にこの
+          弧の内部にある点)なら**延長先の候補から除外する**(内部へ戻る、または自己ループする
+          解を選ばないため)。
+       3. 残った候補について、start 側を延ばす場合は `delta = wrap_2pi(start_angle - theta_p)`、
+          end 側を延ばす場合は `delta = wrap_2pi(theta_p - end_angle)` を計算する(いずれも
+          「その側の端点から見て、外側へ向かって最短でどれだけ回転すれば交点に届くか」を表す
+          非負値)。候補が複数あれば `delta` が最小のものを採用する。
+       4. **`Arc` を構築する前に**(構築してから `sweep()` で畳まれた値を見ても手遅れなので、
+          畳み込み前の生の delta で判定する)
+          `current_sweep + delta >= TAU - EPS` なら [`OffsetError`] と同じ形の
+          `TrimExtendError::Degenerate` を返し拒否する(`Arc` は全周(2π)を表現できないため)。
+       5. 拒否されなければ、start 側は `new_start_angle = start_angle - delta`、end 側は
+          `new_end_angle = end_angle + delta` として新しい `Arc` を構築する(非正規化のまま
+          保持する既存の `Arc::rotated` と同じ流儀)。
+     - **`LineSeg` の延長**: `Shape` に「無限直線」を表す型がないため、対象を「境界の AABB を
+       確実に覆う長さまで一時的に延ばした `LineSeg`」に置き換えたうえで、既存 `intersect()` を
+       そのまま呼ぶ(新しい交点公式は追加しない)。延長長さの下限は
+       `distance(自由端, 境界AABBの最遠角)`(4隅のうち最大)+ 微小マージンとする。これは
+       「無限直線が境界の AABB と交わる点は必ずこの範囲内にある」という幾何的事実に基づく
+       **正当な上界**であり、ヒューリスティックな「大きな定数」ではない(M5 のマイター上限問題
+       — 平行に近い角で交点が数百万倍に飛ぶ — とは性質が異なり、ここでは境界のスケールに比例した
+       妥当な長さしか使わないため数値的に安定する)。新設 API:
+       `pub fn extend_reach(free_end: Point2, boundary_aabb: Aabb) -> f64`
+       (`mcad-geom` に置く小さなヘルパー。テスト: 境界 AABB の隅への距離と一致することを固定)。
+     - **`extend_reach` の正当性(采配役確認事項B-1への回答)**: AABB は凸領域であり、凸領域の
+       外部の任意の点から見て「領域内の最遠点は必ず頂点(4隅のいずれか)である」という凸幾何の
+       一般的性質により、`free_end` から境界 AABB **内の任意の点**までの距離は
+       `free_end から4隅への距離の最大値` を超えない。この性質は `free_end` が AABB の**外側**に
+       あっても**内側**にあっても成り立つ(証明は AABB の凸性のみに依存し、`free_end` の位置関係を
+       使わない)。したがって:
+       - **境界が円のとき**: 円は自身の AABB(外接正方形)に完全に内包されるため、直線と円の
+         交点は必ず AABB 内にあり、上記の上界でカバーされる(円の半径ベースのタイトな上界より
+         緩いが、正当性は失われない)。
+       - **境界がポリラインのとき**: 各セグメントの端点はポリライン全体の AABB
+         (`Polyline::aabb`、`Aabb::from_points` で全頂点から構成)に含まれるため、どのセグメントとの
+         交点も同じ上界でカバーされる。
+       - **対象の自由端が境界 AABB の内部にあるとき**: 上記のとおり凸性の議論は `free_end` の
+         内外を問わないため破綻しない。
+       以上より「境界 AABB の最遠隅までの距離」は3ケースいずれでも十分な上界であることを確認した。
+   - **数値ロバスト性の方針**(新設 API もすべてこの方針を継承する):
+     - 平行・接線判定は既存と同じ相対 EPS(`EPS * |a| * |b|`、なす角の sin 相当)を使う。
+       トリム/延長/フィレットの「境界と対象が平行で交点なし」は新規の判定を作らず、
+       `intersect()` が空を返すケースとしてそのまま拾う。
+     - 「クリック位置に最も近い交点(または頂点)を選ぶ」ロジック(トリム/延長/分割)は、
+       線分では パラメータ `t ∈ [0,1]`(またはその延長)、弧では角度オフセット
+       `wrap_2pi(theta − start_angle)`、Polyline ではセグメント index + セグメント内 `t` で比較する。
+       いずれも無次元なので `EPS` を直接比較に使う(既存 `Arc::contains_angle` と同じ流儀)。
+     - フィレットの退化判定(平行線・半径が線分長に対し大きすぎる等)は新設の
+       `FilletError` 列挙で理由を返し、UI 側が ASCII メッセージへ対応付ける(`OffsetError` と
+       同じパターン)。
+     - トリム/延長/分割で結果が「事実上 no-op」(交点がクリック位置とほぼ一致し、結果の
+       線分／弧が実質長さ0や掃引0になる)場合は確定せず拒否する(M5 の退化拒否規約を継承)。
+
+3. **geom 層の新設 API 一覧**(すべて既存シグネチャは変更せず追加のみ。tcad への破壊的変更なし):
+   ```rust
+   // mcad-geom::trim_extend(新設モジュール)
+   pub enum TrimExtendError { NoIntersection, Unsupported, Degenerate }
+
+   /// トリムの結果。境界との交点でパラメータ空間を分割し、クリックされた区間を取り除いた
+   /// **残りの断片**をすべて返す(Codex adversarial review 2026-07-26 指摘、A-1 参照)。
+   /// `retained.len()` は 1(片側のみ残る、既存の単純ケース)または 2(境界と2点以上で交わり、
+   /// クリック区間の両側に断片が残るケース)を取りうる。0 になる入力は数学的に生じない
+   /// (設計判断3a を参照)ため、実装は 0 要素を「防御的にしか到達しない不変条件違反」として
+   /// 扱い、テストで `retained.len() ∈ {1, 2}` を固定する。
+   pub struct TrimResult { pub retained: Vec<Shape> }
+
+   /// `click` は「捨てたい(除去したい)側」を示す点。境界との交点で `target` のパラメータ
+   /// 空間(線分は `t ∈ [0,1]`、弧は掃引角オフセット)を区間に分割し、`click` の射影が属する
+   /// 区間を取り除いて残りを [`TrimResult`] として返す(AutoCAD TRIM と同じ慣習: クリックした
+   /// 部分が消える)。区間分割・確定コマンドの詳細アルゴリズムは設計判断3a。
+   pub fn trim(target: &Shape, boundary: &Shape, click: Point2)
+       -> Result<TrimResult, TrimExtendError>;
+
+   /// `click` は延長したい自由端(`target` の2端点のうち `click` に近い方)を選ぶための
+   /// 参考点。選ばれた自由端から境界方向へ伸ばし、境界との交点(現在の範囲の外側にある候補の
+   /// うち最短で届くもの)まで到達させる。延長は対象を分裂させないため戻り値は `Shape` 1個の
+   /// ままでよい(トリムと異なり [`TrimResult`] 化は不要)。角度側の詳細アルゴリズムは
+   /// 設計判断2 の「`Arc` の延長」を参照。
+   pub fn extend(target: &Shape, boundary: &Shape, click: Point2)
+       -> Result<Shape, TrimExtendError>;
+
+   // mcad-geom::fillet(新設モジュール)
+   pub enum FilletError { Parallel, NonPositiveRadius, RadiusTooLarge, Degenerate }
+   pub struct FilletResult { pub trimmed_a: LineSeg, pub trimmed_b: LineSeg, pub arc: Arc }
+
+   pub fn fillet_lines(a: LineSeg, b: LineSeg, radius: f64, near_a: Point2, near_b: Point2)
+       -> Result<FilletResult, FilletError>;
+
+   // mcad-geom::split(新設モジュール)
+   pub enum SplitError { TooCloseToEndpoint, Unsupported }
+   pub fn split(shape: &Shape, at: Point2) -> Result<(Shape, Shape), SplitError>;
+   ```
+   `trim`/`extend`/`split` は `Shape` を受け取り、対象外の種別(Circle/Point、トリム・延長では
+   Polyline、分割では閉じた Polyline)には `Unsupported` を返す薄いディスパッチ
+   (`Shape::offset` と同じ形)とし、実体は `LineSeg`/`Arc`/`Polyline` 側の非公開ヘルパーに実装する。
+
+3a. **トリムの区間選択アルゴリズムと確定コマンド**(Codex adversarial review 2026-07-26 指摘
+   A-1 への対応。`trim` の完全な仕様):
+   - **パラメータ空間**: 線分は `t ∈ [0,1]`(`target.a` が 0、`target.b` が 1)、弧は掃引角
+     オフセット `d ∈ [0, sweep]`(`start_angle` が 0)を対象全体のパラメータ範囲とする。
+   - **区間分割**: `intersect(target, boundary)` で得た交点をすべて対象のパラメータへ変換し、
+     昇順ソートする(重複は `intersect` 側の `dedup_points` が既に除去済み)。これらのパラメータ
+     が対象の全範囲 `[0, param_max]` を `n+1` 個の小区間に分割する(`n` = 交点数)。交点が0個
+     なら `TrimExtendError::NoIntersection`。
+   - **クリック区間の特定**: `click` を対象へ射影したパラメータ `t_click`(線分は
+     `closest_point` と同じ `t` の算出式、弧は `closest_point` と同じ「範囲内なら射影角、
+     範囲外なら近い方の端点」のロジックを流用)が属する小区間を求める。
+   - **除去する区間の両隣**: クリック区間の**両隣の交点パラメータ**(下側 `left`: クリック区間
+     より小さい交点のうち最大のもの、無ければ対象の下端 `0`。上側 `right`: クリック区間より
+     大きい交点のうち最小のもの、無ければ対象の上端 `param_max`)を求める。
+   - **再構成**: 取り除くのは `[left, right]` の**クリック区間だけ**であり、`left`/`right` の
+     外側にある他の交点(境界と3点以上で交わる場合の残りの交点)では**それ以上分割しない**
+     (AutoCAD TRIM が境界選択後にクリックした一箇所だけを切り取り、他の交点では分割しないのと
+     同じ挙動。過剰な細分化を避ける)。したがって残る断片は最大で2個:
+     - `left > EPS` なら `[0, left]` を1断片として `Shape` 化する。
+     - `param_max - right > EPS` なら `[right, param_max]` を1断片として `Shape` 化する。
+     この2条件のうち少なくとも一方は必ず成り立つ(`left` と `right` が同時に対象全体の両端に
+     一致するのは、対象の全範囲がまるごとクリック区間になる場合だけだが、それは交点が
+     1つも無い(`NoIntersection` で既に弾かれている)か、対象が退化している場合に限られ、
+     通常入力では起こらない)。これが `retained.len()` が実質的に0にならない理由であり、
+     `TrimResult::retained` の doc に記した不変条件の根拠。
+   - **確定コマンド(app 層)**: `retained.len()` で分岐する。
+     - **1個**: 対象は依然「同じ物体が短くなっただけ」なので ID を維持する。
+       `Command::ModifyEntity { id: target.id, new_geom: retained[0] }`。
+     - **2個**: 対象は1つのエンティティから2つへ位相が変わるため、**分割(タスク29/33)と
+       同じ表現に揃える**(一貫性のため。ID安定性よりも「トポロジが変わったら新規IDにする」
+       という M7 全体の規約 — 設計判断5 の分割の項 — を優先する):
+       `Command::Batch([RemoveEntity(target.id), AddEntity(retained[0]), AddEntity(retained[1])])`。
+       確定後の選択集合は分割と同じく新規2 entity へ切り替える(`NewIds.entities`)。
+     - **0個**: 実装上は到達しない不変条件(上記)なので、万一到達したら `ToolResult::Rejected`
+       とし `Command` は作らない(防御的分岐であり、正常経路では使われない)。
+   - **テスト**: 円を貫通する線分に対し (a) 2交点の手前側クリック→1断片、(b) 2交点の中間
+     クリック→2断片、(c) 2交点の奥側クリック→1断片 の3ケースを固定する。境界がポリラインで
+     対象と3点以上で交わるケースでも「クリック区間の両隣以外では分割されない」ことを固定する
+     (設計判断8で詳細)。
+
+4. **フィレットの中心の求め方と分岐選択**(`fillet_lines` の仕様。2026-07-26 采配役指摘により
+   修正: 旧稿は「a を near_a 側へオフセット」としていたが、`near_a` は直線 a **上**の点なので
+   a からの「側」を決める情報を持たない。正しくは相手側のクリック点で決める):
+   - 2 本の無限直線が平行(既存の相対 EPS 判定)なら `FilletError::Parallel`。
+   - 半径 `radius` は正の有限値必須(`FilletError::NonPositiveRadius`)。
+   - `near_a` は直線 a 上のクリック点、`near_b` は直線 b 上のクリック点。**それぞれのオフセット
+     方向は「相手側のクリック点がどちらにあるか」で決める**:
+     - 直線 a を、**`near_b`** がある側(`LineSeg::offset` の `toward` 引数と同じ「側」の決め方
+       — 最近点→`toward` の向き — を a に対して `near_b` で適用)へ距離 `radius` だけ
+       オフセットした直線 `a'` を作る。
+     - 直線 b を、**`near_a`** がある側へ同様にオフセットした直線 `b'` を作る。
+     - `a'` と `b'` の交点をフィレット円の中心 `C` とする。
+     - この「相手のクリック点で自分のオフセット方向を決める」規則により、`near_a`・`near_b` の
+       組み合わせが 4 通り(a の側 2 × b の側 2 のうち、実際には `near_a`/`near_b` の位置で
+       一意に決まる)あるうちの 1 つが一意に選ばれる: `near_a`/`near_b` はユーザーが
+       「フィレット後に残したい側(＝コーナーの反対側)」を直感的にクリックする点であり、
+       その点は求めたい中心 `C` から見て「残る側」にあるはずなので、相手直線を自分の
+       クリック点がある側へオフセットすることで、コーナーを削る側に中心が来る解が選ばれる。
+   - `C` から各直線への垂線の足が接点 `T_a`／`T_b`。フィレット弧は `T_a` から `T_b` への
+     掃引角が π 以下になる向き(＝コーナー側に張り出す短い方の弧)を採用する。
+   - **残る側(トリム範囲)の決定**: `trimmed_a` は元の線分 `a` のうち `T_a` と `near_a` に
+     近い側の端点を結んだ線分(＝コーナー側の端点を `T_a` へ差し替え、`near_a` 側の端点は
+     維持する)。`trimmed_b` も同様に `near_b` 側を維持する。すなわち `near_a`／`near_b` は
+     「中心 `C` を決める入力(相手のオフセット方向)」と「自分自身のトリム後に残る側を示す点」
+     の 2 つの役割を兼ねる。
+   - **半径が過大なケース**(`T_a`／`T_b` が元の線分の区間 `[0,1]` の外に出る)は
+     `FilletError::RadiusTooLarge` で拒否する(延長してまで接点を作らない。境界外に伸びた
+     結果を黙って作らない方針は M5 のオフセット退化拒否と一貫させる)。
+   - **典型的な L 字コーナーを誤って弾かないか(采配役確認事項B-2への回答)**: 弾かない。接点
+     `T_a` はコーナー点(2直線の交点)から、半径 `radius` と両直線のなす角 `theta` から決まる
+     接線長 `radius / tan(theta/2)` だけ、対象の遠い方の端点へ向かって離れた位置に来る。
+     2本の線分がコーナーでちょうど接続している通常のケース(`a.b == b.a` のような L 字)では、
+     この接線長が線分長より短い限り `T_a`/`T_b` は自然に `[0,1]` の範囲内に収まる。
+     `RadiusTooLarge` が発火するのは、接線長が実際の線分長を超える(＝要求された半径に対して
+     線分が短すぎる)場合だけであり、これはまさに「この半径でこの2本をフィレットできない」と
+     ユーザーへ伝えるべき正当な拒否である。誤検出ではない。
+   - **`[0,1]` 判定の基準点**: 特別な基準(near_a 側を 0 とする等)は設けず、`a`/`b` それぞれの
+     元々の端点定義(`a.a` が `t=0`、`a.b` が `t=1`)をそのまま使う。接点は幾何的に一意に定まる
+     点であり、判定にユーザー入力(`near_a`/`near_b`)由来の基準を混ぜる必要がないため。
+   - 新しい弧のレイヤー・スタイルは「1本目にクリックした線分(a)」のものを継承する
+     (a・b が異なるレイヤー／スタイルの場合の一意な規約として明記する)。
+
+5. **core 層でのコマンド表現**: **新しい `Command` バリアントは追加しない**。既存の
+   `AddEntity` / `RemoveEntity` / `ModifyEntity` / `Batch` で全演算を表現できる:
+   - **延長**: 対象 1 entity の幾何だけが変わるので `Command::ModifyEntity { id, new_geom }`
+     1 個で足りる(ID は不変。M5 の Move/Rotate/Mirror と同じ「確定後も選択維持」の性質を持つ)。
+   - **トリム**: `TrimResult::retained` が1個なら延長と同じ `Command::ModifyEntity` 1個(ID維持)。
+     2個(境界と2点以上で交わり中間をクリックしたケース。設計判断3a・Codex指摘A-1)なら
+     1 entity → 2 entity のトポロジ変化なので、分割と同じ表現
+     `Command::Batch([RemoveEntity(id), AddEntity(piece1), AddEntity(piece2)])` で原子的に
+     確定する(詳細は設計判断3a)。
+   - **フィレット**: 対象 2 entity(両方とも `LineSeg`)の幾何変更 + 新規弧 1 entity の追加。
+     `Command::Batch(vec![ModifyEntity(id_a, trimmed_a), ModifyEntity(id_b, trimmed_b),
+     AddEntity(arc_entity)])` の 1 発で原子的に適用する(3 つのうちどれか 1 つでも失敗
+     — 例えば a か b のレイヤーがロック — したら Batch 全体がロールバックされる。既存の
+     `Command::Batch` の原子性契約をそのまま使うだけで新規実装は不要)。
+   - **分割**: 1 entity → 2 entity になるため、ユーザー要件どおり
+     `Command::Batch(vec![RemoveEntity(id), AddEntity(piece1), AddEntity(piece2)])` で
+     原子的に表現する(LineSeg/Arc/開いた Polyline のいずれでも同じ表現)。`RemoveEntity` は
+     対象エンティティの所属レイヤーのロックで失敗しうるので、ロックされたレイヤーの entity は
+     分割全体が失敗し、部分適用(削除だけ成功して追加が失敗、等)は起きない
+     (`Command::Batch` の既存契約どおり)。新しい 2 entity は元のレイヤー・スタイルを
+     複製する(M5 の複製・オフセットと同じ規約)。`NewIds.entities` は `AddEntity` の出現順を
+     保持する既存実装により `[piece1_id, piece2_id]` を返すので、確定後の選択集合をこの 2 件へ
+     切り替えられる(複製と同じ「新集合を選択」規約。元 ID は墓標化されて選択対象から自然に外れる)。
+   - **結論**: core 層の変更はゼロ(`Command`／`Document::apply` は無改修)。M7 は geom 層の新設
+     モジュールと app 層のツール追加のみで完結する。
+
+6. **app 層の UX**:
+   - **設計の分岐点(明記)**: M5 の 移動・回転・鏡映・オフセットは「先に Select で対象を選択 →
+     キーでモードへ入る → クリックで確定」という `SelectTool` のサブモード(`PlacementKind` /
+     `OffsetState`)だった。M7 の 4 操作はこのパターンを採らず、**独立した `Tool` トレイト実装
+     (`TrimTool`/`ExtendTool`/`FilletTool`/`SplitTool`)とし、対象エンティティは事前選択ではなく
+     クリックによるヒットテストで直接指定する**(AutoCAD の TRIM/EXTEND/FILLET と同じ操作感。
+     事前に「対象を選択してからキーを押す」手間がなく、境界と対象という非対称な役割を持つ 2 つの
+     エンティティを 1 回の操作列の中で順にクリック指定できる)。既存の M6 `DimRadialTool` が
+     「1 クリック目で円／円弧をヒットテストする」ために `Tool::wants_circle_pick` /
+     `Tool::on_circle_pick` という拡張点を持っている前例を一般化する。
+   - **`Tool` トレイトへの新規拡張点**(`wants_circle_pick`/`on_circle_pick` と同じ形の
+     デフォルト実装つきメソッドとして追加。既存メソッドのシグネチャ変更はなし):
+     ```rust
+     pub struct ShapePick { pub id: EntityId, pub shape: Shape, pub click: Point2 }
+     fn wants_shape_pick(&self) -> bool { false }
+     fn on_shape_pick(&mut self, _hit: ShapePick) {}
+     ```
+     app 層に汎用ヒットテスト関数
+     `pub fn pick_shape_entity(document: &Document, world: Point2, tol: f64) -> Option<ShapePick>`
+     を新設する(`SelectTool::pick` と同じ「最短距離 ≤ tol の中で最も近い、可視のみ」契約。
+     `EntityGeom::as_shape()` が `None`(Text/寸法)のエンティティは自然に除外される)。
+     この関数は `pick_circle_or_arc` と役割が重なる部分が大きいため、共通の内部ヘルパーへ
+     リファクタし重複を避ける(実装タスクの完了条件に含める)。
+   - **ヒットテストのみで、事前クリックホバー中のライブプレビューは行わない**
+     (`DimRadialTool` の `WaitingCircle` 状態が持つプレビューが無いのと同じ理由: `Move`
+     イベントは `Document` を持たず、クリックしてヒットテストするまで対象の形状が分からない。
+     この非対称性は既存踏襲であり新規の設計問題ではないことを明記する)。
+   - **起動キー**(2026-07-26 采配役指摘によりトリム/延長のキー割当を変更。未使用キーである
+     ことを `mcad-app` のキー処理箇所〔`main.rs`／`tool.rs`〕を実測して確認済み: `grep -n
+     "Key::X"` は 0 件で、既存の全キー使用箇所(ツール S/1/L/C/A/P/T/D/Shift+D、Select 内
+     M/Shift+M/R/O、Ctrl 系ファイル・履歴、F3・Enter・Escape・Space・Delete/Backspace)とも
+     衝突しない):
+     - **トリム = `X`**、**延長 = `E`**(いずれも Shift 併用なしの単押し。`M`/`Shift+M`・
+       `D`/`Shift+D` の「基本キー / Shift 併用」ペア命名規則からは意図的に外す — トリム・延長は
+       どちらも作図中に高頻度で使う操作であり、単押し2キーの方が Shift 併用より押しやすいため)
+     - **フィレット = `F`**
+     - **分割 = `B`**(break の頭文字。`分割`という訳語だが操作としては AutoCAD の BREAK に近い
+       — 「1点で切る」であり「2点間を消す」ではないため、キーは BREAK 由来だが結果は必ず
+       2 entity になる点を明記する)
+   - **トリム(`X`)**: `WaitingBoundary` → クリックで境界エンティティをヒットテスト
+     (`on_shape_pick`)→ `WaitingTarget(boundary)` → クリックで対象エンティティをヒットテスト
+     → `mcad_geom::trim_extend::trim(&target.shape, &boundary.shape, target.click)` を呼ぶ
+     (`click` は「捨てたい側」を示す点。設計判断3の doc 参照)。成功時の確定コマンドは
+     `TrimResult::retained` の個数で分岐する(設計判断3a・Codex指摘A-1): 1個なら
+     `Command::ModifyEntity { id: target.id, new_geom: retained[0] }`、2個なら
+     `Command::Batch([RemoveEntity(target.id), AddEntity(retained[0]), AddEntity(retained[1])])`
+     (分割と同じ表現、確定後の選択集合も分割と同じく新規2 entity へ切り替える)。**確定後も
+     `WaitingTarget(boundary)` のまま留まり**、同じ境界に対して複数の対象へ連続してトリムを
+     繰り返せる(AutoCAD の TRIM が境界選択後に複数回切れるのと同じ操作感。M5 のオフセットが
+     確定後に元エンティティ選択を維持して連続オフセットしやすくした設計判断と同種の配慮)。
+     失敗(`Unsupported`/`NoIntersection`/`Degenerate`)は `Rejected` とし状態は
+     `WaitingTarget(boundary)` のまま据え置く(同じ境界のまま別対象を試せる)。
+   - **延長(`E`)**: トリムと全く同じ2段階の状態機械(`WaitingBoundary` →
+     `WaitingTarget(boundary)`)を共有する設計とし、`extend` を呼ぶ点のみ異なる。したがって
+     **延長も同一境界に対して複数の対象へ連続して適用できる**(トリムと非対称にする理由がなく、
+     状態機械を共有する以上わざわざ単発へ制限する意味がないため。トリムと同じく確定後も
+     `WaitingTarget(boundary)` に留まる)。
+   - **フィレット(`F`)**: `WaitingFirstLine` → クリックでヒットテスト(`LineSeg` 以外なら
+     `Rejected`)→ `WaitingSecondLine { a, near_a }` → クリックでヒットテスト → 半径は
+     ツールパネルの数値入力欄(Offset と同じ ASCII ラベル付き入力欄パターンを相乗り、正の
+     有限値のみ受理・空欄は `Rejected("Fillet: enter a radius")`)から読み、
+     `fillet_lines(a, b, radius, near_a, near_b)` を呼ぶ。成功なら
+     `Command::Batch([ModifyEntity(a.id, trimmed_a), ModifyEntity(b.id, trimmed_b),
+     AddEntity(arc)])` を `Commit` し、状態は `WaitingFirstLine` へリセットする(連続フィレットは
+     角ごとに radius が同じとは限らないため、トリムほど自明に反復しやすくないので単発仕様とする)。
+     失敗は `Rejected` とし `WaitingSecondLine { a, near_a }` のまま据え置く(1本目は選び直さずに
+     2本目だけ選び直せる)。**確定後の選択集合**は「変更された 2 本 + 新規の弧」の 3 entity へ
+     切り替える(`ModifyEntity` の対象 ID 2 つは呼び出し側が既知、弧 ID は `NewIds.entities[0]`)。
+     Move/Rotate 系の「元の選択維持」でも Duplicate 系の「新規のみ選択」でもない、フィレット
+     固有の規約であることを明記する。
+   - **分割(`B`)**: `WaitingTarget` の単一状態。クリックでヒットテスト →
+     `split(&target.shape, mcad_geom::closest_point(&target.shape, target.click))` を呼ぶ
+     (クリック点そのものではなく `closest_point`(`primitives.rs` で定義・`lib.rs` が
+     `mcad_geom::closest_point` として再エクスポート済み、実測確認済みの既存 API)で対象上へ
+     射影した点を分割点とする。ピック許容量内のクリックでも対象からずれているため)。成功なら
+     `Command::Batch([RemoveEntity(id), AddEntity(piece1), AddEntity(piece2)])` を `Commit`。
+     確定後は選択集合を新規 2 entity へ切り替える(複製と同じ規約)。失敗は `Rejected` とし
+     状態は `WaitingTarget` のまま(単一状態なので実質何も変わらないが、既存の規約
+     — 拒否時は確定せず状態据え置き — に合わせて明記する)。
+   - **共通規約**(M5/M6 と同一。個別に再定義しない): 全クリックにスナップ適用。
+     Esc・ツール切替・ファイル操作・モーダル表示・undo/redo で状態を初期状態へリセットし、
+     `Document` は変更しない。確定失敗(レイヤーロック含む)は ASCII ステータスメッセージへ。
+     入力欄(フィレットの半径欄)フォーカス中は M5 タスク20 の `app_shortcuts_enabled` 機構で
+     全ドキュメント系ショートカットを抑止する。
+
+7. **tcad への影響**: `mcad-geom`/`mcad-core` の公開 API 変更は追加のみ(新規モジュール
+   `trim_extend`/`fillet`/`split`、`Aabb` 関連の小さなヘルパー1つ)で、既存の型・関数の
+   シグネチャは一切変更しない。`Tool` トレイトの拡張(`wants_shape_pick`/`on_shape_pick`)は
+   `mcad-app` 内部のみで、tcad は `mcad-app` を再利用していない(DESIGN.md 7章冒頭)ため無関係。
+   したがって **tcad 側のコード修正は不要**と見込まれるが、運用ルールどおり geom 層タスク
+   (27〜29)の完了条件に `../tcad` で `cargo test --workspace` が通ることを含める
+   (M6 タスク22で「当初『不要』としていたのが実装時に誤りと判明した」前例があるため、
+   予断せず必ず実測する)。
+
+8. **テスト戦略**:
+   - **geom(単体・proptest)**:
+     - トリム: 直線×直線・直線×円・弧×円で「クリックした側が正しく除去され、逆側が
+       残る」ことを固定(`click` = 捨てたい側、という設計判断3の仕様に統一。両側クリックで
+       残る側が入れ替わることも検証)。**円を貫通する線分に対し (a) 手前側交点より外側の
+       クリック→1断片、(b) 2交点の中間クリック→2断片(`retained.len() == 2`)、(c) 奥側交点
+       より外側のクリック→1断片、の3ケースを固定する**(Codex指摘A-1)。境界がポリラインで
+       対象と3点以上で交わるケースも1つ入れ、「クリック区間の両隣以外の交点では分割されない」
+       (設計判断3a)ことを固定する。交点なしは `NoIntersection`。Circle/Polyline/Point
+       ターゲットは `Unsupported`。
+     - 延長: 直線を境界(直線・円・弧)まで正しく伸ばすケース、逆方向(伸ばしても届かない)は
+       `NoIntersection`。**弧の延長で、start 側・end 側それぞれの両側に交点がある配置
+       (現在の弧の内部にある候補が正しく除外されることを検証)、および掃引がほぼ一周・
+       一周超えになる候補を含む配置での拒否(`Degenerate`。`Arc` は全周を表現できないため。
+       `Arc` を構築する前に判定していることが担保されるよう、畳み込み後の `sweep()` からは
+       区別できない「ほぼ2π」と「2π超えのため縮んで見える」を両方固定する)を追加する**
+       (Codex指摘A-2)。`extend_reach` が境界 AABB の最遠隅への距離と一致することを固定する
+       ユニットテスト。
+     - フィレット: 直角・鋭角・鈍角コーナーで既知の解析解(半径・接点座標を手計算できる
+       直角コーナー等)と比較。平行線・半径過大・非正半径の拒否。`near_a`/`near_b` を
+       入れ替えたときに異なる象限の解が選ばれることを固定(4分岐の少なくとも2つを直接検証)。
+     - 分割: 線分・弧・開いた Polyline の中間点で2分され、両ピースの結合が元の形状に一致すること
+       (往復性)。線分・弧は端点近傍クリックで `TooCloseToEndpoint`。Polyline は
+       全体の始点/終点近傍クリックで `TooCloseToEndpoint`、中間頂点近傍クリックは
+       その頂点で素直に分割される(新規頂点を挿入しない。設計判断1a)ことを固定。
+       閉じた Polyline・Circle・Point は `Unsupported`。proptest で
+       「ランダムな線分・弧・開いた Polyline + ランダムな分割点 → 2ピースの両端が元の
+       全体端点と分割点に一致し、両ピースとも頂点2以上」を性質として固定する。
+   - **core**: 新規 `Command` バリアントを追加しないため新規の undo/redo テストは最小限。
+     ただし「フィレットの Batch が a のレイヤーロックで失敗したとき b・arc も含め全体が
+     ロールバックされる」「分割の Batch が対象レイヤーロックで失敗したとき削除も追加も
+     起きない」の2点は、既存の `Command::Batch` 原子性テストのパターンに沿って
+     `mcad-core` 側(または `mcad-app` の統合テスト)で固定する。
+   - **app(状態機械)**: `tool.rs` 既存の単体テスト群と同じ形式で、
+     `TrimTool`/`ExtendTool`/`FilletTool`/`SplitTool` それぞれの `on_input`/`on_shape_pick`を
+     `Document` なしで駆動できるユニットテスト(`ShapePick` を直接構築して渡す)に加え、
+     `pick_shape_entity` のヒットテスト(Text/寸法除外を含む)は `Document` ありのテストで固定。
+   - **GUI 手動スモークテスト項目**(実機確認をユーザーへ依頼):
+     1. 2本の交差する線分でトリム→片方をクリックしてクリックした側が消えることを確認、
+        同じ境界のまま別の対象を続けてトリムできることを確認。
+     2. 境界に届いていない線分を延長キーで境界まで伸ばせることを確認。同じ境界のまま
+        別の対象を続けて延長できることを確認。
+     3. 直角に交わる2本の線分でフィレット(半径入力)→ 丸角ができ、undo 1回で元に戻ることを確認。
+     4. 線分・円弧・開いたポリラインを1点で分割→ 2つの独立したエンティティになり、それぞれ
+        個別に選択・移動できることを確認、undo 1回で元の1本に戻ることを確認。
+     5. レイヤーロック中のエンティティに対してトリム/フィレット/分割を試み、失敗がステータス
+        バーに表示され `Document` が変化しないことを確認。
+     6. Esc・ツール切替の途中キャンセルで `Document` が変化しないことを確認。
+
+#### タスク分割
+
+| # | タスク | 内容 | 担当 | 依存 |
+|---|---|---|---|---|
+| 27 | geom: 交点拡張 + トリム/延長API | `mcad-geom` に `trim_extend` モジュール新設。`trim`(Line/Arc対象、境界はShape全種、区間分割で `TrimResult{retained: Vec<Shape>}` を返す。設計判断3a)/`extend`(unwrapped角度差アルゴリズム。設計判断2・A-2)、`extend_reach`(境界AABBからの延長長さ算出)、`TrimExtendError`。`click` は trim=「捨てる側」・extend=「延長する自由端の参考点」であることをdoc・実装で統一。単体・proptestで多重交点(2断片ケース含む)・退化ケース(2π超え含む)を固定。`../tcad` の `cargo test --workspace` 実測 | implement-opus | — |
+| 28 | geom: フィレットAPI | `mcad-geom` に `fillet` モジュール新設。`fillet_lines`(`near_b`でaのオフセット方向、`near_a`でbのオフセット方向を決めて中心を一意に求める・接点計算・両線分のトリム範囲算出)、`FilletError`。直角コーナー等の解析解と比較する単体テスト。`../tcad` の `cargo test --workspace` 実測 | implement-opus | — |
+| 29 | geom: 分割API | `mcad-geom` に `split` モジュール新設。`split`(Line/Arc/開いたPolyline対象、端点近傍クリックの拒否、Polyline中間頂点近傍は新規頂点を挿入せずその頂点で分割)、`SplitError`(閉じたPolyline/Circle/Pointは`Unsupported`)。往復性のproptestをLine/Arc/Polylineに拡張 | implement-sonnet | — |
+| 30 | app: 汎用エンティティピック基盤 | `Tool` トレイトへ `wants_shape_pick`/`on_shape_pick`(`ShapePick`型)を追加。`pick_shape_entity` 新設、既存 `pick_circle_or_arc`/`SelectTool::pick` との重複を共通ヘルパーへ整理 | implement-sonnet | — |
+| 31 | app: トリム/延長ツール | `TrimTool`/`ExtendTool`(`X`/`E`、いずれも単押し)。境界→対象の2段階状態機械(共有)、同一境界での連続トリム・連続延長、失敗時の状態据え置き。トリムは `TrimResult::retained` の個数で `Command::ModifyEntity`(1個)/`Command::Batch(Remove+Add×2)`(2個)を分岐(設計判断3a)、延長は `Command::ModifyEntity` 確定 | implement-opus | 27, 30 |
+| 32 | app: フィレットツール | `FilletTool`(`F`)。半径入力欄(Offsetの入力欄パターンを相乗り)+ 2クリック、`Command::Batch` 確定(2本のModifyEntity + 弧のAddEntity)、確定後の選択集合切替(3件) | implement-opus | 28, 30 |
+| 33 | app: 分割ツール | `SplitTool`(`B`)。単一クリック、`mcad_geom::closest_point` で対象上へ射影して分割、`Command::Batch`(RemoveEntity + AddEntity×2)確定、確定後の選択集合切替(新規2件)。Polyline対応を含む | implement-sonnet | 29, 30 |
+| 34 | ドキュメント整合 | README・キーバインド一覧・モジュールdoc更新、DESIGN.md本章の実装反映、CHANGELOG、v0.7.0リリース | haiku-assistant | 27-33 |
+
+#### 検収基準(M7完了の定義)
+
+- 交差する2本の線分・線分×円/弧でトリムができ、クリックした側が正しく除去される
+  (多重交点では最寄りの交点までのトリムになる)
+- 境界に届いていない線分・弧を延長でき、境界まで正しく伸びる(届かない場合は拒否される)。
+  トリム・延長とも同一境界に対して連続して複数対象へ適用できる。弧の延長で掃引が2πを
+  超える場合は拒否される
+- 境界と2点で交わる対象の中間をクリックすると2つの独立エンティティが残り、undo 1回で
+  元に戻る(Codex指摘A-1)
+- 直線同士のフィレットが半径入力に従って正しい弧を作り、両線分が正しくトリムされる。
+  undo 1回でフィレット全体(2本のModify + 1本のAdd)が戻る
+- 線分・円弧・開いたポリラインを1点で分割でき、結果の2エンティティが独立して選択・編集できる。
+  undo 1回で分割全体(Remove + Add×2)が戻る
+- Circle・閉じたPolyline(分割のみ)・Text・寸法を対象にした場合は明示的な理由(ASCII)で
+  拒否され、`Document` は変化しない
+- 全操作がレイヤーロックを尊重し、失敗はステータスバーに出る(フィレット・分割は
+  `Command::Batch` の原子性により部分適用が起きないことをテストで固定)
+- `../tcad` の `cargo test --workspace` が通る(geom層API追加の確認)
+- fmt / clippy / workspace test 通過、GUI 変更は手動スモークテストを記録する
+
+M8 以降の詳細設計は、各マイルストーン着手時に本章へ追記する(M4 までと同じ運用)。

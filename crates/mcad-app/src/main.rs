@@ -9,6 +9,7 @@
 
 mod dimension;
 mod fonts;
+mod ortho;
 mod snap;
 mod tool;
 mod viewport;
@@ -293,6 +294,11 @@ struct McadApp {
     /// 直近フレームで作図ツールのカーソルがスナップした先。マーカー描画に使う。
     /// スナップしていない・作図ツール非アクティブ・スナップ無効のときは `None`。
     snap_marker: Option<snap::SnapResult>,
+    /// 直交モード（ortho、v0.7.1）の有効/無効。`F8` でトグルする（既定は無効）。
+    /// `Line`/`Polyline`/`Arc` の作図中、スナップ候補が無い場所でだけ直前の点から
+    /// 水平・垂直な方向へ拘束する（`ortho.rs`、`resolve_click_point` 参照）。
+    /// `snap_enabled` と同じく実行時フィールドのみで永続化しない（M8まで）。
+    ortho_enabled: bool,
     /// ステータスバーに一時表示するメッセージ（主にコア操作のエラー通知）。
     /// メッセージごとに保持している表示時間（[`StatusMessage::duration_secs`]、通常は
     /// [`STATUS_MESSAGE_SECS`]、ファイル入出力の結果は [`STATUS_MESSAGE_SECS_IMPORTANT`]）
@@ -383,6 +389,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "Del=Delete",
     "Esc=Cancel",
     "F3=Snap",
+    "F8=Ortho",
     "Ctrl+Z=Undo",
     "Ctrl+Y=Redo",
     "Ctrl+N=New",
@@ -462,6 +469,7 @@ impl McadApp {
             select_tool: SelectTool::default(),
             snap_enabled: true,
             snap_marker: None,
+            ortho_enabled: false,
             status: None,
             current_path: None,
             confirm_state: ConfirmState::Idle,
@@ -1127,6 +1135,13 @@ impl eframe::App for McadApp {
             }
         }
 
+        // F8 で直交モード（ortho）の有効/無効をトグルする。F3 と同じガード条件
+        // （モーダル非表示中は常に効く）。ortho は専用マーカーを持たない設計
+        // （`ortho.rs` doc 参照）なので、トグル自体はフラグの反転のみでよい。
+        if self.confirm_state == ConfirmState::Idle && ui.input(|i| i.key_pressed(Key::F8)) {
+            self.ortho_enabled = !self.ortho_enabled;
+        }
+
         // 表示時間を過ぎたステータスメッセージは消す。
         if self
             .status
@@ -1146,6 +1161,11 @@ impl eframe::App for McadApp {
                     ui.label(format!(
                         "Snap: {}",
                         if self.snap_enabled { "ON" } else { "OFF" }
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "Ortho: {}",
+                        if self.ortho_enabled { "ON" } else { "OFF" }
                     ));
                     ui.separator();
                     // オフセット距離入力欄（設計判断5）。モーダルにせず上部パネルへ常設だが、
@@ -1282,6 +1302,7 @@ impl eframe::App for McadApp {
                         &mut self.select_tool,
                         self.snap_enabled,
                         &mut self.snap_marker,
+                        self.ortho_enabled,
                         &mut self.status,
                         now,
                         parse_fillet_radius(&self.fillet_radius_input),
@@ -1470,6 +1491,7 @@ fn handle_tool_input(
     select_tool: &mut SelectTool,
     snap_enabled: bool,
     snap_marker: &mut Option<snap::SnapResult>,
+    ortho_enabled: bool,
     status: &mut Option<StatusMessage>,
     now: f64,
     fillet_radius: Option<f64>,
@@ -1504,7 +1526,7 @@ fn handle_tool_input(
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
         let extra_points = active.snap_points();
-        let (world, marker) = apply_snap(
+        let (_, marker) = apply_snap(
             document,
             snap_enabled,
             raw,
@@ -1513,6 +1535,7 @@ fn handle_tool_input(
             &extra_points,
         );
         *snap_marker = marker;
+        let world = resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin());
         let _ = active.on_input(&ctx, InputEvent::Move(world));
     } else {
         *snap_marker = None;
@@ -1552,7 +1575,7 @@ fn handle_tool_input(
             }
         } else {
             let extra_points = active.snap_points();
-            let (world, _) = apply_snap(
+            let (_, marker) = apply_snap(
                 document,
                 snap_enabled,
                 raw,
@@ -1560,6 +1583,7 @@ fn handle_tool_input(
                 grid_step,
                 &extra_points,
             );
+            let world = resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin());
             result = active.on_input(&ctx, InputEvent::Click(world));
         }
     }
@@ -1726,6 +1750,69 @@ fn apply_snap(
     match snap::snap(document, raw, radius, grid_step, extra_points) {
         Some(result) => (result.point, Some(result)),
         None => (raw, None),
+    }
+}
+
+/// スナップと直交モード（ortho、v0.7.1）を「スナップ優先」で合成する（`ortho.rs` §2）。
+///
+/// `snap_result` が `Some`（スナップ候補が見つかった）ならその座標をそのまま使い、
+/// ortho は適用しない。`None`（候補なし）のときだけ、`ortho_enabled` かつ
+/// `origin`（[`tool::Tool::ortho_origin`]）が `Some` であれば `raw` を軸拘束する。
+/// `Move`/`Click` の両経路が同じこの関数を通ることで、プレビューと確定がずれない。
+#[must_use]
+fn resolve_click_point(
+    snap_result: Option<snap::SnapResult>,
+    raw: Point2,
+    ortho_enabled: bool,
+    origin: Option<Point2>,
+) -> Point2 {
+    match snap_result {
+        Some(result) => result.point,
+        None if ortho_enabled => origin.map_or(raw, |o| ortho::constrain(o, raw)),
+        None => raw,
+    }
+}
+
+#[cfg(test)]
+mod resolve_click_point_tests {
+    use super::*;
+
+    #[test]
+    fn snap_wins_over_ortho() {
+        let snap_result = Some(snap::SnapResult {
+            kind: snap::SnapKind::Endpoint,
+            point: Point2::new(9.0, 9.0),
+        });
+        let raw = Point2::new(10.0, 0.5);
+        let origin = Some(Point2::new(0.0, 0.0));
+        assert_eq!(
+            resolve_click_point(snap_result, raw, true, origin),
+            Point2::new(9.0, 9.0)
+        );
+    }
+
+    #[test]
+    fn no_snap_ortho_on_with_origin_constrains() {
+        let raw = Point2::new(10.0, 0.5);
+        let origin = Some(Point2::new(0.0, 0.0));
+        assert_eq!(
+            resolve_click_point(None, raw, true, origin),
+            Point2::new(10.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn ortho_off_returns_raw() {
+        let raw = Point2::new(10.0, 0.5);
+        let origin = Some(Point2::new(0.0, 0.0));
+        assert_eq!(resolve_click_point(None, raw, false, origin), raw);
+    }
+
+    #[test]
+    fn no_origin_returns_raw_even_if_ortho_on() {
+        // 1点目のクリック待ちなど、基準点がまだ無い局面。
+        let raw = Point2::new(10.0, 0.5);
+        assert_eq!(resolve_click_point(None, raw, true, None), raw);
     }
 }
 

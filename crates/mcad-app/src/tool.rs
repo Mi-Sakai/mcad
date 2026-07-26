@@ -285,6 +285,23 @@ pub trait Tool {
     /// [`ToolKind::keeps_state_on_commit_failure`]: crate::ToolKind::keeps_state_on_commit_failure
     fn on_commit_failed(&mut self) {}
 
+    /// 直交モード（ortho、v0.7.1）が拘束の基準にする「直前に確定した点」を返す。
+    /// 既定は `None`（対象外。基準点が無い＝ortho を適用しない）。
+    ///
+    /// # なぜ `snap_points()` を流用しないのか
+    ///
+    /// [`Tool::snap_points`] は「スナップ候補として扱う頂点の集合」であり意味が違う
+    /// （例: `ArcTool` の `WaitingP3` は `snap_points()` が `p1`・`p2` の2点を返すが、
+    /// ortho の基準は直近の `p2` だけでよい）。誤って対象に入れないよう、ツールごとに
+    /// 明示的にオプトインする専用の拡張点にする（`ortho.rs` のモジュール doc も参照）。
+    ///
+    /// override するのは [`LineTool`]・[`PolylineTool`]・[`ArcTool`] の3つのみ。
+    /// Circle・Text・寸法系・M7の4ツールは「直前の点からの方向が結果に効かない」
+    /// または「クリックの意味が用途ごとに変わる」ため既定のまま（対象外）。
+    fn ortho_origin(&self) -> Option<Point2> {
+        None
+    }
+
     /// app 層が持つ数値入力欄（[`FilletTool`] の半径欄）の解析値をツールへ渡す
     /// （正の有限値のみ `Some`、空欄・不正値は `None`）。既定は何もしない。
     ///
@@ -404,6 +421,13 @@ impl Tool for LineTool {
         match self.state {
             LineState::WaitingFirst => Vec::new(),
             LineState::WaitingSecond(first) => vec![first],
+        }
+    }
+
+    fn ortho_origin(&self) -> Option<Point2> {
+        match self.state {
+            LineState::WaitingFirst => None,
+            LineState::WaitingSecond(first) => Some(first),
         }
     }
 }
@@ -593,6 +617,15 @@ impl Tool for ArcTool {
             ArcState::WaitingP3(p1, p2) => vec![p1, p2],
         }
     }
+
+    fn ortho_origin(&self) -> Option<Point2> {
+        match self.state {
+            ArcState::WaitingP1 => None,
+            ArcState::WaitingP2(p1) => Some(p1),
+            // 3点目の基準は直近の p2（設計書 §3）。
+            ArcState::WaitingP3(_p1, p2) => Some(p2),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -683,6 +716,10 @@ impl Tool for PolylineTool {
 
     fn snap_points(&self) -> Vec<Point2> {
         self.vertices.clone()
+    }
+
+    fn ortho_origin(&self) -> Option<Point2> {
+        self.vertices.last().copied()
     }
 }
 

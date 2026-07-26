@@ -88,6 +88,50 @@ pub struct CirclePick {
     pub radius: f64,
 }
 
+/// [`pick_shape_entity`] が返す、任意形状エンティティのヒット結果（M7 タスク30）。
+///
+/// [`CirclePick`] と異なり、対象エンティティの [`EntityId`] とヒット時のクリック点
+/// （ワールド座標）も保持する。M7 のトリム・延長・フィレット・分割（タスク31〜33）は
+/// 既存エンティティを実際に書き換える（`ModifyEntity`）ため、値を写し取るだけでなく
+/// 対象を ID で追跡する必要があり、演算によってはクリック位置自体（例: どちら側の端を
+/// 残すか）も要るための設計。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapePick {
+    /// ヒットしたエンティティの ID。
+    pub id: EntityId,
+    /// ヒットしたエンティティの形状（`EntityGeom::as_shape()` の複製）。
+    pub shape: Shape,
+    /// ヒットテストに使ったクリック点（ワールド座標）。
+    pub click: Point2,
+}
+
+/// [`pick_circle_or_arc`] / [`pick_shape_entity`] / [`SelectTool::pick`] が共有する
+/// 「可視エンティティを走査し、`tol` 以内で最も近いものを選ぶ」ヒットテストの骨格
+/// （M7 タスク30、重複整理）。`score` はエンティティごとに距離と結果値の組
+/// `(distance, T)` を返す（対象外なら `None`）。3 箇所とも距離の定義自体は異なる
+/// （実形状への最近距離／Text の aabb 距離／寸法の展開線分距離など）ため、その部分だけ
+/// 呼び出し側のクロージャに残し、走査・可視レイヤーフィルタ・`tol` 判定・最小距離選択の
+/// 共通部分だけをここへ集約する。
+fn pick_nearest<T>(
+    document: &Document,
+    tol: f64,
+    mut score: impl FnMut(EntityId, &Entity) -> Option<(f64, T)>,
+) -> Option<T> {
+    let mut best: Option<(f64, T)> = None;
+    for (id, entity) in document.entities() {
+        if !layer_visible(document, entity) {
+            continue;
+        }
+        let Some((d, value)) = score(id, entity) else {
+            continue;
+        };
+        if d <= tol && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+            best = Some((d, value));
+        }
+    }
+    best.map(|(_, value)| value)
+}
+
 /// ツールへの入力。ワールド座標とキー操作のみからなる軽量な列挙型
 /// （GUIなしで単体テストできるようにするための設計）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,6 +215,26 @@ pub trait Tool {
     /// 進める。既定は何もしない（他ツールでは呼ばれない）。外した場合は app 層が本メソッドを
     /// 呼ばずステータスへ拒否メッセージを出すため、状態は据え置きになる。
     fn on_circle_pick(&mut self, _hit: CirclePick) {}
+
+    /// ツールが「次のクリックで任意形状のエンティティをヒットテストする」段階にあるとき
+    /// `true`。app 層（`handle_tool_input`）はこのとき通常の [`Tool::on_input`]`(Click)` の
+    /// 代わりにドキュメントをヒットテストし（[`pick_shape_entity`]）、結果を
+    /// [`Tool::on_shape_pick`] へ渡す。他ツール・他状態では `false`（既定）。
+    ///
+    /// [`Tool::wants_circle_pick`] の一般化版（M7 タスク30）。半径寸法は円／円弧だけを対象に
+    /// 中心・半径だけを採取すればよかったが、M7 のトリム・延長・フィレット・分割（タスク
+    /// 31〜33）は対象形状が Line/Arc/Polyline と多様で、かつクリック位置そのもの（`click`）も
+    /// 演算に必要（例: フィレットの「どちら側の端を残すか」判定）なため、別の拡張点として
+    /// 用意する。既存の `wants_circle_pick`/`on_circle_pick` はそのまま残す（`DimRadialTool`
+    /// のシグネチャ変更禁止）。
+    fn wants_shape_pick(&self) -> bool {
+        false
+    }
+
+    /// [`Tool::wants_shape_pick`] が `true` のとき、app 層が当てたエンティティを受け取り状態を
+    /// 進める。既定は何もしない（他ツールでは呼ばれない）。外した場合は app 層が本メソッドを
+    /// 呼ばずステータスへ拒否メッセージを出すため、状態は据え置きになる。
+    fn on_shape_pick(&mut self, _hit: ShapePick) {}
 }
 
 // ---------------------------------------------------------------------
@@ -864,14 +928,8 @@ impl Tool for DimRadialTool {
 /// 判定は [`SelectTool::pick`] と同じく「実形状への最近距離 ≤ tol かつ最も近い」統一契約に従う。
 #[must_use]
 pub fn pick_circle_or_arc(document: &Document, world: Point2, tol: f64) -> Option<CirclePick> {
-    let mut best: Option<(f64, CirclePick)> = None;
-    for (_id, entity) in document.entities() {
-        if !layer_visible(document, entity) {
-            continue;
-        }
-        let Some(shape) = entity.geom.as_shape() else {
-            continue;
-        };
+    pick_nearest(document, tol, |_id, entity| {
+        let shape = entity.geom.as_shape()?;
         let pick = match shape {
             Shape::Circle(c) => CirclePick {
                 center: c.center,
@@ -881,14 +939,36 @@ pub fn pick_circle_or_arc(document: &Document, world: Point2, tol: f64) -> Optio
                 center: a.center,
                 radius: a.radius,
             },
-            _ => continue,
+            _ => return None,
         };
         let d = distance_to(shape, world);
-        if d <= tol && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
-            best = Some((d, pick));
-        }
-    }
-    best.map(|(_, pick)| pick)
+        Some((d, pick))
+    })
+}
+
+/// クリック点 `world` から許容量 `tol`（ワールド）以内で最も近い可視な**任意形状**の
+/// エンティティを [`ShapePick`] で返す（M7 タスク30、app 層の汎用エンティティピック基盤）。
+///
+/// 契約は [`SelectTool::pick`] と同じ「実形状への最短距離 ≤ tol の中で最も近い、可視
+/// レイヤーのエンティティのみ」。`EntityGeom::as_shape()` が `None` を返すもの（`Text`・
+/// 寸法）は自然に除外される（[`pick_circle_or_arc`] が Circle/Arc 以外を除外するのと同じ
+/// 仕組み）。M7 のトリム・延長・フィレット・分割（タスク31〜33）が対象エンティティを拾う
+/// 際の共通入口として使う。この関数自体はまだどのツールからも呼ばれない
+/// （`wants_shape_pick` を true にするツールはタスク31〜33 で追加する）。
+#[must_use]
+pub fn pick_shape_entity(document: &Document, world: Point2, tol: f64) -> Option<ShapePick> {
+    pick_nearest(document, tol, |id, entity| {
+        let shape = entity.geom.as_shape()?;
+        let d = distance_to(shape, world);
+        Some((
+            d,
+            ShapePick {
+                id,
+                shape: shape.clone(),
+                click: world,
+            },
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1230,28 +1310,21 @@ impl SelectTool {
     /// クリック位置 `world` から許容量 `tol`（ワールド単位）以内で最も近い可視
     /// エンティティを返す。該当なしなら `None`。
     fn pick(&self, document: &Document, world: Point2, tol: f64) -> Option<EntityId> {
-        let mut best: Option<(f64, EntityId)> = None;
-        for (id, entity) in document.entities() {
-            if !layer_visible(document, entity) {
-                continue;
-            }
-            // ヒット距離: Shape は実形状への最近距離、Text は近似 aabb への符号なし距離
-            // （DESIGN.md M6 L429 の割り切り。内部なら 0、外部なら境界までのユークリッド距離。
-            // これにより tol 内なら枠のすぐ外側も拾えるし、枠内の空白よりも実形状が近ければ
-            // そちらを優先できる）。寸法は展開線分（寸法線・補助線・引出線）への最近距離
-            // （`dimension` の純関数）。いずれも「tol 以内で最も近いものを拾う」統一比較に
-            // 素直に載る連続距離で、2 値判定（線の上/外）にはしない（M6 タスク23 の教訓）。
+        // ヒット距離: Shape は実形状への最近距離、Text は近似 aabb への符号なし距離
+        // （DESIGN.md M6 L429 の割り切り。内部なら 0、外部なら境界までのユークリッド距離。
+        // これにより tol 内なら枠のすぐ外側も拾えるし、枠内の空白よりも実形状が近ければ
+        // そちらを優先できる）。寸法は展開線分（寸法線・補助線・引出線）への最近距離
+        // （`dimension` の純関数）。いずれも「tol 以内で最も近いものを拾う」統一比較に
+        // 素直に載る連続距離で、2 値判定（線の上/外）にはしない（M6 タスク23 の教訓）。
+        pick_nearest(document, tol, |id, entity| {
             let d = match &entity.geom {
                 EntityGeom::Shape(shape) => distance_to(shape, world),
                 EntityGeom::Text(_) => entity.geom.aabb().distance_to_point(world),
                 EntityGeom::DimLinear(dim) => crate::dimension::linear_distance(dim, world),
                 EntityGeom::DimRadial(dim) => crate::dimension::radial_distance(dim, world),
             };
-            if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
-                best = Some((d, id));
-            }
-        }
-        best.map(|(_, id)| id)
+            Some((d, id))
+        })
     }
 
     /// 単一クリック（ドラッグを伴わない）。累積方式（AutoCAD 流）:
@@ -3993,6 +4066,72 @@ mod tests {
 
         // 線分上（(0.5,0)）は円/円弧ではないのでヒットしない。
         assert!(pick_circle_or_arc(&doc, Point2::new(0.5, 0.0), 0.1).is_none());
+    }
+
+    // --- pick_shape_entity（app 層の汎用エンティティピック基盤、M7 タスク30）---
+
+    #[test]
+    fn pick_shape_entity_picks_nearest_among_multiple() {
+        let mut doc = Document::new();
+        let near = add_hline(&mut doc, 0.0); // 線分 (0,0)-(1,0)
+        let _far = add_hline(&mut doc, 10.0); // 線分 (10,0)-(11,0)
+        let _circle = add_circle(&mut doc, Point2::new(50.0, 50.0), 5.0);
+
+        // (0.5, 0.02) は near にごく近く、他の候補からは遠い。
+        let hit = pick_shape_entity(&doc, Point2::new(0.5, 0.02), 0.1).expect("shape hit");
+        assert_eq!(hit.id, near);
+        assert_eq!(
+            hit.shape,
+            Shape::Line(LineSeg::new(Point2::ORIGIN, Point2::new(1.0, 0.0)))
+        );
+        assert_eq!(hit.click, Point2::new(0.5, 0.02));
+    }
+
+    #[test]
+    fn pick_shape_entity_none_beyond_tolerance() {
+        let mut doc = Document::new();
+        add_hline(&mut doc, 0.0); // 線分 (0,0)-(1,0)
+
+        // 線分から 1.0 離れた点は tol 0.1 では拾えない。
+        assert!(pick_shape_entity(&doc, Point2::new(0.5, 1.0), 0.1).is_none());
+    }
+
+    #[test]
+    fn pick_shape_entity_excludes_text_and_dimensions() {
+        let mut doc = Document::new();
+        add_text(&mut doc, Point2::ORIGIN, "hi", 1.0);
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::ORIGIN,
+                p2: Point2::new(1.0, 0.0),
+                offset: 0.5,
+            }),
+            doc.current_layer(),
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        // Text・寸法しか無いドキュメントでは（as_shape() が None のため）何もヒットしない。
+        assert!(pick_shape_entity(&doc, Point2::ORIGIN, 1.0).is_none());
+    }
+
+    #[test]
+    fn pick_shape_entity_excludes_hidden_layer() {
+        let mut doc = Document::new();
+        add_hline(&mut doc, 0.0); // 線分 (0,0)-(1,0)
+        let layer_id = doc.current_layer();
+        let mut props = doc.layer(layer_id).unwrap().clone();
+        props.visible = false;
+        doc.apply(Command::SetLayerProps {
+            id: layer_id,
+            props,
+        })
+        .unwrap();
+
+        assert!(
+            pick_shape_entity(&doc, Point2::new(0.5, 0.0), 0.1).is_none(),
+            "非表示レイヤーのエンティティは拾わない"
+        );
     }
 
     // --- 寸法の選択（pick 経由）---

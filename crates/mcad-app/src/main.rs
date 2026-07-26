@@ -1428,6 +1428,15 @@ fn handle_tool_input(
                 Some(hit) => active.on_circle_pick(hit),
                 None => set_status(status, now, "Radial dim: click a circle or arc".to_string()),
             }
+        } else if active.wants_shape_pick() {
+            // 汎用エンティティピック（M7 タスク30）: wants_circle_pick と同じ配線。この時点
+            // では wants_shape_pick を true にするツールは存在しない（タスク31〜33 で追加）
+            // ため、このブランチは現状到達しない。将来ツールが追加された時点で拒否メッセージ
+            // の文言もツール側の事情に合わせて調整する想定。
+            match tool::pick_shape_entity(document, raw, pick_tol) {
+                Some(hit) => active.on_shape_pick(hit),
+                None => set_status(status, now, "Pick: click a line, arc, or shape".to_string()),
+            }
         } else {
             let extra_points = active.snap_points();
             let (world, _) = apply_snap(

@@ -10,23 +10,31 @@
 //! - プリミティブ: [`LineSeg`], [`Circle`], [`Arc`], [`Polyline`]
 //! - それらをまとめる列挙型 [`Shape`]（mcad-core の `Entity { geom: Shape, .. }` が使う）
 //! - 幾何クエリ: [`closest_point`], [`distance_to`], [`intersect`], [`circumcircle`]
+//! - 修正系演算: [`trim`], [`extend`]（[`trim_extend`] モジュール）、
+//!   [`fillet_lines`]（[`fillet`] モジュール）
 //! - ジオメトリ検証: [`Shape::validate`]（非有限座標・負半径・空ポリラインなどを検出）
 //!
 //! すべての形状は [`Shape::aabb`]（および各プリミティブの `aabb` メソッド）で
 //! 軸並行境界ボックスを算出でき、ビューポートカリング・矩形選択に使う。
 
 mod aabb;
+pub mod fillet;
 mod intersect;
 mod point;
 mod primitives;
+pub mod split;
+pub mod trim_extend;
 mod vec2;
 
 pub use aabb::Aabb;
+pub use fillet::{FilletError, FilletResult, fillet_lines};
 pub use intersect::intersect;
 pub use point::Point2;
 pub use primitives::{
     Arc, Circle, LineSeg, OffsetError, Polyline, Shape, circumcircle, closest_point, distance_to,
 };
+pub use split::{SplitError, split};
+pub use trim_extend::{TrimExtendError, TrimResult, extend, extend_reach, trim};
 pub use vec2::Vec2;
 
 /// 幾何述語で用いる基準となる相対イプシロン。

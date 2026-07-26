@@ -38,10 +38,12 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, LayerId, Style,
+    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, LayerId, NewIds, Style,
 };
 use mcad_geom::{
-    Aabb, Arc, LineSeg, OffsetError, Point2, Polyline, Shape, Vec2, circumcircle, distance_to,
+    Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
+    TrimExtendError, Vec2, circumcircle, closest_point, distance_to, extend, fillet_lines, split,
+    trim,
 };
 
 use crate::draw_shape;
@@ -103,6 +105,15 @@ pub struct ShapePick {
     pub shape: Shape,
     /// ヒットテストに使ったクリック点（ワールド座標）。
     pub click: Point2,
+    /// ヒットしたエンティティの所属レイヤー。
+    ///
+    /// トリムが 2 断片へ分かれた場合（[`TrimTool`]）や分割（タスク33）は、元エンティティを
+    /// 削除して新規 2 件を追加するため、**元のレイヤー・スタイルを複製**する必要がある
+    /// （M5 の複製・オフセットと同じ規約）。ツールは [`Document`] を参照しない設計なので、
+    /// ヒットテストを行う app 層（[`pick_shape_entity`]）がここへ写し取って渡す。
+    pub layer: LayerId,
+    /// ヒットしたエンティティのスタイル（複製用。`layer` と同じ理由）。
+    pub style: Style,
 }
 
 /// [`pick_circle_or_arc`] / [`pick_shape_entity`] / [`SelectTool::pick`] が共有する
@@ -234,7 +245,58 @@ pub trait Tool {
     /// [`Tool::wants_shape_pick`] が `true` のとき、app 層が当てたエンティティを受け取り状態を
     /// 進める。既定は何もしない（他ツールでは呼ばれない）。外した場合は app 層が本メソッドを
     /// 呼ばずステータスへ拒否メッセージを出すため、状態は据え置きになる。
-    fn on_shape_pick(&mut self, _hit: ShapePick) {}
+    ///
+    /// [`Tool::on_circle_pick`] と違い [`ToolResult`] を返すのは、トリム・延長（タスク31）が
+    /// **ピックそのもので確定する**（2 クリック目の対象ピックが即 `Commit`）ためで、
+    /// `on_input` を経由しない確定・拒否経路が必要になる。半径寸法は 1 クリック目のピックが
+    /// 状態を進めるだけで確定は 2 クリック目の `on_input` が担うため戻り値が要らなかった。
+    fn on_shape_pick(&mut self, _hit: ShapePick) -> ToolResult {
+        ToolResult::Continue
+    }
+
+    /// 直前の [`ToolResult::Commit`] が `Document` へ適用された直後に呼ばれ、選択集合を
+    /// 置き換えたい場合にその ID 列を返す。`None`（既定）は「選択集合に触らない」。
+    ///
+    /// トポロジが変わる確定（トリムが 2 断片へ分かれたケース。DESIGN.md M7 設計判断3a）は、
+    /// 元エンティティが墓標化して選択から自然に外れる代わりに、新規 2 件を選択集合へ
+    /// 載せ替える規約になっている。その ID は `Document::apply` の戻り値 [`NewIds`] に
+    /// しか無く、ツール側は確定時点では知り得ないため、適用後にこのフックで受け渡す。
+    ///
+    /// `&mut self` なのは「今回の確定だけ載せ替える」フラグを消費するため（次の確定で
+    /// 意図せず選択が書き換わらないようにする）。
+    fn take_commit_selection(&mut self, _new_ids: &NewIds) -> Option<Vec<EntityId>> {
+        None
+    }
+
+    /// 直前の [`ToolResult::Commit`] を `Document::apply` へ渡した結果が `Err`
+    /// （レイヤーロック等）だったときに呼ばれる後始末フック。既定は何もしない。
+    ///
+    /// M7 の4ツール（トリム・延長・フィレット・分割）は [`ToolKind::keeps_state_on_commit_failure`]
+    /// が `true` を返すため、app 層は失敗時も `spawn()` でツールを作り直さず、状態
+    /// （境界・1本目の線分など）を保ったまま再挑戦させる（DESIGN.md M7設計判断6）。
+    /// 一方これらのツールは確定成功時、次の [`Tool::take_commit_selection`] 呼び出しで
+    /// 選択集合を新規エンティティへ載せ替える片道フラグ（`select_new_entities`/
+    /// `committed`/`committed_pair` 等）をコマンド作成と同時に立てる。作り直しを
+    /// やめたことでこのフラグが「確定は失敗したのに立ったまま」残ってしまうと、次に
+    /// 別の確定が成功したとき `take_commit_selection` がそれを誤って消費し、無関係の
+    /// 確定の選択集合を空／不正な ID 列へ壊す。本フックはこの片道フラグを失敗時に
+    /// クリアするために使う（Codex adversarial review 2026-07-26 指摘）。
+    ///
+    /// [`ToolKind::keeps_state_on_commit_failure`]: crate::ToolKind::keeps_state_on_commit_failure
+    fn on_commit_failed(&mut self) {}
+
+    /// app 層が持つ数値入力欄（[`FilletTool`] の半径欄）の解析値をツールへ渡す
+    /// （正の有限値のみ `Some`、空欄・不正値は `None`）。既定は何もしない。
+    ///
+    /// # なぜ Tool トレイトに置くのか
+    ///
+    /// 入力欄そのものは egui のウィジェットなので app 層（`main.rs` の上部パネル）が持つ
+    /// のが既定路線（テキストの文字列・高さ欄、オフセットの距離欄と同じ）。一方フィレットは
+    /// 「2 クリック目のヒットテストと同時に確定する」ため、確定判断を行うツール側が値を
+    /// 知っている必要がある。[`Tool::pending_text_anchor`] が「ツールの状態を app 層へ
+    /// 見せる」向きの拡張点なのに対し、こちらは「app 層の入力欄をツールへ流し込む」逆向きの
+    /// 拡張点。app 層は毎フレーム呼ぶので、ツール側は最後に渡された値だけを保持すればよい。
+    fn set_radius_input(&mut self, _radius: Option<f64>) {}
 }
 
 // ---------------------------------------------------------------------
@@ -953,8 +1015,8 @@ pub fn pick_circle_or_arc(document: &Document, world: Point2, tol: f64) -> Optio
 /// レイヤーのエンティティのみ」。`EntityGeom::as_shape()` が `None` を返すもの（`Text`・
 /// 寸法）は自然に除外される（[`pick_circle_or_arc`] が Circle/Arc 以外を除外するのと同じ
 /// 仕組み）。M7 のトリム・延長・フィレット・分割（タスク31〜33）が対象エンティティを拾う
-/// 際の共通入口として使う。この関数自体はまだどのツールからも呼ばれない
-/// （`wants_shape_pick` を true にするツールはタスク31〜33 で追加する）。
+/// 際の共通入口として使う（タスク31 で [`TrimTool`] / [`ExtendTool`] が利用開始。
+/// フィレット・分割はタスク32/33 で追加する）。
 #[must_use]
 pub fn pick_shape_entity(document: &Document, world: Point2, tol: f64) -> Option<ShapePick> {
     pick_nearest(document, tol, |id, entity| {
@@ -966,9 +1028,515 @@ pub fn pick_shape_entity(document: &Document, world: Point2, tol: f64) -> Option
                 id,
                 shape: shape.clone(),
                 click: world,
+                layer: entity.layer,
+                style: entity.style,
             },
         ))
     })
+}
+
+// ---------------------------------------------------------------------
+// トリム（X）／延長（E）
+// ---------------------------------------------------------------------
+
+/// トリム（`X`）と延長（`E`）が共有する 2 段階状態（DESIGN.md M7 設計判断6）。
+///
+/// 1 クリック目で境界を、2 クリック目で対象をヒットテストする。**確定後も
+/// `WaitingTarget` に留まる**ので、同じ境界に対して対象を変えながら連続適用できる
+/// （AutoCAD の TRIM/EXTEND と同じ操作感）。
+#[derive(Debug, Default, Clone, PartialEq)]
+enum BoundaryTargetState {
+    /// 境界エンティティのヒットテスト待ち（1 クリック目）。
+    #[default]
+    WaitingBoundary,
+    /// 対象エンティティのヒットテスト待ち（2 クリック目以降）。境界の形状は採取済み。
+    ///
+    /// 境界は「交点計算の相手」としてしか使わないので [`EntityId`] ではなく [`Shape`] の
+    /// スナップショットを持つ（半径寸法が中心・半径だけを写し取るのと同じ非関連方式）。
+    /// このため undo/redo で境界エンティティ自体が消えるとスナップショットが実体と
+    /// 食い違いうるが、app 層が undo/redo 後にツールを作り直して初期状態へ戻すことで
+    /// 古い境界を持ち越さないようにしている（`main.rs` の `after_history_change`）。
+    WaitingTarget { boundary: Shape },
+}
+
+/// [`BoundaryTargetTool`] が行う演算の種別。状態機械は完全に共通で、確定時に呼ぶ
+/// geom 関数と ASCII メッセージだけが異なる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrimExtendOp {
+    Trim,
+    Extend,
+}
+
+/// トリム・延長に共通の状態機械の実体。[`TrimTool`] / [`ExtendTool`] が薄く包む。
+#[derive(Debug)]
+struct BoundaryTargetTool {
+    op: TrimExtendOp,
+    state: BoundaryTargetState,
+    /// 直前の `Commit` が「元 1 件を削除して新規 2 件を追加する」トリムだったか。
+    /// [`Tool::take_commit_selection`] が消費し、適用後の選択集合を新規 2 件へ載せ替える。
+    select_new_entities: bool,
+}
+
+impl BoundaryTargetTool {
+    fn new(op: TrimExtendOp) -> Self {
+        Self {
+            op,
+            state: BoundaryTargetState::WaitingBoundary,
+            select_new_entities: false,
+        }
+    }
+
+    /// geom のエラーを ASCII のステータス文言へ対応付ける（geom は GUI 非依存で文言を
+    /// 持たないため。`OffsetError` の扱いと同じ）。
+    fn reject(self_op: TrimExtendOp, err: TrimExtendError) -> ToolResult {
+        ToolResult::Rejected(match (self_op, err) {
+            (TrimExtendOp::Trim, TrimExtendError::Unsupported) => {
+                "Trim: target must be a line or an arc"
+            }
+            (TrimExtendOp::Trim, TrimExtendError::NoIntersection) => {
+                "Trim: target does not cross the boundary"
+            }
+            (TrimExtendOp::Trim, TrimExtendError::Degenerate) => {
+                "Trim: ambiguous click, pick a point away from the intersections"
+            }
+            (TrimExtendOp::Extend, TrimExtendError::Unsupported) => {
+                "Extend: target must be a line or an arc"
+            }
+            (TrimExtendOp::Extend, TrimExtendError::NoIntersection) => {
+                "Extend: boundary is not reachable in that direction"
+            }
+            (TrimExtendOp::Extend, TrimExtendError::Degenerate) => {
+                "Extend: result would be degenerate"
+            }
+        })
+    }
+
+    /// 対象ピックを演算へ通し、確定コマンドまたは拒否を返す。状態は
+    /// `WaitingTarget { boundary }` のまま据え置く（成功・失敗どちらでも）。
+    fn apply_to_target(&mut self, boundary: &Shape, hit: ShapePick) -> ToolResult {
+        match self.op {
+            TrimExtendOp::Trim => match trim(&hit.shape, boundary, hit.click) {
+                Ok(result) => self.commit_trim(&hit, result.retained),
+                Err(err) => Self::reject(self.op, err),
+            },
+            TrimExtendOp::Extend => match extend(&hit.shape, boundary, hit.click) {
+                Ok(shape) => ToolResult::Commit(Command::ModifyEntity {
+                    id: hit.id,
+                    new_geom: EntityGeom::from(shape),
+                }),
+                Err(err) => Self::reject(self.op, err),
+            },
+        }
+    }
+
+    /// トリム結果の断片数で確定コマンドを分岐する（DESIGN.md M7 設計判断3a）。
+    fn commit_trim(&mut self, hit: &ShapePick, mut retained: Vec<Shape>) -> ToolResult {
+        match retained.len() {
+            // 1 断片: 「同じ物体が短くなっただけ」なので ID を維持する。
+            1 => ToolResult::Commit(Command::ModifyEntity {
+                id: hit.id,
+                new_geom: EntityGeom::from(retained.remove(0)),
+            }),
+            // 2 断片: 1 エンティティが 2 つへ分かれてトポロジが変わるので、分割
+            // （タスク33）と同じ「削除 + 追加 ×2」で表す。新規 2 件は元のレイヤー・
+            // スタイルを複製し、確定後の選択集合を新規 2 件へ載せ替える。
+            2 => {
+                let second = retained.remove(1);
+                let first = retained.remove(0);
+                self.select_new_entities = true;
+                ToolResult::Commit(Command::Batch(vec![
+                    Command::RemoveEntity(hit.id),
+                    Command::AddEntity(Entity::new(first, hit.layer, hit.style)),
+                    Command::AddEntity(Entity::new(second, hit.layer, hit.style)),
+                ]))
+            }
+            // 0 個・3 個以上は `TrimResult` の不変条件（1 か 2）に反する。geom 側が
+            // `Degenerate` で弾いている想定なので通常は到達しないが、コマンドを
+            // 作らず拒否する防御的分岐（設計判断3a）。
+            _ => ToolResult::Rejected("Trim: nothing left to keep"),
+        }
+    }
+
+    fn on_input(&mut self, ev: InputEvent) -> ToolResult {
+        match ev {
+            // Move はプレビューに使わない（ヒットテスト結果が無いと対象形状が分からず、
+            // `Move` は Document を持たないため。DESIGN.md M7 設計判断6 の
+            // 「ホバー中のライブプレビューは行わない」）。
+            InputEvent::Move(_) | InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Cancel => {
+                self.state = BoundaryTargetState::WaitingBoundary;
+                ToolResult::Cancel
+            }
+            // クリックは常にヒットテスト経路（`wants_shape_pick`）を通るのでここへは
+            // 来ない想定。来ても状態は変えない（`DimRadialTool` と同じ扱い）。
+            InputEvent::Click(_) => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+        // 選択済みの境界だけをハイライトして「今どちらを選んだか」を示す。カーソル追従の
+        // ライブプレビューは行わない（上記のとおり）。
+        if let BoundaryTargetState::WaitingTarget { boundary } = &self.state {
+            draw_shape(painter, rect, viewport, boundary, preview_stroke());
+        }
+    }
+
+    fn on_shape_pick(&mut self, hit: ShapePick) -> ToolResult {
+        match self.state.clone() {
+            BoundaryTargetState::WaitingBoundary => {
+                self.state = BoundaryTargetState::WaitingTarget {
+                    boundary: hit.shape,
+                };
+                ToolResult::Continue
+            }
+            BoundaryTargetState::WaitingTarget { boundary } => self.apply_to_target(&boundary, hit),
+        }
+    }
+
+    fn take_commit_selection(&mut self, new_ids: &NewIds) -> Option<Vec<EntityId>> {
+        if std::mem::take(&mut self.select_new_entities) {
+            Some(new_ids.entities.clone())
+        } else {
+            None
+        }
+    }
+
+    /// [`Tool::on_commit_failed`] の実体。2断片トリムがコマンド作成時に立てた
+    /// `select_new_entities` フラグを、`Document::apply` の失敗でクリアする
+    /// （そのままだと次に成功した無関係の確定の選択集合を誤って載せ替えてしまう）。
+    fn on_commit_failed(&mut self) {
+        self.select_new_entities = false;
+    }
+}
+
+/// トリムツール（`X`）。境界 → 対象の順にクリックし、**対象のクリックした側**を境界との
+/// 交点まで切り落とす（DESIGN.md M7 設計判断3・3a・6）。
+///
+/// 確定後も同じ境界のまま対象待ちに留まるので、境界を選び直さずに連続してトリムできる。
+/// 失敗（対象が Line/Arc 以外・交点なし・交点直上のクリック・レイヤーロック）は
+/// ステータスへ ASCII で理由を出し、`Document` は変更しない。
+#[derive(Debug)]
+pub struct TrimTool(BoundaryTargetTool);
+
+impl Default for TrimTool {
+    fn default() -> Self {
+        Self(BoundaryTargetTool::new(TrimExtendOp::Trim))
+    }
+}
+
+/// 延長ツール（`E`）。境界 → 対象の順にクリックし、**クリックに近い側の自由端**を境界まで
+/// 伸ばす（DESIGN.md M7 設計判断2・6）。状態機械はトリムと共通で、連続適用も同じ。
+#[derive(Debug)]
+pub struct ExtendTool(BoundaryTargetTool);
+
+impl Default for ExtendTool {
+    fn default() -> Self {
+        Self(BoundaryTargetTool::new(TrimExtendOp::Extend))
+    }
+}
+
+/// [`TrimTool`] / [`ExtendTool`] の [`Tool`] 実装は内側の共通状態機械へ丸ごと委譲する
+/// （2 ツールの違いは [`TrimExtendOp`] だけ）。
+macro_rules! impl_tool_for_boundary_target {
+    ($ty:ty) => {
+        impl Tool for $ty {
+            fn on_input(&mut self, _ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+                self.0.on_input(ev)
+            }
+
+            fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+                self.0.draw_preview(painter, rect, viewport);
+            }
+
+            fn wants_shape_pick(&self) -> bool {
+                true
+            }
+
+            fn on_shape_pick(&mut self, hit: ShapePick) -> ToolResult {
+                self.0.on_shape_pick(hit)
+            }
+
+            fn take_commit_selection(&mut self, new_ids: &NewIds) -> Option<Vec<EntityId>> {
+                self.0.take_commit_selection(new_ids)
+            }
+
+            fn on_commit_failed(&mut self) {
+                self.0.on_commit_failed();
+            }
+        }
+    };
+}
+
+impl_tool_for_boundary_target!(TrimTool);
+impl_tool_for_boundary_target!(ExtendTool);
+
+// ---------------------------------------------------------------------
+// フィレット（F）
+// ---------------------------------------------------------------------
+
+/// [`FilletTool`] の状態（DESIGN.md M7 設計判断6 のフィレットの項）。
+#[derive(Debug, Default, Clone, PartialEq)]
+enum FilletState {
+    /// 1 本目の線分のヒットテスト待ち。
+    #[default]
+    WaitingFirstLine,
+    /// 2 本目の線分のヒットテスト待ち。1 本目は採取済み。
+    ///
+    /// 1 本目は幾何（`line`）だけでなく [`ShapePick`] 全体を保持する: `id` は確定コマンド
+    /// （`ModifyEntity` の対象）と確定後の選択集合に、`click` は `fillet_lines` の `near_a`
+    /// （残したい側の指示）に、`layer`/`style` は新しい弧の継承元（設計判断4）に要るため。
+    /// 形状のスナップショットを抱えるので、undo/redo・ファイル操作の後は app 層が
+    /// ツールを作り直して初期状態へ戻す（[`crate::ToolKind::caches_picked_shapes`]）。
+    WaitingSecondLine { first: ShapePick, line: LineSeg },
+}
+
+/// フィレットツール（`F`）。2 本の線分を順にクリックし、半径入力欄の値で角を丸める
+/// （DESIGN.md M7 設計判断4・6）。
+///
+/// 1 本目・2 本目とも「フィレット後に**残したい側**」をクリックする（クリック点が
+/// `fillet_lines` の `near_a`/`near_b` になり、中心の分岐選択と残る側の両方を決める）。
+/// 確定は `Command::Batch([ModifyEntity(a), ModifyEntity(b), AddEntity(arc)])` の 1 発で、
+/// 3 つのうちどれか 1 つでも失敗（レイヤーロック等）すれば全体がロールバックされる。
+/// 新しい弧のレイヤー・スタイルは **1 本目**のものを継承する（設計判断4）。
+///
+/// 確定後は `WaitingFirstLine` へ戻る単発仕様（角ごとに半径が異なりうるため、トリム・延長の
+/// ような連続適用にはしない）。失敗は `Rejected` で状態を `WaitingSecondLine` に据え置き、
+/// 1 本目を選び直さずに 2 本目だけ試し直せるようにする。
+#[derive(Debug, Default)]
+pub struct FilletTool {
+    state: FilletState,
+    /// app 層の半径入力欄の解析値（[`Tool::set_radius_input`] が毎フレーム更新する）。
+    radius: Option<f64>,
+    /// 直前の `Commit` で変更した 2 本の ID。[`Tool::take_commit_selection`] が消費し、
+    /// 新規の弧（`NewIds.entities`）と合わせて確定後の選択集合にする。
+    committed_pair: Option<(EntityId, EntityId)>,
+    /// `apply_second_line` が確定コマンドを組み立てて `state` を `WaitingFirstLine` へ
+    /// 進めた際、直前の `WaitingSecondLine { first, line }` のスナップショットをここへ
+    /// 退避する。確定コマンドを作った時点では `Document::apply` が実際に成功するかは
+    /// まだ分からない（それは main.rs が後で行う）ため、[`Tool::on_commit_failed`] が
+    /// 呼ばれたらここから状態を巻き戻し、1本目を選び直さず2本目だけ試し直せるようにする
+    /// （DESIGN.md M7設計判断6）。`committed_pair` と対で `take`/クリアする。
+    pre_commit_state: Option<FilletState>,
+}
+
+impl FilletTool {
+    /// 対象が線分ならその [`LineSeg`] を返す。フィレットは線分同士のみ対応
+    /// （円弧×直線・円弧×円弧は M7 対象外。設計判断1）。
+    fn as_line(shape: &Shape) -> Option<LineSeg> {
+        match shape {
+            Shape::Line(seg) => Some(*seg),
+            _ => None,
+        }
+    }
+
+    /// geom のエラーを ASCII のステータス文言へ対応付ける（`TrimExtendError` と同じパターン）。
+    fn reject(err: FilletError) -> ToolResult {
+        ToolResult::Rejected(match err {
+            FilletError::Parallel => "Fillet: the two lines are parallel",
+            FilletError::NonPositiveRadius => "Fillet: radius must be a positive number",
+            FilletError::RadiusTooLarge => "Fillet: radius is too large for these lines",
+            FilletError::Degenerate => "Fillet: cannot fillet there, click away from the corner",
+        })
+    }
+
+    /// 2 本目のピックを受けて確定コマンドを組み立てる。成功時のみ状態を
+    /// `WaitingFirstLine` へ戻す（失敗時は据え置き）。
+    fn apply_second_line(&mut self, first: &ShapePick, a: LineSeg, hit: &ShapePick) -> ToolResult {
+        let Some(b) = Self::as_line(&hit.shape) else {
+            return ToolResult::Rejected("Fillet: second pick must be a line");
+        };
+        if hit.id == first.id {
+            return ToolResult::Rejected("Fillet: pick two different lines");
+        }
+        let Some(radius) = self.radius else {
+            return ToolResult::Rejected("Fillet: enter a radius");
+        };
+        let result = match fillet_lines(a, b, radius, first.click, hit.click) {
+            Ok(result) => result,
+            Err(err) => return Self::reject(err),
+        };
+
+        // 確定コマンドを作った時点ではまだ Document::apply の成否は分からないので、
+        // 巻き戻し用に直前の状態を退避してから WaitingFirstLine へ進める
+        // （`pre_commit_state` の doc / `Tool::on_commit_failed` 参照）。
+        self.pre_commit_state = Some(FilletState::WaitingSecondLine {
+            first: first.clone(),
+            line: a,
+        });
+        self.state = FilletState::WaitingFirstLine;
+        self.committed_pair = Some((first.id, hit.id));
+        ToolResult::Commit(Command::Batch(vec![
+            Command::ModifyEntity {
+                id: first.id,
+                new_geom: EntityGeom::from(Shape::Line(result.trimmed_a)),
+            },
+            Command::ModifyEntity {
+                id: hit.id,
+                new_geom: EntityGeom::from(Shape::Line(result.trimmed_b)),
+            },
+            // 新しい弧は 1 本目のレイヤー・スタイルを継承する（設計判断4）。
+            Command::AddEntity(Entity::new(
+                Shape::Arc(result.arc),
+                first.layer,
+                first.style,
+            )),
+        ]))
+    }
+}
+
+impl Tool for FilletTool {
+    fn on_input(&mut self, _ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            // トリム・延長と同じ理由でホバー中のライブプレビューは行わない
+            // （`Move` は Document を持たず、ヒットするまで対象形状が分からない）。
+            InputEvent::Move(_) | InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Cancel => {
+                self.state = FilletState::WaitingFirstLine;
+                ToolResult::Cancel
+            }
+            // クリックは常にヒットテスト経路（`wants_shape_pick`）を通るのでここへは
+            // 来ない想定。来ても状態は変えない。
+            InputEvent::Click(_) => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+        // 選んだ 1 本目だけをハイライトする（トリム・延長が境界を示すのと同じ流儀）。
+        if let FilletState::WaitingSecondLine { first, .. } = &self.state {
+            draw_shape(painter, rect, viewport, &first.shape, preview_stroke());
+        }
+    }
+
+    fn wants_shape_pick(&self) -> bool {
+        true
+    }
+
+    fn on_shape_pick(&mut self, hit: ShapePick) -> ToolResult {
+        match self.state.clone() {
+            FilletState::WaitingFirstLine => match Self::as_line(&hit.shape) {
+                Some(line) => {
+                    self.state = FilletState::WaitingSecondLine { first: hit, line };
+                    ToolResult::Continue
+                }
+                None => ToolResult::Rejected("Fillet: first pick must be a line"),
+            },
+            FilletState::WaitingSecondLine { first, line } => {
+                self.apply_second_line(&first, line, &hit)
+            }
+        }
+    }
+
+    fn take_commit_selection(&mut self, new_ids: &NewIds) -> Option<Vec<EntityId>> {
+        let (id_a, id_b) = self.committed_pair.take()?;
+        // 確定は成功したと確定したので、巻き戻し用スナップショットはもう不要。
+        self.pre_commit_state = None;
+        // 「変更された 2 本 + 新規の弧」の 3 件へ載せ替える（設計判断6）。弧の ID は
+        // 確定時点では分からず `Document::apply` の戻り値にしか無いのでここで足す。
+        let mut ids = vec![id_a, id_b];
+        ids.extend(new_ids.entities.iter().copied());
+        Some(ids)
+    }
+
+    fn set_radius_input(&mut self, radius: Option<f64>) {
+        self.radius = radius;
+    }
+
+    /// `Document::apply` の失敗を受けて後始末する。2本目のピック確定時にセットした
+    /// `committed_pair`（そのままだと次に成功した無関係の確定の選択集合を誤って
+    /// 「変更された2本 + 新規の弧」へ載せ替えてしまう）をクリアし、`apply_second_line`
+    /// が先取りで進めていた状態を `pre_commit_state` から `WaitingSecondLine` へ巻き戻す
+    /// （DESIGN.md M7設計判断6: 失敗時は1本目を選び直さず2本目だけ試し直せる）。
+    fn on_commit_failed(&mut self) {
+        self.committed_pair = None;
+        if let Some(previous) = self.pre_commit_state.take() {
+            self.state = previous;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 分割（B）
+// ---------------------------------------------------------------------
+
+/// 分割ツール（`B`）。クリックで対象エンティティをヒットテストし、
+/// `mcad_geom::closest_point` で対象上へ射影した点を分割点として 2 つに分ける
+/// （DESIGN.md M7 設計判断6 の分割の項）。
+///
+/// トリム・延長・フィレットと違い「境界」「1本目」のような非対称な役割を持つ対象が
+/// なく、状態は `WaitingTarget` 相当の単一状態のみ（`ShapePick` のスナップショットを
+/// 跨いで保持しないため専用の enum は持たない）。確定後もそのまま同じ状態に留まり、
+/// 続けて別のエンティティを分割できる。失敗（`SplitError::TooCloseToEndpoint`/
+/// `SplitError::Unsupported`）は `Rejected` とし、状態は据え置く（単一状態なので
+/// 実質何も変わらないが、他ツールと同じ「拒否時は確定せず据え置き」規約に合わせる）。
+#[derive(Debug, Default)]
+pub struct SplitTool {
+    /// 直前の `Commit` が新規 2 件への選択切替を要求したか。
+    /// [`Tool::take_commit_selection`] が消費し、次の確定へ持ち越さない。
+    committed: bool,
+}
+
+impl SplitTool {
+    /// geom のエラーを ASCII のステータス文言へ対応付ける（`TrimExtendError`/`FilletError`
+    /// と同じパターン）。
+    fn reject(err: SplitError) -> ToolResult {
+        ToolResult::Rejected(match err {
+            SplitError::TooCloseToEndpoint => "Split: too close to an endpoint",
+            SplitError::Unsupported => "Split: target must be a line, arc, or open polyline",
+        })
+    }
+}
+
+impl Tool for SplitTool {
+    fn on_input(&mut self, _ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            // トリム・延長・フィレットと同じ理由でホバー中のライブプレビューは行わない
+            // （`Move` は Document を持たず、ヒットするまで対象形状が分からない）。
+            InputEvent::Move(_) | InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Cancel => ToolResult::Cancel,
+            // クリックは常にヒットテスト経路（`wants_shape_pick`）を通るのでここへは
+            // 来ない想定。来ても状態は変えない。
+            InputEvent::Click(_) => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(&self, _painter: &Painter, _rect: Rect, _viewport: &Viewport) {
+        // 単一状態でハイライトすべき「選択済みの一部」が無いため、他ツールと違い
+        // プレビュー描画自体を持たない。
+    }
+
+    fn wants_shape_pick(&self) -> bool {
+        true
+    }
+
+    fn on_shape_pick(&mut self, hit: ShapePick) -> ToolResult {
+        let projected = closest_point(&hit.shape, hit.click);
+        match split(&hit.shape, projected) {
+            Ok((piece1, piece2)) => {
+                self.committed = true;
+                ToolResult::Commit(Command::Batch(vec![
+                    Command::RemoveEntity(hit.id),
+                    Command::AddEntity(Entity::new(piece1, hit.layer, hit.style)),
+                    Command::AddEntity(Entity::new(piece2, hit.layer, hit.style)),
+                ]))
+            }
+            Err(err) => Self::reject(err),
+        }
+    }
+
+    fn take_commit_selection(&mut self, new_ids: &NewIds) -> Option<Vec<EntityId>> {
+        if std::mem::take(&mut self.committed) {
+            Some(new_ids.entities.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 確定コマンド作成時にセットした `committed` フラグを、`Document::apply` の
+    /// 失敗でクリアする（そのままだと次に成功した無関係の確定の選択集合を誤って
+    /// 載せ替えてしまう）。
+    fn on_commit_failed(&mut self) {
+        self.committed = false;
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -4132,6 +4700,985 @@ mod tests {
             pick_shape_entity(&doc, Point2::new(0.5, 0.0), 0.1).is_none(),
             "非表示レイヤーのエンティティは拾わない"
         );
+    }
+
+    // --- トリム／延長ツール（M7 タスク31）---
+
+    /// `doc` へ `shape` を実際に追加して [`EntityId`] を発行し、その結果を
+    /// [`ShapePick`] として組み立てる（app 層のヒットテストが返すものと同じ形）。
+    /// 状態機械のテストは `Document` を経由せず、この `ShapePick` を直接ツールへ渡す。
+    fn shape_pick(doc: &mut Document, shape: Shape, click: Point2) -> ShapePick {
+        let layer = doc.current_layer();
+        let style = Style::inherited();
+        let id = doc
+            .apply(Command::AddEntity(Entity::new(shape.clone(), layer, style)))
+            .unwrap()
+            .entities[0];
+        ShapePick {
+            id,
+            shape,
+            click,
+            layer,
+            style,
+        }
+    }
+
+    fn hline(x0: f64, x1: f64, y: f64) -> Shape {
+        Shape::Line(LineSeg::new(Point2::new(x0, y), Point2::new(x1, y)))
+    }
+
+    fn vline(x: f64, y0: f64, y1: f64) -> Shape {
+        Shape::Line(LineSeg::new(Point2::new(x, y0), Point2::new(x, y1)))
+    }
+
+    fn line_of(shape: &Shape) -> LineSeg {
+        match shape {
+            Shape::Line(seg) => *seg,
+            other => panic!("expected a line, got {other:?}"),
+        }
+    }
+
+    fn modified_geom(result: &ToolResult, expect_id: EntityId) -> Shape {
+        match result {
+            ToolResult::Commit(Command::ModifyEntity { id, new_geom }) => {
+                assert_eq!(*id, expect_id, "ModifyEntity は対象 ID を維持する");
+                match new_geom {
+                    EntityGeom::Shape(shape) => shape.clone(),
+                    other => panic!("expected a Shape geom, got {other:?}"),
+                }
+            }
+            other => panic!("expected Commit(ModifyEntity), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trim_tool_two_stage_pick_commits_single_piece() {
+        // 境界 x=1 の縦線、対象 (0,0)-(2,0) の横線。交点は (1,0) の1点だけなので、
+        // 交点より右をクリックすると右半分が消え、残るのは1断片 → ID 維持の ModifyEntity。
+        let mut doc = Document::new();
+        let mut tool = TrimTool::default();
+        assert!(tool.wants_shape_pick());
+
+        let boundary = shape_pick(&mut doc, vline(1.0, -1.0, 1.0), Point2::new(1.0, 0.5));
+        assert_eq!(tool.on_shape_pick(boundary), ToolResult::Continue);
+        assert!(matches!(
+            tool.0.state,
+            BoundaryTargetState::WaitingTarget { .. }
+        ));
+
+        let target = shape_pick(&mut doc, hline(0.0, 2.0, 0.0), Point2::new(1.5, 0.0));
+        let target_id = target.id;
+        let result = tool.on_shape_pick(target);
+        let kept = line_of(&modified_geom(&result, target_id));
+        assert_eq!(kept.a, Point2::new(0.0, 0.0));
+        assert_eq!(kept.b, Point2::new(1.0, 0.0));
+        // 1断片トリムは選択集合を触らない。
+        assert_eq!(tool.take_commit_selection(&NewIds::default()), None);
+    }
+
+    #[test]
+    fn trim_tool_middle_click_splits_into_two_pieces() {
+        // 境界は中心 (1,0)・半径 0.5 の円、対象は (0,0)-(2,0)。交点は (0.5,0)・(1.5,0)。
+        // その中間をクリックすると両側に断片が残り、Batch(Remove + Add ×2) になる。
+        let mut doc = Document::new();
+        // 対象を既定と違うレイヤー・スタイルに置き、新規2件へ複製されることを検証する。
+        let other_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "other",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let style = Style {
+            color: Some(mcad_core::Rgb::new(1, 2, 3)),
+            ..Style::inherited()
+        };
+        let target_shape = hline(0.0, 2.0, 0.0);
+        let target_id = doc
+            .apply(Command::AddEntity(Entity::new(
+                target_shape.clone(),
+                other_layer,
+                style,
+            )))
+            .unwrap()
+            .entities[0];
+
+        let mut tool = TrimTool::default();
+        let boundary = shape_pick(
+            &mut doc,
+            Shape::Circle(mcad_geom::Circle::new(Point2::new(1.0, 0.0), 0.5)),
+            Point2::new(1.5, 0.0),
+        );
+        assert_eq!(tool.on_shape_pick(boundary), ToolResult::Continue);
+
+        let result = tool.on_shape_pick(ShapePick {
+            id: target_id,
+            shape: target_shape,
+            click: Point2::new(1.0, 0.0),
+            layer: other_layer,
+            style,
+        });
+        let ToolResult::Commit(Command::Batch(cmds)) = &result else {
+            panic!("expected Commit(Batch), got {result:?}");
+        };
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0], Command::RemoveEntity(target_id));
+        let mut added = Vec::new();
+        for cmd in &cmds[1..] {
+            let Command::AddEntity(entity) = cmd else {
+                panic!("expected AddEntity, got {cmd:?}");
+            };
+            // 新規2件は元エンティティのレイヤー・スタイルを複製する。
+            assert_eq!(entity.layer, other_layer);
+            assert_eq!(entity.style, style);
+            let EntityGeom::Shape(shape) = &entity.geom else {
+                panic!("expected a Shape geom");
+            };
+            added.push(line_of(shape));
+        }
+        assert_eq!(added[0].a, Point2::new(0.0, 0.0));
+        assert!((added[0].b.x - 0.5).abs() < 1e-9);
+        assert!((added[1].a.x - 1.5).abs() < 1e-9);
+        assert_eq!(added[1].b, Point2::new(2.0, 0.0));
+
+        // 2断片トリムは確定後の選択集合を新規2件へ載せ替える（1回だけ消費される）。
+        let new_ids = NewIds {
+            entities: vec![target_id],
+            ..NewIds::default()
+        };
+        assert_eq!(
+            tool.take_commit_selection(&new_ids),
+            Some(vec![target_id]),
+            "NewIds.entities をそのまま新選択にする"
+        );
+        assert_eq!(tool.take_commit_selection(&new_ids), None, "消費済み");
+    }
+
+    #[test]
+    fn trim_tool_stays_in_waiting_target_for_consecutive_trims() {
+        // 確定後も境界を保持したまま WaitingTarget に留まり、2本目を続けて切れる。
+        let mut doc = Document::new();
+        let mut tool = TrimTool::default();
+        let boundary_shape = vline(1.0, -5.0, 5.0);
+        let boundary = shape_pick(&mut doc, boundary_shape.clone(), Point2::new(1.0, 0.5));
+        tool.on_shape_pick(boundary);
+
+        let first = shape_pick(&mut doc, hline(0.0, 2.0, 0.0), Point2::new(1.5, 0.0));
+        let first_id = first.id;
+        let r1 = tool.on_shape_pick(first);
+        assert!(matches!(r1, ToolResult::Commit(_)));
+        assert_eq!(
+            tool.0.state,
+            BoundaryTargetState::WaitingTarget {
+                boundary: boundary_shape.clone()
+            },
+            "確定後も同じ境界のまま対象待ちに留まる"
+        );
+
+        let second = shape_pick(&mut doc, hline(0.0, 2.0, 1.0), Point2::new(1.5, 1.0));
+        let second_id = second.id;
+        let r2 = tool.on_shape_pick(second);
+        let kept = line_of(&modified_geom(&r2, second_id));
+        assert_eq!(kept.b, Point2::new(1.0, 1.0));
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            tool.0.state,
+            BoundaryTargetState::WaitingTarget {
+                boundary: boundary_shape
+            }
+        );
+    }
+
+    #[test]
+    fn trim_tool_rejects_unsupported_target_and_keeps_state() {
+        // 対象が Circle は geom が Unsupported。状態は WaitingTarget のまま据え置き。
+        let mut doc = Document::new();
+        let mut tool = TrimTool::default();
+        let boundary_shape = vline(1.0, -5.0, 5.0);
+        let boundary = shape_pick(&mut doc, boundary_shape.clone(), Point2::new(1.0, 0.5));
+        tool.on_shape_pick(boundary);
+
+        let target = shape_pick(
+            &mut doc,
+            Shape::Circle(mcad_geom::Circle::new(Point2::new(1.0, 0.0), 2.0)),
+            Point2::new(3.0, 0.0),
+        );
+        assert_eq!(
+            tool.on_shape_pick(target),
+            ToolResult::Rejected("Trim: target must be a line or an arc")
+        );
+        assert_eq!(
+            tool.0.state,
+            BoundaryTargetState::WaitingTarget {
+                boundary: boundary_shape
+            },
+            "拒否しても同じ境界のまま別対象を試せる"
+        );
+    }
+
+    #[test]
+    fn trim_tool_rejects_target_without_intersection() {
+        let mut doc = Document::new();
+        let mut tool = TrimTool::default();
+        let boundary = shape_pick(&mut doc, vline(1.0, -5.0, 5.0), Point2::new(1.0, 0.5));
+        tool.on_shape_pick(boundary);
+
+        // 境界（x=1 の縦線）と交わらない位置の横線。
+        let target = shape_pick(&mut doc, hline(5.0, 7.0, 0.0), Point2::new(6.0, 0.0));
+        assert_eq!(
+            tool.on_shape_pick(target),
+            ToolResult::Rejected("Trim: target does not cross the boundary")
+        );
+    }
+
+    #[test]
+    fn extend_tool_commits_modify_entity() {
+        // 境界 x=2 の縦線、対象 (0,0)-(1,0)。自由端 (1,0) 側をクリックして境界まで伸ばす。
+        let mut doc = Document::new();
+        let mut tool = ExtendTool::default();
+        assert!(tool.wants_shape_pick());
+
+        let boundary_shape = vline(2.0, -1.0, 1.0);
+        let boundary = shape_pick(&mut doc, boundary_shape.clone(), Point2::new(2.0, 0.5));
+        assert_eq!(tool.on_shape_pick(boundary), ToolResult::Continue);
+
+        let target = shape_pick(&mut doc, hline(0.0, 1.0, 0.0), Point2::new(0.95, 0.0));
+        let target_id = target.id;
+        let result = tool.on_shape_pick(target);
+        let extended = line_of(&modified_geom(&result, target_id));
+        assert_eq!(extended.a, Point2::new(0.0, 0.0));
+        assert!((extended.b.x - 2.0).abs() < 1e-9);
+        assert!((extended.b.y).abs() < 1e-9);
+        // 延長は分裂しないので選択集合は触らない。
+        assert_eq!(tool.take_commit_selection(&NewIds::default()), None);
+        // 確定後も同じ境界のまま連続適用できる。
+        assert_eq!(
+            tool.0.state,
+            BoundaryTargetState::WaitingTarget {
+                boundary: boundary_shape
+            }
+        );
+    }
+
+    #[test]
+    fn extend_tool_rejects_unreachable_boundary_and_keeps_state() {
+        // 自由端を境界と反対側に選ぶと延長方向に交点が無い。
+        let mut doc = Document::new();
+        let mut tool = ExtendTool::default();
+        let boundary_shape = vline(2.0, -1.0, 1.0);
+        let boundary = shape_pick(&mut doc, boundary_shape.clone(), Point2::new(2.0, 0.5));
+        tool.on_shape_pick(boundary);
+
+        let target = shape_pick(&mut doc, hline(0.0, 1.0, 0.0), Point2::new(0.05, 0.0));
+        assert_eq!(
+            tool.on_shape_pick(target),
+            ToolResult::Rejected("Extend: boundary is not reachable in that direction")
+        );
+        assert_eq!(
+            tool.0.state,
+            BoundaryTargetState::WaitingTarget {
+                boundary: boundary_shape
+            }
+        );
+    }
+
+    #[test]
+    fn trim_and_extend_tools_reset_on_escape() {
+        // Esc は Cancel を返し（app 層が Select へ戻す）、内部状態も初期化する。
+        let (mut doc, ctx) = ctx();
+        for tool in [
+            &mut TrimTool::default() as &mut dyn Tool,
+            &mut ExtendTool::default() as &mut dyn Tool,
+        ] {
+            let boundary = shape_pick(&mut doc, vline(1.0, -1.0, 1.0), Point2::new(1.0, 0.5));
+            assert_eq!(tool.on_shape_pick(boundary), ToolResult::Continue);
+            assert_eq!(
+                tool.on_input(&ctx, InputEvent::Cancel),
+                ToolResult::Cancel,
+                "Esc は Cancel（app 層が Select へ戻す）"
+            );
+            // 初期状態へ戻っているので、次のピックは再び境界の採取になる。
+            let again = shape_pick(&mut doc, vline(3.0, -1.0, 1.0), Point2::new(3.0, 0.5));
+            assert_eq!(tool.on_shape_pick(again), ToolResult::Continue);
+        }
+    }
+
+    #[test]
+    fn trim_tool_click_event_does_not_advance_state() {
+        // クリックは常に app 層のヒットテスト経路を通る。素の Click が漏れてきても
+        // 状態を進めない（DimRadialTool と同じ扱い）。
+        let (_doc, ctx) = ctx();
+        let mut tool = TrimTool::default();
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0))),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.0.state, BoundaryTargetState::WaitingBoundary);
+    }
+
+    #[test]
+    fn trim_two_piece_batch_rolls_back_on_locked_layer() {
+        // 2断片トリムの Batch は原子的。対象がロックレイヤー上なら削除も追加も起きない。
+        let mut doc = Document::new();
+        let locked_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "locked",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let target_shape = hline(0.0, 2.0, 0.0);
+        let target_id = doc
+            .apply(Command::AddEntity(Entity::new(
+                target_shape.clone(),
+                locked_layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut props = doc.layer(locked_layer).unwrap().clone();
+        props.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: locked_layer,
+            props,
+        })
+        .unwrap();
+
+        let entities_before = doc.entities().count();
+        let geom_before = doc.entity(target_id).unwrap().geom.clone();
+
+        let mut tool = TrimTool::default();
+        let boundary = shape_pick(
+            &mut doc,
+            Shape::Circle(mcad_geom::Circle::new(Point2::new(1.0, 0.0), 0.5)),
+            Point2::new(1.5, 0.0),
+        );
+        tool.on_shape_pick(boundary);
+        let result = tool.on_shape_pick(ShapePick {
+            id: target_id,
+            shape: target_shape,
+            click: Point2::new(1.0, 0.0),
+            layer: locked_layer,
+            style: Style::inherited(),
+        });
+        let ToolResult::Commit(cmd) = result else {
+            panic!("expected Commit");
+        };
+        // 境界の追加でエンティティが1本増えている分を差し引いて比較する。
+        let entities_after_boundary = doc.entities().count();
+        assert_eq!(entities_after_boundary, entities_before + 1);
+
+        assert!(doc.apply(cmd).is_err(), "ロックレイヤーなので失敗する");
+        assert_eq!(doc.entities().count(), entities_after_boundary);
+        assert_eq!(doc.entity(target_id).unwrap().geom, geom_before);
+    }
+
+    // --- フィレットツール（M7 タスク32）---
+
+    /// 直角コーナー用の 2 本。a = (0,0)-(10,0)、b = (0,0)-(0,10)。半径 2 なら
+    /// 接点は (2,0)・(0,2)、中心は (2,2)。`near_a`/`near_b` はコーナーから遠い側
+    /// （＝残したい側）を指す。
+    fn corner_pair(doc: &mut Document) -> (ShapePick, ShapePick) {
+        let a = shape_pick(doc, hline(0.0, 10.0, 0.0), Point2::new(8.0, 0.0));
+        let b = shape_pick(doc, vline(0.0, 0.0, 10.0), Point2::new(0.0, 8.0));
+        (a, b)
+    }
+
+    /// フィレット確定の `Batch` を分解し、(trimmed_a, trimmed_b, 弧のエンティティ) を返す。
+    fn fillet_commit(
+        result: &ToolResult,
+        expect_a: EntityId,
+        expect_b: EntityId,
+    ) -> (LineSeg, LineSeg, Entity) {
+        let ToolResult::Commit(Command::Batch(cmds)) = result else {
+            panic!("expected Commit(Batch), got {result:?}");
+        };
+        assert_eq!(cmds.len(), 3, "ModifyEntity ×2 + AddEntity ×1");
+        let mut trimmed = Vec::new();
+        for (cmd, expect_id) in cmds[..2].iter().zip([expect_a, expect_b]) {
+            let Command::ModifyEntity { id, new_geom } = cmd else {
+                panic!("expected ModifyEntity, got {cmd:?}");
+            };
+            assert_eq!(*id, expect_id, "ModifyEntity は対象 ID を維持する");
+            let EntityGeom::Shape(shape) = new_geom else {
+                panic!("expected a Shape geom");
+            };
+            trimmed.push(line_of(shape));
+        }
+        let Command::AddEntity(entity) = &cmds[2] else {
+            panic!("expected AddEntity, got {:?}", cmds[2]);
+        };
+        (trimmed[0], trimmed[1], entity.clone())
+    }
+
+    #[test]
+    fn fillet_tool_commits_batch_and_inherits_first_line_layer_style() {
+        let mut doc = Document::new();
+        // 1 本目を既定と違うレイヤー・スタイルに置き、弧がそちらを継承することを検証する
+        // （設計判断4: 弧は「1 本目にクリックした線分」のレイヤー・スタイルを継承）。
+        let layer_a = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "a",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let style_a = Style {
+            color: Some(mcad_core::Rgb::new(1, 2, 3)),
+            ..Style::inherited()
+        };
+        let id_a = doc
+            .apply(Command::AddEntity(Entity::new(
+                hline(0.0, 10.0, 0.0),
+                layer_a,
+                style_a,
+            )))
+            .unwrap()
+            .entities[0];
+        let pick_a = ShapePick {
+            id: id_a,
+            shape: hline(0.0, 10.0, 0.0),
+            click: Point2::new(8.0, 0.0),
+            layer: layer_a,
+            style: style_a,
+        };
+        // 2 本目は既定レイヤー・スタイル（継承元にならないことの確認用）。
+        let pick_b = shape_pick(&mut doc, vline(0.0, 0.0, 10.0), Point2::new(0.0, 8.0));
+        let id_b = pick_b.id;
+
+        let mut tool = FilletTool::default();
+        assert!(tool.wants_shape_pick());
+        tool.set_radius_input(Some(2.0));
+
+        assert_eq!(tool.on_shape_pick(pick_a), ToolResult::Continue);
+        let result = tool.on_shape_pick(pick_b);
+        let (trimmed_a, trimmed_b, arc_entity) = fillet_commit(&result, id_a, id_b);
+
+        // 接点 (2,0)・(0,2) までトリムされ、クリックした側（遠い端）が残る。
+        assert!((trimmed_a.a.x - 2.0).abs() < 1e-9 && trimmed_a.a.y.abs() < 1e-9);
+        assert_eq!(trimmed_a.b, Point2::new(10.0, 0.0));
+        assert!((trimmed_b.a.y - 2.0).abs() < 1e-9 && trimmed_b.a.x.abs() < 1e-9);
+        assert_eq!(trimmed_b.b, Point2::new(0.0, 10.0));
+
+        // 弧は中心 (2,2)・半径 2 で、1 本目のレイヤー・スタイルを継承する。
+        assert_eq!(arc_entity.layer, layer_a, "弧のレイヤーは 1 本目由来");
+        assert_eq!(arc_entity.style, style_a, "弧のスタイルは 1 本目由来");
+        let EntityGeom::Shape(Shape::Arc(arc)) = &arc_entity.geom else {
+            panic!("expected an Arc geom, got {:?}", arc_entity.geom);
+        };
+        assert!((arc.center - Point2::new(2.0, 2.0)).length() < 1e-9);
+        assert!((arc.radius - 2.0).abs() < 1e-9);
+
+        // 確定後の選択集合は「変更した 2 本 + 新規の弧」の 3 件（設計判断6）。
+        let arc_id = doc
+            .apply(Command::AddEntity(Entity::new(
+                hline(50.0, 51.0, 0.0),
+                layer_a,
+                style_a,
+            )))
+            .unwrap()
+            .entities[0];
+        let new_ids = NewIds {
+            entities: vec![arc_id],
+            ..NewIds::default()
+        };
+        assert_eq!(
+            tool.take_commit_selection(&new_ids),
+            Some(vec![id_a, id_b, arc_id])
+        );
+        assert_eq!(tool.take_commit_selection(&new_ids), None, "消費済み");
+    }
+
+    #[test]
+    fn fillet_tool_returns_to_waiting_first_line_after_commit() {
+        // 単発仕様: 確定後は 1 本目待ちへ戻る（トリムのような連続適用はしない）。
+        let mut doc = Document::new();
+        let (a, b) = corner_pair(&mut doc);
+        let mut tool = FilletTool::default();
+        tool.set_radius_input(Some(2.0));
+        tool.on_shape_pick(a);
+        assert!(matches!(tool.state, FilletState::WaitingSecondLine { .. }));
+        assert!(matches!(tool.on_shape_pick(b), ToolResult::Commit(_)));
+        assert_eq!(tool.state, FilletState::WaitingFirstLine);
+    }
+
+    #[test]
+    fn fillet_tool_rejects_missing_or_invalid_radius_and_keeps_state() {
+        let mut doc = Document::new();
+        let (a, b) = corner_pair(&mut doc);
+        let mut tool = FilletTool::default();
+        // 半径未入力（欄が空・不正値のとき app 層は None を渡す）。
+        tool.set_radius_input(None);
+        tool.on_shape_pick(a.clone());
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(b.clone()),
+            ToolResult::Rejected("Fillet: enter a radius")
+        );
+        assert_eq!(tool.state, before, "1 本目を保持して 2 本目だけ選び直せる");
+        // 拒否は選択集合も触らない。
+        assert_eq!(tool.take_commit_selection(&NewIds::default()), None);
+
+        // 半径を入れ直せば同じ 2 本目のピックで確定できる。
+        tool.set_radius_input(Some(2.0));
+        assert!(matches!(tool.on_shape_pick(b), ToolResult::Commit(_)));
+    }
+
+    #[test]
+    fn fillet_tool_rejects_non_line_picks() {
+        let mut doc = Document::new();
+        let mut tool = FilletTool::default();
+        tool.set_radius_input(Some(2.0));
+
+        // 1 本目が円 → 拒否。状態は 1 本目待ちのまま。
+        let circle = shape_pick(
+            &mut doc,
+            Shape::Circle(mcad_geom::Circle::new(Point2::new(20.0, 20.0), 3.0)),
+            Point2::new(23.0, 20.0),
+        );
+        assert_eq!(
+            tool.on_shape_pick(circle.clone()),
+            ToolResult::Rejected("Fillet: first pick must be a line")
+        );
+        assert_eq!(tool.state, FilletState::WaitingFirstLine);
+
+        // 2 本目が円 → 拒否。1 本目は保持したまま。
+        let (a, _) = corner_pair(&mut doc);
+        tool.on_shape_pick(a);
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(circle),
+            ToolResult::Rejected("Fillet: second pick must be a line")
+        );
+        assert_eq!(tool.state, before);
+    }
+
+    #[test]
+    fn fillet_tool_rejects_same_entity_twice() {
+        // 同じ線分同士のフィレットは無意味なので拒否する（状態は据え置き）。
+        let mut doc = Document::new();
+        let (a, _) = corner_pair(&mut doc);
+        let mut tool = FilletTool::default();
+        tool.set_radius_input(Some(2.0));
+        tool.on_shape_pick(a.clone());
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(a),
+            ToolResult::Rejected("Fillet: pick two different lines")
+        );
+        assert_eq!(tool.state, before);
+    }
+
+    #[test]
+    fn fillet_tool_maps_geom_errors_and_keeps_state() {
+        let mut doc = Document::new();
+
+        // 平行な 2 本。
+        let mut tool = FilletTool::default();
+        tool.set_radius_input(Some(1.0));
+        let a = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(5.0, 0.0));
+        let parallel = shape_pick(&mut doc, hline(0.0, 10.0, 5.0), Point2::new(5.0, 5.0));
+        tool.on_shape_pick(a);
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(parallel),
+            ToolResult::Rejected("Fillet: the two lines are parallel")
+        );
+        assert_eq!(tool.state, before);
+
+        // 半径が線分長に対して過大（接点が線分の外へ出る）。
+        let mut tool = FilletTool::default();
+        tool.set_radius_input(Some(100.0));
+        let (a, b) = corner_pair(&mut doc);
+        tool.on_shape_pick(a);
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(b),
+            ToolResult::Rejected("Fillet: radius is too large for these lines")
+        );
+        assert_eq!(tool.state, before);
+    }
+
+    #[test]
+    fn fillet_tool_resets_on_escape_and_tool_switch() {
+        let (mut doc, ctx) = ctx();
+        let mut tool = FilletTool::default();
+        tool.set_radius_input(Some(2.0));
+        let (a, b) = corner_pair(&mut doc);
+        assert_eq!(tool.on_shape_pick(a), ToolResult::Continue);
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Cancel),
+            ToolResult::Cancel,
+            "Esc は Cancel（app 層が Select へ戻す）"
+        );
+        assert_eq!(tool.state, FilletState::WaitingFirstLine);
+        // 初期状態へ戻っているので、次のピックは再び 1 本目の採取になる。
+        assert_eq!(tool.on_shape_pick(b), ToolResult::Continue);
+
+        // ツール切替は app 層が `ToolKind::spawn()` で作り直す（＝Default 相当）。
+        // `caches_picked_shapes` に Fillet が含まれるので undo/redo・ファイル操作でも同じ。
+        let fresh = FilletTool::default();
+        assert_eq!(fresh.state, FilletState::WaitingFirstLine);
+        assert_eq!(fresh.radius, None);
+    }
+
+    #[test]
+    fn fillet_tool_click_event_does_not_advance_state() {
+        // クリックは常に app 層のヒットテスト経路を通る。素の Click が漏れてきても
+        // 状態を進めない（トリム・延長と同じ扱い）。
+        let (_doc, ctx) = ctx();
+        let mut tool = FilletTool::default();
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0))),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.state, FilletState::WaitingFirstLine);
+    }
+
+    #[test]
+    fn fillet_batch_rolls_back_on_locked_layer() {
+        // Batch は原子的: 1 本目のレイヤーがロックされていれば、2 本目の変更も弧の追加も
+        // 起きず Document は一切変化しない（設計判断5・8）。
+        let mut doc = Document::new();
+        let locked_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "locked",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let shape_a = hline(0.0, 10.0, 0.0);
+        let id_a = doc
+            .apply(Command::AddEntity(Entity::new(
+                shape_a.clone(),
+                locked_layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut props = doc.layer(locked_layer).unwrap().clone();
+        props.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: locked_layer,
+            props,
+        })
+        .unwrap();
+        // 2 本目はロックされていないレイヤー（部分適用が起きないことを見るため）。
+        let pick_b = shape_pick(&mut doc, vline(0.0, 0.0, 10.0), Point2::new(0.0, 8.0));
+        let id_b = pick_b.id;
+
+        let mut tool = FilletTool::default();
+        tool.set_radius_input(Some(2.0));
+        tool.on_shape_pick(ShapePick {
+            id: id_a,
+            shape: shape_a,
+            click: Point2::new(8.0, 0.0),
+            layer: locked_layer,
+            style: Style::inherited(),
+        });
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(pick_b) else {
+            panic!("expected Commit");
+        };
+
+        let count_before = doc.entities().count();
+        let geom_a_before = doc.entity(id_a).unwrap().geom.clone();
+        let geom_b_before = doc.entity(id_b).unwrap().geom.clone();
+        assert!(doc.apply(cmd).is_err(), "ロックレイヤーなので失敗する");
+        assert_eq!(doc.entities().count(), count_before, "弧は追加されない");
+        assert_eq!(doc.entity(id_a).unwrap().geom, geom_a_before);
+        assert_eq!(doc.entity(id_b).unwrap().geom, geom_b_before);
+    }
+
+    // --- 分割ツール（M7 タスク33）---
+
+    fn as_line_shape(shape: &Shape) -> LineSeg {
+        line_of(shape)
+    }
+
+    #[test]
+    fn split_tool_line_midpoint_commits_batch_with_same_layer_and_style() {
+        let mut doc = Document::new();
+        let other_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "other",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let style = Style {
+            color: Some(mcad_core::Rgb::new(1, 2, 3)),
+            ..Style::inherited()
+        };
+        let target_shape = hline(0.0, 10.0, 0.0);
+        let target_id = doc
+            .apply(Command::AddEntity(Entity::new(
+                target_shape.clone(),
+                other_layer,
+                style,
+            )))
+            .unwrap()
+            .entities[0];
+
+        let mut tool = SplitTool::default();
+        assert!(tool.wants_shape_pick());
+        let result = tool.on_shape_pick(ShapePick {
+            id: target_id,
+            shape: target_shape,
+            click: Point2::new(5.0, 0.0),
+            layer: other_layer,
+            style,
+        });
+        let ToolResult::Commit(Command::Batch(cmds)) = result else {
+            panic!("expected Commit(Batch), got {result:?}");
+        };
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0], Command::RemoveEntity(target_id));
+        for cmd in &cmds[1..] {
+            let Command::AddEntity(entity) = cmd else {
+                panic!("expected AddEntity, got {cmd:?}");
+            };
+            assert_eq!(entity.layer, other_layer);
+            assert_eq!(entity.style, style);
+        }
+        let EntityGeom::Shape(Shape::Line(l1)) = &cmds_entity(&cmds[1]).geom else {
+            panic!("expected a line");
+        };
+        let EntityGeom::Shape(Shape::Line(l2)) = &cmds_entity(&cmds[2]).geom else {
+            panic!("expected a line");
+        };
+        assert_eq!(l1.a, Point2::new(0.0, 0.0));
+        assert_eq!(l1.b, Point2::new(5.0, 0.0));
+        assert_eq!(l2.a, Point2::new(5.0, 0.0));
+        assert_eq!(l2.b, Point2::new(10.0, 0.0));
+    }
+
+    fn cmds_entity(cmd: &Command) -> &Entity {
+        match cmd {
+            Command::AddEntity(entity) => entity,
+            other => panic!("expected AddEntity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_tool_take_commit_selection_returns_new_pair_once() {
+        let mut doc = Document::new();
+        let target = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(5.0, 0.0));
+        let mut tool = SplitTool::default();
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(target) else {
+            panic!("expected Commit(Batch)");
+        };
+        let new_ids = doc.apply(cmd).expect("split batch applies cleanly");
+        assert_eq!(new_ids.entities.len(), 2);
+        assert_eq!(
+            tool.take_commit_selection(&new_ids),
+            Some(new_ids.entities.clone())
+        );
+        // 1回消費したら次は None。
+        assert_eq!(tool.take_commit_selection(&new_ids), None);
+    }
+
+    #[test]
+    fn split_tool_arc_midpoint_commits() {
+        let mut doc = Document::new();
+        let arc = Shape::Arc(Arc::new(Point2::ORIGIN, 5.0, 0.0, std::f64::consts::PI));
+        let id = doc
+            .apply(Command::AddEntity(Entity::new(
+                arc.clone(),
+                doc.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SplitTool::default();
+        let result = tool.on_shape_pick(ShapePick {
+            id,
+            shape: arc,
+            click: Point2::new(0.0, 5.0),
+            layer: doc.current_layer(),
+            style: Style::inherited(),
+        });
+        assert!(matches!(result, ToolResult::Commit(Command::Batch(_))));
+    }
+
+    #[test]
+    fn split_tool_open_polyline_commits() {
+        let mut doc = Document::new();
+        let pl = Shape::Polyline(Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+                Point2::new(10.0, 10.0),
+            ],
+            false,
+        ));
+        let id = doc
+            .apply(Command::AddEntity(Entity::new(
+                pl.clone(),
+                doc.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SplitTool::default();
+        let result = tool.on_shape_pick(ShapePick {
+            id,
+            shape: pl,
+            click: Point2::new(5.0, 0.0),
+            layer: doc.current_layer(),
+            style: Style::inherited(),
+        });
+        assert!(matches!(result, ToolResult::Commit(Command::Batch(_))));
+    }
+
+    #[test]
+    fn split_tool_near_endpoint_rejected_and_state_unchanged() {
+        let mut doc = Document::new();
+        let target = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(0.0, 0.0));
+        let mut tool = SplitTool::default();
+        let result = tool.on_shape_pick(target);
+        assert_eq!(
+            result,
+            ToolResult::Rejected("Split: too close to an endpoint")
+        );
+        // 単一状態なので「据え置き」は次のピックが通常どおり処理できることで確認する。
+        let retry = shape_pick(&mut doc, hline(0.0, 10.0, 20.0), Point2::new(5.0, 20.0));
+        assert!(matches!(
+            tool.on_shape_pick(retry),
+            ToolResult::Commit(Command::Batch(_))
+        ));
+    }
+
+    #[test]
+    fn split_tool_circle_rejected_unsupported() {
+        let mut doc = Document::new();
+        let circle_id = add_circle(&mut doc, Point2::ORIGIN, 5.0);
+        let mut tool = SplitTool::default();
+        let result = tool.on_shape_pick(ShapePick {
+            id: circle_id,
+            shape: Shape::Circle(mcad_geom::Circle::new(Point2::ORIGIN, 5.0)),
+            click: Point2::new(5.0, 0.0),
+            layer: doc.current_layer(),
+            style: Style::inherited(),
+        });
+        assert_eq!(
+            result,
+            ToolResult::Rejected("Split: target must be a line, arc, or open polyline")
+        );
+    }
+
+    #[test]
+    fn split_tool_closed_polyline_rejected_unsupported() {
+        let mut doc = Document::new();
+        let pl = Shape::Polyline(Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+                Point2::new(5.0, 10.0),
+            ],
+            true,
+        ));
+        let id = doc
+            .apply(Command::AddEntity(Entity::new(
+                pl.clone(),
+                doc.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SplitTool::default();
+        let result = tool.on_shape_pick(ShapePick {
+            id,
+            shape: pl,
+            click: Point2::new(5.0, 0.0),
+            layer: doc.current_layer(),
+            style: Style::inherited(),
+        });
+        assert_eq!(
+            result,
+            ToolResult::Rejected("Split: target must be a line, arc, or open polyline")
+        );
+    }
+
+    #[test]
+    fn split_tool_projects_off_shape_click_onto_closest_point() {
+        // クリック点が線分から少しずれていても closest_point で射影されて
+        // 正しい位置 (5,0) で分割される。
+        let mut doc = Document::new();
+        let target = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(5.0, 3.0));
+        let target_shape = target.shape.clone();
+        let mut tool = SplitTool::default();
+        let result = tool.on_shape_pick(target);
+        let ToolResult::Commit(Command::Batch(cmds)) = result else {
+            panic!("expected Commit(Batch), got {result:?}");
+        };
+        let l1 = as_line_shape(match &cmds[1] {
+            Command::AddEntity(e) => match &e.geom {
+                EntityGeom::Shape(s) => s,
+                _ => panic!("expected shape"),
+            },
+            _ => panic!("expected AddEntity"),
+        });
+        assert_eq!(l1.a, line_of(&target_shape).a);
+        assert_eq!(l1.b, Point2::new(5.0, 0.0));
+    }
+
+    #[test]
+    fn split_tool_cancel_resets_and_click_event_does_not_advance() {
+        let (_doc, ctx) = ctx();
+        let mut tool = SplitTool::default();
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0))),
+            ToolResult::Continue,
+            "クリックは常にヒットテスト経路を通るので on_input には来ない想定"
+        );
+    }
+
+    #[test]
+    fn split_batch_rolls_back_on_locked_layer() {
+        // Batch は原子的: 対象レイヤーがロックされていれば削除も追加も起きない。
+        let mut doc = Document::new();
+        let locked_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "locked",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let target_shape = hline(0.0, 10.0, 0.0);
+        let target_id = doc
+            .apply(Command::AddEntity(Entity::new(
+                target_shape.clone(),
+                locked_layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut props = doc.layer(locked_layer).unwrap().clone();
+        props.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: locked_layer,
+            props,
+        })
+        .unwrap();
+
+        let entities_before = doc.entities().count();
+        let geom_before = doc.entity(target_id).unwrap().geom.clone();
+
+        let mut tool = SplitTool::default();
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(ShapePick {
+            id: target_id,
+            shape: target_shape,
+            click: Point2::new(5.0, 0.0),
+            layer: locked_layer,
+            style: Style::inherited(),
+        }) else {
+            panic!("expected Commit");
+        };
+
+        assert!(doc.apply(cmd).is_err(), "ロックレイヤーなので失敗する");
+        assert_eq!(doc.entities().count(), entities_before);
+        assert_eq!(doc.entity(target_id).unwrap().geom, geom_before);
     }
 
     // --- 寸法の選択（pick 経由）---

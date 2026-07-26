@@ -25,9 +25,9 @@ use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use tool::{
-    ArcTool, CircleTool, DimLinearTool, DimRadialTool, DragPreview, InputEvent, LineTool,
-    OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolylineTool,
-    SelectTool, TextTool, Tool, ToolCtx, ToolResult,
+    ArcTool, CircleTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool, FilletTool,
+    InputEvent, LineTool, OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview,
+    PointTool, PolylineTool, SelectTool, SplitTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool,
 };
 use viewport::Viewport;
 
@@ -200,6 +200,10 @@ enum ToolKind {
     Text,
     DimLinear,
     DimRadial,
+    Trim,
+    Extend,
+    Fillet,
+    Split,
 }
 
 impl ToolKind {
@@ -217,7 +221,41 @@ impl ToolKind {
             ToolKind::Text => Some(Box::new(TextTool::default())),
             ToolKind::DimLinear => Some(Box::new(DimLinearTool::default())),
             ToolKind::DimRadial => Some(Box::new(DimRadialTool::default())),
+            ToolKind::Trim => Some(Box::new(TrimTool::default())),
+            ToolKind::Extend => Some(Box::new(ExtendTool::default())),
+            ToolKind::Fillet => Some(Box::new(FilletTool::default())),
+            ToolKind::Split => Some(Box::new(SplitTool::default())),
         }
+    }
+
+    /// このツールが既存エンティティのヒットテスト結果（境界・フィレット1本目など）を
+    /// スナップショットとして抱え込むか。抱え込むツールは undo/redo・ファイル操作の後で
+    /// 作り直し、消えたエンティティの形状を持ち越さないようにする
+    /// （DESIGN.md M7 設計判断6 の共通規約）。
+    ///
+    /// `Split` は含まない: `SplitTool` は `ShapePick` を状態として跨いで保持しない
+    /// （単一状態で、ヒットした形状は `on_shape_pick` の引数から確定コマンドを作るその場で
+    /// しか使わない）ため、undo/redo・ファイル操作をまたいで持ち越される古いスナップショットが
+    /// 存在しない。
+    fn caches_picked_shapes(self) -> bool {
+        matches!(self, ToolKind::Trim | ToolKind::Extend | ToolKind::Fillet)
+    }
+
+    /// `Document::apply` が失敗した（レイヤーロック等）ときも、このツールをそのまま
+    /// （`spawn()` で作り直さず）使い続けるか。
+    ///
+    /// M7 の4ツール（トリム・延長・フィレット・分割）はDESIGN.md M7設計判断6が「失敗時は
+    /// 状態据え置きで、同じ境界のまま別対象を試せる／1本目は選び直さず2本目だけ選び直せる」
+    /// という再挑戦フローを規定している。他ツールと同じ「失敗時は spawn() で作り直す」を
+    /// 適用すると、`TrimTool`/`ExtendTool` の `WaitingTarget { boundary }` や `FilletTool` の
+    /// `WaitingSecondLine` が失われ、この規約が崩れる（Codex adversarial review
+    /// 2026-07-26 指摘）。作り直さない代わりに、選択集合の載せ替えフラグを次の確定へ
+    /// 誤って持ち越さないよう [`Tool::on_commit_failed`] でクリアする必要がある。
+    fn keeps_state_on_commit_failure(self) -> bool {
+        matches!(
+            self,
+            ToolKind::Trim | ToolKind::Extend | ToolKind::Fillet | ToolKind::Split
+        )
     }
 
     /// ステータス表示用のラベル。
@@ -232,6 +270,10 @@ impl ToolKind {
             ToolKind::Text => "Text",
             ToolKind::DimLinear => "Linear Dim",
             ToolKind::DimRadial => "Radial Dim",
+            ToolKind::Trim => "Trim",
+            ToolKind::Extend => "Extend",
+            ToolKind::Fillet => "Fillet",
+            ToolKind::Split => "Split",
         }
     }
 }
@@ -295,6 +337,13 @@ struct McadApp {
     /// 文字列自体はセッション中保持し、`O` 再押下での等間隔連続オフセットに使い回せる
     /// （新規・読込では [`McadApp::reset_transient_ui_state`] でクリア）。
     offset_distance_input: String,
+    /// フィレット半径入力欄の文字列（M7 タスク32、設計判断6）。オフセット距離欄と同じ
+    /// 「正の有限値のみ受理」規則（[`parse_fillet_radius`]）で、空欄・不正値のままフィレットを
+    /// 確定しようとすると ASCII の理由付きで拒否される（通過点方式のようなフォールバックは
+    /// 半径には存在しないため）。欄はフィレットツール中のみ上部パネルへ表示するが、文字列
+    /// 自体はセッション中保持し、同じ半径での連続フィレットに使い回せる（新規・読込では
+    /// [`McadApp::reset_transient_ui_state`] でクリア）。
+    fillet_radius_input: String,
     /// Text ツールの文字列入力欄（M6 タスク23）。アンカー確定後に上部パネルへ表示し、
     /// Enter で `AddEntity` 確定。CJK（IME 入力）可。確定・キャンセルのたびにクリアする。
     text_content_input: String,
@@ -322,6 +371,10 @@ const KEYBIND_LEGEND: &[&str] = &[
     "T=Text",
     "D=Linear Dim",
     "Shift+D=Radial Dim",
+    "X=Trim",
+    "E=Extend",
+    "F=Fillet",
+    "B=Split",
     "M=Move",
     "R=Rotate",
     "Shift+M=Mirror",
@@ -415,6 +468,7 @@ impl McadApp {
             pending_zoom_fit: false,
             last_dialog_dir: None,
             offset_distance_input: String::new(),
+            fillet_radius_input: String::new(),
             text_content_input: String::new(),
             text_height_input: DEFAULT_TEXT_HEIGHT.to_owned(),
             text_field_shown: false,
@@ -432,8 +486,9 @@ impl McadApp {
         self.select_tool.clear_selection();
         self.select_tool.cancel_placement();
         self.select_tool.cancel_offset();
-        // 読込前の距離入力は持ち越さない（別図面では意味が変わるため）。
+        // 読込前の距離・半径入力は持ち越さない（別図面では意味が変わるため）。
         self.offset_distance_input.clear();
+        self.fillet_radius_input.clear();
         // Text 入力欄も初期化する（文字列はクリア、高さは既定へ戻す）。
         self.text_content_input.clear();
         self.text_height_input = DEFAULT_TEXT_HEIGHT.to_owned();
@@ -450,6 +505,7 @@ impl McadApp {
     /// （DESIGN.md 設計判断2: 選択の意図が崩れたら配置は畳む）。
     fn after_history_change(&mut self) {
         self.select_tool.retain_alive(&self.document);
+        self.reset_picked_shape_tool();
         self.select_tool.cancel_placement();
         // オフセットモードも解除する（対象が undo/redo で消えたり、選択の意図が崩れたら
         // 宙ぶらりんのオフセットを残さない。設計判断2 と同じ思想）。
@@ -469,7 +525,23 @@ impl McadApp {
     fn cancel_placement_for_file_op(&mut self) {
         self.select_tool.cancel_placement();
         self.select_tool.cancel_offset();
+        self.reset_picked_shape_tool();
         self.snap_marker = None;
+    }
+
+    /// ヒットテスト結果をスナップショットとして抱えるツール（トリム・延長・フィレット）を
+    /// 初期状態へ戻す（[`ToolKind::caches_picked_shapes`]）。
+    ///
+    /// undo/redo とファイル操作は、境界やフィレットの 1 本目として選んだエンティティを
+    /// 消したり別図面へ差し替えたりしうる。これらはエンティティ ID ではなく形状の
+    /// スナップショットとして保持されるため放置すると「もう存在しない線で切る／丸める」
+    /// 状態が残る。ツール種別自体は変えず（ユーザーが選んだモードは尊重する）、
+    /// インスタンスだけ作り直して初期状態へ戻す。他のツール（Line の連続線分など）は
+    /// 既存挙動を保つため触らない。
+    fn reset_picked_shape_tool(&mut self) {
+        if self.tool_kind.caches_picked_shapes() {
+            self.tool = self.tool_kind.spawn();
+        }
     }
 
     /// ファイルダイアログを開く際の初期ディレクトリを決める。
@@ -974,12 +1046,15 @@ impl eframe::App for McadApp {
         // 配置ステートを残さない（DESIGN.md 設計判断2: モーダル表示は配置モードを解除）。
         // Ctrl+N/Ctrl+O 等でモーダルを開いたのがこのフレームでも、上のショートカット処理で
         // `confirm_state` が更新済みなので同フレームで確実に解除できる。
-        if self.confirm_state != ConfirmState::Idle
-            && (self.select_tool.is_placing() || self.select_tool.is_offsetting())
-        {
-            self.select_tool.cancel_placement();
-            self.select_tool.cancel_offset();
-            self.snap_marker = None;
+        if self.confirm_state != ConfirmState::Idle {
+            if self.select_tool.is_placing() || self.select_tool.is_offsetting() {
+                self.select_tool.cancel_placement();
+                self.select_tool.cancel_offset();
+                self.snap_marker = None;
+            }
+            // トリム・延長の途中状態（採取済みの境界）もモーダル表示で畳む
+            // （DESIGN.md M7 設計判断6 の共通規約: モーダル表示は初期状態へ戻す）。
+            self.reset_picked_shape_tool();
         }
 
         // ウィンドウを閉じる操作（OSの閉じるボタン等）を検出する。未保存の変更が
@@ -1082,6 +1157,19 @@ impl eframe::App for McadApp {
                             egui::TextEdit::singleline(&mut self.offset_distance_input)
                                 .desired_width(56.0)
                                 .hint_text("through"),
+                        );
+                        ui.separator();
+                    }
+                    // フィレット半径入力欄（M7 タスク32、設計判断6）。オフセット距離欄と同じ
+                    // 常設パネル方式で、フィレットツール中のみ表示する。フォーカス中の
+                    // ショートカット抑止は既存の `app_shortcuts_enabled`（text_focused）が
+                    // 全入力欄まとめて担うので、ここでは何もしなくてよい。
+                    if self.tool_kind == ToolKind::Fillet {
+                        ui.label("Fillet radius:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.fillet_radius_input)
+                                .desired_width(56.0)
+                                .hint_text("radius"),
                         );
                         ui.separator();
                     }
@@ -1191,10 +1279,12 @@ impl eframe::App for McadApp {
                         &mut self.document,
                         &mut self.tool_kind,
                         &mut self.tool,
+                        &mut self.select_tool,
                         self.snap_enabled,
                         &mut self.snap_marker,
                         &mut self.status,
                         now,
+                        parse_fillet_radius(&self.fillet_radius_input),
                     );
                 }
             }
@@ -1286,7 +1376,8 @@ impl eframe::App for McadApp {
 
 /// キーボードショートカットでアクティブツールを切り替える（DESIGN.md 3.4 のツール群）。
 ///
-/// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `P`=Polyline。
+/// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `P`=Polyline, `T`=Text,
+/// `D`/`Shift+D`=Linear/Radial Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
 /// 作図ツールへ切り替えるときは、描画中に古い選択ハイライトが残らないよう選択をクリアする。
 fn handle_tool_shortcut_keys(
@@ -1326,6 +1417,16 @@ fn handle_tool_shortcut_keys(
             requested = Some(ToolKind::Polyline);
         } else if i.key_pressed(Key::T) {
             requested = Some(ToolKind::Text);
+        } else if i.key_pressed(Key::X) {
+            requested = Some(ToolKind::Trim);
+        } else if i.key_pressed(Key::E) {
+            // 単押しのみ。Ctrl+E（DXF エクスポート）は上の command 早期 return で
+            // 既に除かれている。
+            requested = Some(ToolKind::Extend);
+        } else if i.key_pressed(Key::F) {
+            requested = Some(ToolKind::Fillet);
+        } else if i.key_pressed(Key::B) {
+            requested = Some(ToolKind::Split);
         }
     });
     if let Some(kind) = requested {
@@ -1366,14 +1467,21 @@ fn handle_tool_input(
     document: &mut Document,
     tool_kind: &mut ToolKind,
     tool: &mut Option<Box<dyn Tool>>,
+    select_tool: &mut SelectTool,
     snap_enabled: bool,
     snap_marker: &mut Option<snap::SnapResult>,
     status: &mut Option<StatusMessage>,
     now: f64,
+    fillet_radius: Option<f64>,
 ) {
     let Some(active) = tool.as_mut() else {
         return;
     };
+
+    // 数値入力欄（フィレットの半径）の現在値をツールへ流し込む。フィレットは 2 クリック目の
+    // ヒットテストと同時に確定するため、確定判断を行うツール側が値を持っている必要がある
+    // （[`Tool::set_radius_input`] の doc 参照）。他ツールでは既定実装の no-op。
+    active.set_radius_input(fillet_radius);
 
     // ピック許容量（ワールド）。半径寸法ツールの円/円弧ヒットテスト（画面上のピック =
     // ズーム依存）が選択のピック許容量と揃うようにする。寸法の退化判定はこれとは別に
@@ -1429,13 +1537,18 @@ fn handle_tool_input(
                 None => set_status(status, now, "Radial dim: click a circle or arc".to_string()),
             }
         } else if active.wants_shape_pick() {
-            // 汎用エンティティピック（M7 タスク30）: wants_circle_pick と同じ配線。この時点
-            // では wants_shape_pick を true にするツールは存在しない（タスク31〜33 で追加）
-            // ため、このブランチは現状到達しない。将来ツールが追加された時点で拒否メッセージ
-            // の文言もツール側の事情に合わせて調整する想定。
+            // 汎用エンティティピック（M7 タスク30）: wants_circle_pick と同じ配線。トリム・
+            // 延長（タスク31）が境界・対象の両クリックで使う。ここもスナップは掛けず raw を
+            // 使う: 既存エンティティの実位置で当てる必要があるうえ、トリムの `click` は
+            // 「捨てる側」を示す意味を持つため、交点へ吸着すると本来通るはずの操作が
+            // 交点直上クリックとして拒否されてしまう。
             match tool::pick_shape_entity(document, raw, pick_tol) {
-                Some(hit) => active.on_shape_pick(hit),
-                None => set_status(status, now, "Pick: click a line, arc, or shape".to_string()),
+                Some(hit) => result = active.on_shape_pick(hit),
+                None => set_status(
+                    status,
+                    now,
+                    "Pick: click a line, arc, circle, or polyline".to_string(),
+                ),
             }
         } else {
             let extra_points = active.snap_points();
@@ -1472,10 +1585,25 @@ fn handle_tool_input(
             // 失敗時のみ spawn() でリセットする: 確定できなかった中途状態を
             // 次のクリックへ持ち越さないため。
             match document.apply(cmd) {
-                Ok(_) => {}
+                Ok(new_ids) => {
+                    // トポロジが変わる確定（2 断片トリム）だけ、新規エンティティを
+                    // 選択集合へ載せ替える（DESIGN.md M7 設計判断3a）。それ以外の
+                    // ツールは `None` を返すので選択は変わらない。
+                    if let Some(ids) = active.take_commit_selection(&new_ids) {
+                        select_tool.set_selection(ids);
+                    }
+                }
                 Err(err) => {
                     set_status(status, now, format!("Commit failed: {err}"));
-                    *tool = tool_kind.spawn();
+                    if tool_kind.keeps_state_on_commit_failure() {
+                        // M7の4ツール（トリム/延長/フィレット/分割）は失敗時も状態を
+                        // 据え置く（DESIGN.md M7設計判断6）。spawn() で作り直さない
+                        // 代わりに、選択集合の載せ替えフラグが次の確定へ誤って持ち越され
+                        // ないようクリアする（Tool::on_commit_failed の doc 参照）。
+                        active.on_commit_failed();
+                    } else {
+                        *tool = tool_kind.spawn();
+                    }
                 }
             }
         }
@@ -1895,13 +2023,27 @@ fn handle_placement_input(
 /// 空・0・負・非数は `None`（呼び出し側は通過点方式のフォールバックとして扱う。
 /// 設計判断5: 「欄が空・0・非数なら通過点方式へフォールバックする」）。
 fn parse_offset_distance(text: &str) -> Option<f64> {
-    let value: f64 = text.trim().parse().ok()?;
-    (value.is_finite() && value > 0.0).then_some(value)
+    parse_positive_length(text)
 }
 
 /// Text ツールの高さ入力欄（ワールド単位）を解析する。**正の有限値のみ** `Some`。
 /// 空・0・負・非数は `None`（確定は拒否し、プレビューは描かない）。
 fn parse_text_height(text: &str) -> Option<f64> {
+    parse_positive_length(text)
+}
+
+/// フィレット半径入力欄を解析する。**正の有限値のみ** `Some`（M7 設計判断6）。
+/// 空・0・負・非数は `None` で、[`FilletTool`] が 2 本目のピック時に
+/// 「Fillet: enter a radius」として拒否する（半径にはフォールバックが無い）。
+fn parse_fillet_radius(text: &str) -> Option<f64> {
+    parse_positive_length(text)
+}
+
+/// 長さ系の数値入力欄（オフセット距離・テキスト高さ・フィレット半径）に共通の解析。
+/// 前後の空白を無視し、**正の有限値のみ** `Some` を返す。3 欄とも「意味を持つのは正の
+/// 有限値だけ」という点で規則が同じなので、実体をここへ集約し、欄ごとの薄いラッパで
+/// 用途と `None` の扱いを doc に残す。
+fn parse_positive_length(text: &str) -> Option<f64> {
     let value: f64 = text.trim().parse().ok()?;
     (value.is_finite() && value > 0.0).then_some(value)
 }
@@ -2708,6 +2850,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_fillet_radius_accepts_only_positive_finite() {
+        assert_eq!(parse_fillet_radius("2.5"), Some(2.5));
+        assert_eq!(parse_fillet_radius("  3 "), Some(3.0));
+        // 空・0・負・非数・非有限は None（FilletTool 側が「enter a radius」で拒否する）。
+        for text in ["", "0", "-1", "abc", "inf", "NaN"] {
+            assert_eq!(parse_fillet_radius(text), None, "input: {text:?}");
+        }
+    }
+
+    #[test]
+    fn fillet_tool_caches_picked_shapes() {
+        // 1 本目の形状スナップショットを抱えるので、undo/redo・ファイル操作の後に
+        // 作り直される側（[`McadApp::reset_picked_shape_tool`]）に含まれる。
+        assert!(ToolKind::Fillet.caches_picked_shapes());
+        assert!(!ToolKind::Line.caches_picked_shapes());
+        // Split は ShapePick を状態として跨いで保持しないので含まれない。
+        assert!(!ToolKind::Split.caches_picked_shapes());
+    }
+
+    #[test]
     fn new_document_resets_to_empty_document_and_clears_path_and_dirty() {
         // new_document 自体は dirty を確認しない（呼び出し側の
         // request_new_document/確認モーダルが確認済みであることを前提とする）。
@@ -3092,6 +3254,297 @@ mod tests {
         assert_eq!(
             app.last_dialog_dir,
             Some(PathBuf::from("/home/user/project"))
+        );
+    }
+
+    // --- M7ツールのコミット失敗時の状態保持（Codex adversarial review 2026-07-26 指摘の回帰） ---
+    //
+    // `handle_tool_input` は `Document::apply(cmd)` が `Err`（レイヤーロック等）のとき、
+    // 以前は無条件に `*tool = tool_kind.spawn()` でツールを作り直していた。M7の4ツール
+    // （トリム・延長・フィレット・分割）は DESIGN.md M7設計判断6により失敗時も状態据え置き
+    // （境界・1本目の線分は選び直さない）という再挑戦フローを規定しており、それが崩れて
+    // いた。ここでは `handle_tool_input` の実際のブランチ（`ToolKind::keeps_state_on_commit_failure`
+    // による分岐と、`Tool::on_commit_failed` の呼び出し）を模して検証する。
+    //
+    // `egui::Response` を要する `handle_tool_input` 自体は headless では構築できないため、
+    // その `Err` 分岐が呼ぶのと同じ2つの公開経路（`ToolKind::keeps_state_on_commit_failure`
+    // / `Tool::on_commit_failed`）を直接使い、内部状態は `Tool` トレイトの公開メソッド
+    // （`on_shape_pick`・`take_commit_selection`）だけを通して黒箱的に確認する。
+
+    /// カレントレイヤーをロックする（`mcad-core` の `lock_layer` テストヘルパーと同じ手法）。
+    fn lock_current_layer(document: &mut Document) -> mcad_core::LayerId {
+        let layer = document.current_layer();
+        let mut props = document.layer(layer).unwrap().clone();
+        props.locked = true;
+        document
+            .apply(Command::SetLayerProps { id: layer, props })
+            .unwrap();
+        layer
+    }
+
+    #[test]
+    fn trim_tool_keeps_waiting_target_after_locked_layer_commit_failure() {
+        // 境界 x=1 の縦線、対象 (0,0)-(2,0) の横線。ロック前に対象を追加してからレイヤーを
+        // ロックし、確定を失敗させる。
+        let mut document = Document::new();
+        let target_shape = Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(2.0, 0.0)));
+        let target_id = document
+            .apply(Command::AddEntity(Entity::new(
+                target_shape.clone(),
+                document.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let layer = lock_current_layer(&mut document);
+        let entity_count_before = document.entity_count();
+
+        let mut tool = ToolKind::Trim.spawn().expect("Trim always spawns a tool");
+        assert_eq!(
+            tool.on_shape_pick(tool::ShapePick {
+                id: target_id,
+                shape: Shape::Line(LineSeg::new(Point2::new(1.0, -5.0), Point2::new(1.0, 5.0))),
+                click: Point2::new(1.0, 0.5),
+                layer,
+                style: Style::inherited(),
+            }),
+            ToolResult::Continue,
+            "1クリック目は境界を採取するだけ"
+        );
+
+        let target = tool::ShapePick {
+            id: target_id,
+            shape: target_shape,
+            click: Point2::new(1.5, 0.0),
+            layer,
+            style: Style::inherited(),
+        };
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(target.clone()) else {
+            panic!("expected Commit");
+        };
+        assert!(
+            document.apply(cmd).is_err(),
+            "ロックレイヤーなので確定は失敗する"
+        );
+        assert_eq!(document.entity_count(), entity_count_before, "文書は不変");
+
+        // 本来の handle_tool_input の Err 分岐と同じ処理: 作り直さず後始末フックだけ呼ぶ。
+        assert!(ToolKind::Trim.keeps_state_on_commit_failure());
+        tool.on_commit_failed();
+
+        // 境界がまだ known なら、同じ対象を再ピックしても「新しい境界の指定」
+        // （Continue）ではなく「対象への確定」（Commit）になる。ツールを作り直して
+        // いた旧実装ではここが Continue に戻ってしまい、境界を選び直す羽目になる。
+        let retry = tool.on_shape_pick(target);
+        assert!(
+            matches!(retry, ToolResult::Commit(_)),
+            "境界を持ち越したまま別対象へ再挑戦できるはず、got {retry:?}"
+        );
+    }
+
+    #[test]
+    fn fillet_tool_keeps_first_line_after_locked_layer_commit_failure() {
+        // 直角コーナー: a=(0,0)-(10,0), b=(0,0)-(0,10)。半径2で接点(2,0)/(0,2)。
+        let mut document = Document::new();
+        let a_shape = Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0)));
+        let b_shape = Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(0.0, 10.0)));
+        let a_id = document
+            .apply(Command::AddEntity(Entity::new(
+                a_shape.clone(),
+                document.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let b_id = document
+            .apply(Command::AddEntity(Entity::new(
+                b_shape.clone(),
+                document.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let layer = lock_current_layer(&mut document);
+
+        let mut tool = ToolKind::Fillet
+            .spawn()
+            .expect("Fillet always spawns a tool");
+        tool.set_radius_input(Some(2.0));
+        assert_eq!(
+            tool.on_shape_pick(tool::ShapePick {
+                id: a_id,
+                shape: a_shape,
+                click: Point2::new(8.0, 0.0),
+                layer,
+                style: Style::inherited(),
+            }),
+            ToolResult::Continue,
+            "1本目のピックは状態を進めるだけ"
+        );
+
+        let second = tool::ShapePick {
+            id: b_id,
+            shape: b_shape,
+            click: Point2::new(0.0, 8.0),
+            layer,
+            style: Style::inherited(),
+        };
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(second.clone()) else {
+            panic!("expected Commit");
+        };
+        assert!(
+            document.apply(cmd).is_err(),
+            "ロックレイヤーなので確定は失敗する"
+        );
+
+        assert!(ToolKind::Fillet.keeps_state_on_commit_failure());
+        tool.on_commit_failed();
+
+        // 1本目を持ち越していれば、2本目の再ピックはまた確定（Commit）になる。作り直して
+        // いた旧実装では WaitingFirstLine に戻り、この2本目ピックは「1本目の選び直し」
+        // （Continue、しかも b は線分なので通ってしまう）になっていた。
+        let retry = tool.on_shape_pick(second);
+        assert!(
+            matches!(retry, ToolResult::Commit(_)),
+            "1本目を持ち越したまま2本目だけ選び直せるはず、got {retry:?}"
+        );
+    }
+
+    #[test]
+    fn split_tool_can_retry_after_locked_layer_commit_failure() {
+        let mut document = Document::new();
+        let shape = Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0)));
+        let id = document
+            .apply(Command::AddEntity(Entity::new(
+                shape.clone(),
+                document.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let layer = lock_current_layer(&mut document);
+        let entity_count_before = document.entity_count();
+
+        let mut tool = ToolKind::Split.spawn().expect("Split always spawns a tool");
+        let pick = tool::ShapePick {
+            id,
+            shape,
+            click: Point2::new(5.0, 0.0),
+            layer,
+            style: Style::inherited(),
+        };
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(pick.clone()) else {
+            panic!("expected Commit");
+        };
+        assert!(
+            document.apply(cmd).is_err(),
+            "ロックレイヤーなので確定は失敗する"
+        );
+        assert_eq!(document.entity_count(), entity_count_before, "文書は不変");
+
+        assert!(ToolKind::Split.keeps_state_on_commit_failure());
+        tool.on_commit_failed();
+
+        // 分割は単一状態なので、失敗後の再ピックがそのまま確定できることを確認する。
+        let retry = tool.on_shape_pick(pick);
+        assert!(
+            matches!(retry, ToolResult::Commit(_)),
+            "失敗後も同じ対象へ再挑戦できるはず、got {retry:?}"
+        );
+    }
+
+    #[test]
+    fn trim_tool_commit_failure_does_not_leak_stale_selection_flag() {
+        // 回帰(A-3): 2断片トリムの確定がロックで失敗しても、選択集合の載せ替えフラグ
+        // （`select_new_entities`）が立ったまま残ってはいけない。残ると、次に成功した
+        // 無関係の確定（1断片トリム）が `take_commit_selection` に誤って消費され、
+        // 空の `NewIds.entities` で選択集合が壊れる。
+        let mut document = Document::new();
+
+        // 境界1: 円 中心(1,0) 半径0.5。対象(0,0)-(2,0) の中間をクリックすると2断片に割れる
+        // （select_new_entities が立つ経路）。この対象はロックレイヤー上に置く。
+        let locked_target_shape =
+            Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(2.0, 0.0)));
+        let locked_target_id = document
+            .apply(Command::AddEntity(Entity::new(
+                locked_target_shape.clone(),
+                document.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let locked_layer = lock_current_layer(&mut document);
+
+        // 別レイヤー（ロックなし）に、同じ境界円（中心(1,0) 半径0.5）と1点だけ交わる
+        // 対象 (1,0)-(1,5) を置く（片端が円内、もう片端が円外なので交点は1つだけ）。
+        // クリックは円外側の1点なので、その側が捨てられ1断片トリムになる。
+        let unlocked_layer = document
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "unlocked",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let free_target_shape =
+            Shape::Line(LineSeg::new(Point2::new(1.0, 0.0), Point2::new(1.0, 5.0)));
+        let free_target_id = document
+            .apply(Command::AddEntity(Entity::new(
+                free_target_shape.clone(),
+                unlocked_layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
+        let mut tool = ToolKind::Trim.spawn().expect("Trim always spawns a tool");
+
+        // 1本目: 円境界を選び、ロックされた対象を中間クリックして2断片トリムを試みる。
+        assert_eq!(
+            tool.on_shape_pick(tool::ShapePick {
+                id: locked_target_id,
+                shape: Shape::Circle(mcad_geom::Circle::new(Point2::new(1.0, 0.0), 0.5)),
+                click: Point2::new(1.5, 0.0),
+                layer: locked_layer,
+                style: Style::inherited(),
+            }),
+            ToolResult::Continue
+        );
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(tool::ShapePick {
+            id: locked_target_id,
+            shape: locked_target_shape,
+            click: Point2::new(1.0, 0.0),
+            layer: locked_layer,
+            style: Style::inherited(),
+        }) else {
+            panic!("expected Commit(Batch) for the 2-piece trim");
+        };
+        assert!(
+            document.apply(cmd).is_err(),
+            "ロックレイヤーなので確定は失敗する"
+        );
+
+        assert!(ToolKind::Trim.keeps_state_on_commit_failure());
+        tool.on_commit_failed();
+
+        // 2本目: 境界は同じ円のまま（状態はトリムの規約どおり WaitingTarget に留まって
+        // いる）、ロックされていない対象を円外側でクリックして1断片トリムする。
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(tool::ShapePick {
+            id: free_target_id,
+            shape: free_target_shape,
+            click: Point2::new(1.0, 3.0),
+            layer: unlocked_layer,
+            style: Style::inherited(),
+        }) else {
+            panic!("expected Commit(ModifyEntity) for the 1-piece trim");
+        };
+        let new_ids = document.apply(cmd).expect("unlocked layer commit succeeds");
+
+        // 1断片トリムは選択集合を触らないはず。フラグが漏れていれば、ここで
+        // `Some(new_ids.entities.clone())`（空の Vec）を誤って返してしまう。
+        assert_eq!(
+            tool.take_commit_selection(&new_ids),
+            None,
+            "失敗した2断片トリムのフラグが後続の無関係な確定へ漏れてはいけない"
         );
     }
 }

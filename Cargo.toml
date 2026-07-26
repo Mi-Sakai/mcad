@@ -3,10 +3,10 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 
 [workspace.dependencies]
-mcad-geom = { version = "0.6.0", path = "crates/mcad-geom" }
-mcad-core = { version = "0.6.0", path = "crates/mcad-core" }
-mcad-io = { version = "0.6.0", path = "crates/mcad-io" }
+mcad-geom = { version = "0.7.0", path = "crates/mcad-geom" }
+mcad-core = { version = "0.7.0", path = "crates/mcad-core" }
+mcad-io = { version = "0.7.0", path = "crates/mcad-io" }

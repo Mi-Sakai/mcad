@@ -22,6 +22,6 @@ mod mcad_file;
 pub use dxf_file::{ExportSummary, ImportSummary, export_dxf, import_dxf, load_dxf, save_dxf};
 pub use error::IoError;
 pub use mcad_file::{
-    FORMAT_VERSION, FileDocument, FileEntity, export_document, from_json, import_document,
-    load_mcad, save_mcad, to_json,
+    FORMAT_VERSION, FileDocument, FileEntity, FileLayer, export_document, from_json,
+    import_document, load_mcad, save_mcad, to_json,
 };

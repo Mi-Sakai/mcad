@@ -225,6 +225,22 @@ impl Document {
             .filter_map(|(k, v)| v.as_ref().map(|l| (k, l)))
     }
 
+    /// 生存しているレイヤーを重ね順（[`Layer::order`] 昇順 = 奥から手前）で列挙する。
+    ///
+    /// 墓標（削除済みスロット）は含まれない。`order` が同じレイヤー（同順位）は
+    /// [`Document::layers`] の反復順のまま安定に並ぶ（安定ソートを使う）。`layers` の
+    /// 反復順自体は「未規定だが同一ドキュメントに対しては決定的」なので、この関数の
+    /// 戻り順も決定的であり、呼び出しごとに揺れることはない。
+    ///
+    /// 描画側は「返された順にそのまま描く」ことで、後の要素が手前に来る。
+    #[must_use]
+    pub fn layers_in_order(&self) -> Vec<(LayerId, &Layer)> {
+        let mut ordered: Vec<(LayerId, &Layer)> = self.layers().collect();
+        // sort_by_key は安定ソートなので、同順位は layers() の反復順を保つ。
+        ordered.sort_by_key(|(_, layer)| layer.order);
+        ordered
+    }
+
     /// 生存エンティティ数。
     #[must_use]
     pub fn entity_count(&self) -> usize {
@@ -1393,6 +1409,143 @@ mod tests {
             .unwrap();
         let id = assert_single_new_id(&new_ids.layers, &new_ids.entities);
         assert!(doc.layer(id).is_some());
+    }
+
+    /// 指定した重ね順を持つレイヤーを 1 つ追加し、その ID を返す。
+    fn add_layer_with_order(doc: &mut Document, name: &str, order: i32) -> LayerId {
+        let mut layer = Layer::new(name, Rgb::WHITE);
+        layer.order = order;
+        let new_ids = doc.apply(Command::AddLayer(layer)).unwrap();
+        assert_single_new_id(&new_ids.layers, &new_ids.entities)
+    }
+
+    /// [`Document::layers_in_order`] の戻り値から ID 列だけを取り出す。
+    fn ordered_layer_ids(doc: &Document) -> Vec<LayerId> {
+        doc.layers_in_order()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn new_layer_has_zero_order_by_default() {
+        // Layer::new は order を 0 で埋める（既存の 2 引数シグネチャは不変）。
+        assert_eq!(Layer::new("aux", Rgb::WHITE).order, 0);
+        // Document::new のデフォルトレイヤーも同じ既定値。
+        let doc = Document::new();
+        assert_eq!(doc.layer(doc.default_layer()).unwrap().order, 0);
+    }
+
+    #[test]
+    fn set_layer_props_changes_order_with_undo_redo() {
+        // 重ね順は専用コマンドを持たず、他のレイヤー属性と同じ SetLayerProps に乗る。
+        let mut doc = Document::new();
+        let back = doc.default_layer();
+        let front = add_layer_with_order(&mut doc, "front", 1);
+        assert_eq!(ordered_layer_ids(&doc), vec![back, front]);
+
+        // front を最背面へ送る（order だけを差し替える）。
+        let mut props = doc.layer(front).unwrap().clone();
+        props.order = -1;
+        doc.apply(Command::SetLayerProps { id: front, props })
+            .unwrap();
+        assert_eq!(ordered_layer_ids(&doc), vec![front, back]);
+        // 他の属性は巻き込まれていない。
+        assert_eq!(doc.layer(front).unwrap().name, "front");
+
+        assert!(doc.undo());
+        assert_eq!(doc.layer(front).unwrap().order, 1);
+        assert_eq!(ordered_layer_ids(&doc), vec![back, front]);
+
+        assert!(doc.redo());
+        assert_eq!(doc.layer(front).unwrap().order, -1);
+        assert_eq!(ordered_layer_ids(&doc), vec![front, back]);
+    }
+
+    #[test]
+    fn set_layer_props_with_identical_order_is_noop() {
+        // 「すでに最前面のレイヤーを最前面へ」のような操作が同じ order を渡しても、
+        // 既存の before == after 判定に乗って履歴を汚さない。
+        let mut doc = Document::new();
+        let id = add_layer_with_order(&mut doc, "front", 5);
+
+        let undo_len_before = doc.undo_stack.len();
+        let redo_len_before = doc.redo_stack.len();
+        let generation_before = doc.generation();
+
+        let mut props = doc.layer(id).unwrap().clone();
+        props.order = 5;
+        assert_eq!(
+            doc.apply(Command::SetLayerProps { id, props }),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.redo_stack.len(), redo_len_before);
+        assert_eq!(doc.generation(), generation_before);
+    }
+
+    #[test]
+    fn locked_layer_order_can_still_be_changed() {
+        // 回帰: ロックは「そのレイヤー上のエンティティ」への変更を禁じるだけで、
+        // レイヤー属性自体（色・表示・ロック・重ね順）の変更は禁止しない。
+        // 重ね順が既存の色変更と同じ経路（require_editable_* を通らない）に乗って
+        // いることの担保。
+        let mut doc = Document::new();
+        let id = add_layer_with_order(&mut doc, "locked", 3);
+        lock_layer(&mut doc, id);
+
+        let mut props = doc.layer(id).unwrap().clone();
+        assert!(props.locked);
+        props.order = 42;
+        assert_eq!(
+            doc.apply(Command::SetLayerProps { id, props }),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.layer(id).unwrap().order, 42);
+        assert!(doc.layer(id).unwrap().locked);
+    }
+
+    #[test]
+    fn layers_in_order_sorts_ascending_by_order() {
+        // 昇順（小さい = 奥、大きい = 手前）。負値も含めて素直に並ぶ。
+        let mut doc = Document::new();
+        let zero = doc.default_layer();
+        let front = add_layer_with_order(&mut doc, "front", 10);
+        let back = add_layer_with_order(&mut doc, "back", -10);
+        let mid = add_layer_with_order(&mut doc, "mid", 5);
+
+        assert_eq!(ordered_layer_ids(&doc), vec![back, zero, mid, front]);
+    }
+
+    #[test]
+    fn layers_in_order_keeps_iteration_order_for_equal_order() {
+        // 同順位（order が同値）は layers() の反復順のまま安定に並ぶ（安定ソート）。
+        let mut doc = Document::new();
+        add_layer_with_order(&mut doc, "a", 0);
+        add_layer_with_order(&mut doc, "b", 0);
+        add_layer_with_order(&mut doc, "c", 0);
+
+        let iteration_order: Vec<LayerId> = doc.layers().map(|(id, _)| id).collect();
+        assert_eq!(iteration_order.len(), 4);
+        assert_eq!(ordered_layer_ids(&doc), iteration_order);
+        // 呼び出しごとに揺れない（決定的）。
+        assert_eq!(ordered_layer_ids(&doc), ordered_layer_ids(&doc));
+    }
+
+    #[test]
+    fn layers_in_order_excludes_tombstones() {
+        // 墓標（削除済みスロット）は列挙されない。undo で復活すれば再び現れる。
+        let mut doc = Document::new();
+        let zero = doc.default_layer();
+        let removed = add_layer_with_order(&mut doc, "removed", 1);
+        let kept = add_layer_with_order(&mut doc, "kept", 2);
+
+        doc.apply(Command::RemoveLayer(removed)).unwrap();
+        assert_eq!(ordered_layer_ids(&doc), vec![zero, kept]);
+        assert_eq!(doc.layers_in_order().len(), doc.layer_count());
+
+        assert!(doc.undo());
+        assert_eq!(ordered_layer_ids(&doc), vec![zero, removed, kept]);
     }
 
     #[test]

@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, Layer, LayerId, Rgb, Style,
-    TextGeom,
+    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb,
+    Style, TextGeom,
 };
 use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
@@ -106,6 +106,18 @@ const LAYER_COLOR_PALETTE: [Rgb; 6] = [
     Rgb::new(200, 90, 220),
     Rgb::new(70, 210, 210),
 ];
+
+/// 新規文書（起動時・Ctrl+N）に用意する、デフォルトレイヤー `"0"` 以外の既定レイヤー。
+///
+/// `(レイヤー名, 色)` を **奥から手前の順** に並べる。重ね順（[`Layer::order`]）は
+/// この配列の添字 + 1 を割り当てる（`"0"` が `order = 0` なので、既定レイヤーは
+/// 常に `"0"` より手前に載る）。将来ハッチング等を実装したときは**この配列へ1行
+/// 足すだけ**で既定セットを拡張できる。
+///
+/// 現状 `"Text"` のみ。文字が図形に隠れないよう最上位に置くのが一般的な運用で、
+/// 初期状態からその並びを提供する。ハッチ用レイヤーは機能自体が未実装のうちは
+/// 用途の分からない空レイヤーになるため入れない。
+const DEFAULT_EXTRA_LAYERS: [(&str, Rgb); 1] = [("Text", LAYER_COLOR_PALETTE[3])];
 
 /// ステータスメッセージの文字色（エラー通知が主用途なので警告寄りの赤）。
 const STATUS_MESSAGE_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
@@ -438,6 +450,39 @@ fn set_status_with_duration(
     });
 }
 
+/// 新規文書（起動直後・Ctrl+N）用のドキュメントを作る。
+///
+/// [`Document::new()`] の `"0"` 1枚だけの文書に、[`DEFAULT_EXTRA_LAYERS`] の既定
+/// レイヤーを [`Command::AddLayer`] で重ね順つきで追加し、履歴を消して返す。
+///
+/// # なぜ core（`Document::new()`）ではなく app 側に置くのか
+///
+/// `Document::new()` は `.mcad` / DXF の読込時にも「再構築の出発点」として使われる
+/// （読込はデフォルトレイヤーを [`Command::SetLayerProps`] で上書きし、残りを
+/// ファイル内容から [`Command::AddLayer`] する）。既定レイヤーを core へ入れると
+/// **既存ファイルを読むたびにファイルに存在しない `"Text"` レイヤーが生えてしまう**。
+/// そのため「新規文書のテンプレート」という UI 上の判断は app 側だけに置き、
+/// 読込経路（[`McadApp::open_document`] / [`McadApp::apply_imported_dxf`]）からは
+/// 一切呼ばない。
+///
+/// [`Command::AddLayer`] は検証を持たない（core の `execute` 参照）ので、この経路で
+/// 失敗することはない。
+fn fresh_document() -> Document {
+    let mut document = Document::new();
+    for (index, (name, color)) in DEFAULT_EXTRA_LAYERS.iter().enumerate() {
+        let mut layer = Layer::new(*name, *color);
+        // "0" が order = 0。既定レイヤーはその手前に配列順で積み上げる。
+        layer.order = i32::try_from(index).expect("DEFAULT_EXTRA_LAYERS is tiny") + 1;
+        document
+            .apply(Command::AddLayer(layer))
+            .expect("AddLayer on a fresh document cannot fail");
+    }
+    // 既定レイヤーの追加自体を Ctrl+Z で巻き戻せてはいけない（読込と同じ扱い）。
+    // 呼び出し側は clear_history 後の世代（0）を saved_generation の基準点にする。
+    document.clear_history();
+    document
+}
+
 impl McadApp {
     /// 空文書（起動直後の画面）を持つアプリを作る。
     ///
@@ -457,8 +502,18 @@ impl McadApp {
     /// 目視確認という役目は終わったとみなし、起動も Ctrl+N と同じ真に空の
     /// [`Document::new()`] にする。サンプル生成コード自体は削除せず、複数種の
     /// エンティティを要するテストのためのヘルパー（`tests::sample_document`）へ移した。
+    ///
+    /// # 既定レイヤーセットの導入（レイヤー重ね順の設計 §5）
+    ///
+    /// 上記の「Ctrl+N も起動時も `Document::new()` のみ」という判断のうち、
+    /// **エンティティは一切追加しない**という部分は変わらないが、**レイヤーについては
+    /// 覆した**: 起動時・Ctrl+N ともに [`fresh_document`] を使い、`"0"` に加えて
+    /// [`DEFAULT_EXTRA_LAYERS`]（現状 `"Text"`）を持つ文書を作る。文字を最前面に置く
+    /// といった典型的な運用を初期状態で満たすためで、既定セットを core ではなく app 側に
+    /// 置いた理由（ファイル読込時にレイヤーが増えるのを避ける）は [`fresh_document`] の
+    /// doc を参照。**読込経路は従来どおり `Document::new()` ベースで再構築する。**
     fn new() -> Self {
-        let document = Document::new();
+        let document = fresh_document();
         Self {
             // 起動直後（空文書）の世代を保存済み基準点とし、未保存扱いにしない。
             saved_generation: document.generation(),
@@ -704,13 +759,13 @@ impl McadApp {
         self.text_field_shown = shown;
     }
 
-    /// 真に空の新規ドキュメントへ置き換える（サンプルエンティティは一切追加しない。
-    /// [`McadApp::new`] の doc 参照）。
+    /// 新規ドキュメントへ置き換える（エンティティは一切追加せず、レイヤーは既定セット
+    /// [`DEFAULT_EXTRA_LAYERS`] のみ。[`McadApp::new`] / [`fresh_document`] の doc 参照）。
     ///
     /// 未保存の変更があるかどうかは確認しない。呼び出し側（[`McadApp::request_new_document`]
     /// または確認モーダルの「破棄して続行」選択）が確認済みであることを前提とする。
     fn new_document(&mut self, now: f64) {
-        self.document = Document::new();
+        self.document = fresh_document();
         self.current_path = None;
         // 新規ドキュメントの現在世代を保存済み基準点にする（読込直後は未保存でない）。
         self.saved_generation = self.document.generation();
@@ -1644,9 +1699,142 @@ fn handle_tool_input(
     }
 }
 
+/// 「最前面へ」で割り当てる重ね順（[`Layer::order`]）。
+///
+/// `current` は対象レイヤーの現在の order、`other_orders` は**それ以外の**生存レイヤーの
+/// order 列。「他のレイヤーの最大 + 1」を採るが、既に最前面（あるいはレイヤーが1枚だけ）
+/// なら `current` をそのまま返すため、[`Command::SetLayerProps`] の既存 no-op 判定
+/// （`before == props` なら履歴を汚さない）にそのまま乗る。呼び出し側は戻り値が
+/// `current` と等しいかどうかでボタンの有効/無効も決められる。
+///
+/// `saturating_add` なのは `i32::MAX` のレイヤーがあっても算術オーバーフローで
+/// パニックしないため（飽和時は同順位に並ぶだけで、描画は破綻しない）。
+fn bring_to_front_order(current: i32, other_orders: impl IntoIterator<Item = i32>) -> i32 {
+    other_orders
+        .into_iter()
+        .max()
+        .map_or(current, |max| current.max(max.saturating_add(1)))
+}
+
+/// 「最背面へ」で割り当てる重ね順。[`bring_to_front_order`] の対称版
+/// （「他のレイヤーの最小 - 1」、既に最背面なら `current` のまま）。
+fn send_to_back_order(current: i32, other_orders: impl IntoIterator<Item = i32>) -> i32 {
+    other_orders
+        .into_iter()
+        .min()
+        .map_or(current, |min| current.min(min.saturating_sub(1)))
+}
+
+/// [`front_order_plan`] / [`back_order_plan`] が返す「その `LayerId` の order を
+/// この値へ変える」更新1件。
+type OrderUpdate = (LayerId, i32);
+
+/// 「最前面へ」を安全に適用するための更新計画を返す（Codex adversarial review
+/// の medium 指摘対応）。
+///
+/// `layers` は生存レイヤー全件の `(LayerId, order)`（対象 `target` を含む）。
+///
+/// 通常（他レイヤーの最大 order が `i32::MAX` でない）は [`bring_to_front_order`]
+/// と同じ「他レイヤーの最大 + 1」を対象1件だけに適用する計画を返す。すでに
+/// 対象が唯一の最前面なら空の計画（no-op）を返す。
+///
+/// 他レイヤーの最大 order が `i32::MAX` のときは単純な +1 が使えない
+/// （`saturating_add` が現在値と同じ `i32::MAX` を返し、最前面にならない）ため、
+/// 全レイヤーの order を `0..n` へ再正規化しつつ対象を末尾（最前面）に置く
+/// 計画を返す（相対順序は保つ）。この経路は他レイヤーが `i32::MAX` に達している
+/// 場合にしか通らないため、通常ケースの履歴を汚さない。
+fn front_order_plan(target: LayerId, layers: &[(LayerId, i32)]) -> Vec<OrderUpdate> {
+    let Some(current) = layers
+        .iter()
+        .find(|(id, _)| *id == target)
+        .map(|(_, order)| *order)
+    else {
+        return Vec::new();
+    };
+    let other_max = layers
+        .iter()
+        .filter(|(id, _)| *id != target)
+        .map(|(_, order)| *order)
+        .max();
+    match other_max {
+        None => Vec::new(),
+        Some(max) if current > max => Vec::new(),
+        Some(i32::MAX) => renormalize_front(target, layers),
+        Some(max) => vec![(target, bring_to_front_order(current, [max]))],
+    }
+}
+
+/// 「最背面へ」の対称版（[`front_order_plan`] 参照）。
+fn back_order_plan(target: LayerId, layers: &[(LayerId, i32)]) -> Vec<OrderUpdate> {
+    let Some(current) = layers
+        .iter()
+        .find(|(id, _)| *id == target)
+        .map(|(_, order)| *order)
+    else {
+        return Vec::new();
+    };
+    let other_min = layers
+        .iter()
+        .filter(|(id, _)| *id != target)
+        .map(|(_, order)| *order)
+        .min();
+    match other_min {
+        None => Vec::new(),
+        Some(min) if current < min => Vec::new(),
+        Some(i32::MIN) => renormalize_back(target, layers),
+        Some(min) => vec![(target, send_to_back_order(current, [min]))],
+    }
+}
+
+/// 全レイヤーの order を `0..n` へ再正規化し、`target` をその末尾（＝最前面）に
+/// 置く。`target` 以外は元の order の大小関係（相対順序）を保ったまま詰め直す。
+///
+/// 戻り値には「新しい order が現在の order と異なるレイヤーのみ」を含む
+/// （変わらないレイヤーは計画に含めず、無駄な `SetLayerProps` を作らない）。
+fn renormalize_front(target: LayerId, layers: &[(LayerId, i32)]) -> Vec<OrderUpdate> {
+    let mut others: Vec<(LayerId, i32)> = layers
+        .iter()
+        .filter(|(id, _)| *id != target)
+        .copied()
+        .collect();
+    others.sort_by_key(|(_, order)| *order);
+    let mut plan: Vec<OrderUpdate> = others
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (id, old_order))| {
+            let new_order = i as i32;
+            (new_order != *old_order).then_some((*id, new_order))
+        })
+        .collect();
+    // 対象は他レイヤー全件より 1 大きい order へ置くので、常に唯一の最前面になる。
+    plan.push((target, others.len() as i32));
+    plan
+}
+
+/// [`renormalize_front`] の対称版。`target` を先頭（＝最背面）に置く。
+fn renormalize_back(target: LayerId, layers: &[(LayerId, i32)]) -> Vec<OrderUpdate> {
+    let mut others: Vec<(LayerId, i32)> = layers
+        .iter()
+        .filter(|(id, _)| *id != target)
+        .copied()
+        .collect();
+    others.sort_by_key(|(_, order)| *order);
+    let mut plan: Vec<OrderUpdate> = vec![(target, 0)];
+    plan.extend(
+        others
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (id, old_order))| {
+                let new_order = i as i32 + 1;
+                (new_order != *old_order).then_some((*id, new_order))
+            }),
+    );
+    plan
+}
+
 /// 右側のレイヤーパネル（DESIGN.md 3.4 の UI レイアウト）。
 ///
-/// 一覧・カレント切替（ラジオ）・色変更・表示/ロック切替・追加/削除を提供する。
+/// 一覧・カレント切替（ラジオ）・色変更・表示/ロック切替・重ね順変更・追加/削除を提供する。
 /// すべての変更は [`Command`] として [`Document::apply`] へ載せるため undo/redo の
 /// 対象になる。削除の制約（デフォルト/カレント/非空レイヤーは不可）はコア側が
 /// 検証し、失敗はステータスバーへ表示する。
@@ -1664,8 +1852,14 @@ fn layer_panel(
     if ui.button("+ Add layer").clicked() {
         let n = document.layer_count();
         let color = LAYER_COLOR_PALETTE[n % LAYER_COLOR_PALETTE.len()];
-        let cmd = Command::AddLayer(Layer::new(format!("Layer {n}"), color));
-        if let Err(err) = document.apply(cmd) {
+        let mut layer = Layer::new(format!("Layer {n}"), color);
+        // 新規レイヤーは常に最前面へ（既存の最大 order + 1）。空の文書なら 0。
+        layer.order = document
+            .layers()
+            .map(|(_, existing)| existing.order)
+            .max()
+            .map_or(0, |max| max.saturating_add(1));
+        if let Err(err) = document.apply(Command::AddLayer(layer)) {
             set_status(status, now, format!("Add layer failed: {err}"));
         }
     }
@@ -1675,10 +1869,15 @@ fn layer_panel(
     let default_layer = document.default_layer();
     // パネル描画中の可変借用を避けるため、レイヤー一覧のスナップショットを取り、
     // 操作から生じたコマンドは走査後に一括適用する。
-    let layers: Vec<(LayerId, Layer)> = document
-        .layers()
+    //
+    // 行の並びは重ね順で、**手前のレイヤーが上**（一般的なレイヤーパネルの慣習）。
+    // `layers_in_order()` は奥→手前の昇順なので反転する。
+    let mut layers: Vec<(LayerId, Layer)> = document
+        .layers_in_order()
+        .into_iter()
         .map(|(id, layer)| (id, layer.clone()))
         .collect();
+    layers.reverse();
     let mut pending: Vec<Command> = Vec::new();
 
     for (id, layer) in &layers {
@@ -1715,6 +1914,47 @@ fn layer_panel(
             }
 
             ui.label(&layer.name);
+
+            // 重ね順（最前面へ / 最背面へ）。専用コマンドは作らず、既存の
+            // SetLayerProps を並べた Command::Batch として適用する（1クリック =
+            // undo 1単位。Batch はサブコマンド1件でも1記録として履歴に積まれるため、
+            // 通常ケースでは単発 SetLayerProps と同じ粒度のまま）。
+            //
+            // 通常は対象レイヤー1件だけを動かす（[`front_order_plan`] /
+            // [`back_order_plan`] が「他レイヤーの最大+1 / 最小-1」を計算する）。
+            // 他レイヤーが i32::MAX / i32::MIN に達していて単純な +1/-1 が使えない
+            // 場合だけ、全レイヤーの order を再正規化する計画が返る（Codex
+            // adversarial review の medium 指摘対応）。計画が空なら「既に端にいる」
+            // ということなのでボタンを無効化する。
+            let all_orders: Vec<(LayerId, i32)> =
+                layers.iter().map(|(lid, l)| (*lid, l.order)).collect();
+            let front_plan = front_order_plan(*id, &all_orders);
+            let back_plan = back_order_plan(*id, &all_orders);
+            let plan_to_batch = |plan: Vec<(LayerId, i32)>| -> Command {
+                Command::Batch(
+                    plan.into_iter()
+                        .filter_map(|(lid, order)| {
+                            let mut props = layers.iter().find(|(l, _)| *l == lid)?.1.clone();
+                            props.order = order;
+                            Some(Command::SetLayerProps { id: lid, props })
+                        })
+                        .collect(),
+                )
+            };
+            if ui
+                .add_enabled(!front_plan.is_empty(), egui::Button::new("Front"))
+                .on_hover_text("Bring to front")
+                .clicked()
+            {
+                pending.push(plan_to_batch(front_plan));
+            }
+            if ui
+                .add_enabled(!back_plan.is_empty(), egui::Button::new("Back"))
+                .on_hover_text("Send to back")
+                .clicked()
+            {
+                pending.push(plan_to_batch(back_plan));
+            }
 
             // 削除。デフォルトレイヤーにはボタン自体を出さない（コア側でも拒否される）。
             // カレント・非空レイヤーの削除失敗はコアの検証に任せ、理由を表示する。
@@ -2297,20 +2537,43 @@ fn draw_grid_lines(
     }
 }
 
+/// ビューポートの可視 AABB と交差し、かつ表示レイヤーに属するエンティティを
+/// **描画順（奥→手前）** に並べて返す。
+///
+/// 順序の規則:
+/// - レイヤー間はレイヤーの重ね順（[`Layer::order`] 昇順。大きいほど手前）。
+/// - 同一レイヤー内（および同順位レイヤーの間）は [`Document::entities()`] の反復順
+///   （＝エンティティの追加順）のまま。[`Vec::sort_by_key`] が安定ソートであることに
+///   依存している。
+///
+/// 性能: 並べ替えるのはカリング後の可視エンティティ `k` 件のみで、全エンティティは
+/// ソートしない（`O(k log k)`）。将来 `k` が数万規模になったら「重ね順やエンティティ
+/// 集合が変わったときだけ再計算するキャッシュ」が対策になるが、現状の作図規模では
+/// フレーム時間に測れる影響がないため先回りしない。
+fn entities_in_draw_order<'a>(
+    document: &'a Document,
+    visible: &Aabb,
+) -> Vec<(EntityId, &'a Entity, &'a Layer)> {
+    let mut drawable: Vec<(EntityId, &Entity, &Layer)> = document
+        .entities()
+        .filter_map(|(id, entity)| {
+            let layer = document.layer(entity.layer)?;
+            (layer.visible && entity.geom.aabb().intersects(visible)).then_some((id, entity, layer))
+        })
+        .collect();
+    drawable.sort_by_key(|(_, _, layer)| layer.order);
+    drawable
+}
+
 /// ビューポートの可視 AABB と交差するエンティティのみをカリングして描画する。
 /// 非表示レイヤーのエンティティは描画しない。
+///
+/// 描画順は [`entities_in_draw_order`]（レイヤーの重ね順、同一レイヤー内は追加順）。
+/// 選択ハイライト・ツールのプレビュー・スナップマーカーはこの関数より後に描くため、
+/// 常にエンティティ本体より手前に出る（呼び出し側 [`McadApp::ui`] の描画順を参照）。
 fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewport: &Viewport) {
     let visible = viewport.visible_aabb(rect);
-    for (_id, entity) in document.entities() {
-        let Some(layer) = document.layer(entity.layer) else {
-            continue;
-        };
-        if !layer.visible {
-            continue;
-        }
-        if !entity.geom.aabb().intersects(&visible) {
-            continue;
-        }
+    for (_id, entity, layer) in entities_in_draw_order(document, &visible) {
         let color = to_color32(entity.style.effective_color(layer.color));
         match &entity.geom {
             EntityGeom::Shape(shape) => {
@@ -2811,7 +3074,8 @@ mod tests {
         // （テストが必要なら `sample_document()` を使う）。
         let app = McadApp::new();
         assert_eq!(app.document.entity_count(), 0);
-        assert_eq!(app.document.layer_count(), 1);
+        // レイヤーは既定セット（"0" + DEFAULT_EXTRA_LAYERS）のみ。
+        assert_eq!(app.document.layer_count(), 1 + DEFAULT_EXTRA_LAYERS.len());
         assert_eq!(app.viewport, Viewport::new());
         assert!(!app.pending_zoom_fit);
     }
@@ -2975,9 +3239,10 @@ mod tests {
 
         app.new_document(0.0);
 
-        // Codex レビュー指摘への対応: Ctrl+N はサンプルを含まない真に空の文書にする。
+        // Codex レビュー指摘への対応: Ctrl+N はサンプル**エンティティ**を含まない。
+        // レイヤーだけは既定セット（"0" + DEFAULT_EXTRA_LAYERS）を持つ（§5）。
         assert_eq!(app.document.entity_count(), 0);
-        assert_eq!(app.document.layer_count(), 1);
+        assert_eq!(app.document.layer_count(), 1 + DEFAULT_EXTRA_LAYERS.len());
         assert!(app.current_path.is_none());
         // 新規文書は saved_generation を新しい基準点へ合わせるので未 dirty。
         assert!(!app.is_dirty());
@@ -3633,5 +3898,409 @@ mod tests {
             None,
             "失敗した2断片トリムのフラグが後続の無関係な確定へ漏れてはいけない"
         );
+    }
+
+    // ---- レイヤー重ね順（既定レイヤーセット・描画順・Front/Back） ----
+
+    /// レイヤー名を重ね順（奥→手前）で並べて返す。
+    fn ordered_layer_names(document: &Document) -> Vec<String> {
+        document
+            .layers_in_order()
+            .into_iter()
+            .map(|(_, layer)| layer.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn fresh_document_has_default_layer_set_in_order_with_clean_history() {
+        let document = fresh_document();
+
+        // "0"（デフォルト、order=0）が最背面で、既定レイヤーが配列順に手前へ載る。
+        let mut expected = vec!["0".to_owned()];
+        expected.extend(
+            DEFAULT_EXTRA_LAYERS
+                .iter()
+                .map(|(name, _)| (*name).to_owned()),
+        );
+        assert_eq!(ordered_layer_names(&document), expected);
+        assert_eq!(
+            document
+                .layers_in_order()
+                .into_iter()
+                .map(|(_, layer)| layer.order)
+                .collect::<Vec<_>>(),
+            (0..=DEFAULT_EXTRA_LAYERS.len() as i32).collect::<Vec<_>>()
+        );
+
+        // カレントレイヤーは "0" のまま（AddLayer はカレントを動かさない）。
+        assert_eq!(document.current_layer(), document.default_layer());
+        assert_eq!(document.layer(document.default_layer()).unwrap().name, "0");
+
+        // 既定レイヤーの追加は履歴に残らず、世代は基準点（0）に戻っている。
+        assert!(!document.can_undo());
+        assert!(!document.can_redo());
+        assert_eq!(document.generation(), 0);
+        assert_eq!(document.entity_count(), 0);
+    }
+
+    #[test]
+    fn new_and_new_document_share_the_default_layer_set() {
+        // 起動時と Ctrl+N は同じ既定セットを持つ（[`McadApp::new`] の doc）。
+        let started = McadApp::new();
+        let mut app = McadApp::new();
+        app.new_document(0.0);
+
+        assert_eq!(
+            ordered_layer_names(&app.document),
+            ordered_layer_names(&started.document)
+        );
+        assert!(
+            !app.is_dirty(),
+            "既定レイヤーの追加で dirty になってはいけない"
+        );
+        assert!(
+            !app.document.can_undo(),
+            "既定レイヤーの追加を Ctrl+Z で巻き戻せてはいけない"
+        );
+    }
+
+    #[test]
+    fn loading_a_document_does_not_inject_default_layers() {
+        // 既定セットは「新規文書のテンプレート」であって読込時には足さない（§5）。
+        // rfd を開かない DXF import 経路（apply_imported_dxf）で固定する。
+        // `.mcad` の open_document も同じく `load_mcad` の戻り値をそのまま代入する。
+        let mut app = McadApp::new();
+        assert!(app.document.layer_count() > 1, "起動時は既定セットを持つ");
+
+        let imported = Document::new();
+        let imported_layers = imported.layer_count();
+        app.apply_imported_dxf(
+            ImportSummary {
+                document: imported,
+                skipped_entities: 0,
+            },
+            0.0,
+        );
+
+        assert_eq!(app.document.layer_count(), imported_layers);
+        assert_eq!(ordered_layer_names(&app.document), vec!["0".to_owned()]);
+    }
+
+    #[test]
+    fn bring_to_front_order_picks_max_plus_one_and_is_noop_at_the_front() {
+        // 他レイヤーの最大 + 1。
+        assert_eq!(bring_to_front_order(0, [1, 5, 3]), 6);
+        // order が非連続でも「最大 + 1」で足りる（詰め直しは不要）。
+        assert_eq!(bring_to_front_order(-10, [-4, 40]), 41);
+        // 既に最前面なら現在値のまま（SetLayerProps の no-op 判定に乗る）。
+        assert_eq!(bring_to_front_order(7, [1, 5]), 7);
+        // レイヤーが1枚だけ（他レイヤーなし）でも現在値のまま。
+        assert_eq!(bring_to_front_order(3, []), 3);
+        // 飽和: i32::MAX があってもオーバーフローでパニックしない。
+        assert_eq!(bring_to_front_order(0, [i32::MAX]), i32::MAX);
+        assert_eq!(bring_to_front_order(i32::MAX, [i32::MAX]), i32::MAX);
+    }
+
+    #[test]
+    fn send_to_back_order_picks_min_minus_one_and_is_noop_at_the_back() {
+        assert_eq!(send_to_back_order(4, [1, 5, 3]), 0);
+        assert_eq!(send_to_back_order(40, [-4, 10]), -5);
+        // 既に最背面なら現在値のまま。
+        assert_eq!(send_to_back_order(-2, [1, 5]), -2);
+        assert_eq!(send_to_back_order(3, []), 3);
+        // 飽和。
+        assert_eq!(send_to_back_order(0, [i32::MIN]), i32::MIN);
+        assert_eq!(send_to_back_order(i32::MIN, [i32::MIN]), i32::MIN);
+    }
+
+    #[test]
+    fn front_order_change_is_a_single_undo_step() {
+        // Front/Back は専用コマンドを持たず SetLayerProps 1発なので undo も1回で戻る。
+        let mut document = fresh_document();
+        let back = document.default_layer();
+        let others: Vec<i32> = document
+            .layers()
+            .filter(|(id, _)| *id != back)
+            .map(|(_, layer)| layer.order)
+            .collect();
+        let before = ordered_layer_names(&document);
+
+        let mut props = document.layer(back).unwrap().clone();
+        props.order = bring_to_front_order(props.order, others);
+        document
+            .apply(Command::SetLayerProps { id: back, props })
+            .unwrap();
+        assert_eq!(
+            ordered_layer_names(&document).last().map(String::as_str),
+            Some("0"),
+            "\"0\" が最前面へ来る"
+        );
+
+        assert!(document.undo());
+        assert_eq!(ordered_layer_names(&document), before);
+        assert!(!document.can_undo(), "1操作 = undo 1単位");
+    }
+
+    /// `front_order_plan` の純関数テスト: 他レイヤーに `i32::MAX` があるときは
+    /// 単純な +1 が使えないため、全レイヤーを再正規化する計画を返す（Codex
+    /// adversarial review の medium 指摘対応）。相対順序（`c` は `b` より奥）も
+    /// 保たれることを確認する。
+    #[test]
+    fn front_order_plan_renormalizes_when_other_order_is_i32_max() {
+        let mut document = Document::new();
+        let a = document.default_layer(); // order 0、これを最前面へ動かす対象。
+        let b = add_layer_with_order(&mut document, "b", i32::MAX);
+        let c = add_layer_with_order(&mut document, "c", 5);
+
+        let all_orders: Vec<(LayerId, i32)> =
+            document.layers().map(|(id, l)| (id, l.order)).collect();
+        let plan = front_order_plan(a, &all_orders);
+        assert!(
+            !plan.is_empty(),
+            "i32::MAX が既にあるので再正規化が必要なはず"
+        );
+
+        let plan_map: std::collections::HashMap<LayerId, i32> = plan.into_iter().collect();
+        let resolved = |id: LayerId| -> i32 {
+            plan_map
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| all_orders.iter().find(|(o, _)| *o == id).unwrap().1)
+        };
+        let a_new = resolved(a);
+        let b_new = resolved(b);
+        let c_new = resolved(c);
+        assert!(a_new > b_new, "対象が唯一の最前面になるはず");
+        assert!(a_new > c_new, "対象が唯一の最前面になるはず");
+        // 相対順序: 元々 c(5) は b(i32::MAX) より奥だったので、再正規化後も奥のまま。
+        assert!(c_new < b_new, "対象以外の相対順序は保たれるはず");
+    }
+
+    /// [`front_order_plan_renormalizes_when_other_order_is_i32_max`] の対称版。
+    #[test]
+    fn back_order_plan_renormalizes_when_other_order_is_i32_min() {
+        let mut document = Document::new();
+        let a = document.default_layer();
+        let b = add_layer_with_order(&mut document, "b", i32::MIN);
+        let c = add_layer_with_order(&mut document, "c", -5);
+
+        let all_orders: Vec<(LayerId, i32)> =
+            document.layers().map(|(id, l)| (id, l.order)).collect();
+        let plan = back_order_plan(a, &all_orders);
+        assert!(
+            !plan.is_empty(),
+            "i32::MIN が既にあるので再正規化が必要なはず"
+        );
+
+        let plan_map: std::collections::HashMap<LayerId, i32> = plan.into_iter().collect();
+        let resolved = |id: LayerId| -> i32 {
+            plan_map
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| all_orders.iter().find(|(o, _)| *o == id).unwrap().1)
+        };
+        let a_new = resolved(a);
+        let b_new = resolved(b);
+        let c_new = resolved(c);
+        assert!(a_new < b_new, "対象が唯一の最背面になるはず");
+        assert!(a_new < c_new, "対象が唯一の最背面になるはず");
+        // 相対順序: 元々 c(-5) は b(i32::MIN) より手前だったので、再正規化後も手前のまま。
+        assert!(c_new > b_new, "対象以外の相対順序は保たれるはず");
+    }
+
+    /// UI 経路（[`layer_panel`] が組み立てる `Command::Batch`）を模して、境界値
+    /// （他レイヤーが `i32::MAX`）で実際に Front を適用すると全レイヤーの order が
+    /// 再正規化され、対象が真に最前面になること。また undo 1回で全レイヤーの order
+    /// が完全に元へ戻ることを固定する（Codex adversarial review の medium 指摘）。
+    #[test]
+    fn bring_to_front_at_i32_max_boundary_renormalizes_and_undoes_in_one_step() {
+        let mut document = Document::new();
+        let default = document.default_layer(); // order 0
+        let maxed = add_layer_with_order(&mut document, "maxed", i32::MAX);
+        let mid = add_layer_with_order(&mut document, "mid", 3);
+        // レイヤー追加自体を undo 対象から外す(検証したいのは Front 操作の undo 単位)。
+        document.clear_history();
+
+        let before: std::collections::HashMap<LayerId, i32> =
+            document.layers().map(|(id, l)| (id, l.order)).collect();
+
+        let all_orders: Vec<(LayerId, i32)> = before.iter().map(|(id, o)| (*id, *o)).collect();
+        let plan = front_order_plan(default, &all_orders);
+        assert!(!plan.is_empty());
+
+        let cmds: Vec<Command> = plan
+            .into_iter()
+            .map(|(id, order)| {
+                let mut props = document.layer(id).unwrap().clone();
+                props.order = order;
+                Command::SetLayerProps { id, props }
+            })
+            .collect();
+        document.apply(Command::Batch(cmds)).unwrap();
+
+        let default_order = document.layer(default).unwrap().order;
+        assert!(default_order > document.layer(maxed).unwrap().order);
+        assert!(default_order > document.layer(mid).unwrap().order);
+
+        assert!(document.undo(), "Batch は undo 1回で戻るはず");
+        let after: std::collections::HashMap<LayerId, i32> =
+            document.layers().map(|(id, l)| (id, l.order)).collect();
+        assert_eq!(
+            after, before,
+            "undo 1回で全レイヤーの order が完全に戻るはず"
+        );
+        assert!(!document.can_undo(), "1操作 = undo 1単位");
+    }
+
+    /// [`bring_to_front_at_i32_max_boundary_renormalizes_and_undoes_in_one_step`]
+    /// の Back / `i32::MIN` 版。
+    #[test]
+    fn send_to_back_at_i32_min_boundary_renormalizes_and_undoes_in_one_step() {
+        let mut document = Document::new();
+        let default = document.default_layer(); // order 0
+        let mined = add_layer_with_order(&mut document, "mined", i32::MIN);
+        let mid = add_layer_with_order(&mut document, "mid", -3);
+        // レイヤー追加自体を undo 対象から外す(検証したいのは Back 操作の undo 単位)。
+        document.clear_history();
+
+        let before: std::collections::HashMap<LayerId, i32> =
+            document.layers().map(|(id, l)| (id, l.order)).collect();
+
+        let all_orders: Vec<(LayerId, i32)> = before.iter().map(|(id, o)| (*id, *o)).collect();
+        let plan = back_order_plan(default, &all_orders);
+        assert!(!plan.is_empty());
+
+        let cmds: Vec<Command> = plan
+            .into_iter()
+            .map(|(id, order)| {
+                let mut props = document.layer(id).unwrap().clone();
+                props.order = order;
+                Command::SetLayerProps { id, props }
+            })
+            .collect();
+        document.apply(Command::Batch(cmds)).unwrap();
+
+        let default_order = document.layer(default).unwrap().order;
+        assert!(default_order < document.layer(mined).unwrap().order);
+        assert!(default_order < document.layer(mid).unwrap().order);
+
+        assert!(document.undo(), "Batch は undo 1回で戻るはず");
+        let after: std::collections::HashMap<LayerId, i32> =
+            document.layers().map(|(id, l)| (id, l.order)).collect();
+        assert_eq!(
+            after, before,
+            "undo 1回で全レイヤーの order が完全に戻るはず"
+        );
+        assert!(!document.can_undo(), "1操作 = undo 1単位");
+    }
+
+    /// 指定レイヤー上に、AABB が `visible` に必ず入る点エンティティを1つ追加する。
+    fn add_point(document: &mut Document, layer: LayerId, x: f64) -> EntityId {
+        document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Point(Point2::new(x, 0.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0]
+    }
+
+    /// 指定した重ね順のレイヤーを追加する。
+    fn add_layer_with_order(document: &mut Document, name: &str, order: i32) -> LayerId {
+        let mut layer = Layer::new(name, Rgb::WHITE);
+        layer.order = order;
+        document.apply(Command::AddLayer(layer)).unwrap().layers[0]
+    }
+
+    /// 全エンティティを含む十分大きな可視 AABB。
+    fn whole_world() -> Aabb {
+        Aabb::new(Point2::new(-1000.0, -1000.0), Point2::new(1000.0, 1000.0))
+    }
+
+    #[test]
+    fn draw_order_follows_layer_order_and_is_stable_within_a_layer() {
+        let mut document = Document::new();
+        let base = document.default_layer(); // order = 0
+        let front = add_layer_with_order(&mut document, "front", 5);
+        let back = add_layer_with_order(&mut document, "back", -5);
+
+        // 追加順は base, front, back, base, front（レイヤー順とはあえてずらす）。
+        let base_first = add_point(&mut document, base, 0.0);
+        let front_first = add_point(&mut document, front, 1.0);
+        let back_only = add_point(&mut document, back, 2.0);
+        let base_second = add_point(&mut document, base, 3.0);
+        let front_second = add_point(&mut document, front, 4.0);
+
+        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &whole_world())
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+
+        // レイヤーは order 昇順（back → base → front）、各レイヤー内は追加順のまま。
+        assert_eq!(
+            drawn,
+            vec![
+                back_only,
+                base_first,
+                base_second,
+                front_first,
+                front_second
+            ]
+        );
+    }
+
+    /// [`draw_order_follows_layer_order_and_is_stable_within_a_layer`] の隣。
+    /// 異なるレイヤーが**同順位**（同じ `Layer::order`）のときの描画順を固定する。
+    /// `entities_in_draw_order` は `layer.order` だけで安定ソートするため、同順位の
+    /// レイヤー間ではレイヤーの境界を無視して [`Document::entities`] の反復順
+    /// （＝エンティティの追加順）がそのまま残るはず（`.mcad` v3 は任意の `i32` order を
+    /// 正規入力として受理するため、複数レイヤーが同じ order を持つ状態は普通に起こる）。
+    #[test]
+    fn draw_order_is_stable_across_layers_with_equal_order() {
+        let mut document = Document::new();
+        let base = document.default_layer(); // order = 0
+        let same_a = add_layer_with_order(&mut document, "same_a", 0);
+        let same_b = add_layer_with_order(&mut document, "same_b", 0);
+
+        // 追加順は same_a, base, same_b, base（レイヤーをまたいで交互に追加する）。
+        let a_first = add_point(&mut document, same_a, 0.0);
+        let base_first = add_point(&mut document, base, 1.0);
+        let b_first = add_point(&mut document, same_b, 2.0);
+        let base_second = add_point(&mut document, base, 3.0);
+
+        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &whole_world())
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+
+        // 3レイヤーとも order = 0 なので、レイヤー境界に関係なく追加順のまま。
+        assert_eq!(drawn, vec![a_first, base_first, b_first, base_second]);
+    }
+
+    #[test]
+    fn draw_order_skips_hidden_layers_and_culled_entities() {
+        let mut document = Document::new();
+        let base = document.default_layer();
+        let hidden = add_layer_with_order(&mut document, "hidden", 1);
+        let visible_id = add_point(&mut document, base, 0.0);
+        let hidden_id = add_point(&mut document, hidden, 0.0);
+        let far_id = add_point(&mut document, base, 500.0);
+
+        let mut props = document.layer(hidden).unwrap().clone();
+        props.visible = false;
+        document
+            .apply(Command::SetLayerProps { id: hidden, props })
+            .unwrap();
+
+        // 可視範囲は原点付近のみ。非表示レイヤーと範囲外エンティティは落ちる。
+        let view = Aabb::new(Point2::new(-10.0, -10.0), Point2::new(10.0, 10.0));
+        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &view)
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert_eq!(drawn, vec![visible_id]);
+        assert!(!drawn.contains(&hidden_id));
+        assert!(!drawn.contains(&far_id));
     }
 }

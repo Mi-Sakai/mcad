@@ -8,10 +8,25 @@
 //!
 //! - レイヤー参照は `LayerId` ではなく **`layers` 配列へのインデックス**（安定な
 //!   ファイル ID）。
+//! - レイヤー自体も core の [`Layer`] をそのまま流用せず、io 専用の DTO
+//!   （[`FileLayer`]）として書く。core 側の型変更がファイル形式へ直接漏れないように
+//!   するため。
 //! - 生存中のレイヤー・エンティティのみを列挙する。undo/redo 履歴・墓標は保存しない。
-//! - `version` フィールド必須（現行は `2`）。書き出しは常に v2。読込は v1（幾何が
-//!   [`Shape`] のみ）を後方互換で受理し（[`from_json`] が [`EntityGeom::Shape`] へ変換）、
-//!   それ以外の未知バージョンは拒否する。
+//! - `version` フィールド必須（現行は `3`）。書き出しは常に v3。読込は v1・v2 を
+//!   後方互換で受理し、それ以外の未知バージョンは拒否する（[`from_json`]）。
+//!
+//! # バージョン履歴と後方互換の変換規則
+//!
+//! | version | 差分 | 読込時の変換 |
+//! |---|---|---|
+//! | 1 | 幾何が [`Shape`] のみ。レイヤーは `order` なし | [`EntityGeom::Shape`] で包む + `order = 配列インデックス` |
+//! | 2 | 幾何が [`EntityGeom`]（M6 でテキスト・寸法を追加）。レイヤーは `order` なし | `order = 配列インデックス` |
+//! | 3 | レイヤーに `order`（重ね順）を追加。現行 | なし |
+//!
+//! `order` を持たない v1/v2 のレイヤーには **配列内のインデックスをそのまま
+//! `order` として採用する**。export は常にデフォルトレイヤーを先頭に列挙してきた
+//! ため、この規則で復元した重ね順は「ファイル内の元の並び」に一致し、`SlotMap` の
+//! 未規定な反復順に依存しない。
 //!
 //! # import の再構築
 //!
@@ -41,33 +56,79 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use mcad_core::{Command, Document, Entity, EntityGeom, Layer, LayerId, Style};
+use mcad_core::{Command, Document, Entity, EntityGeom, Layer, LayerId, Rgb, Style};
 use mcad_geom::Shape;
 
 use crate::IoError;
 
 /// 現行のファイルフォーマットバージョン。
 ///
-/// v2（M6）で [`FileEntity::geom`] を [`EntityGeom`]（テキスト・寸法を含む）へ拡張した。
-/// v1 ファイル（幾何が [`Shape`] のみ）は [`from_json`] が後方互換で読み込む（
-/// [`FileDocumentV1`] 参照）。書き出しは常に v2。
-pub const FORMAT_VERSION: u32 = 2;
+/// - v2（M6）で [`FileEntity::geom`] を [`EntityGeom`]（テキスト・寸法を含む）へ拡張。
+/// - v3 でレイヤーに `order`（重ね順）を追加（[`FileLayer`]）。
+///
+/// 書き出しは常に v3。v1・v2 のファイルは [`from_json`] が後方互換で読み込む
+/// （[`FileDocumentV1`] / [`FileDocumentV2`] / [`FileLayerV2`] 参照）。
+pub const FORMAT_VERSION: u32 = 3;
 
-/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v2）。
+/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v3）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDocument {
     /// フォーマットバージョン。[`FORMAT_VERSION`] 以外は読込を拒否する。
     pub version: u32,
     /// レイヤー一覧。先頭（インデックス 0）が `Document` のデフォルトレイヤーに
-    /// 対応する。
-    pub layers: Vec<Layer>,
+    /// 対応する。**配列の並びは重ね順ではない**（重ね順は [`FileLayer::order`]）。
+    pub layers: Vec<FileLayer>,
     /// カレントレイヤー（`layers` へのインデックス）。
     pub current_layer: usize,
     /// エンティティ一覧。
     pub entities: Vec<FileEntity>,
 }
 
-/// `.mcad` ファイル内のエンティティ 1 件（現行 v2）。
+/// `.mcad` ファイル内のレイヤー 1 枚（現行 v3）。
+///
+/// core の [`Layer`] とフィールドは一致するが、**ファイル形式を core の型定義から
+/// 切り離すために別型として持つ**。core 側にフィールドが増えても、ここへ明示的に
+/// 足さない限りファイル形式は変わらない（逆に、ここを変えるならフォーマット
+/// バージョンを上げる、という対応が明確になる）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLayer {
+    /// レイヤー名。
+    pub name: String,
+    /// レイヤー色。
+    pub color: Rgb,
+    /// 表示するか。
+    pub visible: bool,
+    /// ロックされているか。
+    pub locked: bool,
+    /// 重ね順（値が大きいほど手前）。v3 で追加。
+    pub order: i32,
+}
+
+impl FileLayer {
+    /// core の [`Layer`] から DTO を作る。
+    fn from_core(layer: &Layer) -> Self {
+        Self {
+            name: layer.name.clone(),
+            color: layer.color,
+            visible: layer.visible,
+            locked: layer.locked,
+            order: layer.order,
+        }
+    }
+
+    /// DTO から core の [`Layer`] を作る。
+    fn to_core(&self) -> Layer {
+        Layer {
+            name: self.name.clone(),
+            color: self.color,
+            visible: self.visible,
+            locked: self.locked,
+            order: self.order,
+        }
+    }
+}
+
+/// `.mcad` ファイル内のエンティティ 1 件（v2 以降で共通）。
 ///
 /// [`mcad_core::Entity`] と違い、所属レイヤーを `LayerId` ではなく
 /// [`FileDocument::layers`] へのインデックスで参照する。
@@ -81,12 +142,74 @@ pub struct FileEntity {
     pub geom: EntityGeom,
 }
 
+/// v2 以前のレイヤー 1 枚を表す凍結 DTO（後方互換読込専用）。
+///
+/// v1・v2 の時代のレイヤーは 4 フィールドで、`order` を持たなかった。この型は
+/// **その当時の形のまま凍結する**（今後 core の [`Layer`] や [`FileLayer`] が
+/// 変わっても追随しない）。v1 と v2 でレイヤー構造は同一だったため、両バージョンの
+/// 読込がこの 1 つの型を共有する。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct FileLayerV2 {
+    name: String,
+    color: Rgb,
+    visible: bool,
+    locked: bool,
+}
+
+impl FileLayerV2 {
+    /// 凍結 DTO を現行の [`FileLayer`] へ変換する。
+    ///
+    /// `index` は `layers` 配列内の位置で、これをそのまま `order` に採用する
+    /// （モジュール doc「後方互換の変換規則」参照）。
+    fn into_v3(self, index: usize) -> FileLayer {
+        FileLayer {
+            name: self.name,
+            color: self.color,
+            visible: self.visible,
+            locked: self.locked,
+            order: i32::try_from(index).unwrap_or(i32::MAX),
+        }
+    }
+}
+
+/// v1・v2 の `layers` 配列を現行の [`FileLayer`] 列へ変換する（`order = インデックス`）。
+fn layers_v2_into_v3(layers: Vec<FileLayerV2>) -> Vec<FileLayer> {
+    layers
+        .into_iter()
+        .enumerate()
+        .map(|(index, layer)| layer.into_v3(index))
+        .collect()
+}
+
+/// v2 ファイル全体を表す DTO（後方互換読込専用）。v3 との差はレイヤーが
+/// [`FileLayerV2`]（`order` なし）であること。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct FileDocumentV2 {
+    version: u32,
+    layers: Vec<FileLayerV2>,
+    current_layer: usize,
+    entities: Vec<FileEntity>,
+}
+
+impl FileDocumentV2 {
+    /// v2 DTO を現行の v3 [`FileDocument`] へ変換する（バージョンは
+    /// [`FORMAT_VERSION`] に更新）。
+    fn into_v3(self) -> FileDocument {
+        FileDocument {
+            version: FORMAT_VERSION,
+            layers: layers_v2_into_v3(self.layers),
+            current_layer: self.current_layer,
+            entities: self.entities,
+        }
+    }
+}
+
 /// v1 ファイル全体を表す DTO（後方互換読込専用）。v2 との差は [`FileEntityV1`] の
 /// `geom` が [`Shape`] であること。[`from_json`] が `version == 1` を検出したときのみ使う。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FileDocumentV1 {
     version: u32,
-    layers: Vec<Layer>,
+    layers: Vec<FileLayerV2>,
     current_layer: usize,
     entities: Vec<FileEntityV1>,
 }
@@ -100,12 +223,13 @@ struct FileEntityV1 {
 }
 
 impl FileDocumentV1 {
-    /// v1 DTO を現行の v2 [`FileDocument`] へ変換する（各 `Shape` を
-    /// [`EntityGeom::Shape`] で包む。バージョンは [`FORMAT_VERSION`] に更新）。
-    fn into_v2(self) -> FileDocument {
+    /// v1 DTO を現行の v3 [`FileDocument`] へ変換する（各 `Shape` を
+    /// [`EntityGeom::Shape`] で包み、レイヤーは `order = インデックス` で復元する。
+    /// バージョンは [`FORMAT_VERSION`] に更新）。
+    fn into_v3(self) -> FileDocument {
         FileDocument {
             version: FORMAT_VERSION,
-            layers: self.layers,
+            layers: layers_v2_into_v3(self.layers),
             current_layer: self.current_layer,
             entities: self
                 .entities
@@ -147,7 +271,10 @@ pub fn export_document(doc: &Document) -> FileDocument {
 
     FileDocument {
         version: FORMAT_VERSION,
-        layers: layers.into_iter().map(|(_, l)| l).collect(),
+        layers: layers
+            .iter()
+            .map(|(_, l)| FileLayer::from_core(l))
+            .collect(),
         current_layer,
         entities,
     }
@@ -192,7 +319,7 @@ pub fn import_document(file: &FileDocument) -> Result<Document, IoError> {
     for (index, layer) in file.layers.iter().enumerate() {
         let unlocked = Layer {
             locked: false,
-            ..layer.clone()
+            ..layer.to_core()
         };
         if index == 0 {
             let id = doc.default_layer();
@@ -222,7 +349,7 @@ pub fn import_document(file: &FileDocument) -> Result<Document, IoError> {
         if layer.locked {
             doc.apply(Command::SetLayerProps {
                 id: layer_ids[index],
-                props: layer.clone(),
+                props: layer.to_core(),
             })?;
         }
     }
@@ -244,10 +371,16 @@ pub fn to_json(doc: &Document) -> Result<String, IoError> {
 ///
 /// # バージョン互換
 ///
-/// 先頭でフォーマットバージョンだけを読み、`version == 1` なら旧 DTO（[`FileDocumentV1`]、
-/// 幾何は [`Shape`]）としてパースして [`EntityGeom::Shape`] へ変換し、`version == 2`
-/// （[`FORMAT_VERSION`]）なら現行 DTO としてパースする。それ以外は
-/// [`IoError::UnsupportedVersion`] を返す。書き出しは常に v2。
+/// 先頭でフォーマットバージョンだけを読み、バージョンごとに DTO を選ぶ:
+///
+/// - `1`: [`FileDocumentV1`]（幾何は [`Shape`]、レイヤーは `order` なし）
+/// - `2`: [`FileDocumentV2`]（レイヤーは `order` なし）
+/// - `3`（[`FORMAT_VERSION`]）: 現行の [`FileDocument`]
+///
+/// それ以外は [`IoError::UnsupportedVersion`] を返す。書き出しは常に v3。
+///
+/// v3 として読むファイルのレイヤーに `order` が欠けていれば [`IoError::Json`] で
+/// 失敗する（`order` を暗黙の既定値で埋めない = 壊れた v3 ファイルを検出できる）。
 ///
 /// # Errors
 ///
@@ -264,7 +397,11 @@ pub fn from_json(json: &str) -> Result<Document, IoError> {
     match probe.version {
         1 => {
             let v1: FileDocumentV1 = serde_json::from_str(json)?;
-            import_document(&v1.into_v2())
+            import_document(&v1.into_v3())
+        }
+        2 => {
+            let v2: FileDocumentV2 = serde_json::from_str(json)?;
+            import_document(&v2.into_v3())
         }
         FORMAT_VERSION => {
             let file: FileDocument = serde_json::from_str(json)?;
@@ -346,6 +483,8 @@ mod tests {
         let mut props = doc.layer(second).unwrap().clone();
         props.locked = true;
         props.visible = false;
+        // 重ね順も既定値から動かしておき、往復テストが order を含めて検証するようにする。
+        props.order = 7;
         doc.apply(Command::SetLayerProps { id: second, props })
             .unwrap();
         doc
@@ -421,13 +560,140 @@ mod tests {
 
     #[test]
     fn unsupported_version_fails() {
-        // 現行は v2。未知の将来バージョン（3）は拒否する。
+        // 現行は v3。未知の将来バージョン（4）は拒否する。
         let mut file = export_document(&Document::new());
-        file.version = 3;
+        file.version = 4;
         assert!(matches!(
             import_document(&file),
-            Err(IoError::UnsupportedVersion(3))
+            Err(IoError::UnsupportedVersion(4))
         ));
+    }
+
+    #[test]
+    fn v3_round_trip_preserves_layer_order() {
+        // v3 の往復で重ね順が保たれる（配列順ではなく order フィールドが根拠）。
+        let mut doc = Document::new();
+        let default = doc.default_layer();
+
+        // デフォルトレイヤーを一番手前（order = 10）へ、後から足す 2 枚をその奥へ置く。
+        // → 配列順（デフォルトが先頭）と重ね順が一致しない状態を作る。
+        let mut props = doc.layer(default).unwrap().clone();
+        props.order = 10;
+        doc.apply(Command::SetLayerProps { id: default, props })
+            .unwrap();
+        for (name, order) in [("mid", 5), ("back", -3)] {
+            let mut layer = Layer::new(name, Rgb::new(1, 2, 3));
+            layer.order = order;
+            doc.apply(Command::AddLayer(layer)).unwrap();
+        }
+
+        let expected: Vec<(String, i32)> = doc
+            .layers_in_order()
+            .into_iter()
+            .map(|(_, l)| (l.name.clone(), l.order))
+            .collect();
+        assert_eq!(
+            expected,
+            vec![
+                ("back".to_owned(), -3),
+                ("mid".to_owned(), 5),
+                ("0".to_owned(), 10),
+            ]
+        );
+
+        let loaded = from_json(&to_json(&doc).unwrap()).unwrap();
+        let actual: Vec<(String, i32)> = loaded
+            .layers_in_order()
+            .into_iter()
+            .map(|(_, l)| (l.name.clone(), l.order))
+            .collect();
+        assert_eq!(actual, expected);
+        // デフォルトレイヤーの対応（先頭 = デフォルト）も往復で保たれる。
+        assert_eq!(loaded.layer(loaded.default_layer()).unwrap().name, "0");
+        assert_eq!(export_document(&loaded), export_document(&doc));
+    }
+
+    #[test]
+    fn v2_file_is_read_with_backward_compat() {
+        // v0.7.x 以前の v2 ファイル。レイヤーに order キーが無い。
+        // 幾何は v2 以降の EntityGeom（"Shape" ラッパーあり）。
+        let v2_json = r#"{
+          "version": 2,
+          "layers": [
+            {"name": "0", "color": {"r": 255, "g": 255, "b": 255}, "visible": true, "locked": false},
+            {"name": "middle", "color": {"r": 10, "g": 20, "b": 30}, "visible": false, "locked": true},
+            {"name": "top", "color": {"r": 40, "g": 50, "b": 60}, "visible": true, "locked": false}
+          ],
+          "current_layer": 2,
+          "entities": [
+            {"layer": 1, "style": {"color": null, "width": 1.0},
+             "geom": {"Shape": {"Line": {"a": {"x": 0.0, "y": 0.0}, "b": {"x": 3.0, "y": 4.0}}}}}
+          ]
+        }"#;
+
+        let doc = from_json(v2_json).expect("v2 ファイルは後方互換で読み込めるべき");
+
+        // order は配列インデックスで復元される（並びはファイル内の元の順序）。
+        let ordered: Vec<(String, i32)> = doc
+            .layers_in_order()
+            .into_iter()
+            .map(|(_, l)| (l.name.clone(), l.order))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("0".to_owned(), 0),
+                ("middle".to_owned(), 1),
+                ("top".to_owned(), 2),
+            ]
+        );
+
+        // 他のプロパティ・カレントレイヤー・エンティティも従来どおり復元される。
+        let (_, middle) = doc.layers().find(|(_, l)| l.name == "middle").unwrap();
+        assert!(middle.locked && !middle.visible);
+        assert_eq!(doc.layer(doc.current_layer()).unwrap().name, "top");
+        assert_eq!(doc.entity_count(), 1);
+
+        // 読込後の書き出しは常に v3。
+        assert_eq!(export_document(&doc).version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn v1_file_layer_order_falls_back_to_array_index() {
+        // v1 もレイヤーは order なし。v2 と同じ「order = 配列インデックス」規則を通る。
+        let v1_json = r#"{
+          "version": 1,
+          "layers": [
+            {"name": "0", "color": {"r": 255, "g": 255, "b": 255}, "visible": true, "locked": false},
+            {"name": "front", "color": {"r": 1, "g": 2, "b": 3}, "visible": true, "locked": false}
+          ],
+          "current_layer": 0,
+          "entities": []
+        }"#;
+
+        let doc = from_json(v1_json).unwrap();
+        let ordered: Vec<(String, i32)> = doc
+            .layers_in_order()
+            .into_iter()
+            .map(|(_, l)| (l.name.clone(), l.order))
+            .collect();
+        assert_eq!(ordered, vec![("0".to_owned(), 0), ("front".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn v3_file_without_layer_order_is_rejected() {
+        // v3 と自称するファイルのレイヤーに order が無いのは壊れたファイル。
+        // 暗黙の既定値で埋めず、JSON エラーとして弾く（core の Layer に
+        // serde(default) を付けない理由そのもの）。
+        let broken = r#"{
+          "version": 3,
+          "layers": [
+            {"name": "0", "color": {"r": 255, "g": 255, "b": 255}, "visible": true, "locked": false}
+          ],
+          "current_layer": 0,
+          "entities": []
+        }"#;
+        assert!(matches!(from_json(broken), Err(IoError::Json(_))));
     }
 
     #[test]

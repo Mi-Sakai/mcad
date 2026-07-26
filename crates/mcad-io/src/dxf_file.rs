@@ -67,6 +67,38 @@
 //! クレートのバージョンでは公開されていない）。そのため DXF 往復ではロック状態を
 //! 保存できず、import 時は常に `locked: false` として復元する。
 //!
+//! # レイヤーの重ね順は保存されない
+//!
+//! `dxf::tables::Layer`（クレート 0.6.1 の生成コード
+//! `target/debug/build/dxf-*/out/generated/tables.rs`）のフィールドは
+//! `name, handle, color, line_type_name, is_layer_plotted, line_weight,
+//! is_layer_on` 等のみで、重ね順／z-index に相当するフィールドが**存在しない**
+//! （実測。ロックが同クレートに無いのと同じ理由）。DXF の LAYER テーブル自体に
+//! 重ね順という概念がないため、これは仕様上の制約であり回避できない。
+//!
+//! - **export** は、デフォルトレイヤーを LAYER テーブルの先頭に固定し、残りを
+//!   [`Document::layers_in_order`](mcad_core::Document::layers_in_order) の順
+//!   （[`Layer::order`](mcad_core::Layer::order) 昇順、奥→手前）で続けて
+//!   `drawing.add_layer` を呼ぶ（[`export_dxf`] 参照）。先頭固定は、下記
+//!   import の「テーブル先頭 = デフォルトレイヤー」規則を常に成り立たせる
+//!   ためで、これを崩すと**デフォルトレイヤー（削除できない特別なレイヤー）が
+//!   往復で入れ替わる**実害のあるバグになる（2026-07-26 の Codex adversarial
+//!   review [high] 指摘で発覚、[`export_dxf`] のコメント参照）。
+//!   デフォルト以外のレイヤー間では、DXF はこの出現順を重ね順として解釈しない
+//!   ため、これは**他 CAD のレイヤー一覧表示がテーブル出現順に従った場合にだけ
+//!   意味を持つ best-effort** であり、保証ではない。
+//! - **import** は LAYER テーブルの出現順（`enumerate()` の `index`）を
+//!   そのまま `order = index as i32` として採用する（[`import_dxf`] 参照）。
+//! - したがって「mcad → DXF export → 同じ mcad で import」の往復では、
+//!   デフォルト以外のレイヤーは export が出現順を重ね順に揃えているため
+//!   **`order`（＝見た目の重ね順）は結果的に保たれる**。一方、**デフォルト
+//!   レイヤー自身の `order` は先頭固定のため往復で失われ、re-import 後は常に
+//!   `order = 0` になる**（先頭固定を優先した意図的な割り切り）。また、他 CAD
+//!   がテーブルを並べ替えて保存した DXF や、LAYER テーブルを手で編集した DXF を
+//!   import する場合は、その CAD が採用した出現順がそのまま `order` になるため、
+//!   **mcad 側の元の重ね順とは一致しない可能性がある**（ロック・線幅と同じ
+//!   「往復で失われうる」仕様）。
+//!
 //! # 色は近似（ACI ⇔ RGB）
 //!
 //! mcad の [`Rgb`] は真の 24bit RGB だが、`dxf` クレートの `Color` は AutoCAD
@@ -448,8 +480,35 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
     // 取り除き、`Document` のレイヤーだけで組み直す。
     while drawing.remove_layer(0).is_some() {}
 
+    // レイヤーは「デフォルトレイヤーを先頭に固定し、残りを mcad の重ね順
+    // （layers_in_order、奥→手前の昇順）で続ける」順で書き出す（タスク41の
+    // Codex adversarial review [high] 指摘対応）。
+    //
+    // なぜ先頭固定が必要か: import 側は昔から「LAYER テーブルの先頭 = mcad の
+    // デフォルトレイヤー（削除できないレイヤー）」という規則で `Document` を
+    // 再構築する（下の import_dxf 参照）。これは layers_in_order 順で書いていた
+    // 旧実装では、デフォルトレイヤーより order が小さい（奥の）レイヤーが
+    // 存在すると破れる: そちらが先頭に来てしまい、import 時に「デフォルトレイヤー
+    // が入れ替わる」（削除できないはずのレイヤーが変わる）という実害のある
+    // バグになる。デフォルトを先頭へ固定すればこの規則は常に保たれる。
+    //
+    // 代償: デフォルトレイヤー自身の重ね順（order）は先頭に固定されるため、
+    // DXF 往復では復元できない（re-import 時に index 0 → order = 0 になる）。
+    // モジュール doc「レイヤーの重ね順は保存されない」が述べるとおり、DXF の
+    // 重ね順往復はもともと best-effort で保証しないため、これは許容する
+    // （デフォルト以外のレイヤーの相対順序は従来どおり保たれる）。
     let mut layer_names: HashMap<LayerId, String> = HashMap::new();
-    for (id, layer) in doc.layers() {
+    let default_id = doc.default_layer();
+    let ordered_ids: Vec<LayerId> = std::iter::once(default_id)
+        .chain(
+            doc.layers_in_order()
+                .into_iter()
+                .map(|(id, _)| id)
+                .filter(|id| *id != default_id),
+        )
+        .collect();
+    for id in ordered_ids {
+        let layer = doc.layer(id).expect("Document invariant: layer is alive");
         layer_names.insert(id, layer.name.clone());
         drawing.add_layer(DxfLayer {
             name: layer.name.clone(),
@@ -537,6 +596,9 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
             // dxf::tables::Layer にロック状態のフィールドがないため常に未ロックで
             // 復元する（モジュール doc「レイヤーロックは保存されない」参照）。
             locked: false,
+            // DXF に重ね順の概念はないため、LAYER テーブルの並び順を重ね順として
+            // 採用する（未規定の反復順に依存しない決定的な規則）。
+            order: i32::try_from(index).unwrap_or(i32::MAX),
         };
         if index == 0 {
             let id = doc.default_layer();
@@ -1072,6 +1134,161 @@ mod tests {
         let summary = import_dxf(&drawing).unwrap();
         assert_eq!(summary.skipped_entities, 1);
         assert_eq!(summary.document.entity_count(), 0);
+    }
+
+    /// import: LAYER テーブルの出現順（`enumerate()` の `index`）がそのまま
+    /// `order` になることの回帰テスト（タスク41、モジュール doc「レイヤーの
+    /// 重ね順は保存されない」参照）。テーブル出現順と名前のアルファベット順が
+    /// 一致しない並びを使い、名前順に引きずられていないことを確認する。
+    #[test]
+    fn import_assigns_order_from_layer_table_appearance() {
+        let mut drawing = Drawing::new();
+        while drawing.remove_layer(0).is_some() {}
+        for name in ["zeta", "0", "alpha"] {
+            drawing.add_layer(DxfLayer {
+                name: name.to_string(),
+                ..Default::default()
+            });
+        }
+
+        let summary = import_dxf(&drawing).unwrap();
+        let doc = summary.document;
+        let ordered: Vec<_> = doc
+            .layers_in_order()
+            .into_iter()
+            .map(|(_, l)| l.name.clone())
+            .collect();
+        assert_eq!(ordered, vec!["zeta", "0", "alpha"]);
+    }
+
+    /// export: レイヤーは「デフォルトレイヤーが先頭、残りは
+    /// [`Document::layers_in_order`] の順（`order` 昇順、奥→手前）」で LAYER
+    /// テーブルへ書き出される（タスク41、Codex adversarial review [high] 指摘対応で
+    /// 先頭固定に変更）。挿入順（"0" → "second" → "third"）とも
+    /// `layers_in_order`（"third" → "0" → "second"）とも異なる並びになることを
+    /// 確認する: デフォルト "0" は `order` 上は "third" より奥（数値が小さい）だが、
+    /// 先頭固定のためテーブル上は "third" より先に出る。
+    #[test]
+    fn export_writes_layers_in_layers_in_order_sequence() {
+        let mut doc = Document::new();
+        let default = doc.default_layer();
+        let second = doc
+            .apply(Command::AddLayer(Layer::new("second", Rgb::WHITE)))
+            .unwrap()
+            .layers[0];
+        let third = doc
+            .apply(Command::AddLayer(Layer::new("third", Rgb::WHITE)))
+            .unwrap()
+            .layers[0];
+
+        // 挿入順は 0, second, third だが、重ね順は third, 0, second にする。
+        let mut default_props = doc.layer(default).unwrap().clone();
+        default_props.order = 1;
+        doc.apply(Command::SetLayerProps {
+            id: default,
+            props: default_props,
+        })
+        .unwrap();
+        let mut second_props = doc.layer(second).unwrap().clone();
+        second_props.order = 2;
+        doc.apply(Command::SetLayerProps {
+            id: second,
+            props: second_props,
+        })
+        .unwrap();
+        let mut third_props = doc.layer(third).unwrap().clone();
+        third_props.order = 0;
+        doc.apply(Command::SetLayerProps {
+            id: third,
+            props: third_props,
+        })
+        .unwrap();
+
+        let layers_in_order: Vec<String> = doc
+            .layers_in_order()
+            .into_iter()
+            .map(|(_, l)| l.name.clone())
+            .collect();
+        assert_eq!(layers_in_order, vec!["third", "0", "second"]);
+
+        // 書き出し順は「デフォルト "0" が先頭、残りは layers_in_order 順
+        // （"third" → "second"、"0" を除いたもの）」。
+        let export = export_dxf(&doc);
+        let exported_names: Vec<String> = export.drawing.layers().map(|l| l.name.clone()).collect();
+        assert_eq!(exported_names, vec!["0", "third", "second"]);
+    }
+
+    /// export → import の往復で、**デフォルトレイヤーの `order` が最小でない**
+    /// （デフォルトより奥のレイヤーがある）図面でも、往復後に同じレイヤー
+    /// （名前で判定）がデフォルトレイヤーのままであることを固定する
+    /// （Codex adversarial review [high] 指摘の回帰テスト）。
+    ///
+    /// 修正前の実装は、export が `layers_in_order`（`order` 昇順）の順で
+    /// LAYER テーブルを書いていたため、デフォルトより奥のレイヤーがあると
+    /// そちらがテーブルの先頭に来てしまい、import は「テーブル先頭 = デフォルト」
+    /// という規則で読むため、**最背面のレイヤーがデフォルトへ化け、元のデフォルトは
+    /// 通常レイヤーになる**という実害のあるバグがあった
+    /// （既存の `export_writes_layers_in_layers_in_order_sequence` は再 import
+    /// していなかったためこの回帰を検出できなかった）。
+    #[test]
+    fn round_trip_preserves_default_layer_identity_when_default_is_not_backmost() {
+        let mut doc = Document::new();
+        let default = doc.default_layer(); // 名前は "0"
+
+        // デフォルトより奥（order が小さい）レイヤーを作る。
+        let behind = doc
+            .apply(Command::AddLayer(Layer::new("behind", Rgb::WHITE)))
+            .unwrap()
+            .layers[0];
+        let mut behind_props = doc.layer(behind).unwrap().clone();
+        behind_props.order = -10;
+        doc.apply(Command::SetLayerProps {
+            id: behind,
+            props: behind_props,
+        })
+        .unwrap();
+
+        // デフォルトより手前のレイヤーも1枚。
+        let front = doc
+            .apply(Command::AddLayer(Layer::new("front", Rgb::WHITE)))
+            .unwrap()
+            .layers[0];
+        let mut front_props = doc.layer(front).unwrap().clone();
+        front_props.order = 10;
+        doc.apply(Command::SetLayerProps {
+            id: front,
+            props: front_props,
+        })
+        .unwrap();
+
+        // 前提: "behind" がデフォルトより奥にいる（これが回帰の引き金）。
+        let layers_in_order: Vec<String> = doc
+            .layers_in_order()
+            .into_iter()
+            .map(|(_, l)| l.name.clone())
+            .collect();
+        assert_eq!(layers_in_order, vec!["behind", "0", "front"]);
+
+        let export = export_dxf(&doc);
+        let summary = import_dxf(&export.drawing).unwrap();
+        let mut imported = summary.document;
+
+        // デフォルトレイヤーは名前で見て "0" のままであること
+        // （import 側は削除できない特別なレイヤーとして "0" を扱う）。
+        let imported_default_name = &imported.layer(imported.default_layer()).unwrap().name;
+        assert_eq!(
+            imported_default_name,
+            &doc.layer(default).unwrap().name,
+            "デフォルトレイヤーの同一性(名前)が往復で入れ替わってはならない"
+        );
+        assert_eq!(imported_default_name, "0");
+
+        // 削除できないのが本当に "0" であることも確認する（"behind" は削除できる）。
+        assert!(
+            imported
+                .apply(Command::RemoveLayer(imported.default_layer()))
+                .is_err()
+        );
     }
 
     #[test]

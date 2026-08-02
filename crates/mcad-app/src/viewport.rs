@@ -22,12 +22,18 @@ pub const MAX_ZOOM: f64 = 1e6;
 /// 図面全体は画面の `1 / (1 + 2*FIT_MARGIN_RATIO)` 程度の割合を占める。
 const FIT_MARGIN_RATIO: f64 = 0.1;
 
-/// [`Viewport::fit_to_aabb`] で使う絶対値マージンの下限（ワールド単位）。
+/// [`Viewport::fit_to_aabb`] で保証する余白の下限（画面 px 基準）。
 ///
-/// 単一点のみ・水平/垂直線のみなど、AABBの一辺（またはその両方）がゼロになる
-/// 退化ケースで `FIT_MARGIN_RATIO * 0` もゼロになりゼロ除算を招くため、
-/// 常にこの値以上のマージンを保証するフォールバックとして使う。
-const FIT_MIN_MARGIN: f64 = 1.0;
+/// 単一点のみ・水平/垂直線のみなど、AABBの一辺（またはその両方）がゼロ、または
+/// [`FIT_MARGIN_RATIO`] 分の余白がスクリーン上でほぼ見えないほど小さくなる退化ケースの
+/// フォールバックとして使う。DESIGN.md M8 設計判断9: 単位系確定（1ワールド単位=1mm）に
+/// 伴い、この下限を「ワールド単位の絶対値」ではなく「画面 px 基準」で定義し直した
+/// （旧 `FIT_MIN_MARGIN: f64 = 1.0`（ワールド単位）は、図面のワールド寸法が極端に小さい
+/// （例: 1e-3 未満）場合にこの固定マージンがAABBそのものを圧倒し、フィット後の
+/// 図形がスクリーン上でほぼ不可視（1px未満）になる不具合があった。画面 px 基準に
+/// することで、ワールドスケールが 1e-6〜1e6 のどちらへ極端に振れても、フィット後の
+/// 余白は常に画面上で意味のある大きさを保つ）。
+const FIT_MARGIN_MIN_PX: f64 = 24.0;
 
 /// ワールド(f64)↔スクリーン(egui, f32)変換とズーム/パン状態を保持するビューポート。
 ///
@@ -114,17 +120,25 @@ impl Viewport {
     }
 
     /// `aabb` がスクリーン矩形 `screen_rect` に（余白付きで）収まるよう `zoom`・`center`
-    /// を更新する（M4タスク13: ファイル読込後のズームフィット）。
+    /// を更新する（M4タスク13: ファイル読込後のズームフィット。M8タスク42: `Home` キーの
+    /// 手動ズームフィットもこの関数を再利用する）。
     ///
-    /// `center` は常に `aabb.center()` に設定する。`zoom` は `aabb` の上下左右に
-    /// [`FIT_MARGIN_RATIO`]（AABB最大辺に対する比率、下限 [`FIT_MIN_MARGIN`]）分の余白を
-    /// 持たせたうえで、幅・高さそれぞれがスクリーンへ収まる倍率のうち小さい方を採用し、
-    /// 最後に [`MIN_ZOOM`]..=[`MAX_ZOOM`] へクランプする。
+    /// `center` は常に `aabb.center()` に設定する。余白は2つの成分の大きい方
+    /// （軸ごとに独立、[`Self::axis_fit_zoom`] 参照）を採る:
+    /// - [`FIT_MARGIN_RATIO`][]: AABB最大辺に対する比率（ワールド単位）。図面が大きいほど
+    ///   余白もそれに比例して広がる、通常時の見た目。
+    /// - [`FIT_MARGIN_MIN_PX`][]: 画面 px 基準の下限。AABBが退化（辺長ゼロ）または
+    ///   [`FIT_MARGIN_RATIO`][] 分の余白がスクリーン上でほぼ見えないほど小さいワールド
+    ///   スケール（判断9参照）でも、画面上で意味のある余白を確保する。
     ///
-    /// 単一点のみ・水平/垂直線のみの退化した `aabb`（`width()`/`height()` が 0）でも、
-    /// 余白の下限 [`FIT_MIN_MARGIN`] により `expanded` 後の幅・高さは必ず正になるため
-    /// ゼロ除算・無限大にはならない。`screen_rect` が空（幅または高さが 0 以下、
-    /// レイアウト確定前のフレーム等）の場合は何も更新しない。
+    /// 余白をワールド単位の絶対値ではなく画面 px 基準の量として定義したことで、
+    /// 極端なワールドスケール（1e-6〜1e6 オーダー）でも余白が図形を圧倒したり
+    /// 無視できるほど縮んだりしない。ただし極端に小さい AABB（[`MAX_ZOOM`] でも
+    /// 数px未満にしかならない）ではズームが [`MAX_ZOOM`] へクランプされ、それ以上は
+    /// 拡大できない（これは余白計算ではなくズーム上限自体の制約）。
+    ///
+    /// `screen_rect` が空（幅または高さが 0 以下、レイアウト確定前のフレーム等）の場合は
+    /// 何も更新しない。
     pub fn fit_to_aabb(&mut self, aabb: Aabb, screen_rect: Rect) {
         let screen_w = f64::from(screen_rect.width());
         let screen_h = f64::from(screen_rect.height());
@@ -135,12 +149,44 @@ impl Viewport {
         self.center = aabb.center();
 
         let extent = aabb.width().max(aabb.height());
-        let margin = (extent * FIT_MARGIN_RATIO).max(FIT_MIN_MARGIN);
-        let padded = aabb.expanded(margin);
+        let ratio_margin = extent * FIT_MARGIN_RATIO;
 
-        let zoom_x = screen_w / padded.width();
-        let zoom_y = screen_h / padded.height();
-        self.zoom = zoom_x.min(zoom_y).clamp(MIN_ZOOM, MAX_ZOOM);
+        let zoom_x = Self::axis_fit_zoom(screen_w, aabb.width(), ratio_margin);
+        let zoom_y = Self::axis_fit_zoom(screen_h, aabb.height(), ratio_margin);
+        let zoom = zoom_x.min(zoom_y);
+
+        // 両軸とも無限大（辺長ゼロの単一点で、余白側の制約もゼロ幅ゆえに効かない）の
+        // 場合、フィット計算だけでは自然な倍率を決められないため既定の等倍へ落とす。
+        self.zoom = if zoom.is_finite() {
+            zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+        } else {
+            1.0
+        };
+    }
+
+    /// [`Self::fit_to_aabb`] の1軸分の計算。`screen_dim`（スクリーン側の幅または高さ、px）に
+    /// `obj_dim`（AABB側の対応する辺の長さ、ワールド単位）を、`ratio_margin`（ワールド単位、
+    /// 両側合計ではなく片側分）と [`FIT_MARGIN_MIN_PX`]（画面 px、片側分）のうち実効的に
+    /// 大きい方の余白を持たせて収める倍率を返す。
+    ///
+    /// 画面 px 基準の余白は「求める `zoom` 自身」に依存する（`px_margin_world = PX / zoom`）
+    /// ため素朴には循環するが、境界条件 `screen_dim = zoom * obj_dim + 2 * PX` は `zoom` について
+    /// 閉じた形で解ける（`zoom = (screen_dim - 2*PX) / obj_dim`）。この2つの独立した
+    /// 候補ズーム（比率余白のみ／px下限余白のみ）のうち小さい方を採れば、
+    /// 「余白 = 2つの成分の大きい方」を反映した最終ズームに一致する
+    /// （`zoom` は余白の単調減少関数なので、大きい余白ほど小さい `zoom` を要求する）。
+    ///
+    /// `obj_dim == 0` の軸は px 下限余白による制約を受けない（辺長ゼロの方向へは
+    /// どれだけ余白を足しても常に画面へ収まるため）。`screen_dim` が px 下限余白の
+    /// 2倍以下（極端に小さい `screen_rect`）の場合も同様に無視し、比率余白のみで決める。
+    fn axis_fit_zoom(screen_dim: f64, obj_dim: f64, ratio_margin: f64) -> f64 {
+        let zoom_ratio = screen_dim / (obj_dim + 2.0 * ratio_margin);
+        let zoom_px = if obj_dim > 0.0 && screen_dim > 2.0 * FIT_MARGIN_MIN_PX {
+            (screen_dim - 2.0 * FIT_MARGIN_MIN_PX) / obj_dim
+        } else {
+            f64::INFINITY
+        };
+        zoom_ratio.min(zoom_px)
     }
 }
 
@@ -469,17 +515,106 @@ mod tests {
     }
 
     #[test]
-    fn fit_to_aabb_tiny_aabb_stays_finite_and_does_not_zoom_absurdly() {
-        // FIT_MIN_MARGIN のフォールバックにより、ほぼ点に近い AABB でも
-        // マージンが最小サイズ未満には縮まらない。有限かつ極端に巨大でない
-        // (MAX_ZOOM 未満の) 常識的な zoom になることを確認する。
+    fn fit_to_aabb_tiny_aabb_stays_finite_and_clamps_to_max_zoom() {
+        // 1e-12 オーダーという、MAX_ZOOM(1e6) をもってしても画面上で数px にすら
+        // ならないほど極端に小さい AABB（M8タスク42想定の 1e-6〜1e6 スケールより
+        // さらに極端）では、余白計算の方式によらずズーム上限 MAX_ZOOM に張り付く
+        // （これは余白計算の不具合ではなく MAX_ZOOM 自体の制約。M8タスク42の
+        // 「クランプとの相互作用」に該当する）。有限であり NaN/無限大にはならない
+        // ことを確認する。
         let mut vp = Viewport::new();
         let aabb = Aabb::from_corners(Point2::new(-1e-12, -1e-12), Point2::new(1e-12, 1e-12));
         let r = rect(800.0, 600.0);
         vp.fit_to_aabb(aabb, r);
         assert!(vp.zoom.is_finite());
-        assert!(vp.zoom > 0.0);
+        assert!((vp.zoom - MAX_ZOOM).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fit_to_aabb_small_world_scale_stays_visible_on_screen() {
+        // 画面 px 基準の余白（FIT_MARGIN_MIN_PX）への変更の主眼: ワールド寸法が
+        // 極端に小さい（1e-3 オーダー）図面でも、フィット後は画面上で十分な大きさ
+        // （数百 px オーダー）で見えること。旧実装（ワールド単位固定の
+        // FIT_MIN_MARGIN=1.0）ではこの余白がAABBそのもの(1e-3)を圧倒し、
+        // zoom がほぼ screen/(2*1.0) 程度で頭打ちになり、図形は1px未満に潰れて
+        // 実質不可視だった。
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(-5e-4, -5e-4), Point2::new(5e-4, 5e-4));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+
+        assert!(vp.zoom.is_finite());
+        let width_px = aabb.width() * vp.zoom;
+        let height_px = aabb.height() * vp.zoom;
+        // 旧実装だと 1e-3 * 400 = 0.4px 程度にしかならなかった値域。新実装では
+        // 画面の大半を図形が占めるはず（数百px オーダー）。
+        assert!(
+            width_px > 100.0,
+            "width_px={width_px} should be clearly visible, not sub-pixel"
+        );
+        assert!(
+            height_px > 100.0,
+            "height_px={height_px} should be clearly visible, not sub-pixel"
+        );
+    }
+
+    #[test]
+    fn fit_to_aabb_huge_world_scale_fits_without_clamping() {
+        // ワールド寸法が極端に大きい（1e6 オーダー）図面でも、比率余白
+        // (FIT_MARGIN_RATIO) がそのままスケールするため、MIN_ZOOM/MAX_ZOOM の
+        // クランプに引っかからず妥当な zoom でフィットする。
+        let mut vp = Viewport::new();
+        let aabb = Aabb::from_corners(Point2::new(-5e5, -5e5), Point2::new(5e5, 5e5));
+        let r = rect(800.0, 600.0);
+        vp.fit_to_aabb(aabb, r);
+
+        assert!(vp.zoom.is_finite());
+        assert!(vp.zoom > MIN_ZOOM);
         assert!(vp.zoom < MAX_ZOOM);
+
+        // 4隅が余白付きで画面内に収まる。
+        let corners = [
+            Point2::new(aabb.min.x, aabb.min.y),
+            Point2::new(aabb.min.x, aabb.max.y),
+            Point2::new(aabb.max.x, aabb.min.y),
+            Point2::new(aabb.max.x, aabb.max.y),
+        ];
+        for c in corners {
+            let sp = vp.world_to_screen(r, c);
+            assert!(r.contains(sp), "corner {c:?} -> {sp:?} not inside {r:?}");
+        }
+    }
+
+    #[test]
+    fn fit_to_aabb_visible_size_is_scale_invariant_across_extreme_world_scales() {
+        // 正方形AABBを 1e-3・1・1e3 倍のワールドスケールでフィットすると、
+        // （クランプに当たらない範囲では）画面上の表示サイズ（px）はスケールに
+        // よらずほぼ一定になるはず（[`Viewport::fit_to_aabb`] のdoc参照:
+        // 比率ベースの余白は screen*RATIO/(1+2*RATIO) 相当の一定px幅に帰着するため、
+        // AABBのワールドスケールが変わっても画面占有率は変わらない）。旧実装の
+        // ワールド単位固定フォールバック（`FIT_MIN_MARGIN`）はこの不変性を壊し、
+        // 小スケール側で図形が余白に埋もれて不可視になっていた。
+        let r = rect(800.0, 600.0);
+        let mut widths_px = Vec::new();
+        for half_extent in [1e-3, 1.0, 1e3] {
+            let mut vp = Viewport::new();
+            let aabb = Aabb::from_corners(
+                Point2::new(-half_extent, -half_extent),
+                Point2::new(half_extent, half_extent),
+            );
+            vp.fit_to_aabb(aabb, r);
+            assert!(vp.zoom.is_finite() && vp.zoom > 0.0);
+            // クランプに当たっていないことを確認したうえで比較する
+            // （クランプ域の比較は別テストの役割）。
+            assert!(vp.zoom > MIN_ZOOM && vp.zoom < MAX_ZOOM);
+            widths_px.push(aabb.width() * vp.zoom);
+        }
+        for w in &widths_px {
+            assert!(
+                (w - widths_px[0]).abs() < 1.0,
+                "widths_px={widths_px:?} should all be nearly equal (scale-invariant fit)"
+            );
+        }
     }
 
     #[test]

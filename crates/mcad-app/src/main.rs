@@ -418,6 +418,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "Ctrl+Shift+S=Save As",
     "Ctrl+Shift+O=Import DXF",
     "Ctrl+E=Export DXF",
+    "Home=Zoom Fit",
 ];
 
 /// ステータスバーに一時表示するメッセージ。
@@ -654,15 +655,18 @@ impl McadApp {
         }
     }
 
-    /// ファイル読込（`.mcad`/DXF共通）直後に呼ぶ。M4タスク13（起動状態とズームフィット）。
+    /// ズームフィットを要求する。呼び出し元はファイル読込（`.mcad`/DXF共通）直後
+    /// （M4タスク13: 起動状態とズームフィット）と、`Home` キーの手動ズームフィット
+    /// （M8タスク42。同じ判定・計算を再利用し、フィットロジックを二重化しない）。
     ///
-    /// 読込直後の時点ではキャンバスのスクリーン矩形がまだ確定していないため、
-    /// フィット計算をその場では行えない。読み込んだドキュメントにエンティティが
-    /// 1件以上あれば [`McadApp::pending_zoom_fit`] を立てて次フレームの `CentralPanel`
-    /// （スクリーン矩形確定後）へ計算を委ねる。エンティティが0件（空の`.mcad`/DXF）なら
+    /// 呼び出し時点ではキャンバスのスクリーン矩形がまだ確定していない（読込直後）か、
+    /// あるいは確定済みでもこの関数自体はそれを持たない（`Home` キー押下時）ため、
+    /// フィット計算をその場では行えない。ドキュメントにエンティティが1件以上あれば
+    /// [`McadApp::pending_zoom_fit`] を立てて次フレームの `CentralPanel`
+    /// （スクリーン矩形確定後）へ計算を委ねる。エンティティが0件（空文書）なら
     /// フィット対象がないため、その場で [`Viewport::new`] の既定ビューへリセットする
     /// （DESIGN.md 6章タスク13: 「空文書は既定ビューへリセット」）。
-    fn request_zoom_fit_after_load(&mut self) {
+    fn request_zoom_fit(&mut self) {
         if self.document.entity_count() > 0 {
             self.pending_zoom_fit = true;
         } else {
@@ -828,7 +832,7 @@ impl McadApp {
                 // 読込直後を未保存でない状態にするため、その世代へ合わせる。
                 self.saved_generation = self.document.generation();
                 self.reset_transient_ui_state();
-                self.request_zoom_fit_after_load();
+                self.request_zoom_fit();
                 set_status_important(&mut self.status, now, open_status(clamped_widths));
             }
             Err(err) => {
@@ -873,19 +877,31 @@ impl McadApp {
         let ImportSummary {
             document,
             skipped_entities,
+            clamped_line_widths,
         } = summary;
         self.document = document;
         self.current_path = None;
         self.saved_generation = DXF_IMPORT_SAVED_GENERATION_SENTINEL;
         self.reset_transient_ui_state();
-        self.request_zoom_fit_after_load();
-        let message = if skipped_entities > 0 {
-            format!(
-                "Imported DXF: {skipped_entities} entity(ies) skipped \
-                 (unsupported type); layer locks are not restored from DXF"
-            )
-        } else {
+        self.request_zoom_fit();
+        let mut notes = Vec::new();
+        if skipped_entities > 0 {
+            notes.push(format!(
+                "{skipped_entities} entity(ies) skipped (unsupported type)"
+            ));
+        }
+        if clamped_line_widths > 0 {
+            notes.push(format!(
+                "{clamped_line_widths} line width(s) clamped to the 0.05..=5.0mm range"
+            ));
+        }
+        let message = if notes.is_empty() {
             "Imported DXF file; layer locks are not restored from DXF".to_string()
+        } else {
+            format!(
+                "Imported DXF: {}; layer locks are not restored from DXF",
+                notes.join(", ")
+            )
         };
         set_status_important(&mut self.status, now, message);
     }
@@ -1209,6 +1225,17 @@ impl eframe::App for McadApp {
             );
         }
 
+        // M8タスク42: Home キーで手動ズームフィット（図面全体が収まるようフィット）。
+        // Home はテキスト入力欄ではカーソルを行頭へ移動する一般的なキーなので、
+        // ツール切替と同じ `app_shortcuts_enabled`（テキスト欄フォーカス中は抑止）
+        // ゲートに合わせる。読込直後の自動フィットと同じ判定・計算を
+        // `request_zoom_fit` の再利用で行う（ロジックの二重化を避ける）。
+        if app_shortcuts_enabled(self.confirm_state, text_focused)
+            && ui.input(|i| i.key_pressed(Key::Home))
+        {
+            self.request_zoom_fit();
+        }
+
         // F3 でスナップの有効/無効をトグルする（作図時の吸着を一時的に切りたい場面用）。
         // ファンクションキーはテキスト入力と競合しないので、モーダル非表示中なら常に効かせる。
         if self.confirm_state == ConfirmState::Idle && ui.input(|i| i.key_pressed(Key::F3)) {
@@ -1341,7 +1368,7 @@ impl eframe::App for McadApp {
 
             // M4タスク13: ファイル読込直後のズームフィットは、読込時点ではまだこの
             // スクリーン矩形（rect）が確定していないため実行できず、ここまで遅延させる
-            // 必要がある（`request_zoom_fit_after_load` の doc 参照）。
+            // 必要がある（`request_zoom_fit` の doc 参照）。
             if self.pending_zoom_fit {
                 if let Some(aabb) = document_aabb(&self.document) {
                     self.viewport.fit_to_aabb(aabb, rect);
@@ -3346,6 +3373,7 @@ mod tests {
         let summary = ImportSummary {
             document: imported,
             skipped_entities: 2,
+            clamped_line_widths: 0,
         };
 
         app.apply_imported_dxf(summary, 0.0);
@@ -3384,6 +3412,7 @@ mod tests {
         let summary = ImportSummary {
             document: Document::new(),
             skipped_entities: 0,
+            clamped_line_widths: 0,
         };
         app.apply_imported_dxf(summary, 0.0);
 
@@ -3407,6 +3436,7 @@ mod tests {
         let summary = ImportSummary {
             document: sample_document(),
             skipped_entities: 0,
+            clamped_line_widths: 0,
         };
         app.apply_imported_dxf(summary, 0.0);
 
@@ -3424,6 +3454,7 @@ mod tests {
         let summary = ImportSummary {
             document: Document::new(),
             skipped_entities: 0,
+            clamped_line_widths: 0,
         };
         app.apply_imported_dxf(summary, 0.0);
 
@@ -3432,17 +3463,17 @@ mod tests {
     }
 
     #[test]
-    fn request_zoom_fit_after_load_sets_flag_only_when_entities_present() {
+    fn request_zoom_fit_sets_flag_only_when_entities_present() {
         let mut app = McadApp::new();
 
         app.document = sample_document();
         app.pending_zoom_fit = false;
-        app.request_zoom_fit_after_load();
+        app.request_zoom_fit();
         assert!(app.pending_zoom_fit);
 
         app.document = Document::new();
         app.viewport.zoom = 7.0;
-        app.request_zoom_fit_after_load();
+        app.request_zoom_fit();
         assert!(!app.pending_zoom_fit);
         assert_eq!(app.viewport, Viewport::new());
     }
@@ -4026,6 +4057,7 @@ mod tests {
             ImportSummary {
                 document: imported,
                 skipped_entities: 0,
+                clamped_line_widths: 0,
             },
             0.0,
         );

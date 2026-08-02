@@ -143,6 +143,101 @@
 //! 起こりうる）。これを無視するとエンティティごと復元できなくなってしまうため、
 //! 未知のレイヤー名を見つけた時点でその場に新しいレイヤーを追加し、そちらへ
 //! 割り当てる（復元性を優先する）。
+//!
+//! # 単位（`$INSUNITS`）
+//!
+//! export は DXF ヘッダの `$INSUNITS`（`dxf::Header::default_drawing_units`）に
+//! `Units::Millimeters`（値 4）を書く（DESIGN.md M8 設計判断1）。mcad のワールド
+//! 単位が常に mm であることの明示であり、他 CAD が単位系変換の要否を判断する
+//! 手がかりになる。import 側は `$INSUNITS` を読まない（もともと 1 ワールド単位
+//! = 1mm の無変換取り込みであり、DESIGN.md M8 設計判断1が既存図面もこの前提で
+//! 再解釈すると決めているため）。
+//!
+//! # TEXT 高さの尺度契約（DESIGN.md M8 設計判断4a）
+//!
+//! [`TextGeom::height`] は紙 mm（表示・出力先ごとに換算される「格納値」）で持つ。
+//! DXF の TEXT 高さ（group code 40）はモデル空間の長さなので、そのまま転写すると
+//! 尺度 1:1 以外で誤る。ここでは:
+//!
+//! - **export**: 図面の [`mcad_core::SheetMeta::scale`] から
+//!   `k = Scale::world_mm_per_paper_mm()` を求め、`text_height = height * k` を書く
+//!   （[`text_to_dxf_entity`]）。1:1（`k = 1.0`）では従来どおり無変換と等価。
+//! - **import**: DXF ファイルには図面尺度の概念がないため、**1:1 とみなして**
+//!   `text_height` の数値をそのまま紙 mm として取り込む（[`dxf_entity_to_geom`]）。
+//!
+//! この結果、尺度が 1:1 以外の図面を export → import すると「紙 mm としての
+//! 意味」は往復しない（import 後は常に尺度 1:1 の図面として解釈される）が、
+//! **モデル空間での幾何サイズ（ワールド高さ）は正しく保存される**
+//! （1:2 で紙 mm 3.5 → DXF 7.0 → import 後は尺度 1:1 の紙 mm 7.0 = ワールド高さ
+//! 7.0 で不変）。レイヤー重ね順・色近似と同種の「仕様として非保存」であり、
+//! テストは `text_height_scales_by_sheet_scale_on_export` と
+//! `text_geometric_height_survives_round_trip_across_scale_reinterpretation` が
+//! 固定する。
+//!
+//! # 線幅・線種（lineweight / LTYPE）は best-effort（DESIGN.md M8 設計判断5）
+//!
+//! `dxf` 0.6.1 の実測結果（2026-08-02）:
+//!
+//! - **線幅（エンティティ）**: `dxf::entities::EntityCommon::lineweight_enum_value`
+//!   は生の `pub i16`（group code 370、単位は DXF 仕様どおり **1/100mm**）で、
+//!   任意の値を読み書きできる。[`WidthMm`] との変換は
+//!   [`width_mm_to_dxf_lineweight_raw`] / [`dxf_lineweight_raw_to_width_mm`]。
+//!   **`raw <= 0` はすべて ByLayer**（[`Style::width_mm`] = `None`）として扱う
+//!   （[`dxf_lineweight_to_style_width`]）。負値は DXF 仕様の group code 370 の
+//!   慣例（`-1` = BYLAYER, `-2` = BYBLOCK, `-3` = DEFAULT）に基づく。`0` も
+//!   同じ扱いに含めるのは、`EntityCommon::lineweight_enum_value` の spec 上の
+//!   既定値が `0`（group code 370 を**省略**した DXF ファイルもこの値で入って
+//!   くる）であり、これを「明示的な極細線」としてクランプ対象にすると、
+//!   lineweight を書かない大多数の外部 DXF で毎エンティティがクランプ計上
+//!   されるノイズになるため（色の by_block/by_entity と同じ「クレートの対応
+//!   範囲を超える区別は ByLayer へ丸める」方針の延長）。正の raw 値は
+//!   [`WidthMm`] の範囲（0.05〜5.0mm = raw 5〜500）へクランプし、クランプが
+//!   起きた件数を [`ImportSummary::clamped_line_widths`] に積む（色 ACI・
+//!   DXF import の他の best-effort 変換と同じ「黙って丸めない」流儀）。export
+//!   には型の構成上、検証済みの [`WidthMm`] しか到達しないためクランプ不要
+//!   （[`width_mm_to_dxf_lineweight_raw`] は常に範囲内の raw 値を返す）。
+//! - **線幅（レイヤー）は export できない（実測で判明した非対称な制約）**:
+//!   `dxf::tables::Layer::line_weight` は `i16` ではなく不透明な `LineWeight`
+//!   型（group code 370）で、**任意値を作れる公開コンストラクタが存在しない**
+//!   （`LineWeight::from_raw_value` は `pub(crate)`、公開 API は `by_block()`
+//!   （raw `-1`）・`by_layer()`（raw `-2`）・`Default::default()`（raw `0`）の
+//!   3 つの固定値のみ。実測: `dxf::LineWeight::from_raw_value(35)` を
+//!   `mcad-io` 側から呼ぶと `E0624 private associated function` でコンパイル
+//!   エラーになる）。読む側（`.raw_value()`）は公開されているため **import は
+//!   他 CAD が書いたレイヤー線幅を最大限取り込める**が、**export はレイヤーの
+//!   `width_mm` を DXF へ書けない**（`DxfLayer::line_weight` は既定値
+//!   `raw = 0` のまま）。import 側（[`dxf_layer_lineweight_to_width_mm`]）は
+//!   `raw <= 0` を「未指定」として [`WidthMm::DEFAULT`] を返しクランプ計上
+//!   しない（mcad 自身が export したレイヤーが必ずこの経路を通るため、計上する
+//!   と re-import のたびに全レイヤーがクランプ扱いになりノイズになる）。正の
+//!   raw 値（他 CAD が明示的に書いた値）は通常どおり範囲外をクランプし計上する。
+//!   これはロック・重ね順と同じ「クレート側 API の欠落による仕様上の制約」で
+//!   あり、レイヤー個別色（`color: Color`、公開コンストラクタ `Color::from_index`
+//!   あり）とは非対称。エンティティ個別上書き（[`Style::width_mm`]）は
+//!   `lineweight_enum_value` が生 `i16` のためこの制約を受けず、往復する。
+//! - **線種**: `dxf::tables::LineType`（LTYPE テーブル、`Drawing::add_line_type`）
+//!   と、レイヤー・エンティティ双方の `line_type_name`（`String`、group code 6）
+//!   が存在し読み書きできる。ただし DXF の LTYPE 名は AutoCAD 標準ライブラリ
+//!   （`acad.lin` 等）の任意の名前空間であり、mcad の [`Linetype`] が持つのは
+//!   4 種のみ。export は mcad 側の名前（`CONTINUOUS` / `DASHED` / `DASHDOT` /
+//!   `DIVIDE`。`DashDotDot`（二点鎖線）は AutoCAD 標準ライブラリ（acad.lin）の
+//!   慣例名 `DIVIDE` を使う — `DASHDOT2` は同ライブラリでは「半スケールの
+//!   一点鎖線」を指すため、それを二点鎖線として書く／読むと他 CAD 由来の本物の
+//!   `DASHDOT2` を誤解釈する）で LTYPE テーブルへ簡易パターン
+//!   （[`dxf_line_type_defs`]）を登録し、レイヤー・エンティティへその名前を
+//!   書く。import は名前を
+//!   大文字小文字を無視して mcad の 4 種へ逆引きし（[`dxf_name_to_linetype`]）、
+//!   **一致しない名前（他 CAD 由来の未知の線種）は `Linetype::Continuous` へ
+//!   フォールバックする**（DESIGN.md M8 設計判断5「未知の線種名は Continuous
+//!   へフォールバック」）。この場合は「無視して計上」ではなく「実線として
+//!   確定的に解釈する」ため計上しない（色近似が常に何らかの色を返すのと同じ
+//!   考え方）。エンティティの `line_type_name` が `BYLAYER`/`BYBLOCK`（大文字
+//!   小文字を無視）の場合はレイヤー継承（[`Style::linetype`] = `None`）として
+//!   扱う。
+//!   LTYPE のダッシュパターン長（`total_pattern_length`・
+//!   `dash_dot_space_lengths`）は往復に使わない mcad 独自の簡易値であり、他
+//!   CAD ソフトでの見た目の一致は保証しない（画面表示のダッシュ長は app 層の
+//!   紙 mm 定数が別途決める。DESIGN.md M8 設計判断5・4a 換算表参照）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -151,8 +246,8 @@ use dxf::entities::{
     Arc as DxfArc, Circle as DxfCircle, Entity as DxfEntity, EntityType, Line as DxfLine,
     LwPolyline, ModelPoint, Text as DxfText,
 };
-use dxf::enums::{HorizontalTextJustification, VerticalTextJustification};
-use dxf::tables::Layer as DxfLayer;
+use dxf::enums::{HorizontalTextJustification, Units as DxfUnits, VerticalTextJustification};
+use dxf::tables::{Layer as DxfLayer, LineType as DxfLineType};
 use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
 use mcad_core::{
@@ -193,6 +288,12 @@ pub struct ImportSummary {
     pub document: Document,
     /// 無視したエンティティ数（未対応の種別 + 不正なジオメトリ）。
     pub skipped_entities: usize,
+    /// [`WidthMm`] の範囲（0.05..=5.0mm）外の DXF lineweight を範囲へクランプして
+    /// 取り込んだ件数（レイヤー + エンティティの合計）。無視はしない（エンティティ
+    /// ごと捨てる `skipped_entities` とは別枠）が、黙って値を変えたことを
+    /// ステータス表示できるよう計上する（モジュール doc「線幅・線種は
+    /// best-effort」参照）。
+    pub clamped_line_widths: usize,
 }
 
 /// DXF export の結果。
@@ -257,6 +358,164 @@ fn style_color_to_dxf(color: Option<Rgb>) -> Color {
 /// レイヤー継承として扱う。
 fn dxf_color_to_style(color: &Color) -> Option<Rgb> {
     color.index().map(aci_to_rgb)
+}
+
+/// [`WidthMm`] を DXF lineweight の raw 値（1/100mm 単位、group code 370）へ変換する。
+///
+/// [`WidthMm`] は常に `0.05..=5.0` の範囲（= raw `5..=500`）なので、この変換は
+/// 常に妥当な非負値を返す（クランプ不要。モジュール doc「線幅・線種は
+/// best-effort」参照）。
+fn width_mm_to_dxf_lineweight_raw(width: WidthMm) -> i16 {
+    (f64::from(width.mm()) * 100.0).round() as i16
+}
+
+/// DXF lineweight の raw 値（1/100mm 単位）を [`WidthMm`] へ変換する。
+///
+/// [`WidthMm`] の範囲外（負値含む）は範囲へクランプし、クランプが起きたかを
+/// 2 番目の戻り値で返す（呼び出し側が [`ImportSummary::clamped_line_widths`] へ
+/// 積む）。`raw` は `i16` なので常に有限であり、[`WidthMm::clamped`] が `None`
+/// を返すことはない。
+fn dxf_lineweight_raw_to_width_mm(raw: i16) -> (WidthMm, bool) {
+    let mm = f32::from(raw) / 100.0;
+    match WidthMm::new(mm) {
+        Ok(w) => (w, false),
+        Err(_) => (
+            WidthMm::clamped(mm).expect("raw i16 / 100.0 is always finite"),
+            true,
+        ),
+    }
+}
+
+/// DXF エンティティの lineweight raw 値（group code 370）を [`Style::width_mm`]
+/// （個別上書き。`None` = ByLayer）へ変換する。
+///
+/// `raw <= 0` はすべて ByLayer として扱う: 負値は DXF 仕様の group code 370 の
+/// 慣例で `-1` = BYLAYER・`-2` = BYBLOCK・`-3` = DEFAULT（モジュール doc 参照）。
+/// `0` も含めるのは、このクレートの `EntityCommon::lineweight_enum_value` の
+/// 既定値（spec の `DefaultValue="0"`）が `0` であり、**code 370 を省略した
+/// DXF ファイル**（他 CAD ソフトの出力に多い、「個別指定なし」の意図）を読むと
+/// この既定値のまま入ってくるため。`0` を「明示的な極細線」と区別なく
+/// クランプ対象にすると、code 370 を書かない大多数の外部 DXF で毎エンティティが
+/// クランプ計上されるノイズになる。クランプが起きたかは 2 番目の戻り値で返す。
+fn dxf_lineweight_to_style_width(raw: i16) -> (Option<WidthMm>, bool) {
+    if raw <= 0 {
+        (None, false)
+    } else {
+        let (width, clamped) = dxf_lineweight_raw_to_width_mm(raw);
+        (Some(width), clamped)
+    }
+}
+
+/// レイヤーの DXF lineweight raw 値を [`WidthMm`] へ変換する。
+///
+/// `raw <= 0`（このクレートの `LineWeight::default()` が返す `0` を含む。export
+/// 側は `dxf` 0.6.1 の API 制約でレイヤーへ任意の raw 値を書けないため、
+/// **mcad 自身が export したレイヤーは常にこの経路を通る**。モジュール doc
+/// 「線幅・線種は best-effort」参照）は「未指定」とみなし、[`WidthMm::DEFAULT`]
+/// を返す（クランプではないので計上しない。計上すると自分が export した DXF を
+/// re-import するたびに全レイヤーがクランプ扱いになりノイズになる）。正の raw
+/// 値（他 CAD が明示的に書いた値）は通常どおり範囲外をクランプし、計上する。
+fn dxf_layer_lineweight_to_width_mm(raw: i16) -> (WidthMm, bool) {
+    if raw <= 0 {
+        (WidthMm::DEFAULT, false)
+    } else {
+        dxf_lineweight_raw_to_width_mm(raw)
+    }
+}
+
+/// mcad の [`Linetype`] を、export が LTYPE テーブルへ登録する DXF 線種名へ変換する。
+///
+/// [`Linetype`] は `#[non_exhaustive]` なので、クレート外の本関数では将来追加される
+/// 未知バリアントに備えてワイルドカード腕で `CONTINUOUS`（実線）へフォールバックする。
+///
+/// `DashDotDot`（二点鎖線）は AutoCAD 標準ライブラリ（acad.lin）の慣例名
+/// `DIVIDE` を使う。`DASHDOT2` を使わない理由: 同ライブラリでは `DASHDOT2` は
+/// 「半スケールの一点鎖線（dash-dot）」を指す既存の名前であり、それを二点鎖線と
+/// して書くと、受け手の CAD には一点鎖線と紛らわしい名前を渡すことになる
+/// （モジュール doc「線幅・線種は best-effort」参照）。
+fn linetype_to_dxf_name(linetype: Linetype) -> &'static str {
+    match linetype {
+        Linetype::Continuous => "CONTINUOUS",
+        Linetype::Dashed => "DASHED",
+        Linetype::DashDot => "DASHDOT",
+        Linetype::DashDotDot => "DIVIDE",
+        _ => "CONTINUOUS",
+    }
+}
+
+/// DXF 線種名を mcad の [`Linetype`] へ逆引きする。
+///
+/// 大文字小文字を無視して [`linetype_to_dxf_name`] の逆写像と比較する。一致しない
+/// 名前（他 CAD ソフト由来の未知の線種）は `Linetype::Continuous` へフォールバック
+/// する（DESIGN.md M8 設計判断5。モジュール doc 参照）。`DASHDOT2` の腕は意図的に
+/// 持たない: acad.lin の慣例では `DASHDOT2` は一点鎖線（半スケール）であり
+/// `DashDotDot` ではないため、他 CAD 由来の本物の `DASHDOT2` は未知名として
+/// `Continuous` へフォールバックさせる（[`linetype_to_dxf_name`] のdoc参照）。
+fn dxf_name_to_linetype(name: &str) -> Linetype {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "DASHED" => Linetype::Dashed,
+        "DASHDOT" => Linetype::DashDot,
+        "DIVIDE" => Linetype::DashDotDot,
+        _ => Linetype::Continuous,
+    }
+}
+
+/// DXF エンティティの `line_type_name`（group code 6）を [`Style::linetype`]
+/// （個別上書き。`None` = ByLayer）へ変換する。
+///
+/// `BYLAYER`/`BYBLOCK`（大文字小文字を無視）はレイヤー継承として扱う。それ以外は
+/// [`dxf_name_to_linetype`] で mcad の 4 種へ確定的に解釈する（未知名は
+/// Continuous。フォールバックであり ByLayer ではない）。
+fn dxf_line_type_name_to_style_linetype(name: &str) -> Option<Linetype> {
+    let upper = name.trim().to_ascii_uppercase();
+    if upper == "BYLAYER" || upper == "BYBLOCK" {
+        None
+    } else {
+        Some(dxf_name_to_linetype(name))
+    }
+}
+
+/// export 時に LTYPE テーブルへ登録する 4 線種の簡易定義。
+///
+/// パターン長（`total_pattern_length`・`dash_dot_space_lengths`）は往復に使わない
+/// mcad 独自の見た目用の値で、他 CAD ソフトでの表示一致は保証しない（モジュール
+/// doc「線幅・線種は best-effort」参照。画面上のダッシュ長は app 層の紙 mm 定数が
+/// 別途決める）。要素は正 = 線分、負 = 空白、`0.0` = 点。
+fn dxf_line_type_defs() -> [DxfLineType; 4] {
+    [
+        DxfLineType {
+            name: linetype_to_dxf_name(Linetype::Continuous).to_string(),
+            description: "Solid line".to_string(),
+            ..Default::default()
+        },
+        DxfLineType {
+            name: linetype_to_dxf_name(Linetype::Dashed).to_string(),
+            description: "Dashed".to_string(),
+            alignment_code: 'A' as i32,
+            element_count: 2,
+            total_pattern_length: 0.75,
+            dash_dot_space_lengths: vec![0.5, -0.25],
+            ..Default::default()
+        },
+        DxfLineType {
+            name: linetype_to_dxf_name(Linetype::DashDot).to_string(),
+            description: "Dash dot".to_string(),
+            alignment_code: 'A' as i32,
+            element_count: 4,
+            total_pattern_length: 1.0,
+            dash_dot_space_lengths: vec![0.5, -0.25, 0.0, -0.25],
+            ..Default::default()
+        },
+        DxfLineType {
+            name: linetype_to_dxf_name(Linetype::DashDotDot).to_string(),
+            description: "Divide (dash dot dot)".to_string(),
+            alignment_code: 'A' as i32,
+            element_count: 6,
+            total_pattern_length: 1.25,
+            dash_dot_space_lengths: vec![0.5, -0.25, 0.0, -0.25, 0.0, -0.25],
+            ..Default::default()
+        },
+    ]
 }
 
 fn to_dxf_point(p: Point2) -> DxfPoint {
@@ -416,16 +675,22 @@ fn dxf_entity_to_geom(specific: &EntityType) -> Option<EntityGeom> {
     }
 }
 
-/// [`TextGeom`] を DXF `TEXT` エンティティへ変換する（タスク25）。
+/// [`TextGeom`] を DXF `TEXT` エンティティへ変換する（タスク25、高さの尺度契約は
+/// タスク35c）。
 ///
-/// `anchor` → `location`、`height` → `text_height`、`angle`（ラジアン）→
-/// `rotation`（度）をそのままマッピングする。1 書体のみのため `text_style_name`
-/// は既定（`STANDARD`）のままにする（DESIGN.md M6 設計判断5）。逆写像は
+/// `anchor` → `location`、`angle`（ラジアン）→ `rotation`（度）をそのまま
+/// マッピングする。1 書体のみのため `text_style_name` は既定（`STANDARD`）の
+/// ままにする（DESIGN.md M6 設計判断5）。
+///
+/// `height`（紙 mm）→ `text_height`（DXF モデル空間の長さ）は **`height * k`**
+/// を書く（`k` は呼び出し側が図面の [`mcad_core::SheetMeta::scale`] から渡す
+/// `Scale::world_mm_per_paper_mm()`。DESIGN.md M8 設計判断4a、モジュール doc
+/// 「TEXT 高さの尺度契約」参照）。逆写像（import 側は 1:1 とみなす非対称な写像）は
 /// [`dxf_entity_to_geom`]。
-fn text_to_dxf_entity(text: &TextGeom) -> DxfEntity {
+fn text_to_dxf_entity(text: &TextGeom, world_mm_per_paper_mm: f64) -> DxfEntity {
     let specific = EntityType::Text(DxfText {
         location: to_dxf_point(text.anchor),
-        text_height: text.height,
+        text_height: text.height * world_mm_per_paper_mm,
         value: text.content.clone(),
         rotation: text.angle.to_degrees(),
         ..Default::default()
@@ -478,6 +743,16 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
     // 判断して R2007 とする。DESIGN.md M6 設計判断5 参照。
     drawing.header.version = dxf::enums::AcadVersion::R2007;
 
+    // 単位は mm 固定（DESIGN.md M8 設計判断1、モジュール doc「単位（$INSUNITS）」）。
+    drawing.header.default_drawing_units = DxfUnits::Millimeters;
+
+    // LTYPE テーブルへ mcad の 4 線種を簡易パターンで登録する（モジュール doc
+    // 「線幅・線種は best-effort」参照）。レイヤー・エンティティの
+    // `line_type_name` はこの名前を参照する。
+    for line_type in dxf_line_type_defs() {
+        drawing.add_line_type(line_type);
+    }
+
     // `Drawing::new()` が自動追加するレイヤー（モジュール doc 参照）をすべて
     // 取り除き、`Document` のレイヤーだけで組み直す。
     while drawing.remove_layer(0).is_some() {}
@@ -516,6 +791,13 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
             name: layer.name.clone(),
             color: rgb_to_aci(layer.color),
             is_layer_on: layer.visible,
+            line_type_name: linetype_to_dxf_name(layer.linetype).to_string(),
+            // レイヤーの線幅（`width_mm`）は書けない: `dxf::tables::Layer::line_weight`
+            // は不透明な `LineWeight` 型で、任意値を作れる公開コンストラクタが
+            // ないため（実測、モジュール doc「線幅・線種は best-effort」参照）。
+            // 既定（raw 0）のまま export し、往復では「未指定」として
+            // `WidthMm::DEFAULT`（0.35mm）へ復元される（クランプ計上はしない。
+            // 理由は `dxf_layer_lineweight_to_width_mm` のdoc参照）。
             ..Default::default()
         });
     }
@@ -525,6 +807,9 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
     if let Some(name) = layer_names.get(&doc.current_layer()) {
         drawing.header.current_layer = name.clone();
     }
+
+    // TEXT 高さの尺度契約（DESIGN.md M8 設計判断4a）: `height * k` を書く。
+    let world_mm_per_paper_mm = doc.sheet().scale.world_mm_per_paper_mm();
 
     let mut skipped_entities = 0usize;
     for (_, entity) in doc.entities() {
@@ -537,7 +822,7 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
         // 件数を数える。件数は呼び出し側がステータス表示し、無警告のデータロスを防ぐ。
         let mut dxf_entity = match &entity.geom {
             EntityGeom::Shape(shape) => shape_to_dxf_entity(shape),
-            EntityGeom::Text(text) => text_to_dxf_entity(text),
+            EntityGeom::Text(text) => text_to_dxf_entity(text, world_mm_per_paper_mm),
             // 寸法（DimLinear/DimRadial）と、将来 core へ追加される未知の幾何
             // （`EntityGeom` は `#[non_exhaustive]`）はまとめてスキップ側に回す。
             _ => {
@@ -547,6 +832,17 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
         };
         dxf_entity.common.layer = layer_name;
         dxf_entity.common.color = style_color_to_dxf(entity.style.color);
+        // 線種・線幅は ByLayer（`Style` の該当フィールドが `None`）なら DXF の
+        // 既定（`line_type_name = "BYLAYER"`）のままにする。線幅の既定
+        // （`lineweight_enum_value = 0`）は「明示的に 0」を意味してしまうため、
+        // ByLayer を表す `-1`（group code 370 の慣例）を明示的に書く必要がある。
+        if let Some(linetype) = entity.style.linetype {
+            dxf_entity.common.line_type_name = linetype_to_dxf_name(linetype).to_string();
+        }
+        dxf_entity.common.lineweight_enum_value = entity
+            .style
+            .width_mm
+            .map_or(-1, width_mm_to_dxf_lineweight_raw);
         drawing.add_entity(dxf_entity);
     }
 
@@ -590,16 +886,23 @@ fn resolve_layer(
 pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
     let mut doc = Document::new();
     let mut layer_ids: HashMap<String, LayerId> = HashMap::new();
+    let mut clamped_line_widths = 0usize;
 
     let dxf_layers: Vec<&DxfLayer> = drawing.layers().collect();
     for (index, layer) in dxf_layers.iter().enumerate() {
+        // レイヤーの線幅は「読める」（`LineWeight::raw_value()` は公開）ので、
+        // 他 CAD が書いた値も含めてベストエフォートで取り込む（export 側は
+        // 書けない非対称な制約。モジュール doc「線幅・線種は best-effort」参照）。
+        let (width_mm, width_clamped) =
+            dxf_layer_lineweight_to_width_mm(layer.line_weight.raw_value());
+        if width_clamped {
+            clamped_line_widths += 1;
+        }
         let mcad_layer = Layer {
             name: layer.name.clone(),
             color: dxf_color_to_style(&layer.color).unwrap_or(ACI_FALLBACK_RGB),
-            // 線種・線幅の DXF 往復はタスク35c の担当。ここでは core の既定
-            // （実線・0.35mm）で復元する。
-            linetype: Linetype::default(),
-            width_mm: WidthMm::DEFAULT,
+            linetype: dxf_name_to_linetype(&layer.line_type_name),
+            width_mm,
             visible: layer.is_layer_on,
             // dxf::tables::Layer にロック状態のフィールドがないため常に未ロックで
             // 復元する（モジュール doc「レイヤーロックは保存されない」参照）。
@@ -641,9 +944,15 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
             continue;
         };
         let layer_id = resolve_layer(&mut doc, &mut layer_ids, &entity.common.layer)?;
+        let (width_mm, width_clamped) =
+            dxf_lineweight_to_style_width(entity.common.lineweight_enum_value);
+        if width_clamped {
+            clamped_line_widths += 1;
+        }
         let style = Style {
             color: dxf_color_to_style(&entity.common.color),
-            ..Style::inherited()
+            width_mm,
+            linetype: dxf_line_type_name_to_style_linetype(&entity.common.line_type_name),
         };
         doc.apply(Command::AddEntity(Entity::new(geom, layer_id, style)))?;
     }
@@ -657,6 +966,7 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
     Ok(ImportSummary {
         document: doc,
         skipped_entities,
+        clamped_line_widths,
     })
 }
 
@@ -1550,5 +1860,312 @@ mod tests {
         }
 
         fs::remove_file(&path).ok();
+    }
+
+    /// タスク35c: export ヘッダの `$INSUNITS` は常に mm（値 4）。
+    /// DESIGN.md M8 設計判断1、モジュール doc「単位（$INSUNITS）」。
+    #[test]
+    fn export_writes_insunits_millimeters() {
+        let doc = Document::new();
+        let export = export_dxf(&doc);
+        assert_eq!(
+            export.drawing.header.default_drawing_units,
+            DxfUnits::Millimeters
+        );
+    }
+
+    /// タスク35c: TEXT 高さの尺度契約（export 側）。尺度 1:2（`k = 2.0`）の図面で
+    /// 紙 mm 3.5 の Text は DXF に `3.5 * 2.0 = 7.0` として書かれる（現行の
+    /// 無変換転写は 1:1 でのみ偶然正しかった。DESIGN.md M8 設計判断4a）。
+    #[test]
+    fn text_height_scales_by_sheet_scale_on_export() {
+        use mcad_core::Scale;
+
+        let mut doc = Document::new();
+        let mut sheet = doc.sheet().clone();
+        sheet.scale = Scale::new(1, 2).unwrap(); // 1:2、k = den/num = 2.0
+        doc.apply(Command::SetSheet(sheet)).unwrap();
+
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::new(0.0, 0.0),
+                content: "h".into(),
+                height: 3.5,
+                angle: 0.0,
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+        let text_entity = export
+            .drawing
+            .entities()
+            .find_map(|e| match &e.specific {
+                EntityType::Text(t) => Some(t),
+                _ => None,
+            })
+            .expect("TEXT entity must be present");
+        assert!(
+            (text_entity.text_height - 7.0).abs() < EPS,
+            "expected 3.5 * k(2.0) = 7.0, got {}",
+            text_entity.text_height
+        );
+    }
+
+    /// タスク35c: TEXT 高さの尺度契約（往復）。1:2 で紙 mm 3.5 → DXF 7.0 →
+    /// import（尺度の概念がないので 1:1 とみなす）→ 紙 mm 7.0。
+    ///
+    /// 「紙 mm としての意味」は往復しないが、**モデル空間での幾何サイズ
+    /// （ワールド高さ）は正しく保存される**ことをここで固定する: 元の図面での
+    /// ワールド高さは `3.5 * 2.0 = 7.0`、import 後の図面（尺度 1:1）での
+    /// ワールド高さは `7.0 * 1.0 = 7.0` で一致する（DESIGN.md M8 設計判断4a）。
+    #[test]
+    fn text_geometric_height_survives_round_trip_across_scale_reinterpretation() {
+        use mcad_core::Scale;
+
+        let mut doc = Document::new();
+        let mut sheet = doc.sheet().clone();
+        sheet.scale = Scale::new(1, 2).unwrap();
+        doc.apply(Command::SetSheet(sheet)).unwrap();
+
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::new(0.0, 0.0),
+                content: "h".into(),
+                height: 3.5,
+                angle: 0.0,
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+        let summary = import_dxf(&export.drawing).unwrap();
+        assert_eq!(summary.skipped_entities, 0);
+
+        let (_, entity) = summary.document.entities().next().unwrap();
+        let EntityGeom::Text(text) = &entity.geom else {
+            panic!("Text エンティティのはず: {:?}", entity.geom);
+        };
+        // import 後の図面は尺度 1:1（既定）なので、「紙 mm」の値がそのまま
+        // ワールド高さになる。
+        assert!(
+            (text.height - 7.0).abs() < EPS,
+            "geometric size must survive: expected 7.0, got {}",
+            text.height
+        );
+        assert_eq!(summary.document.sheet().scale, mcad_core::Scale::ONE);
+    }
+
+    /// タスク35c: レイヤーの線種は export/import で往復する。
+    #[test]
+    fn layer_linetype_round_trips() {
+        let mut doc = Document::new();
+        let default = doc.default_layer();
+        let mut props = doc.layer(default).unwrap().clone();
+        props.linetype = Linetype::DashDot;
+        doc.apply(Command::SetLayerProps { id: default, props })
+            .unwrap();
+
+        let export = export_dxf(&doc);
+        let dxf_layer = export
+            .drawing
+            .layers()
+            .find(|l| l.name == "0")
+            .expect("default layer must be present");
+        assert_eq!(dxf_layer.line_type_name, "DASHDOT");
+
+        let summary = import_dxf(&export.drawing).unwrap();
+        let imported_default = summary
+            .document
+            .layer(summary.document.default_layer())
+            .unwrap();
+        assert_eq!(imported_default.linetype, Linetype::DashDot);
+    }
+
+    /// タスク35c: レイヤーの線幅は `dxf` 0.6.1 の API 制約で export できない
+    /// （`LineWeight` に任意値を作れる公開コンストラクタがない。モジュール doc
+    /// 「線幅・線種は best-effort」参照）。export したレイヤーは常に raw `0`
+    /// （既定）になり、re-import では「未指定」として `WidthMm::DEFAULT`
+    /// （0.35mm）へ復元され、クランプとしては計上されないことを固定する
+    /// （往復しないことを意図的に記録するテスト）。
+    #[test]
+    fn layer_line_weight_cannot_be_exported_and_import_resets_to_default() {
+        let mut doc = Document::new();
+        let default = doc.default_layer();
+        let mut props = doc.layer(default).unwrap().clone();
+        props.width_mm = WidthMm::new(1.4).unwrap();
+        doc.apply(Command::SetLayerProps { id: default, props })
+            .unwrap();
+
+        let export = export_dxf(&doc);
+        let dxf_layer = export
+            .drawing
+            .layers()
+            .find(|l| l.name == "0")
+            .expect("default layer must be present");
+        assert_eq!(
+            dxf_layer.line_weight.raw_value(),
+            0,
+            "layer line weight cannot be written by dxf 0.6.1's public API"
+        );
+
+        // raw 0 は「未指定」として扱われ（mcad 自身が export した DXF は必ず
+        // ここを通るため、クランプとしては計上しない。モジュール doc参照）、
+        // 既定 0.35mm に戻る。1.4mm という明示値だったことは失われる。
+        let summary = import_dxf(&export.drawing).unwrap();
+        let imported_default = summary
+            .document
+            .layer(summary.document.default_layer())
+            .unwrap();
+        assert_eq!(imported_default.width_mm, WidthMm::DEFAULT);
+        assert_eq!(
+            summary.clamped_line_widths, 0,
+            "raw 0 is treated as unspecified, not an out-of-range explicit value"
+        );
+    }
+
+    /// タスク35c: エンティティ個別の線幅・線種の上書き（`Style::width_mm` /
+    /// `Style::linetype`）は export/import で往復する（`lineweight_enum_value` /
+    /// `line_type_name` はレイヤーと違い任意値を書ける生フィールドのため）。
+    #[test]
+    fn entity_style_width_and_linetype_override_round_trips() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))),
+            layer,
+            Style {
+                color: None,
+                width_mm: Some(WidthMm::new(0.7).unwrap()),
+                linetype: Some(Linetype::DashDotDot),
+            },
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+        let entity = export.drawing.entities().next().expect("entity present");
+        assert_eq!(entity.common.line_type_name, "DIVIDE");
+        assert_eq!(entity.common.lineweight_enum_value, 70);
+
+        let summary = import_dxf(&export.drawing).unwrap();
+        assert_eq!(summary.clamped_line_widths, 0);
+        let (_, imported) = summary.document.entities().next().unwrap();
+        assert_eq!(imported.style.linetype, Some(Linetype::DashDotDot));
+        assert_eq!(
+            imported.style.width_mm.map(WidthMm::mm),
+            Some(WidthMm::new(0.7).unwrap().mm())
+        );
+    }
+
+    /// タスク35c: `Style::width_mm`/`Style::linetype` が `None`（ByLayer）の
+    /// エンティティは、DXF の `BYLAYER`（線種既定値）・raw `-1`（線幅）で往復する。
+    #[test]
+    fn entity_style_bylayer_width_and_linetype_round_trips() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+        let entity = export.drawing.entities().next().expect("entity present");
+        assert_eq!(entity.common.line_type_name, "BYLAYER");
+        assert_eq!(entity.common.lineweight_enum_value, -1);
+
+        let summary = import_dxf(&export.drawing).unwrap();
+        assert_eq!(summary.clamped_line_widths, 0);
+        let (_, imported) = summary.document.entities().next().unwrap();
+        assert_eq!(imported.style.linetype, None);
+        assert_eq!(imported.style.width_mm, None);
+    }
+
+    /// タスク35c: 範囲外の DXF lineweight（10mm 相当の raw 1000）は
+    /// `WidthMm` の範囲（0.05..=5.0mm）へクランプして取り込み、
+    /// `ImportSummary::clamped_line_widths` に計上する（黙って丸めない）。
+    #[test]
+    fn out_of_range_entity_lineweight_is_clamped_and_counted() {
+        let mut drawing = Drawing::new();
+        while drawing.remove_layer(0).is_some() {}
+        drawing.add_layer(DxfLayer {
+            name: "0".to_string(),
+            ..Default::default()
+        });
+
+        let mut entity = DxfEntity::new(EntityType::Line(DxfLine {
+            p1: DxfPoint::new(0.0, 0.0, 0.0),
+            p2: DxfPoint::new(1.0, 0.0, 0.0),
+            ..Default::default()
+        }));
+        entity.common.layer = "0".to_string();
+        entity.common.lineweight_enum_value = 1000; // 10.0mm、範囲外
+        drawing.add_entity(entity);
+
+        let summary = import_dxf(&drawing).unwrap();
+        assert_eq!(summary.skipped_entities, 0);
+        assert_eq!(summary.clamped_line_widths, 1);
+        let (_, imported) = summary.document.entities().next().unwrap();
+        assert_eq!(
+            imported.style.width_mm.map(WidthMm::mm),
+            Some(WidthMm::MAX_MM)
+        );
+    }
+
+    /// タスク35c: 未知の DXF 線種名（他 CAD 由来）は `Linetype::Continuous` へ
+    /// フォールバックする（DESIGN.md M8 設計判断5）。無視してカウントするのでは
+    /// なく確定的に解釈するため `skipped_entities`/`clamped_line_widths` は
+    /// 増えない。
+    #[test]
+    fn unknown_dxf_line_type_name_falls_back_to_continuous() {
+        let mut drawing = Drawing::new();
+        while drawing.remove_layer(0).is_some() {}
+        drawing.add_layer(DxfLayer {
+            name: "0".to_string(),
+            ..Default::default()
+        });
+
+        let mut entity = DxfEntity::new(EntityType::Line(DxfLine {
+            p1: DxfPoint::new(0.0, 0.0, 0.0),
+            p2: DxfPoint::new(1.0, 0.0, 0.0),
+            ..Default::default()
+        }));
+        entity.common.layer = "0".to_string();
+        entity.common.line_type_name = "ACAD_ISO02W100".to_string(); // 未知の名前
+        drawing.add_entity(entity);
+
+        let summary = import_dxf(&drawing).unwrap();
+        assert_eq!(summary.skipped_entities, 0);
+        assert_eq!(summary.clamped_line_widths, 0);
+        let (_, imported) = summary.document.entities().next().unwrap();
+        assert_eq!(imported.style.linetype, Some(Linetype::Continuous));
+    }
+
+    /// タスク35c: 未知の DXF レイヤー線種名は `Linetype::Continuous` へ
+    /// フォールバックする（レイヤーはエンティティと違い ByLayer 概念がないため
+    /// 常に確定値になる）。
+    #[test]
+    fn unknown_dxf_layer_line_type_name_falls_back_to_continuous() {
+        let mut drawing = Drawing::new();
+        while drawing.remove_layer(0).is_some() {}
+        drawing.add_layer(DxfLayer {
+            name: "0".to_string(),
+            line_type_name: "SOME_OTHER_CAD_LINETYPE".to_string(),
+            ..Default::default()
+        });
+
+        let summary = import_dxf(&drawing).unwrap();
+        let layer = summary
+            .document
+            .layer(summary.document.default_layer())
+            .unwrap();
+        assert_eq!(layer.linetype, Linetype::Continuous);
     }
 }

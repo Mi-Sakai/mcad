@@ -8,15 +8,28 @@
 //!
 //! 交点計算は既存の [`crate::intersect`] をそのまま使い、新しい交点公式は追加しない。
 //! 比較はすべてパラメータ空間（線分は無次元の `t`、弧は角度）で行うため
-//! [`crate::EPS`] を直接使う（[`Arc::contains_angle`] と同じ流儀）。境界を「無限に
-//! 伸ばした対象」で切る必要がある延長だけは、[`extend_reach`] で求めた
-//! **幾何的に正当な上界** まで対象を一時的に伸ばした線分を作って [`crate::intersect`]
-//! へ渡す。
+//! [`crate::EPS`] を直接使う（[`Arc::contains_angle`] と同じ流儀。どちらも一様な
+//! 拡大縮小に対して不変な量なので相対化しない）。**ワールド座標のまま比較する量**
+//! （線分・弧の退化判定、延長方向の符号付き距離）だけは [`crate::point_tol`] /
+//! [`crate::rel_tol`] による相対許容量を使う。境界を「無限に伸ばした対象」で切る
+//! 必要がある延長だけは、[`extend_reach`] で求めた **幾何的に正当な上界** まで
+//! 対象を一時的に伸ばした線分を作って [`crate::intersect`] へ渡す。
 
 use std::f64::consts::TAU;
 
 use crate::primitives::wrap_2pi;
-use crate::{Aabb, Arc, EPS, LineSeg, Point2, Shape, intersect};
+use crate::{Aabb, Arc, EPS, LineSeg, Point2, Shape, intersect, point_tol, rel_tol};
+
+/// 弧が退化しているか（半径が中心の座標スケールに対する相対許容量以下か）。
+///
+/// 半径が「その場所での点の一致許容量」を下回る弧は、円周上の全点が
+/// [`crate::point_tol`] の意味で中心と同一点になり、幾何として意味を持たない。
+/// 非有限半径もここで退化として弾く。
+#[inline]
+#[must_use]
+fn arc_is_degenerate(arc: &Arc) -> bool {
+    !arc.radius.is_finite() || arc.radius <= rel_tol(arc.center.to_vec2().length())
+}
 
 /// トリム・延長が結果を作れない理由。
 ///
@@ -154,10 +167,13 @@ pub fn extend_reach(free_end: Point2, boundary_aabb: Aabb) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// 線分上の点 `p` の直線パラメータ（`a` が 0、`b` が 1）。退化線分は `None`。
+///
+/// 退化の判定は端点の座標スケールに対する相対許容量（[`crate::point_tol`]）で行う。
 fn line_param(seg: &LineSeg, p: Point2) -> Option<f64> {
     let d = seg.direction();
     let len2 = d.length_squared();
-    if len2 <= EPS * EPS {
+    let tol = point_tol(seg.a, seg.b);
+    if len2 <= tol * tol {
         return None;
     }
     Some((p - seg.a).dot(d) / len2)
@@ -169,6 +185,9 @@ fn line_point_at(seg: &LineSeg, t: f64) -> Point2 {
 }
 
 /// `click` がいずれかの交点パラメータから `EPS` 以内にあるかどうか。
+///
+/// `sorted`・`click` はいずれもパラメータ空間の値（線分は無次元の `t`、弧は
+/// ラジアン）。どちらも一様な拡大縮小に対して不変なので [`crate::EPS`] を直接使う。
 ///
 /// 一致していると `click_interval` の厳密比較（`t < click` / `t > click`）から
 /// その交点自身が両側の候補から漏れ、さらに外側の交点が区間境界に選ばれて
@@ -256,7 +275,7 @@ fn arc_param(arc: &Arc, theta: f64) -> f64 {
 /// 範囲内なら射影角、範囲外なら近い方の端点）。
 fn arc_click_param(arc: &Arc, click: Point2) -> f64 {
     let dir = click - arc.center;
-    if dir.length() <= EPS {
+    if dir.length() <= point_tol(click, arc.center) {
         // 中心上のクリックは弧上のどの点とも等距離。始点扱いにする。
         return 0.0;
     }
@@ -271,10 +290,11 @@ fn arc_click_param(arc: &Arc, click: Point2) -> f64 {
 }
 
 fn trim_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<TrimResult, TrimExtendError> {
-    if !arc.radius.is_finite() || arc.radius <= EPS {
+    if arc_is_degenerate(arc) {
         return Err(TrimExtendError::Degenerate);
     }
     let sweep = arc.sweep();
+    // 掃引は角度空間の量（一様な拡大縮小で不変）なので `EPS` を直接使う。
     if sweep <= EPS {
         return Err(TrimExtendError::Degenerate);
     }
@@ -324,6 +344,10 @@ fn trim_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<TrimResult, Tr
 // ---------------------------------------------------------------------------
 
 fn extend_line(seg: &LineSeg, boundary: &Shape, click: Point2) -> Result<Shape, TrimExtendError> {
+    // 退化判定は座標スケールに対して相対（`line_param` と同じ基準）。
+    if seg.length() <= point_tol(seg.a, seg.b) {
+        return Err(TrimExtendError::Degenerate);
+    }
     let Some(dir) = seg.direction().normalize() else {
         return Err(TrimExtendError::Degenerate);
     };
@@ -344,7 +368,7 @@ fn extend_line(seg: &LineSeg, boundary: &Shape, click: Point2) -> Result<Shape, 
 
     // 自由端から外向きへの符号付き距離が正（＝現在の範囲の外）の候補のみ採る。
     // 許容量は座標スケールに対する相対値（`intersect` の点一致判定と同じ形）。
-    let tol = EPS * (1.0 + free.to_vec2().length() + seg.length());
+    let tol = rel_tol(free.to_vec2().length() + seg.length());
     let best = intersect(&Shape::Line(probe), boundary)
         .into_iter()
         .map(|p| ((p - free).dot(u), p))
@@ -362,10 +386,11 @@ fn extend_line(seg: &LineSeg, boundary: &Shape, click: Point2) -> Result<Shape, 
 }
 
 fn extend_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<Shape, TrimExtendError> {
-    if !arc.radius.is_finite() || arc.radius <= EPS {
+    if arc_is_degenerate(arc) {
         return Err(TrimExtendError::Degenerate);
     }
     let sweep = arc.sweep();
+    // 掃引は角度空間の量（一様な拡大縮小で不変）なので `EPS` を直接使う。
     if sweep <= EPS {
         return Err(TrimExtendError::Degenerate);
     }
@@ -915,6 +940,30 @@ mod tests {
         let boundary = line(5.0, 0.0, 7.0, 0.0);
         assert_eq!(
             extend(&Shape::Arc(arc), &boundary, pt(0.0, 5.0)),
+            Err(TrimExtendError::Degenerate)
+        );
+    }
+
+    /// 中心が原点から遠い「その場所の点の一致許容量より小さい半径」の弧は退化。
+    ///
+    /// 半径 1e-6 は絶対 EPS（1e-9）より大きいので旧判定では非退化として通っていたが、
+    /// 中心 (1e6, 0) では点の一致許容量が 1e-3 まで広がるため、円周上の全点が中心と
+    /// 同一点に潰れる。トリム・延長のどちらも `Degenerate` で拒否する。
+    #[test]
+    fn arc_smaller_than_local_point_tolerance_is_degenerate() {
+        let center = pt(1.0e6, 0.0);
+        let radius = 1.0e-6;
+        let arc = Shape::Arc(Arc::new(center, radius, 0.0, FRAC_PI_2));
+        assert!(radius > EPS, "旧・絶対 EPS では非退化だった半径");
+        assert!(radius < rel_tol(center.to_vec2().length()));
+
+        let boundary = line(1.0e6, -1.0, 1.0e6, 1.0);
+        assert_eq!(
+            trim(&arc, &boundary, pt(1.0e6, 0.0)),
+            Err(TrimExtendError::Degenerate)
+        );
+        assert_eq!(
+            extend(&arc, &boundary, pt(1.0e6, 0.0)),
             Err(TrimExtendError::Degenerate)
         );
     }

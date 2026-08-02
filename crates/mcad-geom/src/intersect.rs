@@ -9,11 +9,15 @@
 //! - 平行判定は外積を **相対** イプシロン `EPS * |r| * |s|`（角の sin 相当）で行う。
 //! - 円・線分の交点は中心から直線への垂線の足を基準に計算し、判別式を
 //!   直接扱う定式化よりも接線ケースの誤差を小さくする。
-//! - 接線・外接・内接は距離を半径スケールの許容量と比較して 1 点に落とす。
+//! - 接線・外接・内接は距離を、**中心座標と半径の両方** でスケールした相対許容量
+//!   （[`crate::rel_tol`]）と比較して 1 点に落とす。中心が原点から離れると
+//!   「中心 → 直線」距離の丸め誤差が座標の大きさに比例して増えるため、半径だけを
+//!   スケールに使うと原点から遠い円で許容量が足りなくなる。
+//! - 点の一致・線分の退化は [`crate::point_tol`] で判定する。
 //! - パラメータ `[0, 1]` の境界は無次元なので `EPS` を直接使う。
 
 use crate::primitives::{Arc, Circle, LineSeg, Shape};
-use crate::{EPS, Point2};
+use crate::{EPS, Point2, point_tol, rel_tol};
 
 /// 2 つの形状の交点を列挙する。
 ///
@@ -125,8 +129,7 @@ fn prim_contains_point(prim: &Prim, p: Point2) -> bool {
         Prim::Arc(a) => a.closest_point(p),
     };
     // 点どうしの一致・点が曲線上に載る判定。座標スケールに対する相対許容量。
-    let scale = 1.0 + p.to_vec2().length() + cp.to_vec2().length();
-    p.distance(cp) <= EPS * scale
+    p.distance(cp) <= point_tol(p, cp)
 }
 
 /// 線分 × 線分の真の交点（1 点）。平行・共線・区間重なりは `None`。
@@ -135,8 +138,8 @@ fn seg_seg(s1: &LineSeg, s2: &LineSeg) -> Option<Point2> {
     let s = s2.direction();
     let rl = r.length();
     let sl = s.length();
-    // 退化した（長さ 0 の）線分は交点計算の対象外。
-    if rl <= EPS || sl <= EPS {
+    // 退化した線分（長さが端点の座標スケールに対する相対許容量以下）は交点計算の対象外。
+    if rl <= point_tol(s1.a, s1.b) || sl <= point_tol(s2.a, s2.b) {
         return None;
     }
     let denom = r.cross(s);
@@ -162,9 +165,9 @@ fn seg_seg(s1: &LineSeg, s2: &LineSeg) -> Option<Point2> {
 fn seg_circle(seg: &LineSeg, c: &Circle, out: &mut Vec<Point2>) {
     let d = seg.direction();
     let len = d.length();
-    // 半径スケールの許容量（相対）。半径が極小でも 0 除算しないよう下限を設ける。
-    let tol = EPS * c.radius.max(1.0);
-    if len <= EPS {
+    // 中心座標と半径の両方でスケールした相対許容量（原点から遠い円でも足りるように）。
+    let tol = rel_tol(c.center.to_vec2().length() + c.radius);
+    if len <= point_tol(seg.a, seg.b) {
         // 退化線分は 1 点として円周上判定。
         if (seg.a.distance(c.center) - c.radius).abs() <= tol {
             out.push(seg.a);
@@ -199,9 +202,10 @@ fn circle_circle(c1: &Circle, c2: &Circle, out: &mut Vec<Point2>) {
     let between = c2.center - c1.center;
     let dist = between.length();
     let (r1, r2) = (c1.radius, c2.radius);
-    let tol = EPS * (r1 + r2).max(1.0);
+    // 中心座標と半径の両方でスケールした相対許容量（`seg_circle` と同じ理由）。
+    let tol = rel_tol(c1.center.to_vec2().length() + c2.center.to_vec2().length() + r1 + r2);
 
-    if dist <= EPS {
+    if dist <= point_tol(c1.center, c2.center) {
         // 同心。同一円は無限交点、同心異半径は交点なし。いずれも列挙しない。
         return;
     }
@@ -234,12 +238,10 @@ fn dedup_points(pts: &mut Vec<Point2>) {
     let mut i = 0;
     while i < pts.len() {
         let pi = pts[i];
-        // pi 以降で pi とほぼ一致するものを除去。
-        let scale = 1.0 + pi.to_vec2().length();
-        let tol = EPS * scale;
+        // pi 以降で pi とほぼ一致するものを除去。許容量は両点の座標スケールから決める。
         let mut j = i + 1;
         while j < pts.len() {
-            if pi.distance(pts[j]) <= tol {
+            if pi.distance(pts[j]) <= point_tol(pi, pts[j]) {
                 pts.swap_remove(j);
             } else {
                 j += 1;
@@ -364,6 +366,25 @@ mod tests {
         let pts = intersect(&c1, &c2);
         assert_eq!(pts.len(), 1);
         assert!(contains_approx(&pts, Point2::new(5.0, 0.0)));
+    }
+
+    #[test]
+    fn circle_circle_external_tangent_far_from_origin() {
+        // モデリング許容量が座標スケールに比例することの固定（lib.rs の `rel_tol` doc
+        // 「平行移動に対する非不変性」参照）: 原点から 1e6 離れた場所では、その場所の
+        // 許容量（≒2.8e-3）未満の隙間（ここでは 1e-5）は「実質接している」ものとして
+        // 接線 1 点へ併合される。これは丸め誤差の吸収ではなく **意図した挙動** —
+        // 設計範囲の端では許容量 ≈ 1µm 相当で、製図上の最小有意寸法を常に下回る。
+        // 旧・半径のみスケールの許容量（`EPS * (r1 + r2)` = 1e-8）では同じ隙間が
+        // 「離れすぎ」（交点 0 個）になり、判定が図形の置かれた絶対座標に過敏だった。
+        let base = 1.0e6;
+        let gap = 1.0e-5; // 旧許容量より大きく、この場所の許容量（≒2.8e-3）より小さいずれ。
+        let c1 = Shape::Circle(Circle::new(Point2::new(base, base), 5.0));
+        let c2 = Shape::Circle(Circle::new(Point2::new(base + 10.0 + gap, base), 5.0));
+        let pts = intersect(&c1, &c2);
+        assert_eq!(pts.len(), 1, "外接が接線として 1 点に落ちるべき: {pts:?}");
+        // 接点は両円の中点付近（gap の半分だけ理想位置からずれる）。
+        assert!(pts[0].distance(Point2::new(base + 5.0, base)) < 1.0e-3);
     }
 
     #[test]

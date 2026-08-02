@@ -14,10 +14,14 @@
 //! - 分割: 線分・弧・開いたポリラインの往復性（2 ピースの端点が元の端点と分割点に一致）。
 //! - フィレット: 弧が両直線に接し（中心から各直線までの距離＝半径）、両端点が
 //!   トリム済み線分の切断端に一致し、掃引が π 以下に収まる。
+//! - **スケール不変性**（M8 タスク43）: 図面全体を 1e-6〜1e6 倍しても、交点・最近点・
+//!   分割・トリム・フィレットの結果が同じだけ拡大縮小され、退化判定の結論も変わらない。
+//!   相対 EPS（[`mcad_geom::rel_tol`] / [`mcad_geom::point_tol`]）が横断的に効いているか
+//!   の検証で、絶対 EPS のままだと極端スケールで結論が変わる。
 
 use mcad_geom::{
-    Aabb, Arc, Circle, LineSeg, Point2, Polyline, Shape, closest_point, extend, extend_reach,
-    fillet_lines, intersect, split, trim,
+    Aabb, Arc, Circle, LineSeg, OffsetError, Point2, Polyline, Shape, Vec2, closest_point, extend,
+    extend_reach, fillet_lines, intersect, point_tol, split, trim,
 };
 use proptest::prelude::*;
 
@@ -596,5 +600,278 @@ proptest! {
                 [trimmed.a, trimmed.b].iter().any(|p| ends.iter().any(|e| approx_pt(*p, *e))),
                 "{trimmed:?} does not meet the arc ends {ends:?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// スケール不変性（M8 タスク43: 相対 EPS の横断統一）
+// ---------------------------------------------------------------------------
+//
+// 「ワールド寸法が極端でも判定が破綻しない」を、図面全体の **一様な拡大縮小** に対する
+// 不変性として固定する。CAD の実務では図面ごとに単位・尺度が違うだけで、座標もフィーチャ
+// 寸法も同じ倍率で動く。したがって
+//
+// - 長さ・距離のような次元を持つ量の許容量は倍率に比例して動かなければならない
+//   （＝相対 EPS が必要）、
+// - 角度・無次元パラメータは倍率に対して不変なので絶対 EPS のままでよい、
+//
+// という geom の方針がそのまま「結果が倍率どおりに拡大縮小される」という性質になる。
+
+/// 図面全体へ掛ける倍率（1e-6 〜 1e6）。
+fn scale() -> impl Strategy<Value = f64> {
+    (-6.0f64..=6.0f64).prop_map(|e| 10f64.powf(e))
+}
+
+/// 倍率を掛ける前の基準座標。倍率 1e6 でも 2e7 程度に収まり、f64 の相対精度に余裕がある。
+fn base_coord() -> impl Strategy<Value = f64> {
+    -20.0f64..20.0f64
+}
+
+fn base_point() -> impl Strategy<Value = Point2> {
+    (base_coord(), base_coord()).prop_map(|(x, y)| Point2::new(x, y))
+}
+
+fn scale_pt(p: Point2, s: f64) -> Point2 {
+    Point2::new(p.x * s, p.y * s)
+}
+
+fn scale_seg(seg: LineSeg, s: f64) -> LineSeg {
+    LineSeg::new(scale_pt(seg.a, s), scale_pt(seg.b, s))
+}
+
+/// 倍率 `s` の図面での比較許容量。無次元の [`TOL`] を寸法へ戻したもの。
+///
+/// geom 内部の相対許容量（座標の 1e-9 倍程度）より十分緩く、フィーチャ寸法
+/// （`s` のオーダー）より 6 桁小さいので、「結果が倍率どおりか」を判定できる。
+fn tol_at(s: f64) -> f64 {
+    TOL * s
+}
+
+fn unit_vec(angle: f64) -> Vec2 {
+    Vec2::new(angle.cos(), angle.sin())
+}
+
+proptest! {
+    /// 交わる 2 線分の交点は、図面を `s` 倍しても `s` 倍された同じ点に 1 個だけ出る。
+    #[test]
+    fn segment_intersection_is_scale_invariant(
+        cross in base_point(),
+        d1a in 1.0f64..20.0f64,
+        d1b in 1.0f64..20.0f64,
+        d2a in 1.0f64..20.0f64,
+        d2b in 1.0f64..20.0f64,
+        ang1 in 0.0f64..std::f64::consts::PI,
+        off in 0.3f64..2.8f64, // 平行を避けるための角度差（sin >= 0.29）。
+        s in scale(),
+    ) {
+        let (dir1, dir2) = (unit_vec(ang1), unit_vec(ang1 + off));
+        let s1 = scale_seg(LineSeg::new(cross - dir1 * d1a, cross + dir1 * d1b), s);
+        let s2 = scale_seg(LineSeg::new(cross - dir2 * d2a, cross + dir2 * d2b), s);
+
+        let pts = intersect(&Shape::Line(s1), &Shape::Line(s2));
+        prop_assert_eq!(pts.len(), 1, "scale {} lost the intersection", s);
+        let expected = scale_pt(cross, s);
+        prop_assert!(pts[0].distance(expected) <= tol_at(s),
+            "scale {s}: got {:?} want {expected:?}", pts[0]);
+    }
+
+    /// 円の弦を延長した線分と円の交点は、図面を `s` 倍しても 2 点のまま同じ位置に出る。
+    #[test]
+    fn line_circle_intersection_is_scale_invariant(
+        center in base_point(),
+        radius in 2.0f64..20.0f64,
+        theta_a in 0.0f64..std::f64::consts::TAU,
+        theta_b in 0.0f64..std::f64::consts::TAU,
+        s in scale(),
+    ) {
+        // 接線に近い（2 交点が縮退する）配置は除外する。
+        let gap = (theta_a - theta_b).abs();
+        prop_assume!(gap > 0.3 && gap < std::f64::consts::TAU - 0.3);
+
+        let circle = Circle::new(center, radius);
+        let (pa, pb) = (circle.point_at_angle(theta_a), circle.point_at_angle(theta_b));
+        let dir = (pb - pa).normalize().expect("chord endpoints are distinct");
+        let seg = LineSeg::new(pa - dir * 2.0, pb + dir * 2.0);
+
+        let big = Circle::new(scale_pt(center, s), radius * s);
+        let pts = intersect(&Shape::Line(scale_seg(seg, s)), &Shape::Circle(big));
+        prop_assert_eq!(pts.len(), 2, "scale {} changed the intersection count", s);
+        for want in [scale_pt(pa, s), scale_pt(pb, s)] {
+            prop_assert!(pts.iter().any(|p| p.distance(want) <= tol_at(s)),
+                "scale {s}: {want:?} missing from {pts:?}");
+        }
+    }
+
+    /// 最近点は図面の拡大縮小に追従する（`closest_point(s·shape, s·p) == s·closest_point(shape, p)`）。
+    #[test]
+    fn closest_point_scales_with_the_drawing(
+        a in base_point(),
+        b in base_point(),
+        center in base_point(),
+        radius in 1.0f64..20.0f64,
+        start in angle(),
+        end in angle(),
+        query in base_point(),
+        kind in 0usize..3usize,
+        s in scale(),
+    ) {
+        // 退化線分は「どちらの端点を返しても許容量内で等価」なので比較対象から外す。
+        prop_assume!(a.distance(b) > 1.0);
+        let (small, big) = match kind {
+            0 => (
+                Shape::Line(LineSeg::new(a, b)),
+                Shape::Line(scale_seg(LineSeg::new(a, b), s)),
+            ),
+            1 => (
+                Shape::Circle(Circle::new(center, radius)),
+                Shape::Circle(Circle::new(scale_pt(center, s), radius * s)),
+            ),
+            _ => (
+                Shape::Arc(Arc::new(center, radius, start, end)),
+                Shape::Arc(Arc::new(scale_pt(center, s), radius * s, start, end)),
+            ),
+        };
+        let want = scale_pt(closest_point(&small, query), s);
+        let got = closest_point(&big, scale_pt(query, s));
+        prop_assert!(got.distance(want) <= tol_at(s), "scale {s}: got {got:?} want {want:?}");
+    }
+
+    /// 分割は図面の拡大縮小に追従する（分割点・端点がそのまま `s` 倍になる）。
+    #[test]
+    fn split_line_is_scale_invariant(
+        a in base_point(),
+        b in base_point(),
+        t in 0.1f64..0.9f64,
+        s in scale(),
+    ) {
+        prop_assume!(a.distance(b) > 5.0);
+        let at = a.lerp(b, t);
+        let big = scale_seg(LineSeg::new(a, b), s);
+        let Ok((piece1, piece2)) = split(&Shape::Line(big), scale_pt(at, s)) else {
+            prop_assert!(false, "scale {s} rejected a well-separated split point");
+            unreachable!()
+        };
+        let (Shape::Line(l1), Shape::Line(l2)) = (piece1, piece2) else {
+            prop_assert!(false, "split of a line produced non-line pieces");
+            unreachable!()
+        };
+        prop_assert!(l1.a.distance(scale_pt(a, s)) <= tol_at(s));
+        prop_assert!(l1.b.distance(scale_pt(at, s)) <= tol_at(s));
+        prop_assert!(l2.a.distance(scale_pt(at, s)) <= tol_at(s));
+        prop_assert!(l2.b.distance(scale_pt(b, s)) <= tol_at(s));
+    }
+
+    /// トリムは図面の拡大縮小に追従する。中央で直交する境界・1/4 位置のクリックという
+    /// 決定的な配置なので、どの倍率でも「奥側の 1 断片が残る」結果になる。
+    #[test]
+    fn trim_line_is_scale_invariant(
+        a in base_point(),
+        dir_ang in 0.0f64..std::f64::consts::TAU,
+        len in 5.0f64..20.0f64,
+        s in scale(),
+    ) {
+        let dir = unit_vec(dir_ang);
+        let b = a + dir * len;
+        let mid = a.lerp(b, 0.5);
+        let normal = dir.perp();
+        let boundary = LineSeg::new(mid - normal * 3.0, mid + normal * 3.0);
+        let click = a.lerp(b, 0.25);
+
+        let res = trim(
+            &Shape::Line(scale_seg(LineSeg::new(a, b), s)),
+            &Shape::Line(scale_seg(boundary, s)),
+            scale_pt(click, s),
+        );
+        let Ok(res) = res else {
+            prop_assert!(false, "scale {s} failed to trim across a perpendicular boundary: {res:?}");
+            unreachable!()
+        };
+        prop_assert_eq!(res.retained.len(), 1, "scale {} changed the piece count", s);
+        let Shape::Line(piece) = res.retained[0] else {
+            prop_assert!(false, "trim of a line produced a non-line piece");
+            unreachable!()
+        };
+        prop_assert!(piece.a.distance(scale_pt(mid, s)) <= tol_at(s));
+        prop_assert!(piece.b.distance(scale_pt(b, s)) <= tol_at(s));
+    }
+
+    /// フィレットは図面の拡大縮小に追従する（成否が一致し、弧の中心・半径・接点が `s` 倍）。
+    #[test]
+    fn fillet_lines_is_scale_invariant(
+        corner in base_point(),
+        ang_a in 0.0f64..std::f64::consts::TAU,
+        wedge in 0.5f64..2.6f64,
+        len in 5.0f64..20.0f64,
+        tangent_frac in 0.1f64..0.5f64,
+        s in scale(),
+    ) {
+        let (da, db) = (unit_vec(ang_a), unit_vec(ang_a + wedge));
+        let a = LineSeg::new(corner, corner + da * len);
+        let b = LineSeg::new(corner, corner + db * len);
+        // 接点はコーナーから `radius / tan(wedge/2)` の位置。そこを `tangent_frac * len` に
+        // 固定して、必ず線分の内側に収める（RadiusTooLarge を避ける）。
+        let radius = tangent_frac * len * (wedge / 2.0).tan();
+        let near_a = corner + da * (len * 0.9);
+        let near_b = corner + db * (len * 0.9);
+
+        let small = fillet_lines(a, b, radius, near_a, near_b);
+        let big = fillet_lines(
+            scale_seg(a, s),
+            scale_seg(b, s),
+            radius * s,
+            scale_pt(near_a, s),
+            scale_pt(near_b, s),
+        );
+        match (small, big) {
+            (Ok(u), Ok(v)) => {
+                prop_assert!((v.arc.radius - radius * s).abs() <= tol_at(s));
+                prop_assert!(v.arc.center.distance(scale_pt(u.arc.center, s)) <= tol_at(s));
+                prop_assert!(v.trimmed_a.a.distance(scale_pt(u.trimmed_a.a, s)) <= tol_at(s));
+                prop_assert!(v.trimmed_a.b.distance(scale_pt(u.trimmed_a.b, s)) <= tol_at(s));
+                prop_assert!(v.trimmed_b.a.distance(scale_pt(u.trimmed_b.a, s)) <= tol_at(s));
+                prop_assert!(v.trimmed_b.b.distance(scale_pt(u.trimmed_b.b, s)) <= tol_at(s));
+            }
+            (Err(e1), Err(e2)) => prop_assert_eq!(e1, e2),
+            (x, y) => prop_assert!(false, "scale {s} changed the outcome: {x:?} vs {y:?}"),
+        }
+    }
+
+    /// ゼロ長線分はどの倍率でも退化として扱われる（オフセット拒否・最近点は始点・交点なし）。
+    #[test]
+    fn zero_length_segment_stays_degenerate_at_every_scale(
+        p in base_point(),
+        q in base_point(),
+        s in scale(),
+    ) {
+        let a = scale_pt(p, s);
+        let seg = LineSeg::new(a, a);
+        prop_assert_eq!(seg.offset(s, scale_pt(q, s)), Err(OffsetError::Degenerate));
+        prop_assert_eq!(seg.closest_point(scale_pt(q, s)), a);
+        // 交点計算の対象外（ゼロ長線分は孤立交点を持たない）。
+        let crossing = LineSeg::new(a - Vec2::new(s, s), a + Vec2::new(s, s));
+        prop_assert!(intersect(&Shape::Line(seg), &Shape::Line(crossing)).is_empty());
+    }
+
+    /// 点の一致許容量（[`point_tol`]）より短い線分は、どの倍率でも退化として扱われる。
+    ///
+    /// これが相対 EPS 化の本題。絶対 `EPS`（1e-9）判定だと、原点から遠い座標では
+    /// 「両端点が同一点とみなされるほど短いのに非退化」と誤認し、方向ベクトルが
+    /// 丸め誤差そのものになる線分を下流へ流していた。
+    #[test]
+    fn segment_below_point_tolerance_is_degenerate_at_every_scale(
+        p in base_point(),
+        q in base_point(),
+        frac in 0.01f64..0.5f64,
+        s in scale(),
+    ) {
+        let a = scale_pt(p, s);
+        let b = a + Vec2::new(point_tol(a, a) * frac, 0.0);
+        let seg = LineSeg::new(a, b);
+        prop_assume!(seg.length() <= point_tol(seg.a, seg.b));
+
+        prop_assert_eq!(seg.offset(s, scale_pt(q, s)), Err(OffsetError::Degenerate));
+        prop_assert_eq!(seg.closest_point(scale_pt(q, s)), a);
+        let crossing = LineSeg::new(a - Vec2::new(s, s), a + Vec2::new(s, s));
+        prop_assert!(intersect(&Shape::Line(seg), &Shape::Line(crossing)).is_empty());
     }
 }

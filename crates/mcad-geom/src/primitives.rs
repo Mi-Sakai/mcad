@@ -5,7 +5,32 @@ use std::f64::consts::TAU;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Aabb, Point2, Vec2};
+use crate::{Aabb, Point2, Vec2, point_tol};
+
+/// 線分が退化しているか（長さが端点の座標スケールに対する相対許容量以下か）。
+///
+/// ゼロ長の絶対判定（`len <= EPS`）だと、原点から遠い座標では「点の一致許容量より
+/// 短い線分」を非退化と誤認し、方向ベクトルが丸め誤差そのものになる。判定は
+/// [`crate::point_tol`] に揃える（[`crate::EPS`] の doc 参照）。
+#[inline]
+#[must_use]
+fn seg_is_degenerate(seg: &LineSeg) -> bool {
+    let tol = point_tol(seg.a, seg.b);
+    seg.direction().length_squared() <= tol * tol
+}
+
+/// 線分の単位方向ベクトル。退化（[`seg_is_degenerate`]）していれば `None`。
+///
+/// [`Vec2::normalize`] 単体では相対許容量を使えないので、退化判定だけを座標スケールに
+/// 対して相対化してから正規化する。
+#[inline]
+#[must_use]
+fn seg_unit_direction(seg: &LineSeg) -> Option<Vec2> {
+    if seg_is_degenerate(seg) {
+        return None;
+    }
+    seg.direction().normalize()
+}
 
 /// 角度 `a`（ラジアン）を `[0, TAU)` に正規化する。
 ///
@@ -121,15 +146,16 @@ impl LineSeg {
     /// 点 `p` に最も近い線分上の点。
     ///
     /// 直線へ射影したパラメータ `t` を `[0, 1]` にクランプする。
-    /// 退化した（長さ 0 の）線分では始点を返す。
+    /// 退化した（長さが端点の座標スケールに対する相対許容量以下の）線分では始点を返す
+    /// （そのとき始点と終点は [`crate::point_tol`] の意味で同一点なので、どちらを返しても
+    /// 許容量内で等価）。
     #[must_use]
     pub fn closest_point(&self, p: Point2) -> Point2 {
-        let d = self.direction();
-        let len2 = d.length_squared();
-        if len2 <= crate::EPS * crate::EPS {
+        if seg_is_degenerate(self) {
             return self.a;
         }
-        let t = ((p - self.a).dot(d) / len2).clamp(0.0, 1.0);
+        let d = self.direction();
+        let t = ((p - self.a).dot(d) / d.length_squared()).clamp(0.0, 1.0);
         self.a + d * t
     }
 
@@ -173,14 +199,16 @@ impl LineSeg {
     /// # Errors
     ///
     /// - [`OffsetError::NonPositiveDistance`] — `distance` が正の有限値でない。
-    /// - [`OffsetError::Degenerate`] — 長さ 0 の線分で法線が定義できない。
+    /// - [`OffsetError::Degenerate`] — 退化した線分（長さが [`crate::point_tol`] 以下）で
+    ///   法線が定義できない。
     pub fn offset(self, distance: f64, toward: Point2) -> Result<LineSeg, OffsetError> {
         if !valid_offset_distance(distance) {
             return Err(OffsetError::NonPositiveDistance);
         }
-        let Some(normal) = self.direction().perp().normalize() else {
+        let Some(unit_dir) = seg_unit_direction(&self) else {
             return Err(OffsetError::Degenerate);
         };
+        let normal = unit_dir.perp();
         // `toward` のある側を向く単位法線に符号を合わせる（perp は左法線）。
         let unit = if (toward - self.a).dot(normal) >= 0.0 {
             normal
@@ -229,14 +257,16 @@ impl Circle {
 
     /// 点 `p` に最も近い円周上の点。
     ///
-    /// `p` が中心とほぼ一致する場合は方向が定まらないため、角度 0 の点
-    /// （`center + (radius, 0)`）を返す。
+    /// `p` が中心とほぼ一致する（座標スケールに対する相対許容量 [`crate::point_tol`]
+    /// 以内）場合は方向が定まらないため、角度 0 の点（`center + (radius, 0)`）を返す。
     #[must_use]
     pub fn closest_point(&self, p: Point2) -> Point2 {
-        match (p - self.center).normalize() {
-            Some(dir) => self.center + dir * self.radius,
-            None => self.center + Vec2::new(self.radius, 0.0),
+        let dir = p - self.center;
+        let len = dir.length();
+        if len <= point_tol(p, self.center) {
+            return self.center + Vec2::new(self.radius, 0.0);
         }
+        self.center + dir * (self.radius / len)
     }
 
     /// 変位 `delta` だけ平行移動した新しい円（中心のみ動き、半径は不変）。
@@ -352,6 +382,10 @@ impl Arc {
     }
 
     /// 角度 `theta` が弧の掃引範囲内か（両端点を許容量込みで含む）。
+    ///
+    /// 許容量は角度（ラジアン）空間なので [`crate::EPS`] を直接使う。角度は一様な
+    /// 拡大縮小に対して不変で、半径 R の弧では弧長 `EPS * R` に相当する
+    /// （＝もともと寸法に対して相対的）ため、[`crate::rel_tol`] による相対化は行わない。
     #[must_use]
     pub fn contains_angle(&self, theta: f64) -> bool {
         let sweep = self.sweep();
@@ -385,11 +419,12 @@ impl Arc {
     /// 点 `p` に最も近い弧上の点。
     ///
     /// `p` の方向角が弧の範囲内なら円周への射影点を、範囲外なら近い方の端点を返す。
-    /// `p` が中心とほぼ一致する場合は始点を返す（弧上のどの点も等距離のため）。
+    /// `p` が中心とほぼ一致する（相対許容量 [`crate::point_tol`] 以内）場合は始点を返す
+    /// （弧上のどの点も等距離のため）。
     #[must_use]
     pub fn closest_point(&self, p: Point2) -> Point2 {
         let dir = p - self.center;
-        if dir.length() <= crate::EPS {
+        if dir.length() <= point_tol(p, self.center) {
             return self.start_point();
         }
         let theta = dir.angle();
@@ -450,7 +485,7 @@ impl Arc {
     ///
     /// # 退化軸のガード
     ///
-    /// 軸 2 点がほぼ同一（`|axis_b − axis_a| <= EPS`）だと軸の向きが定まらず、
+    /// 軸 2 点がほぼ同一（`|axis_b − axis_a| <= point_tol(axis_a, axis_b)`）だと軸の向きが定まらず、
     /// `alpha = (axis_b − axis_a).angle()` が `atan2(0, 0) = 0` に化ける。すると
     /// 中心は [`mirror_point`]（内部で [`Vec2::reflected`] が退化軸を恒等写像として
     /// 扱う）により不変のまま、開始/終了角だけが「x 軸に対する反射」で反転してしまい、
@@ -463,7 +498,7 @@ impl Arc {
     #[must_use]
     pub fn mirrored(self, axis_a: Point2, axis_b: Point2) -> Arc {
         // 退化軸（2 点がほぼ同一）は無変換で自身を返す（上記 doc 参照）。
-        if (axis_b - axis_a).length() <= crate::EPS {
+        if (axis_b - axis_a).length() <= point_tol(axis_a, axis_b) {
             return self;
         }
         let alpha = (axis_b - axis_a).angle();
@@ -629,7 +664,8 @@ impl Polyline {
     /// # Errors
     ///
     /// - [`OffsetError::NonPositiveDistance`] — `distance` が正の有限値でない。
-    /// - [`OffsetError::Degenerate`] — 頂点が2未満、または全セグメントがゼロ長で法線が定義できない。
+    /// - [`OffsetError::Degenerate`] — 頂点が2未満、または全セグメントが退化
+    ///   （長さが [`crate::point_tol`] 以下）で法線が定義できない。
     pub fn offset(&self, distance: f64, toward: Point2) -> Result<Polyline, OffsetError> {
         if !valid_offset_distance(distance) {
             return Err(OffsetError::NonPositiveDistance);
@@ -639,10 +675,10 @@ impl Polyline {
             return Err(OffsetError::Degenerate);
         }
         let segs: Vec<LineSeg> = self.segments().collect();
-        // 各セグメントの左法線単位ベクトル。ゼロ長セグメントは `None`。
+        // 各セグメントの左法線単位ベクトル。退化セグメント（[`seg_is_degenerate`]）は `None`。
         let normals: Vec<Option<Vec2>> = segs
             .iter()
-            .map(|s| s.direction().perp().normalize())
+            .map(|s| seg_unit_direction(s).map(Vec2::perp))
             .collect();
 
         // 側の符号を、`toward` に最も近い非退化セグメントの左法線で決める。
@@ -984,6 +1020,30 @@ mod tests {
             s.closest_point(Point2::new(20.0, 1.0)),
             Point2::new(10.0, 0.0)
         ));
+    }
+
+    #[test]
+    fn segment_shorter_than_point_tolerance_is_degenerate_far_from_origin() {
+        // 原点から遠い座標では、点の一致許容量（`point_tol`）が座標の大きさに比例して
+        // 広がる。その許容量より短い線分は「両端点が同一点」なので方向が定まらない。
+        // 絶対 EPS 判定（`len <= 1e-9`）だと長さ 1e-8 を非退化と誤認していた。
+        let a = Point2::new(1.0e6, 1.0e6);
+        let b = Point2::new(1.0e6 + 1.0e-8, 1.0e6);
+        let seg = LineSeg::new(a, b);
+        assert!(
+            seg.length() > crate::EPS,
+            "旧・絶対 EPS では非退化だった長さ"
+        );
+        assert!(
+            seg.length() < point_tol(a, b),
+            "相対許容量では両端点が同一点"
+        );
+
+        assert_eq!(
+            seg.offset(1.0, Point2::ORIGIN),
+            Err(OffsetError::Degenerate)
+        );
+        assert_eq!(seg.closest_point(Point2::ORIGIN), a);
     }
 
     #[test]

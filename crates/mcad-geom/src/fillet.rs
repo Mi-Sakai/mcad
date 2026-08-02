@@ -17,14 +17,16 @@
 //!
 //! 平行判定は既存と同じ相対イプシロン（`|cross| <= EPS * |r| * |s|`、なす角の
 //! sin 相当）を使い、接点の区間判定は無次元のパラメータ `t ∈ [0, 1]` に対して
-//! [`crate::EPS`] を直接使う（[`crate::trim_extend`] と同じ流儀）。
+//! [`crate::EPS`] を直接使う（[`crate::trim_extend`] と同じ流儀）。ワールド座標のまま
+//! 比較する量（線分の退化、直線からの符号付き距離、トリム後に残る長さ）は
+//! [`crate::point_tol`] / [`crate::rel_tol`] による相対許容量で判定する。
 //! オフセット方向の決定は [`LineSeg::offset`] にそのまま委ねるので、
 //! 「側」の意味づけは M5 のオフセットと完全に一致する。
 
 use std::f64::consts::PI;
 
 use crate::primitives::wrap_2pi;
-use crate::{Arc, EPS, LineSeg, OffsetError, Point2, Vec2};
+use crate::{Arc, EPS, LineSeg, OffsetError, Point2, Vec2, point_tol, rel_tol};
 
 /// フィレットが結果を作れない理由。
 ///
@@ -101,7 +103,8 @@ pub fn fillet_lines(
 
     let (da, db) = (a.direction(), b.direction());
     let (la, lb) = (da.length(), db.length());
-    if la <= EPS || lb <= EPS {
+    // 退化判定は端点の座標スケールに対して相対（geom 横断の共通基準）。
+    if la <= point_tol(a.a, a.b) || lb <= point_tol(b.a, b.b) {
         return Err(FilletError::Degenerate);
     }
     // 平行判定: なす角の sin が EPS 未満（`intersect` の seg_seg と同じ形）。
@@ -156,13 +159,13 @@ fn offset_error(err: OffsetError) -> FilletError {
 /// `p` が `seg` を含む無限直線のどちら側にあるかを確実に判定できるか。
 ///
 /// 直線からの符号付き距離が座標スケールに対して相対的に 0 とみなせる場合は
-/// 「側」が決まらない。許容量は [`crate::trim_extend`] と同じ相対形。
+/// 「側」が決まらない。許容量は [`crate::rel_tol`]（[`crate::trim_extend`] と同じ相対形）。
 fn has_definite_side(seg: &LineSeg, p: Point2) -> bool {
     let d = seg.direction();
     let len = d.length();
     let offset = p - seg.a;
     let dist = offset.cross(d).abs() / len;
-    dist > EPS * (1.0 + len + offset.length())
+    dist > rel_tol(len + offset.length())
 }
 
 /// 無限直線 `p + t·r` と `q + u·s` の交点。平行なら `None`。
@@ -176,7 +179,7 @@ fn line_line_intersection(p: Point2, r: Vec2, q: Point2, s: Vec2) -> Option<Poin
 
 /// `p` を `seg` の無限直線へ射影したパラメータ（`seg.a` が 0、`seg.b` が 1）。
 ///
-/// `len` は `seg.direction().length()`（呼び出し側で `EPS` 超と検査済み）。
+/// `len` は `seg.direction().length()`（呼び出し側で [`crate::point_tol`] 超と検査済み）。
 fn param_on(seg: &LineSeg, p: Point2, len: f64) -> f64 {
     (p - seg.a).dot(seg.direction()) / (len * len)
 }
@@ -192,6 +195,7 @@ fn corner_arc(
     let theta_b = (tangent_b - center).angle();
     let sweep = wrap_2pi(theta_b - theta_a);
     // 2 直線が平行でなければ接点半径のなす角は (0, π) に入る。掃引 0 は保険。
+    // 掃引は角度空間の量（一様な拡大縮小で不変）なので `EPS` を直接使う。
     if sweep <= EPS {
         return Err(FilletError::Degenerate);
     }
@@ -218,7 +222,11 @@ fn trim_to_tangent(
         LineSeg::new(tangent, seg.b)
     };
     // 残る側が実質長さ 0 になる結果は確定しない（M5 の退化拒否規約）。
-    if trimmed.length() <= EPS * seg.length() {
+    // 許容量は「元の線分長に対する比率」と「端点座標のスケール」の両方を見る。
+    // 前者だけだと、原点から遠い座標で点の一致許容量より短い断片を通してしまう。
+    if trimmed.length()
+        <= rel_tol(seg.length() + trimmed.a.to_vec2().length() + trimmed.b.to_vec2().length())
+    {
         return Err(FilletError::Degenerate);
     }
     Ok(trimmed)

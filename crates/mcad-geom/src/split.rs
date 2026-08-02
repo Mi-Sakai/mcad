@@ -12,7 +12,7 @@
 //! 絶対許容量を使うと、大縮尺の図面で許容が狭すぎたり小縮尺の図面で広すぎたりする
 //! 既知の問題を避けるため（DESIGN.md M7 設計判断1a）。
 
-use crate::{Arc, EPS, LineSeg, Point2, Polyline, Shape};
+use crate::{Arc, LineSeg, Point2, Polyline, Shape, point_tol};
 
 /// 分割が結果を作れない理由。
 ///
@@ -30,11 +30,10 @@ pub enum SplitError {
 
 /// 点 `p`・`q` が既存 geom の相対 EPS 許容量内で一致するか。
 ///
-/// `intersect.rs` の `prim_contains_point`/`dedup_points` と同じ
-/// `tol = EPS * (1.0 + 座標の大きさ)` 形（両点の大きさを足し合わせてスケールとする）。
+/// geom 横断の共通ヘルパ [`crate::point_tol`]
+/// （`tol = EPS * (1.0 + |p| + |q|)`）へ委譲する。
 fn near(p: Point2, q: Point2) -> bool {
-    let scale = 1.0 + p.to_vec2().length() + q.to_vec2().length();
-    p.distance(q) <= EPS * scale
+    p.distance(q) <= point_tol(p, q)
 }
 
 /// 対象 `shape` を点 `at`（形状上またはその近傍）で 2 つに分割する。

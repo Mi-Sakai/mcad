@@ -4,7 +4,8 @@
 //!
 //! - `.mcad`（JSON）: [`save_mcad`] / [`load_mcad`]（ファイル）、
 //!   [`to_json`] / [`from_json`]（文字列）、
-//!   [`export_document`] / [`import_document`]（DTO [`FileDocument`] との相互変換）
+//!   [`export_document`] / [`import_document`]（DTO [`FileDocument`] との相互変換）。
+//!   読込結果は [`LoadSummary`]（旧バージョンからの線幅移行でクランプした件数を含む）
 //! - DXF: [`save_dxf`] / [`load_dxf`]（ファイル）、
 //!   [`export_dxf`] / [`import_dxf`]（`dxf::Drawing` との相互変換）。
 //!   import 結果は [`ImportSummary`]、export 結果は [`ExportSummary`]（いずれも
@@ -22,6 +23,6 @@ mod mcad_file;
 pub use dxf_file::{ExportSummary, ImportSummary, export_dxf, import_dxf, load_dxf, save_dxf};
 pub use error::IoError;
 pub use mcad_file::{
-    FORMAT_VERSION, FileDocument, FileEntity, FileLayer, export_document, from_json,
+    FORMAT_VERSION, FileDocument, FileEntity, FileLayer, LoadSummary, export_document, from_json,
     import_document, load_mcad, save_mcad, to_json,
 };

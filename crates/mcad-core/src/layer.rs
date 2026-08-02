@@ -2,20 +2,33 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::Rgb;
+use crate::{Linetype, Rgb, WidthMm};
 
-/// レイヤー。名前・色・表示/非表示・ロック状態・重ね順を持つ。
+/// レイヤー。名前・色・線種・線幅・表示/非表示・ロック状態・重ね順を持つ。
 ///
 /// レイヤー自体は識別子（[`crate::LayerId`]）を持たない純粋な値であり、
 /// [`crate::Document`] がキーと対応付けて保持する。ドキュメントに紐づく
 /// レイヤーのプロパティ変更は [`crate::Command::SetLayerProps`] 経由で行う
 /// （[`Layer::order`] も他のプロパティと同じくこの経路で変更する）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` は導出しない（[`Layer::width_mm`] が浮動小数を持つため）。no-op 判定に使う
+/// [`Document::apply`](crate::Document::apply) の `before == after` 比較は
+/// `PartialEq` で足りる。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layer {
     /// レイヤー名。
     pub name: String,
     /// レイヤー色。エンティティの [`crate::Style`] が色を継承する場合に使う。
     pub color: Rgb,
+    /// レイヤー既定の線種。エンティティの [`crate::Style::linetype`] が `None`
+    /// （ByLayer）のときに使う（DESIGN.md M8 設計判断5）。
+    pub linetype: Linetype,
+    /// レイヤー既定の線幅（紙 mm）。エンティティの [`crate::Style::width_mm`] が
+    /// `None`（ByLayer）のときに使う。
+    ///
+    /// 規定 4-1 の「実線_中 0.35mm」のような **線の名称 = レイヤー** という運用を
+    /// 想定している（DESIGN.md M8 設計判断5）。
+    pub width_mm: WidthMm,
     /// 表示するか。`false` なら描画・ヒットテスト対象から外す想定。
     pub visible: bool,
     /// ロックされているか。`true` のレイヤー上のエンティティは追加・変更・削除が
@@ -39,7 +52,8 @@ pub struct Layer {
 }
 
 impl Layer {
-    /// 名前と色からレイヤーを作る（`visible = true`, `locked = false`, `order = 0`）。
+    /// 名前と色からレイヤーを作る（`visible = true`, `locked = false`, `order = 0`,
+    /// `linetype = Continuous`, `width_mm = 0.35mm`）。
     ///
     /// `order` の既定値が `0` なのは「重ね順を気にしない呼び出し側は全レイヤーを
     /// 同順位に置ける」ようにするため。特定の重ね順が要るときは生成後に
@@ -50,9 +64,25 @@ impl Layer {
         Self {
             name: name.into(),
             color,
+            linetype: Linetype::default(),
+            width_mm: WidthMm::DEFAULT,
             visible: true,
             locked: false,
             order: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_layer_defaults_to_continuous_and_default_width() {
+        // 規定 4-1 の「実線_中 0.35mm」相当を既定にする（DESIGN.md M8 設計判断5・6）。
+        let layer = Layer::new("0", Rgb::WHITE);
+        assert_eq!(layer.linetype, Linetype::Continuous);
+        assert_eq!(layer.width_mm, WidthMm::DEFAULT);
+        assert_eq!(layer.width_mm.mm(), 0.35);
     }
 }

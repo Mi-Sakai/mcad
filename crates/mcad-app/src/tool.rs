@@ -1927,6 +1927,9 @@ impl SelectTool {
                 EntityGeom::Text(_) => entity.geom.aabb().distance_to_point(world),
                 EntityGeom::DimLinear(dim) => crate::dimension::linear_distance(dim, world),
                 EntityGeom::DimRadial(dim) => crate::dimension::radial_distance(dim, world),
+                // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は近似 aabb への
+                // 距離で拾う（ピック対象から黙って消えるより穏当）。
+                _ => entity.geom.aabb().distance_to_point(world),
             };
             Some((d, id))
         })

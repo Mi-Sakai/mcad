@@ -8,3 +8,8 @@ mcad-geom = { workspace = true }
 serde = { version = "1.0.228", features = ["derive"] }
 slotmap = "1.1.1"
 thiserror = "2.0.18"
+
+[dev-dependencies]
+# 検証済み型（Scale / WidthMm）の serde `try_from` 境界を、定義と同じ場所で
+# テストするためだけに使う（本体は serde のみに依存し、形式は io 層の責務）。
+serde_json = "1.0.150"

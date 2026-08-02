@@ -22,7 +22,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
-use mcad_core::{Command, CoreError, Document, Entity, EntityGeom, EntityId, Layer, Rgb, Style};
+use mcad_core::{
+    Command, CoreError, Document, Entity, EntityGeom, EntityId, Layer, Linetype, Rgb, Style,
+    WidthMm,
+};
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape, Vec2};
 use mcad_io::{load_dxf, load_mcad, save_dxf, save_mcad};
 
@@ -222,7 +225,9 @@ fn build_round_trip_document() -> Document {
             } else {
                 None
             },
-            width: 1.0 + i as f32,
+            // 線幅は 1 件だけエンティティ固有値にし、残りは ByLayer のままにする。
+            width_mm: (i == 1).then(|| WidthMm::new(0.7).unwrap()),
+            linetype: (i == 3).then_some(Linetype::Dashed),
         };
         doc.apply(Command::AddEntity(Entity::new(shape, layer, style)))
             .unwrap();
@@ -286,7 +291,10 @@ fn mcad_file_round_trip_through_real_file_path() {
     let path = dir.join(format!("roundtrip-{}.mcad", std::process::id()));
 
     save_mcad(&doc, &path).unwrap();
-    let loaded = load_mcad(&path).unwrap();
+    let summary = load_mcad(&path).unwrap();
+    // v4 で保存した図面の読込なので旧線幅の移行は発生しない。
+    assert_eq!(summary.clamped_widths, 0);
+    let loaded = summary.document;
 
     assert_eq!(loaded.entity_count(), original_entity_count);
     assert_eq!(loaded.layer_count(), original_layer_count);

@@ -1083,6 +1083,11 @@ core/io/geom にも及ぶ構成へ拡大している(2026-08-01)。
    として `mcad-core` に置き(serde 可能、tcad の「図枠を自分で作る」ゲーム要素から再利用可能)、
    標準様式 A/B/C(規定 2-4-1)は組み込み定数で提供する。**ユーザー定義様式のデータ構造まで
    実装し、その編集 UI は M8 スコープ外**(標準3様式の選択 + 欄の記入のみ)。
+   実装時追加(2026-08-02、タスク35a): `TitleBlockKind::Custom` は `.mcad` に保存される
+   ユーザーデータであるため、`SheetMeta::validate()` / `TitleBlockTemplate::validate()`
+   (セル幅・段高さの有限・正)と `CoreError::InvalidSheet` を新設し、`Command::SetSheet` の
+   適用前に検証する(Scale / WidthMm と同じ境界問題への予防。セル幅合計 = 全体幅までは
+   要求せず、標準3様式の合計一致はテストで固定)。
 
 4. **注記(寸法の文字・矢印、Text の高さ)は紙基準 mm へ統一する**(6.2 の決定、A-2 で
    前提条件と確定)。`DIM_TEXT_PX`/`DIM_ARROW_PX`(画面 px 基準)を廃止し、紙 mm 定数

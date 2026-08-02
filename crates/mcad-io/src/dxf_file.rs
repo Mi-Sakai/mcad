@@ -155,7 +155,9 @@ use dxf::enums::{HorizontalTextJustification, VerticalTextJustification};
 use dxf::tables::Layer as DxfLayer;
 use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
-use mcad_core::{Command, Document, Entity, EntityGeom, Layer, LayerId, Rgb, Style, TextGeom};
+use mcad_core::{
+    Command, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Rgb, Style, TextGeom, WidthMm,
+};
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
 use crate::IoError;
@@ -536,7 +538,9 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
         let mut dxf_entity = match &entity.geom {
             EntityGeom::Shape(shape) => shape_to_dxf_entity(shape),
             EntityGeom::Text(text) => text_to_dxf_entity(text),
-            EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {
+            // 寸法（DimLinear/DimRadial）と、将来 core へ追加される未知の幾何
+            // （`EntityGeom` は `#[non_exhaustive]`）はまとめてスキップ側に回す。
+            _ => {
                 skipped_entities += 1;
                 continue;
             }
@@ -592,6 +596,10 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
         let mcad_layer = Layer {
             name: layer.name.clone(),
             color: dxf_color_to_style(&layer.color).unwrap_or(ACI_FALLBACK_RGB),
+            // 線種・線幅の DXF 往復はタスク35c の担当。ここでは core の既定
+            // （実線・0.35mm）で復元する。
+            linetype: Linetype::default(),
+            width_mm: WidthMm::DEFAULT,
             visible: layer.is_layer_on,
             // dxf::tables::Layer にロック状態のフィールドがないため常に未ロックで
             // 復元する（モジュール doc「レイヤーロックは保存されない」参照）。
@@ -773,7 +781,9 @@ mod tests {
             let style = if i == 0 {
                 Style {
                     color: Some(Rgb::new(255, 0, 0)), // ACI 1（赤）と厳密一致
-                    width: 2.5,
+                    // 線幅・線種の DXF 往復はタスク35c の担当。ここでは色だけを
+                    // 個別指定し、線幅・線種は ByLayer のままにする。
+                    ..Style::inherited()
                 }
             } else {
                 Style::inherited()

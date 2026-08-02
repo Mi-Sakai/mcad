@@ -115,8 +115,9 @@ pub fn snap(
             EntityGeom::Shape(shape) => enumerate_features(shape, cursor, r2, &mut best),
             // Text はアンカー点のみをスナップ源にする（端点扱い。DESIGN.md M6 L386）。
             EntityGeom::Text(text) => best.consider(SnapKind::Endpoint, text.anchor, cursor, r2),
-            // 寸法はスナップ源にしない（DESIGN.md M6 L386）。
-            EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) => {}
+            // 寸法はスナップ源にしない（DESIGN.md M6 L386）。`EntityGeom` は
+            // `#[non_exhaustive]` なので、未知の幾何も同じくスナップ源にしない。
+            _ => {}
         }
     }
 

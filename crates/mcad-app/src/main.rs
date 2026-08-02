@@ -20,10 +20,10 @@ use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
     Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb,
-    Style, TextGeom,
+    Style, TextGeom, WidthMm,
 };
 use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
-use mcad_io::{ImportSummary, load_dxf, load_mcad, save_dxf, save_mcad};
+use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use tool::{
     ArcTool, CircleTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool, FilletTool,
@@ -121,6 +121,14 @@ const DEFAULT_EXTRA_LAYERS: [(&str, Rgb); 1] = [("Text", LAYER_COLOR_PALETTE[3])
 
 /// ステータスメッセージの文字色（エラー通知が主用途なので警告寄りの赤）。
 const STATUS_MESSAGE_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
+
+/// エンティティ本体を描くときの暫定の線の太さ [px]。
+///
+/// **タスク35a/35b の暫定値**。`Style.width`（px）が `Style.width_mm`（紙 mm の
+/// ByLayer モデル）へ置き換わったが、紙基準の線幅解決
+/// （`px = max(1px, width_mm * den/num * zoom)`）はタスク36 の担当なので、それまでは
+/// 旧既定（`max(width_px, 1.0)` = 1px）と同じ見た目を保つ固定値で描く。
+const PROVISIONAL_STROKE_PX: f32 = 1.0;
 
 /// 選択エンティティのハイライト色（確定済みエンティティ色とは別の強調色）。
 const SELECTION_COLOR: Color32 = Color32::from_rgb(80, 200, 255);
@@ -448,6 +456,23 @@ fn set_status_with_duration(
         shown_at: now,
         duration_secs,
     });
+}
+
+/// `.mcad` 読込成功時のステータス文言（ASCII 限定。egui の既定フォントは CJK 非対応）。
+///
+/// 旧バージョン（v1〜v3）の線幅移行で上限へ丸めた件数があれば必ず添える。黙って値を
+/// 変えたことに気づけるようにするためで、DXF import の skipped 件数表示と同じ流儀
+/// （DESIGN.md M8 設計判断6 の規則3）。
+fn open_status(clamped_widths: usize) -> String {
+    if clamped_widths > 0 {
+        format!(
+            "Opened file: {clamped_widths} entity(ies) had their legacy line width \
+             clamped to {max} mm",
+            max = WidthMm::MAX_MM
+        )
+    } else {
+        "Opened file".to_string()
+    }
 }
 
 /// 新規文書（起動直後・Ctrl+N）用のドキュメントを作る。
@@ -793,15 +818,18 @@ impl McadApp {
         };
         self.remember_dialog_dir(&path);
         match load_mcad(&path) {
-            Ok(doc) => {
-                self.document = doc;
+            Ok(LoadSummary {
+                document,
+                clamped_widths,
+            }) => {
+                self.document = document;
                 self.current_path = Some(path);
                 // load_mcad は再構築後に clear_history 済みで世代が基準点に戻っている。
                 // 読込直後を未保存でない状態にするため、その世代へ合わせる。
                 self.saved_generation = self.document.generation();
                 self.reset_transient_ui_state();
                 self.request_zoom_fit_after_load();
-                set_status_important(&mut self.status, now, "Opened file");
+                set_status_important(&mut self.status, now, open_status(clamped_widths));
             }
             Err(err) => {
                 set_status_important(&mut self.status, now, format!("Open failed: {err}"));
@@ -2577,18 +2605,20 @@ fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewp
         let color = to_color32(entity.style.effective_color(layer.color));
         match &entity.geom {
             EntityGeom::Shape(shape) => {
-                let stroke = Stroke::new(entity.style.width.max(1.0), color);
+                let stroke = Stroke::new(PROVISIONAL_STROKE_PX, color);
                 draw_shape(painter, rect, viewport, shape, stroke);
             }
             EntityGeom::Text(text) => draw_text(painter, rect, viewport, text, color),
             EntityGeom::DimLinear(dim) => {
-                let stroke = Stroke::new(entity.style.width.max(1.0), color);
+                let stroke = Stroke::new(PROVISIONAL_STROKE_PX, color);
                 draw_dim_linear(painter, rect, viewport, dim, stroke);
             }
             EntityGeom::DimRadial(dim) => {
-                let stroke = Stroke::new(entity.style.width.max(1.0), color);
+                let stroke = Stroke::new(PROVISIONAL_STROKE_PX, color);
                 draw_dim_radial(painter, rect, viewport, dim, stroke);
             }
+            // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
+            _ => {}
         }
     }
 }
@@ -2694,6 +2724,8 @@ fn draw_selection(
                     EntityGeom::DimRadial(dim) => {
                         draw_dim_radial(painter, rect, viewport, &dim, highlight);
                     }
+                    // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
+                    _ => {}
                 }
             }
         }
@@ -2764,6 +2796,8 @@ fn draw_selected(
                 }
                 EntityGeom::DimLinear(dim) => draw_dim_linear(painter, rect, viewport, dim, stroke),
                 EntityGeom::DimRadial(dim) => draw_dim_radial(painter, rect, viewport, dim, stroke),
+                // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
+                _ => {}
             }
         }
     }
@@ -3011,7 +3045,8 @@ mod tests {
                 layer,
                 Style {
                     color: Some(Rgb::new(220, 80, 40)),
-                    width: 2.0,
+                    width_mm: Some(WidthMm::new(0.7).unwrap()),
+                    linetype: None,
                 },
             ),
             Entity::new(
@@ -3323,6 +3358,19 @@ mod tests {
                 .as_ref()
                 .is_some_and(|m| m.text.contains('2') && m.text.contains("skipped"))
         );
+    }
+
+    #[test]
+    fn open_status_reports_clamped_legacy_widths() {
+        // 旧 `.mcad`（v1〜v3）の線幅移行で上限へ丸めた件数は黙殺せず表示する
+        // （DESIGN.md M8 設計判断6 の規則3）。文言は ASCII 限定。
+        let quiet = open_status(0);
+        assert_eq!(quiet, "Opened file");
+
+        let noisy = open_status(3);
+        assert!(noisy.contains('3'), "件数が出るべき: {noisy}");
+        assert!(noisy.contains("clamped"), "丸めたことが分かるべき: {noisy}");
+        assert!(noisy.is_ascii(), "egui 可視文字列は ASCII 限定: {noisy}");
     }
 
     #[test]

@@ -42,4 +42,24 @@ pub enum CoreError {
     /// `Command::AddEntity` / `Command::ModifyEntity` の実行前チェックで返る。
     #[error("invalid geometry: {0}")]
     InvalidGeometry(String),
+
+    /// 図面尺度が不正（`num`/`den` に 0 を含む、上限超過）で拒否した。
+    ///
+    /// 判定条件は [`crate::Scale::new`]（DESIGN.md M8 設計判断2）。
+    #[error("invalid scale: {0}")]
+    InvalidScale(String),
+
+    /// 線幅が不正（0・負・非有限・許容範囲外）で拒否した。
+    ///
+    /// 判定条件は [`crate::WidthMm::new`]（DESIGN.md M8 設計判断5）。
+    #[error("invalid line width: {0}")]
+    InvalidLineWidth(String),
+
+    /// 図面メタデータが不正（ユーザー定義の表題欄様式の寸法が非有限・非正など）で
+    /// 拒否した。
+    ///
+    /// 判定条件は [`crate::SheetMeta::validate`]。`Command::SetSheet` の実行前
+    /// チェックで返る。
+    #[error("invalid sheet metadata: {0}")]
+    InvalidSheet(String),
 }

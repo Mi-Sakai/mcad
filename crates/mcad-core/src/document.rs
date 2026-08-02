@@ -18,7 +18,7 @@
 
 use slotmap::SlotMap;
 
-use crate::{Command, CoreError, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb};
+use crate::{Command, CoreError, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb, SheetMeta};
 
 /// 実行済みコマンドの逆操作可能な記録（内部専用）。
 ///
@@ -56,6 +56,10 @@ enum Applied {
     SetCurrentLayer {
         before: LayerId,
         after: LayerId,
+    },
+    SetSheet {
+        before: Box<SheetMeta>,
+        after: Box<SheetMeta>,
     },
     /// 複合コマンドの逆操作記録。サブコマンドの [`Applied`] を **適用順** に保持する。
     /// undo は逆順・redo は正順に適用することで、バッチ全体が 1 単位で戻る/やり直せる。
@@ -149,6 +153,8 @@ pub struct Document {
     current_layer: LayerId,
     /// デフォルトレイヤー（レイヤー0相当）。削除不可。
     default_layer: LayerId,
+    /// 図面メタデータ（尺度・用紙・表題欄）。変更は [`Command::SetSheet`] 経由のみ。
+    sheet: SheetMeta,
     /// undo スタック（末尾が直近の操作）。
     undo_stack: Vec<HistoryEntry>,
     /// redo スタック（末尾が次に redo する操作）。
@@ -169,6 +175,7 @@ impl Document {
     /// 新規ドキュメントを作る。
     ///
     /// デフォルトレイヤー（名前 `"0"`）を 1 つ自動生成し、カレントレイヤーに設定する。
+    /// 図面メタデータは既定値（A4 横・1:1・様式B・枠非表示。DESIGN.md M8 設計判断6）。
     #[must_use]
     pub fn new() -> Self {
         let mut layers: SlotMap<LayerId, Option<Layer>> = SlotMap::with_key();
@@ -178,6 +185,7 @@ impl Document {
             layers,
             current_layer: default_layer,
             default_layer,
+            sheet: SheetMeta::default(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             generation: 0,
@@ -197,6 +205,14 @@ impl Document {
     #[must_use]
     pub fn default_layer(&self) -> LayerId {
         self.default_layer
+    }
+
+    /// 図面メタデータ（尺度・用紙・向き・表題欄・枠表示）。
+    ///
+    /// 変更は [`Command::SetSheet`] 経由で行う（undo 対象。DESIGN.md M8 設計判断2）。
+    #[must_use]
+    pub fn sheet(&self) -> &SheetMeta {
+        &self.sheet
     }
 
     /// 指定 ID のエンティティを参照する。存在しない/削除済みなら `None`。
@@ -482,6 +498,22 @@ impl Document {
                     before != id,
                 ))
             }
+            Command::SetSheet(sheet) => {
+                // 不正な尺度・線幅は型（Scale / WidthMm）で構築時に弾かれているので、
+                // ここで検証するのはユーザー定義の表題欄様式の寸法だけ。検証を
+                // 差し替えより先に行うことで、失敗時に状態を変えない。
+                sheet.validate().map_err(CoreError::InvalidSheet)?;
+                let before = std::mem::replace(&mut self.sheet, sheet.clone());
+                // 同一メタデータの設定は意味的 no-op（履歴を汚さない）。
+                let changed = before != sheet;
+                Ok(ExecuteOutcome::conditional(
+                    Applied::SetSheet {
+                        before: Box::new(before),
+                        after: Box::new(sheet),
+                    },
+                    changed,
+                ))
+            }
             Command::Batch(subs) => {
                 let mut applied: Vec<Applied> = Vec::with_capacity(subs.len());
                 let mut new_ids = NewIds::default();
@@ -527,6 +559,7 @@ impl Document {
             Applied::RemoveLayer { id, layer } => self.set_layer(*id, Some(layer.clone())),
             Applied::SetLayerProps { id, before, .. } => self.set_layer(*id, Some(before.clone())),
             Applied::SetCurrentLayer { before, .. } => self.current_layer = *before,
+            Applied::SetSheet { before, .. } => self.sheet = (**before).clone(),
             // バッチは逆順に各サブ逆操作を適用する（依存関係を正しく巻き戻すため）。
             Applied::Batch(applied) => {
                 for a in applied.iter().rev() {
@@ -546,6 +579,7 @@ impl Document {
             Applied::RemoveLayer { id, .. } => self.set_layer(*id, None),
             Applied::SetLayerProps { id, after, .. } => self.set_layer(*id, Some(after.clone())),
             Applied::SetCurrentLayer { after, .. } => self.current_layer = *after,
+            Applied::SetSheet { after, .. } => self.sheet = (**after).clone(),
             // バッチは正順に各サブ操作を再適用する（execute と同じ順序）。
             Applied::Batch(applied) => {
                 for a in applied.iter() {
@@ -679,7 +713,10 @@ impl Default for Document {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Style;
+    use crate::{
+        Linetype, MAX_SCALE_TERM, Orientation, PaperSize, ProjectionMethod, Scale, Style,
+        TitleBlockFields, TitleBlockKind, TitleBlockTemplate, Unit, WidthMm,
+    };
     use mcad_geom::{LineSeg, Point2, Shape};
 
     fn line(x: f64) -> EntityGeom {
@@ -758,7 +795,8 @@ mod tests {
         let layer = doc.current_layer();
         let style = Style {
             color: Some(Rgb::new(10, 20, 30)),
-            width: 2.5,
+            width_mm: Some(WidthMm::new(0.7).unwrap()),
+            linetype: Some(Linetype::Dashed),
         };
         let original = Entity::new(line(3.0), layer, style);
         let id = add_entity_get_id(&mut doc, original.clone());
@@ -1744,6 +1782,202 @@ mod tests {
         assert!(doc.undo());
         assert_eq!(doc.generation(), 0);
         assert!(!doc.can_undo());
+    }
+
+    // --- 図面メタデータ（DESIGN.md M8 設計判断2、タスク35a）---
+
+    /// 既定と全項目が異なる図面メタデータ（往復・undo の検証用）。
+    fn custom_sheet() -> SheetMeta {
+        SheetMeta {
+            unit: Unit::Millimeter,
+            scale: Scale::new(1, 2).unwrap(),
+            paper: PaperSize::A3,
+            orientation: Orientation::Portrait,
+            title_block: TitleBlockKind::C,
+            fields: TitleBlockFields {
+                drawing_number: "MCAD-001".to_owned(),
+                drawing_title: "ブラケット".to_owned(),
+                projection: ProjectionMethod::FirstAngle,
+                author: "almaz".to_owned(),
+                date: "2026-08-01".to_owned(),
+                revision: "B".to_owned(),
+            },
+            frame_visible: true,
+        }
+    }
+
+    #[test]
+    fn new_document_sheet_is_default() {
+        // 新規ドキュメントは A4 横・1:1・様式B・枠非表示（DESIGN.md M8 設計判断6）。
+        let doc = Document::new();
+        assert_eq!(*doc.sheet(), SheetMeta::default());
+        assert_eq!(doc.sheet().scale, Scale::ONE);
+        assert_eq!(doc.sheet().paper, PaperSize::A4);
+        assert!(!doc.sheet().frame_visible);
+    }
+
+    #[test]
+    fn set_sheet_undo_redo() {
+        let mut doc = Document::new();
+        let before = doc.sheet().clone();
+        let after = custom_sheet();
+
+        doc.apply(Command::SetSheet(after.clone())).unwrap();
+        assert_eq!(*doc.sheet(), after);
+
+        assert!(doc.undo());
+        assert_eq!(*doc.sheet(), before);
+
+        assert!(doc.redo());
+        assert_eq!(*doc.sheet(), after);
+    }
+
+    #[test]
+    fn set_sheet_with_identical_metadata_is_noop() {
+        // SetLayerProps と同じ流儀: before == after なら履歴も世代も汚さない。
+        let mut doc = Document::new();
+        doc.apply(Command::SetSheet(custom_sheet())).unwrap();
+
+        let undo_len_before = doc.undo_stack.len();
+        let redo_len_before = doc.redo_stack.len();
+        let generation_before = doc.generation();
+
+        assert_eq!(
+            doc.apply(Command::SetSheet(custom_sheet())),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.redo_stack.len(), redo_len_before);
+        assert_eq!(doc.generation(), generation_before);
+    }
+
+    #[test]
+    fn set_sheet_is_part_of_an_atomic_batch() {
+        // 図面メタデータの変更も他の内容変更と同じ 1 単位（Batch）に混ぜられる。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let sheet_before = doc.sheet().clone();
+        let ghost = EntityId::default();
+
+        let batch = Command::Batch(vec![
+            Command::SetSheet(custom_sheet()),
+            Command::AddEntity(Entity::new(line(0.0), layer, Style::inherited())),
+        ]);
+        doc.apply(batch).unwrap();
+        assert_eq!(*doc.sheet(), custom_sheet());
+        assert_eq!(doc.entity_count(), 1);
+
+        assert!(doc.undo());
+        assert_eq!(*doc.sheet(), sheet_before);
+        assert_eq!(doc.entity_count(), 0);
+
+        // 途中で失敗するバッチはメタデータ変更も巻き戻す（原子性）。
+        let failing = Command::Batch(vec![
+            Command::SetSheet(custom_sheet()),
+            Command::RemoveEntity(ghost),
+        ]);
+        assert_eq!(doc.apply(failing), Err(CoreError::EntityNotFound(ghost)));
+        assert_eq!(*doc.sheet(), sheet_before);
+    }
+
+    #[test]
+    fn set_sheet_rejects_invalid_custom_title_block_without_mutating() {
+        // ユーザー定義様式の寸法が非有限なら拒否し、状態も履歴も変えない。
+        let mut doc = Document::new();
+        let before = doc.sheet().clone();
+        let mut broken = TitleBlockTemplate::standard_b().clone();
+        broken.rows[0].cells[0].width_mm = f64::NAN;
+        let sheet = SheetMeta {
+            title_block: TitleBlockKind::Custom(broken),
+            ..SheetMeta::default()
+        };
+
+        let result = doc.apply(Command::SetSheet(sheet));
+        assert!(
+            matches!(result, Err(CoreError::InvalidSheet(_))),
+            "expected InvalidSheet, got {result:?}"
+        );
+        assert_eq!(*doc.sheet(), before);
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn invalid_scale_cannot_reach_a_command() {
+        // core のコマンド境界では、不正な尺度はそもそも値として構築できない
+        // （Scale のフィールドは非公開で、生成は検証済みコンストラクタのみ）。
+        // 「拒否」は Scale::new が担い、Command::SetSheet には検証済みの値しか載らない。
+        for (num, den) in [(0, 1), (1, 0), (0, 0), (MAX_SCALE_TERM + 1, 1)] {
+            assert!(
+                matches!(Scale::new(num, den), Err(CoreError::InvalidScale(_))),
+                "{num}:{den} should be rejected before it can reach SetSheet"
+            );
+        }
+
+        // 検証を通った尺度だけがドキュメントへ入る。
+        let mut doc = Document::new();
+        let sheet = SheetMeta {
+            scale: Scale::new(1, 2).unwrap(),
+            ..SheetMeta::default()
+        };
+        doc.apply(Command::SetSheet(sheet)).unwrap();
+        assert_eq!(doc.sheet().scale, Scale::new(1, 2).unwrap());
+        assert!((doc.sheet().scale.world_mm_per_paper_mm() - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn invalid_line_width_cannot_reach_a_layer_or_style_command() {
+        // 線幅も同様に、0・負・非有限・範囲外は WidthMm::new が弾くため
+        // AddLayer / SetLayerProps / AddEntity のいずれにも載らない。
+        for mm in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, 0.01, 9.0] {
+            assert!(
+                matches!(WidthMm::new(mm), Err(CoreError::InvalidLineWidth(_))),
+                "{mm} should be rejected before it can reach a command"
+            );
+        }
+
+        let mut doc = Document::new();
+        let id = doc.default_layer();
+        let mut props = doc.layer(id).unwrap().clone();
+        props.width_mm = WidthMm::new(0.7).unwrap();
+        props.linetype = Linetype::DashDot;
+        doc.apply(Command::SetLayerProps { id, props }).unwrap();
+
+        let layer = doc.layer(id).unwrap();
+        assert_eq!(layer.width_mm.mm(), 0.7);
+        assert_eq!(layer.linetype, Linetype::DashDot);
+
+        // ByLayer（Style 側 None）はレイヤー値へ解決される。
+        let entity_id = add_entity_get_id(&mut doc, Entity::new(line(0.0), id, Style::inherited()));
+        let entity = doc.entity(entity_id).unwrap();
+        let layer = doc.layer(entity.layer).unwrap();
+        assert_eq!(entity.style.effective_width(layer.width_mm).mm(), 0.7);
+        assert_eq!(
+            entity.style.effective_linetype(layer.linetype),
+            Linetype::DashDot
+        );
+    }
+
+    #[test]
+    fn set_layer_props_changes_width_and_linetype_with_undo_redo() {
+        let mut doc = Document::new();
+        let id = doc.default_layer();
+        let before = doc.layer(id).unwrap().clone();
+
+        let mut after = before.clone();
+        after.width_mm = WidthMm::new(1.4).unwrap();
+        after.linetype = Linetype::Dashed;
+        doc.apply(Command::SetLayerProps {
+            id,
+            props: after.clone(),
+        })
+        .unwrap();
+        assert_eq!(*doc.layer(id).unwrap(), after);
+
+        assert!(doc.undo());
+        assert_eq!(*doc.layer(id).unwrap(), before);
+
+        assert!(doc.redo());
+        assert_eq!(*doc.layer(id).unwrap(), after);
     }
 
     #[test]

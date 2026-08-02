@@ -63,7 +63,14 @@ pub struct DimRadial {
 /// [`crate::Entity`] の `geom` フィールドの型であり、[`crate::Command::ModifyEntity`] の
 /// `new_geom` の型でもある。幾何変換・境界ボックス・検証の各メソッドは、[`Shape`]
 /// バリアントは既存の [`Shape`] へ委譲し、テキスト・寸法はそれぞれの規則で処理する。
+///
+/// **`#[non_exhaustive]`**（DESIGN.md M8 タスク35a）: 幾何の種別は今後も増える
+/// （引出線・GPS 記号・ハッチング等）。クレート外の `match` に常にワイルドカード腕を
+/// 要求しておくことで、バリアント追加が mcad-app / mcad-io / tcad の一斉コンパイル
+/// エラーにならないようにする。**ワイルドカード腕は「未知の幾何を安全に無視する」
+/// 実装にすること**（描画・スナップなら何もしない、集計なら数えない）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum EntityGeom {
     /// 既存の幾何プリミティブ（点・線・円・円弧・ポリライン）。
     Shape(Shape),

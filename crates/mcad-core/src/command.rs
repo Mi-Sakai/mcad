@@ -1,6 +1,6 @@
 //! ドキュメントを変更する唯一の手段である [`Command`]。
 
-use crate::{Entity, EntityGeom, EntityId, Layer, LayerId};
+use crate::{Entity, EntityGeom, EntityId, Layer, LayerId, SheetMeta};
 
 /// ドキュメントへの変更を表すコマンド。
 ///
@@ -50,6 +50,19 @@ pub enum Command {
 
     /// カレントレイヤーを切り替える。
     SetCurrentLayer(LayerId),
+
+    /// 図面メタデータ（尺度・用紙・向き・表題欄の様式と記入内容・枠表示）を
+    /// まとめて差し替える。
+    ///
+    /// 尺度・用紙・表題欄の記入は「図面の内容」であって UI の表示設定ではないため、
+    /// 他の内容変更と同じく undo 対象のコマンドにする（DESIGN.md M8 設計判断2）。
+    /// no-op 判定（`before == after` なら履歴を汚さない）は
+    /// [`Command::SetLayerProps`] と同じ流儀。
+    ///
+    /// 不正な尺度・線幅は [`crate::Scale`] / [`crate::WidthMm`] の型で構築時に
+    /// 弾かれるため、このコマンドに載ることはない。実行前に検証するのは
+    /// ユーザー定義の表題欄様式の寸法のみ（[`crate::SheetMeta::validate`]）。
+    SetSheet(SheetMeta),
 
     /// 複数のサブコマンドを **1 つの操作** としてまとめて適用する複合コマンド。
     ///

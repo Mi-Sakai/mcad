@@ -459,7 +459,7 @@ fn set_status_with_duration(
     });
 }
 
-/// `.mcad` 読込成功時のステータス文言（ASCII 限定。egui の既定フォントは CJK 非対応）。
+/// `.mcad` 読込成功時のステータス文言（ステータスバーは未日本語化領域のため英語）。
 ///
 /// 旧バージョン（v1〜v3）の線幅移行で上限へ丸めた件数があれば必ず添える。黙って値を
 /// 変えたことに気づけるようにするためで、DXF import の skipped 件数表示と同じ流儀
@@ -1458,7 +1458,7 @@ impl eframe::App for McadApp {
 
         // 未保存確認モーダル（OS の閉じるボタン / Ctrl+N / Ctrl+O 共通、非ブロッキング）。
         // egui::Modal は最前面レイヤに背景付きで描かれるので、パネル群の後に描いてよい。
-        // ユーザー可視文字列は ASCII 限定（egui 既定フォントは CJK 非対応）。
+        // 文言は未日本語化領域なので英語のまま（日本語化は領域単位で行う規約）。
         // 3経路とも同じモーダル外観を使い、「破棄」ボタンが押されたときの分岐だけ
         // `confirm_state` で切り替える（[`ConfirmState::prompt`] の doc 参照）。
         if let Some((message, discard_label)) = self.confirm_state.prompt() {
@@ -1894,17 +1894,19 @@ fn renormalize_back(target: LayerId, layers: &[(LayerId, i32)]) -> Vec<OrderUpda
 /// 対象になる。削除の制約（デフォルト/カレント/非空レイヤーは不可）はコア側が
 /// 検証し、失敗はステータスバーへ表示する。
 ///
-/// ラベル等のユーザー可視文字列を ASCII に限定しているのは、egui の既定フォントが
-/// CJK グリフを含まず日本語が豆腐（□）になるため。
+/// ラベル等のユーザー可視文字列は日本語（M8 で ASCII 限定を撤廃。[`fonts`] が登録する
+/// Noto Sans JP へグリフ単位でフォールバックする）。日本語化は領域単位で完結させる規約の
+/// ため、このパネル内に英語ラベルを混ぜないこと。なお新規レイヤーの既定名 `Layer {n}` は
+/// UI ラベルではなくドキュメントへ保存されるデータなので英語のままにしている。
 fn layer_panel(
     ui: &mut egui::Ui,
     document: &mut Document,
     status: &mut Option<StatusMessage>,
     now: f64,
 ) {
-    ui.heading("Layers");
+    ui.heading("レイヤー");
 
-    if ui.button("+ Add layer").clicked() {
+    if ui.button("+ レイヤー追加").clicked() {
         let n = document.layer_count();
         let color = LAYER_COLOR_PALETTE[n % LAYER_COLOR_PALETTE.len()];
         let mut layer = Layer::new(format!("Layer {n}"), color);
@@ -1915,7 +1917,7 @@ fn layer_panel(
             .max()
             .map_or(0, |max| max.saturating_add(1));
         if let Err(err) = document.apply(Command::AddLayer(layer)) {
-            set_status(status, now, format!("Add layer failed: {err}"));
+            set_status(status, now, format!("レイヤーの追加に失敗しました: {err}"));
         }
     }
     ui.separator();
@@ -1935,93 +1937,124 @@ fn layer_panel(
     layers.reverse();
     let mut pending: Vec<Command> = Vec::new();
 
-    for (id, layer) in &layers {
-        ui.horizontal(|ui| {
-            // カレントレイヤー切替（ラジオ）。新規エンティティの投入先になる。
-            if ui
-                .radio(*id == current, "")
-                .on_hover_text("Set current layer")
-                .clicked()
-                && *id != current
-            {
-                pending.push(Command::SetCurrentLayer(*id));
-            }
+    // 「表示」「ロック」は各行に同じ語を繰り返さず、列見出しとして冒頭行に1度だけ出す。
+    // 見出しと列を揃えるには行ごとの幅が一定である必要があるため、`ui.horizontal` では
+    // なく [`egui::Grid`] を使う（horizontal はレイヤー名の長さで各行の幅が変わり、
+    // 見出しとずれてしまう）。
+    egui::Grid::new("layer_panel_grid")
+        .num_columns(6)
+        .spacing([8.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("現在");
+            ui.label("色");
+            ui.label("表示");
+            ui.label("ロック");
+            ui.label("名前");
+            ui.label("操作");
+            ui.end_row();
 
-            let mut rgb = [layer.color.r, layer.color.g, layer.color.b];
-            if ui.color_edit_button_srgb(&mut rgb).changed() {
-                let mut props = layer.clone();
-                props.color = Rgb::new(rgb[0], rgb[1], rgb[2]);
-                pending.push(Command::SetLayerProps { id: *id, props });
-            }
+            for (id, layer) in &layers {
+                // カレントレイヤー切替（ラジオ）。新規エンティティの投入先になる。
+                if ui
+                    .radio(*id == current, "")
+                    .on_hover_text("カレントレイヤーに設定")
+                    .clicked()
+                    && *id != current
+                {
+                    pending.push(Command::SetCurrentLayer(*id));
+                }
 
-            let mut visible = layer.visible;
-            if ui.checkbox(&mut visible, "show").changed() {
-                let mut props = layer.clone();
-                props.visible = visible;
-                pending.push(Command::SetLayerProps { id: *id, props });
-            }
+                let mut rgb = [layer.color.r, layer.color.g, layer.color.b];
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    let mut props = layer.clone();
+                    props.color = Rgb::new(rgb[0], rgb[1], rgb[2]);
+                    pending.push(Command::SetLayerProps { id: *id, props });
+                }
 
-            let mut locked = layer.locked;
-            if ui.checkbox(&mut locked, "lock").changed() {
-                let mut props = layer.clone();
-                props.locked = locked;
-                pending.push(Command::SetLayerProps { id: *id, props });
-            }
+                // 意味は列見出しが担うのでラベルは空。単独で見ても分かるようツールチップは残す。
+                let mut visible = layer.visible;
+                if ui
+                    .checkbox(&mut visible, "")
+                    .on_hover_text("表示 / 非表示")
+                    .changed()
+                {
+                    let mut props = layer.clone();
+                    props.visible = visible;
+                    pending.push(Command::SetLayerProps { id: *id, props });
+                }
 
-            ui.label(&layer.name);
+                let mut locked = layer.locked;
+                if ui
+                    .checkbox(&mut locked, "")
+                    .on_hover_text("ロック中は編集できない")
+                    .changed()
+                {
+                    let mut props = layer.clone();
+                    props.locked = locked;
+                    pending.push(Command::SetLayerProps { id: *id, props });
+                }
 
-            // 重ね順（最前面へ / 最背面へ）。専用コマンドは作らず、既存の
-            // SetLayerProps を並べた Command::Batch として適用する（1クリック =
-            // undo 1単位。Batch はサブコマンド1件でも1記録として履歴に積まれるため、
-            // 通常ケースでは単発 SetLayerProps と同じ粒度のまま）。
-            //
-            // 通常は対象レイヤー1件だけを動かす（[`front_order_plan`] /
-            // [`back_order_plan`] が「他レイヤーの最大+1 / 最小-1」を計算する）。
-            // 他レイヤーが i32::MAX / i32::MIN に達していて単純な +1/-1 が使えない
-            // 場合だけ、全レイヤーの order を再正規化する計画が返る（Codex
-            // adversarial review の medium 指摘対応）。計画が空なら「既に端にいる」
-            // ということなのでボタンを無効化する。
-            let all_orders: Vec<(LayerId, i32)> =
-                layers.iter().map(|(lid, l)| (*lid, l.order)).collect();
-            let front_plan = front_order_plan(*id, &all_orders);
-            let back_plan = back_order_plan(*id, &all_orders);
-            let plan_to_batch = |plan: Vec<(LayerId, i32)>| -> Command {
-                Command::Batch(
-                    plan.into_iter()
-                        .filter_map(|(lid, order)| {
-                            let mut props = layers.iter().find(|(l, _)| *l == lid)?.1.clone();
-                            props.order = order;
-                            Some(Command::SetLayerProps { id: lid, props })
-                        })
-                        .collect(),
-                )
-            };
-            if ui
-                .add_enabled(!front_plan.is_empty(), egui::Button::new("Front"))
-                .on_hover_text("Bring to front")
-                .clicked()
-            {
-                pending.push(plan_to_batch(front_plan));
-            }
-            if ui
-                .add_enabled(!back_plan.is_empty(), egui::Button::new("Back"))
-                .on_hover_text("Send to back")
-                .clicked()
-            {
-                pending.push(plan_to_batch(back_plan));
-            }
+                ui.label(&layer.name);
 
-            // 削除。デフォルトレイヤーにはボタン自体を出さない（コア側でも拒否される）。
-            // カレント・非空レイヤーの削除失敗はコアの検証に任せ、理由を表示する。
-            if *id != default_layer && ui.button("x").on_hover_text("Delete layer").clicked() {
-                pending.push(Command::RemoveLayer(*id));
+                // 重ね順（最前面へ / 最背面へ）。専用コマンドは作らず、既存の
+                // SetLayerProps を並べた Command::Batch として適用する（1クリック =
+                // undo 1単位。Batch はサブコマンド1件でも1記録として履歴に積まれるため、
+                // 通常ケースでは単発 SetLayerProps と同じ粒度のまま）。
+                //
+                // 通常は対象レイヤー1件だけを動かす（[`front_order_plan`] /
+                // [`back_order_plan`] が「他レイヤーの最大+1 / 最小-1」を計算する）。
+                // 他レイヤーが i32::MAX / i32::MIN に達していて単純な +1/-1 が使えない
+                // 場合だけ、全レイヤーの order を再正規化する計画が返る（Codex
+                // adversarial review の medium 指摘対応）。計画が空なら「既に端にいる」
+                // ということなのでボタンを無効化する。
+                let all_orders: Vec<(LayerId, i32)> =
+                    layers.iter().map(|(lid, l)| (*lid, l.order)).collect();
+                let front_plan = front_order_plan(*id, &all_orders);
+                let back_plan = back_order_plan(*id, &all_orders);
+                let plan_to_batch = |plan: Vec<(LayerId, i32)>| -> Command {
+                    Command::Batch(
+                        plan.into_iter()
+                            .filter_map(|(lid, order)| {
+                                let mut props = layers.iter().find(|(l, _)| *l == lid)?.1.clone();
+                                props.order = order;
+                                Some(Command::SetLayerProps { id: lid, props })
+                            })
+                            .collect(),
+                    )
+                };
+                // 重ね順と削除はまとめて「操作」列の1セルへ入れる。
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!front_plan.is_empty(), egui::Button::new("前面"))
+                        .on_hover_text("最前面へ移動")
+                        .clicked()
+                    {
+                        pending.push(plan_to_batch(front_plan));
+                    }
+                    if ui
+                        .add_enabled(!back_plan.is_empty(), egui::Button::new("背面"))
+                        .on_hover_text("最背面へ移動")
+                        .clicked()
+                    {
+                        pending.push(plan_to_batch(back_plan));
+                    }
+
+                    // 削除。デフォルトレイヤーにはボタン自体を出さない（コア側でも拒否される）。
+                    // カレント・非空レイヤーの削除失敗はコアの検証に任せ、理由を表示する。
+                    if *id != default_layer
+                        && ui.button("x").on_hover_text("レイヤーを削除").clicked()
+                    {
+                        pending.push(Command::RemoveLayer(*id));
+                    }
+                });
+                ui.end_row();
             }
         });
-    }
 
     for cmd in pending {
         if let Err(err) = document.apply(cmd) {
-            set_status(status, now, format!("Layer operation failed: {err}"));
+            set_status(status, now, format!("レイヤー操作に失敗しました: {err}"));
         }
     }
 }
@@ -3019,7 +3052,7 @@ fn main() -> anyhow::Result<()> {
         native_options,
         Box::new(|cc| {
             // 文書内 Text の CJK グリフ用に、既定フォントの後ろへ Noto Sans JP を追加する
-            // （UI 文字列は ASCII のまま。M6 タスク23）。
+            // （M6 タスク23。M8 以降は UI ラベルの日本語もこの登録で描画される）。
             fonts::install_fallback_fonts(&cc.egui_ctx);
             Ok(Box::new(McadApp::new()))
         }),
@@ -3391,14 +3424,17 @@ mod tests {
     #[test]
     fn open_status_reports_clamped_legacy_widths() {
         // 旧 `.mcad`（v1〜v3）の線幅移行で上限へ丸めた件数は黙殺せず表示する
-        // （DESIGN.md M8 設計判断6 の規則3）。文言は ASCII 限定。
+        // （DESIGN.md M8 設計判断6 の規則3）。
+        //
+        // かつては `is_ascii()` も検証していたが、M8 で ASCII 限定の規約を撤廃したため
+        // 外した（CJK は fonts.rs のフォールバックで描画できる）。ステータスバーは
+        // まだ日本語化していない領域なので文言自体は英語のまま。
         let quiet = open_status(0);
         assert_eq!(quiet, "Opened file");
 
         let noisy = open_status(3);
         assert!(noisy.contains('3'), "件数が出るべき: {noisy}");
         assert!(noisy.contains("clamped"), "丸めたことが分かるべき: {noisy}");
-        assert!(noisy.is_ascii(), "egui 可視文字列は ASCII 限定: {noisy}");
     }
 
     #[test]

@@ -184,6 +184,28 @@ fn resolve_stroke_px(width_mm: f32, k: f64, zoom: f64) -> f32 {
     raw_px.max(f64::from(MIN_STROKE_PX)) as f32
 }
 
+/// 線幅表示（タスク36b、AutoCAD の LWDISPLAY 相当）の ON/OFF を反映して画面 px の
+/// 線幅を決める。OFF なら `width_mm`・`k`・`zoom` に関わらず常に [`MIN_STROKE_PX`]
+/// （タスク36 以前と同じ固定 1px）、ON なら [`resolve_stroke_px`] をそのまま使う
+/// （紙 mm 基準・ズーム比例）。
+///
+/// 線種のダッシュピッチ（[`dash_pattern_px`]）はこのフラグの影響を受けない
+/// （常に紙 mm 基準のまま。DESIGN.md M8 設計判断5 実装時追記）。分岐をこの関数へ
+/// 集約し、`draw_entities` 側で形状・寸法（`DimLinear`/`DimRadial`）の両方に
+/// 同じ規則を適用する。GUI 非依存の純関数なので単体テストできる。
+fn resolve_stroke_px_with_toggle(
+    lineweight_display: bool,
+    width_mm: f32,
+    k: f64,
+    zoom: f64,
+) -> f32 {
+    if lineweight_display {
+        resolve_stroke_px(width_mm, k, zoom)
+    } else {
+        MIN_STROKE_PX
+    }
+}
+
 /// 線種のダッシュパターンを紙 mm 基準で返す（`Continuous` は `None` = 実線）。
 ///
 /// [`Linetype`] は `#[non_exhaustive]` なので、将来の追加は未知の腕として
@@ -587,6 +609,14 @@ struct McadApp {
     /// 水平・垂直な方向へ拘束する（`ortho.rs`、`resolve_click_point` 参照）。
     /// `snap_enabled` と同じく実行時フィールドのみで永続化しない（M8まで）。
     ortho_enabled: bool,
+    /// 線幅表示（タスク36b、AutoCAD の LWDISPLAY 相当）の有効/無効。`F9` でトグルする
+    /// （既定は無効 = OFF）。OFF のときは全エンティティを [`MIN_STROKE_PX`] 固定
+    /// （ズーム非依存）で描く。ON のときはタスク36 の紙 mm 基準 `resolve_stroke_px`
+    /// をそのまま使う（ズームに比例して太くなる）。タスク38 の図面枠実線・タスク39/40
+    /// の SVG/PDF 出力が紙 mm 基準を前提とするため、画面と出力の一致確認に ON が要る
+    /// （DESIGN.md M8 設計判断5 実装時追記）。`ortho_enabled` と同じく実行時フィールド
+    /// のみで永続化しない（タスク41 で config.json へ相乗りする予定）。
+    lineweight_display_enabled: bool,
     /// ステータスバーに一時表示するメッセージ（主にコア操作のエラー通知）。
     /// メッセージごとに保持している表示時間（[`StatusMessage::duration_secs`]、通常は
     /// [`STATUS_MESSAGE_SECS`]、ファイル入出力の結果は [`STATUS_MESSAGE_SECS_IMPORTANT`]）
@@ -678,6 +708,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "Esc=Cancel",
     "F3=Snap",
     "F8=Ortho",
+    "F9=Lineweight Display",
     "Ctrl+Z=Undo",
     "Ctrl+Y=Redo",
     "Ctrl+N=New",
@@ -819,6 +850,7 @@ impl McadApp {
             snap_enabled: true,
             snap_marker: None,
             ortho_enabled: false,
+            lineweight_display_enabled: false,
             status: None,
             current_path: None,
             confirm_state: ConfirmState::Idle,
@@ -1520,6 +1552,13 @@ impl eframe::App for McadApp {
             self.ortho_enabled = !self.ortho_enabled;
         }
 
+        // F9 で線幅表示（タスク36b、AutoCAD の LWDISPLAY 相当）の有効/無効をトグルする。
+        // F3/F8 と同じガード条件（モーダル非表示中は常に効く）。専用マーカーは不要
+        // なので、トグル自体はフラグの反転のみでよい（ortho と同じ形）。
+        if self.confirm_state == ConfirmState::Idle && ui.input(|i| i.key_pressed(Key::F9)) {
+            self.lineweight_display_enabled = !self.lineweight_display_enabled;
+        }
+
         // 表示時間を過ぎたステータスメッセージは消す。
         if self
             .status
@@ -1544,6 +1583,15 @@ impl eframe::App for McadApp {
                     ui.label(format!(
                         "Ortho: {}",
                         if self.ortho_enabled { "ON" } else { "OFF" }
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "Lineweight: {}",
+                        if self.lineweight_display_enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
                     ));
                     ui.separator();
                     // オフセット距離入力欄（設計判断5）。モーダルにせず上部パネルへ常設だが、
@@ -1699,7 +1747,13 @@ impl eframe::App for McadApp {
             painter.rect_filled(rect, 0.0, Color32::from_gray(30));
 
             draw_grid(&painter, rect, &self.viewport);
-            draw_entities(&painter, rect, &self.document, &self.viewport);
+            draw_entities(
+                &painter,
+                rect,
+                &self.document,
+                &self.viewport,
+                self.lineweight_display_enabled,
+            );
             draw_selection(
                 &painter,
                 rect,
@@ -3140,13 +3194,20 @@ fn entities_in_draw_order<'a>(
 /// 描画順は [`entities_in_draw_order`]（レイヤーの重ね順、同一レイヤー内は追加順）。
 /// 選択ハイライト・ツールのプレビュー・スナップマーカーはこの関数より後に描くため、
 /// 常にエンティティ本体より手前に出る（呼び出し側 [`McadApp::ui`] の描画順を参照）。
-fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewport: &Viewport) {
+fn draw_entities(
+    painter: &egui::Painter,
+    rect: Rect,
+    document: &Document,
+    viewport: &Viewport,
+    lineweight_display_enabled: bool,
+) {
     let visible = viewport.visible_aabb(rect);
     let k = document.sheet().scale.world_mm_per_paper_mm();
     for (_id, entity, layer) in entities_in_draw_order(document, &visible) {
         let color = to_color32(entity.style.effective_color(layer.color));
         let width_mm = entity.style.effective_width(layer.width_mm).mm();
-        let stroke_px = resolve_stroke_px(width_mm, k, viewport.zoom);
+        let stroke_px =
+            resolve_stroke_px_with_toggle(lineweight_display_enabled, width_mm, k, viewport.zoom);
         let linetype = entity.style.effective_linetype(layer.linetype);
         match &entity.geom {
             EntityGeom::Shape(shape) => {
@@ -5057,6 +5118,41 @@ mod tests {
         let low = resolve_stroke_px(1.0, 1.0, 1.0);
         let high = resolve_stroke_px(1.0, 1.0, 10.0);
         assert!(high > low);
+    }
+
+    #[test]
+    fn resolve_stroke_px_with_toggle_off_is_always_min_stroke_px() {
+        // タスク36b: OFF なら width_mm・k・zoom によらず常に MIN_STROKE_PX
+        // （タスク36 以前と同じ固定 1px）。
+        let cases = [
+            (0.35_f32, 1.0_f64, 1.0_f64),
+            (WidthMm::MIN_MM, 1.0, 0.001),
+            (2.0, 5.0, 100.0),
+            (0.35, 1.0, LEGACY_WIDTH_PX_REFERENCE_ZOOM * 2.0),
+        ];
+        for (width_mm, k, zoom) in cases {
+            let resolved = resolve_stroke_px_with_toggle(false, width_mm, k, zoom);
+            assert_eq!(
+                resolved, MIN_STROKE_PX,
+                "width_mm={width_mm}, k={k}, zoom={zoom}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_stroke_px_with_toggle_on_matches_resolve_stroke_px() {
+        // タスク36b: ON はタスク36 の既存挙動（`resolve_stroke_px`）と厳密一致する。
+        let cases = [
+            (0.35_f32, 1.0_f64, 1.0_f64),
+            (WidthMm::MIN_MM, 1.0, 0.001),
+            (2.0, 5.0, 100.0),
+            (0.35, 1.0, LEGACY_WIDTH_PX_REFERENCE_ZOOM * 2.0),
+        ];
+        for (width_mm, k, zoom) in cases {
+            let toggled = resolve_stroke_px_with_toggle(true, width_mm, k, zoom);
+            let legacy = resolve_stroke_px(width_mm, k, zoom);
+            assert_eq!(toggled, legacy, "width_mm={width_mm}, k={k}, zoom={zoom}");
+        }
     }
 
     #[test]

@@ -38,7 +38,8 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, LayerId, NewIds, Style,
+    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, LayerId, Linetype,
+    NewIds, Style,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -345,7 +346,15 @@ impl Tool for PointTool {
 
     fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
         if let Some(p) = self.cursor {
-            draw_shape(painter, rect, viewport, &Shape::Point(p), preview_stroke());
+            draw_shape(
+                painter,
+                rect,
+                viewport,
+                &Shape::Point(p),
+                preview_stroke(),
+                Linetype::Continuous,
+                1.0,
+            );
         }
     }
 }
@@ -413,6 +422,8 @@ impl Tool for LineTool {
                 viewport,
                 &Shape::Line(LineSeg::new(*first, cursor)),
                 preview_stroke(),
+                Linetype::Continuous,
+                1.0,
             );
         }
     }
@@ -492,6 +503,8 @@ impl Tool for CircleTool {
                 viewport,
                 &Shape::Circle(mcad_geom::Circle::new(*center, radius)),
                 preview_stroke(),
+                Linetype::Continuous,
+                1.0,
             );
         }
     }
@@ -599,11 +612,21 @@ impl Tool for ArcTool {
                     viewport,
                     &Shape::Line(LineSeg::new(*p1, cursor)),
                     preview_stroke(),
+                    Linetype::Continuous,
+                    1.0,
                 );
             }
             (ArcState::WaitingP3(p1, p2), Some(cursor)) => {
                 if let Some(arc) = build_arc(*p1, *p2, cursor) {
-                    draw_shape(painter, rect, viewport, &Shape::Arc(arc), preview_stroke());
+                    draw_shape(
+                        painter,
+                        rect,
+                        viewport,
+                        &Shape::Arc(arc),
+                        preview_stroke(),
+                        Linetype::Continuous,
+                        1.0,
+                    );
                 }
             }
             _ => {}
@@ -711,6 +734,8 @@ impl Tool for PolylineTool {
             viewport,
             &Shape::Polyline(Polyline::new(preview_vertices, false)),
             preview_stroke(),
+            Linetype::Continuous,
+            1.0,
         );
     }
 
@@ -898,6 +923,8 @@ impl Tool for DimLinearTool {
                     viewport,
                     &Shape::Line(LineSeg::new(p1, cursor)),
                     preview_stroke(),
+                    Linetype::Continuous,
+                    1.0,
                 );
             }
             // 寸法線位置待ち: カーソルで決まる offset の寸法を丸ごとプレビューする。
@@ -1214,7 +1241,15 @@ impl BoundaryTargetTool {
         // 選択済みの境界だけをハイライトして「今どちらを選んだか」を示す。カーソル追従の
         // ライブプレビューは行わない（上記のとおり）。
         if let BoundaryTargetState::WaitingTarget { boundary } = &self.state {
-            draw_shape(painter, rect, viewport, boundary, preview_stroke());
+            draw_shape(
+                painter,
+                rect,
+                viewport,
+                boundary,
+                preview_stroke(),
+                Linetype::Continuous,
+                1.0,
+            );
         }
     }
 
@@ -1440,7 +1475,15 @@ impl Tool for FilletTool {
     fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
         // 選んだ 1 本目だけをハイライトする（トリム・延長が境界を示すのと同じ流儀）。
         if let FilletState::WaitingSecondLine { first, .. } = &self.state {
-            draw_shape(painter, rect, viewport, &first.shape, preview_stroke());
+            draw_shape(
+                painter,
+                rect,
+                viewport,
+                &first.shape,
+                preview_stroke(),
+                Linetype::Continuous,
+                1.0,
+            );
         }
     }
 

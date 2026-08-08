@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb,
-    Style, TextGeom, WidthMm,
+    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, Layer, LayerId,
+    Linetype, Rgb, Style, TextGeom, WidthMm,
 };
 use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
@@ -122,13 +122,281 @@ const DEFAULT_EXTRA_LAYERS: [(&str, Rgb); 1] = [("Text", LAYER_COLOR_PALETTE[3])
 /// ステータスメッセージの文字色（エラー通知が主用途なので警告寄りの赤）。
 const STATUS_MESSAGE_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
 
-/// エンティティ本体を描くときの暫定の線の太さ [px]。
+/// 線幅の画面 px 下限（DESIGN.md M8 設計判断5・6）。
 ///
-/// **タスク35a/35b の暫定値**。`Style.width`（px）が `Style.width_mm`（紙 mm の
-/// ByLayer モデル）へ置き換わったが、紙基準の線幅解決
-/// （`px = max(1px, width_mm * den/num * zoom)`）はタスク36 の担当なので、それまでは
-/// 旧既定（`max(width_px, 1.0)` = 1px）と同じ見た目を保つ固定値で描く。
-const PROVISIONAL_STROKE_PX: f32 = 1.0;
+/// 紙 mm の線幅がズームアウトで極小になっても線が消えないための下限。**出力
+/// （SVG/PDF/DXF）側はこの下限を適用しない**（判断5「出力側はクランプしない」）。
+/// これはタスク35a/35bまで使っていた暫定固定値 `PROVISIONAL_STROKE_PX` の後継で、
+/// 「常にこの太さで描く」から「この太さを下限に、紙 mm 線幅を反映する」へ役割が
+/// 変わったため改名した（[`resolve_stroke_px`]）。
+const MIN_STROKE_PX: f32 = 1.0;
+
+/// 線種のダッシュ周期（紙 mm 換算後の合計 px）がこれ未満なら実線として描く。
+///
+/// ズームアウトでダッシュパターンが潰れると、1 本の線に対して大量の極小
+/// シェイプ（[`egui::Shape::Line`] 断片）が生成され描画コストだけが増え、
+/// かつ人の目にも実線と区別できない。2px は「隣接するダッシュとギャップを
+/// 視覚的に見分けられる最小限」の目安（一般的なディスプレイの実効解像度で
+/// 1px 未満の要素は潰れて見える点を踏まえ、ダッシュ+ギャップの1周期として
+/// 2px を境界にした）。DESIGN.md M8 設計判断5 検収(c)。
+const MIN_DASH_PERIOD_PX: f32 = 2.0;
+
+/// 破線のダッシュパターン（紙 mm 基準: ダッシュ長・ギャップ長）。
+///
+/// `製図規定.md` 4-1 は破線・一点鎖線・二点鎖線の「形状」（パターン長）を規定して
+/// いない（線の太さのみ規定）。JIS Z 8312/ISO 128 も具体的なパターン長までは
+/// 定めていないため、多くの CAD 実装が採用する一般的な値
+/// （破線: 短いダッシュ + 短いギャップ）を採用する。紙 mm 基準なので `k * zoom`
+/// を掛けるだけで尺度・ズームへ追従する（判断5）。
+const DASH_PATTERN_MM: [f32; 2] = [3.0, 1.5];
+
+/// 一点鎖線のダッシュパターン（紙 mm 基準: 長ダッシュ・ギャップ・ドット・ギャップ）。
+///
+/// 中心線は破線よりも視認性を上げるため長いダッシュ（6.0mm）を使い、短い
+/// ドット（0.6mm）を挟む一般的な描画慣行に合わせた（[`DASH_PATTERN_MM`] の doc 参照）。
+const DASH_DOT_PATTERN_MM: [f32; 4] = [6.0, 1.2, 0.6, 1.2];
+
+/// 二点鎖線のダッシュパターン（紙 mm 基準）。[`DASH_DOT_PATTERN_MM`] にドットを
+/// もう1つ加えた形（長ダッシュ・ギャップ・ドット・ギャップ・ドット・ギャップ）。
+const DASH_DOT_DOT_PATTERN_MM: [f32; 6] = [6.0, 1.2, 0.6, 1.2, 0.6, 1.2];
+
+/// v3 `.mcad` の線幅移行規則（DESIGN.md M8 設計判断6）と旧描画 `max(width_px, 1.0)`
+/// が厳密一致することを保証する基準ズーム。判断6 検収(b)が要求する名前付き定数。
+///
+/// 旧描画は「常に 1px」（ズーム非依存）だったため、`resolve_stroke_px` が同じ結果を
+/// 返すのは `width_mm * k * zoom` がちょうど 1px 相当になるズームでしかない。
+/// 旧 `.mcad` の実効表示幅換算（`width_mm = 0.35mm * max(width_px, 1.0)`）は
+/// `0.35mm` を基準単位にしているため、逆数のこのズームで換算が打ち消し合う。
+///
+/// **回帰テスト専用の定数**（実行時の描画ロジックはズームに応じて連続的に px を
+/// 解決するだけで、この基準ズームを特別扱いしない）なので `#[cfg(test)]`。
+#[cfg(test)]
+const LEGACY_WIDTH_PX_REFERENCE_ZOOM: f64 = 1.0 / 0.35;
+
+/// 線幅（紙 mm）とワールド→画面の換算率から、画面 px の線幅を解決する
+/// （DESIGN.md M8 設計判断5: `px = max(1px, width_mm * k * zoom)`）。
+///
+/// `k` は [`mcad_core::Scale::world_mm_per_paper_mm`]（紙 1mm あたりのワールド mm）。
+/// ワールド量として f64 で計算し、egui へ渡す境界でのみ f32 化する
+/// （AGENTS.md のワールド座標 f64 規約）。GUI 非依存の純関数なので単体テストできる。
+fn resolve_stroke_px(width_mm: f32, k: f64, zoom: f64) -> f32 {
+    let raw_px = f64::from(width_mm) * k * zoom;
+    raw_px.max(f64::from(MIN_STROKE_PX)) as f32
+}
+
+/// 線種のダッシュパターンを紙 mm 基準で返す（`Continuous` は `None` = 実線）。
+///
+/// [`Linetype`] は `#[non_exhaustive]` なので、将来の追加は未知の腕として
+/// ワイルドカードで実線へフォールバックする（描画が壊れるより保守的な既定）。
+fn dash_pattern_mm(linetype: Linetype) -> Option<&'static [f32]> {
+    match linetype {
+        Linetype::Continuous => None,
+        Linetype::Dashed => Some(&DASH_PATTERN_MM),
+        Linetype::DashDot => Some(&DASH_DOT_PATTERN_MM),
+        Linetype::DashDotDot => Some(&DASH_DOT_DOT_PATTERN_MM),
+        _ => None,
+    }
+}
+
+/// 線種のダッシュパターンを画面 px 単位（ダッシュ長配列・ギャップ長配列）へ換算する。
+///
+/// [`egui::Shape::dashed_line_many_with_offset`] の引数形（ダッシュ長とギャップ長を
+/// 別配列で持ち、要素ごとに交互のダッシュ/ギャップを表す）に合わせて偶数長の紙 mm
+/// パターンを分割する。周期（合計 px）が [`MIN_DASH_PERIOD_PX`] 未満、または `k*zoom`
+/// が非有限・非正なら `None`（実線へフォールバックする防御。判断5 検収(c)）。
+fn dash_pattern_px(linetype: Linetype, k: f64, zoom: f64) -> Option<(Vec<f32>, Vec<f32>)> {
+    let pattern_mm = dash_pattern_mm(linetype)?;
+    let scale = (k * zoom) as f32;
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let pattern_px: Vec<f32> = pattern_mm.iter().map(|mm| mm * scale).collect();
+    let period: f32 = pattern_px.iter().sum();
+    if !period.is_finite() || period < MIN_DASH_PERIOD_PX {
+        return None;
+    }
+    let dash_lengths: Vec<f32> = pattern_px.iter().step_by(2).copied().collect();
+    let gap_lengths: Vec<f32> = pattern_px.iter().skip(1).step_by(2).copied().collect();
+    Some((dash_lengths, gap_lengths))
+}
+
+/// 生成するダッシュ片数の上限（1本の線あたり）。超える場合は実線へフォールバックする。
+///
+/// クリップ後のビューポート矩形は通常でも数千px規模（一般的なウィンドウで対角
+/// 2000〜3000px程度）で、[`MIN_DASH_PERIOD_PX`]（2px）が周期の下限なので、
+/// クリップ矩形1枚分のダッシュ片数はおよそ「対角px ÷ 2px」= 高々 1500〜2000 程度に
+/// 収まる。多頂点ポリライン（クリップ区間が複数に分かれる）や極端に横長/縦長の
+/// ウィンドウでも安全マージンを持たせるため、一桁上の 20000 を上限とする
+/// （Codex adversarial review 指摘: クリップ前は高ズームでスクリーン座標が
+/// `1e7`px規模に達しうり、周期が数px ならダッシュ片数が数百万個になりフリーズする。
+/// クリップで大部分は解消するが、極端に多い頂点を持つポリラインが繰り返し
+/// クリップ矩形の境界をまたぐ病的なケースへの保険として、この上限を残す）。
+const MAX_DASH_SEGMENTS: usize = 20_000;
+
+/// スクリーン座標の線分 `(a, b)` を矩形 `clip` でクリップする（Liang-Barsky）。
+///
+/// 交差する部分がなければ `None`。パラメトリック媒介変数 `t ∈ [0, 1]`
+/// （`a` が `t=0`、`b` が `t=1`）で計算し、4辺それぞれの半平面制約で
+/// `[t0, t1]` を絞り込む。GUI 非依存の純関数で単体テストできる。
+fn clip_segment_to_rect(a: Pos2, b: Pos2, clip: Rect) -> Option<(Pos2, Pos2)> {
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    let dx = f64::from(b.x - a.x);
+    let dy = f64::from(b.y - a.y);
+    // (p, q): p < 0 は「左/下境界を超えて外へ向かう」方向、p > 0 は「右/上境界へ
+    // 向かう」方向。p == 0 は境界と平行（q < 0 なら完全に外側）。
+    let checks = [
+        (-dx, f64::from(a.x - clip.min.x)),
+        (dx, f64::from(clip.max.x - a.x)),
+        (-dy, f64::from(a.y - clip.min.y)),
+        (dy, f64::from(clip.max.y - a.y)),
+    ];
+    for (p, q) in checks {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                if r > t1 {
+                    return None;
+                }
+                if r > t0 {
+                    t0 = r;
+                }
+            } else {
+                if r < t0 {
+                    return None;
+                }
+                if r < t1 {
+                    t1 = r;
+                }
+            }
+        }
+    }
+    if t0 > t1 {
+        return None;
+    }
+    let lerp = |t: f64| -> Pos2 {
+        Pos2::new(
+            (f64::from(a.x) + t * dx) as f32,
+            (f64::from(a.y) + t * dy) as f32,
+        )
+    };
+    Some((lerp(t0), lerp(t1)))
+}
+
+/// 2点がほぼ同一位置とみなせるか（クリップ後の区間連結判定用の許容誤差）。
+fn points_nearly_equal(a: Pos2, b: Pos2) -> bool {
+    (a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3
+}
+
+/// 開いた点列を矩形 `clip` でクリップし、可視な区間ごとの点列（複数本になりうる）へ
+/// 分割する（GUI 非依存の純関数、単体テストできる）。
+///
+/// 各線分を個別にクリップし、前の線分のクリップ後終点と今の線分のクリップ後始点が
+/// 一致する（＝間に不可視区間を挟まない）場合は同じ区間として連結する。画面外へ
+/// 出て別の場所で再び入る折れ線は、複数の独立した区間として返る。
+///
+/// **ダッシュの位相は区間ごとにリセットする**（各区間の描画は
+/// `dashed_line_many_with_offset` の `dash_offset = 0` から開始する。呼び出し側
+/// [`stroke_polyline`] 参照）。既存の実装も1エンティティ全体の位相を常に 0 起点で
+/// 描いており（形状ごとに独立、パン・ズームでは連続しない）、クリップ区間の切れ目で
+/// 同じ扱いを踏襲するだけなので新しい種類の見た目の破綻ではない。不可視区間の
+/// 長さを跨いで位相を連続させる代替案は、クリップ前の全長（高ズームで最大 `1e7`px
+/// 規模）を経由する累積長計算を要し、シェイプ数ではなく計算コストの点で今回の
+/// 問題を作り込む方向とも言えるため採らない。
+fn clip_polyline_runs(points: &[Pos2], clip: Rect) -> Vec<Vec<Pos2>> {
+    let mut runs: Vec<Vec<Pos2>> = Vec::new();
+    for window in points.windows(2) {
+        let (a, b) = (window[0], window[1]);
+        let Some((ca, cb)) = clip_segment_to_rect(a, b, clip) else {
+            continue;
+        };
+        let continues = runs
+            .last()
+            .and_then(|run| run.last())
+            .is_some_and(|&last| points_nearly_equal(last, ca));
+        if continues {
+            runs.last_mut().expect("just checked non-empty").push(cb);
+        } else {
+            runs.push(vec![ca, cb]);
+        }
+    }
+    runs
+}
+
+/// 折れ線（複数区間）の総延長 [px]。
+fn total_path_length(runs: &[Vec<Pos2>]) -> f32 {
+    runs.iter()
+        .map(|run| run.windows(2).map(|w| (w[1] - w[0]).length()).sum::<f32>())
+        .sum()
+}
+
+/// 線種を反映して開いた/閉じた点列を描く（[`draw_shape`] が扱う全形状で共通に使う）。
+///
+/// `Continuous`、またはダッシュ周期が潰れる場合（[`dash_pattern_px`]）は通常の
+/// 折れ線として描く。ダッシュ化する場合は、点列を `clip_rect`（キャンバスのスクリーン
+/// 矩形）へ線幅+1周期分のマージンを足した矩形でクリップしてから
+/// [`egui::Shape::dashed_line_many_with_offset`] へ渡す（Codex adversarial review
+/// 指摘: クリップしないと、画面外まで伸びる線を高ズームで見たときスクリーン座標の
+/// 全長が周期の桁違いに大きくなり、生成シェイプ数が爆発してフリーズする。マージンは
+/// クリップ境界ちょうどでダッシュの端が不自然に切り詰められて見えるのを避けるため）。
+/// クリップ後もなお生成予定のダッシュ片数が [`MAX_DASH_SEGMENTS`] を超える場合は
+/// 保険として実線へフォールバックする。
+fn stroke_polyline(
+    painter: &egui::Painter,
+    points: Vec<Pos2>,
+    stroke: Stroke,
+    linetype: Linetype,
+    k: f64,
+    zoom: f64,
+    clip_rect: Rect,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    match dash_pattern_px(linetype, k, zoom) {
+        None => {
+            painter.line(points, stroke);
+        }
+        Some((dash_lengths, gap_lengths)) => {
+            let period: f32 = dash_lengths.iter().chain(&gap_lengths).sum();
+            if period <= 0.0 || !period.is_finite() {
+                painter.line(points, stroke);
+                return;
+            }
+            let margin = stroke.width + period;
+            let runs = clip_polyline_runs(&points, clip_rect.expand(margin));
+            if runs.is_empty() {
+                // 画面外（マージン込みでも交差しない）。何も描かない。
+                return;
+            }
+            let estimated_dashes = total_path_length(&runs) / period;
+            if !estimated_dashes.is_finite() || estimated_dashes > MAX_DASH_SEGMENTS as f32 {
+                // 保険: クリップ後もなお片数が過大なら実線へ後退する
+                // （多頂点ポリラインがクリップ境界を繰り返し跨ぐ病的ケース）。
+                painter.line(points, stroke);
+                return;
+            }
+            let mut shapes = Vec::new();
+            for run in &runs {
+                if run.len() < 2 {
+                    continue;
+                }
+                egui::Shape::dashed_line_many_with_offset(
+                    run,
+                    stroke,
+                    &dash_lengths,
+                    &gap_lengths,
+                    0.0,
+                    &mut shapes,
+                );
+            }
+            painter.extend(shapes);
+        }
+    }
+}
 
 /// 選択エンティティのハイライト色（確定済みエンティティ色とは別の強調色）。
 const SELECTION_COLOR: Color32 = Color32::from_rgb(80, 200, 255);
@@ -1360,6 +1628,13 @@ impl eframe::App for McadApp {
 
         egui::Panel::right("layer_panel").show(ui, |ui| {
             layer_panel(ui, &mut self.document, &mut self.status, now);
+            entity_style_panel(
+                ui,
+                &mut self.document,
+                self.select_tool.selection(),
+                &mut self.status,
+                now,
+            );
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1887,6 +2162,85 @@ fn renormalize_back(target: LayerId, layers: &[(LayerId, i32)]) -> Vec<OrderUpda
     plan
 }
 
+/// UI で提示する線幅プリセット（紙 mm。ISO 128 系列、規定 7.1 の決定・DESIGN.md
+/// M8 設計判断5「UI の線幅入力は ISO 128 系列のプリセット提示」）。
+const ISO_LINE_WIDTH_PRESETS_MM: [f32; 9] = [0.13, 0.18, 0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0];
+
+/// [`Linetype`] の日本語表示ラベル（レイヤーパネル・エンティティ上書きパネル共通）。
+///
+/// `Linetype` は `#[non_exhaustive]` なので、将来の追加は未知の腕として
+/// 実線ラベルへフォールバックする（[`dash_pattern_mm`] のフォールバックと対称）。
+fn linetype_label(linetype: Linetype) -> &'static str {
+    match linetype {
+        Linetype::Continuous => "実線",
+        Linetype::Dashed => "破線",
+        Linetype::DashDot => "一点鎖線",
+        Linetype::DashDotDot => "二点鎖線",
+        _ => "実線",
+    }
+}
+
+/// レイヤーパネル・エンティティ上書きパネル共通の線種選択コンボボックス。
+///
+/// クリックされたら `on_select` へ選ばれた線種を渡す（呼び出し側が
+/// `Command` を組み立てて `pending` へ積む）。
+fn linetype_combo(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    current: Linetype,
+    mut on_select: impl FnMut(Linetype),
+) {
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(linetype_label(current))
+        .show_ui(ui, |ui| {
+            for candidate in [
+                Linetype::Continuous,
+                Linetype::Dashed,
+                Linetype::DashDot,
+                Linetype::DashDotDot,
+            ] {
+                if ui
+                    .selectable_label(candidate == current, linetype_label(candidate))
+                    .clicked()
+                    && candidate != current
+                {
+                    on_select(candidate);
+                }
+            }
+        });
+}
+
+/// レイヤーパネル・エンティティ上書きパネル共通の線幅選択コンボボックス
+/// （[`ISO_LINE_WIDTH_PRESETS_MM`] からの選択のみ。任意 mm 値は DXF import 等
+/// 別経路のみが生成し、UI からは検証済みプリセットしか選べない）。
+fn width_mm_combo(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    current: f32,
+    mut on_select: impl FnMut(WidthMm),
+) {
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(format!("{current:.2}mm"))
+        .show_ui(ui, |ui| {
+            for preset in ISO_LINE_WIDTH_PRESETS_MM {
+                if ui
+                    .selectable_label(
+                        (preset - current).abs() < f32::EPSILON,
+                        format!("{preset:.2}mm"),
+                    )
+                    .clicked()
+                    && (preset - current).abs() >= f32::EPSILON
+                {
+                    // プリセットは常に範囲内だが、UI 入力境界での不正線幅拒否という
+                    // 規約（判断5）を型で徹底するため `WidthMm::new` の検証を経由する。
+                    if let Ok(width) = WidthMm::new(preset) {
+                        on_select(width);
+                    }
+                }
+            }
+        });
+}
+
 /// 右側のレイヤーパネル（DESIGN.md 3.4 の UI レイアウト）。
 ///
 /// 一覧・カレント切替（ラジオ）・色変更・表示/ロック切替・重ね順変更・追加/削除を提供する。
@@ -1942,7 +2296,7 @@ fn layer_panel(
     // なく [`egui::Grid`] を使う（horizontal はレイヤー名の長さで各行の幅が変わり、
     // 見出しとずれてしまう）。
     egui::Grid::new("layer_panel_grid")
-        .num_columns(6)
+        .num_columns(8)
         .spacing([8.0, 4.0])
         .striped(true)
         .show(ui, |ui| {
@@ -1951,6 +2305,8 @@ fn layer_panel(
             ui.label("表示");
             ui.label("ロック");
             ui.label("名前");
+            ui.label("線幅");
+            ui.label("線種");
             ui.label("操作");
             ui.end_row();
 
@@ -1996,6 +2352,18 @@ fn layer_panel(
                 }
 
                 ui.label(&layer.name);
+
+                width_mm_combo(ui, ("layer_width", *id), layer.width_mm.mm(), |width| {
+                    let mut props = layer.clone();
+                    props.width_mm = width;
+                    pending.push(Command::SetLayerProps { id: *id, props });
+                });
+
+                linetype_combo(ui, ("layer_linetype", *id), layer.linetype, |linetype| {
+                    let mut props = layer.clone();
+                    props.linetype = linetype;
+                    pending.push(Command::SetLayerProps { id: *id, props });
+                });
 
                 // 重ね順（最前面へ / 最背面へ）。専用コマンドは作らず、既存の
                 // SetLayerProps を並べた Command::Batch として適用する（1クリック =
@@ -2056,6 +2424,119 @@ fn layer_panel(
         if let Err(err) = document.apply(cmd) {
             set_status(status, now, format!("レイヤー操作に失敗しました: {err}"));
         }
+    }
+}
+
+/// 選択中エンティティの線幅・線種を上書き／ByLayer へ戻す最小 UI（M8 タスク36）。
+///
+/// レイヤーパネルの直下に表示する（選択が空なら何も描かない）。既存の色上書き
+/// UI はまだ無いため、線幅・線種のみをタスク36の範囲として提供する。複数選択時は
+/// 先頭エンティティの現在値を表示の基準にし、変更は選択集合全体へ同じ値をまとめて
+/// 適用する（`Command::Batch` で undo 1単位。空文書判定は `Document::apply` の
+/// no-op 集約に任せる）。ロック中レイヤーのエンティティを含む場合、適用時の失敗は
+/// バッチ全体をロールバックしてステータスバーへ表示する（[`Command::Batch`] の原子性）。
+fn entity_style_panel(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    selection: &[EntityId],
+    status: &mut Option<StatusMessage>,
+    now: f64,
+) {
+    // 選択されていても墓標化・削除済みのIDは無視する（undo/redo の直後等で
+    // 選択集合が一時的に古いIDを含みうる。`SelectTool` は自前でこれを掃除する
+    // 責務を持たないため、表示側で防御する）。
+    let live: Vec<(EntityId, Style, Layer)> = selection
+        .iter()
+        .filter_map(|&id| {
+            let entity = document.entity(id)?;
+            let layer = document.layer(entity.layer)?.clone();
+            Some((id, entity.style, layer))
+        })
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+
+    ui.separator();
+    ui.heading("選択中のスタイル");
+
+    let (_, first_style, first_layer) = &live[0];
+    let effective_width = first_style.effective_width(first_layer.width_mm).mm();
+    let effective_linetype = first_style.effective_linetype(first_layer.linetype);
+    let width_is_overridden = first_style.width_mm.is_some();
+    let linetype_is_overridden = first_style.linetype.is_some();
+
+    let mut pending: Vec<Command> = Vec::new();
+
+    ui.horizontal(|ui| {
+        ui.label("線幅:");
+        width_mm_combo(ui, "entity_style_width", effective_width, |width| {
+            for (id, style, _) in &live {
+                let mut new_style = *style;
+                new_style.width_mm = Some(width);
+                pending.push(Command::SetEntityStyle {
+                    id: *id,
+                    style: new_style,
+                });
+            }
+        });
+        if width_is_overridden
+            && ui
+                .button("ByLayer")
+                .on_hover_text("レイヤー既定の線幅へ戻す")
+                .clicked()
+        {
+            for (id, style, _) in &live {
+                let mut new_style = *style;
+                new_style.width_mm = None;
+                pending.push(Command::SetEntityStyle {
+                    id: *id,
+                    style: new_style,
+                });
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("線種:");
+        linetype_combo(
+            ui,
+            "entity_style_linetype",
+            effective_linetype,
+            |linetype| {
+                for (id, style, _) in &live {
+                    let mut new_style = *style;
+                    new_style.linetype = Some(linetype);
+                    pending.push(Command::SetEntityStyle {
+                        id: *id,
+                        style: new_style,
+                    });
+                }
+            },
+        );
+        if linetype_is_overridden
+            && ui
+                .button("ByLayer")
+                .on_hover_text("レイヤー既定の線種へ戻す")
+                .clicked()
+        {
+            for (id, style, _) in &live {
+                let mut new_style = *style;
+                new_style.linetype = None;
+                pending.push(Command::SetEntityStyle {
+                    id: *id,
+                    style: new_style,
+                });
+            }
+        }
+    });
+
+    // 複数のプロパティ変更が同一フレームで起きることは無い（コンボボックス/ボタンは
+    // 排他的にクリックされる）が、将来の拡張に備えて Batch でまとめて適用する。
+    if !pending.is_empty()
+        && let Err(err) = document.apply(Command::Batch(pending))
+    {
+        set_status(status, now, format!("スタイルの変更に失敗しました: {err}"));
     }
 }
 
@@ -2661,20 +3142,28 @@ fn entities_in_draw_order<'a>(
 /// 常にエンティティ本体より手前に出る（呼び出し側 [`McadApp::ui`] の描画順を参照）。
 fn draw_entities(painter: &egui::Painter, rect: Rect, document: &Document, viewport: &Viewport) {
     let visible = viewport.visible_aabb(rect);
+    let k = document.sheet().scale.world_mm_per_paper_mm();
     for (_id, entity, layer) in entities_in_draw_order(document, &visible) {
         let color = to_color32(entity.style.effective_color(layer.color));
+        let width_mm = entity.style.effective_width(layer.width_mm).mm();
+        let stroke_px = resolve_stroke_px(width_mm, k, viewport.zoom);
+        let linetype = entity.style.effective_linetype(layer.linetype);
         match &entity.geom {
             EntityGeom::Shape(shape) => {
-                let stroke = Stroke::new(PROVISIONAL_STROKE_PX, color);
-                draw_shape(painter, rect, viewport, shape, stroke);
+                let stroke = Stroke::new(stroke_px, color);
+                draw_shape(painter, rect, viewport, shape, stroke, linetype, k);
             }
             EntityGeom::Text(text) => draw_text(painter, rect, viewport, text, color),
             EntityGeom::DimLinear(dim) => {
-                let stroke = Stroke::new(PROVISIONAL_STROKE_PX, color);
+                // 寸法は製図慣行として常に実線で描く（線種は形状エンティティのみが
+                // 対象。DESIGN.md M8 タスク36 は `draw_shape` が扱う形状に限定）。
+                // 線幅の紙 mm 解決はここでも同じ式を適用し、既定 0.35mm 相当で
+                // 従来と同じ見た目を保つ。
+                let stroke = Stroke::new(stroke_px, color);
                 draw_dim_linear(painter, rect, viewport, dim, stroke);
             }
             EntityGeom::DimRadial(dim) => {
-                let stroke = Stroke::new(PROVISIONAL_STROKE_PX, color);
+                let stroke = Stroke::new(stroke_px, color);
                 draw_dim_radial(painter, rect, viewport, dim, stroke);
             }
             // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
@@ -2761,7 +3250,15 @@ fn draw_selection(
         draw_selected(painter, rect, document, viewport, select_tool, highlight);
         if let Some(ghost) = select_tool.offset_preview(document, offset_distance) {
             let preview = Stroke::new(SELECTION_WIDTH, OFFSET_PREVIEW_COLOR);
-            draw_shape(painter, rect, viewport, &ghost, preview);
+            draw_shape(
+                painter,
+                rect,
+                viewport,
+                &ghost,
+                preview,
+                Linetype::Continuous,
+                1.0,
+            );
         }
         return;
     }
@@ -2773,7 +3270,15 @@ fn draw_selection(
             if let Some(entity) = document.entity(id) {
                 match transform(&entity.geom) {
                     EntityGeom::Shape(shape) => {
-                        draw_shape(painter, rect, viewport, &shape, highlight);
+                        draw_shape(
+                            painter,
+                            rect,
+                            viewport,
+                            &shape,
+                            highlight,
+                            Linetype::Continuous,
+                            1.0,
+                        );
                     }
                     EntityGeom::Text(text) => {
                         draw_text(painter, rect, viewport, &text, highlight.color);
@@ -2847,7 +3352,17 @@ fn draw_selected(
     for &id in select_tool.selection() {
         if let Some(entity) = document.entity(id) {
             match &entity.geom {
-                EntityGeom::Shape(shape) => draw_shape(painter, rect, viewport, shape, stroke),
+                EntityGeom::Shape(shape) => {
+                    draw_shape(
+                        painter,
+                        rect,
+                        viewport,
+                        shape,
+                        stroke,
+                        Linetype::Continuous,
+                        1.0,
+                    );
+                }
                 EntityGeom::Text(text) => {
                     // 文字を強調色で上書きし、加えて近似 aabb の枠を描く（ヒットテストが
                     // aabb 近似であることを可視化し、選択が分かりやすいように）。
@@ -2943,27 +3458,55 @@ fn draw_shape(
     viewport: &Viewport,
     shape: &Shape,
     stroke: Stroke,
+    linetype: Linetype,
+    k: f64,
 ) {
     match shape {
         Shape::Point(p) => {
+            // 点は塗りつぶし円で表す実装で、線種の概念がない。
             let sp = viewport.world_to_screen(rect, *p);
             painter.circle_filled(sp, stroke.width.max(2.0), stroke.color);
         }
         Shape::Line(line) => {
             let a = viewport.world_to_screen(rect, line.a);
             let b = viewport.world_to_screen(rect, line.b);
-            painter.line_segment([a, b], stroke);
+            stroke_polyline(
+                painter,
+                vec![a, b],
+                stroke,
+                linetype,
+                k,
+                viewport.zoom,
+                rect,
+            );
         }
         Shape::Circle(circle) => {
+            // 円は線種を反映するため、円弧と同じくポリライン近似（一周分）で描く。
+            // `Continuous` のときだけ従来どおり `circle_stroke`（滑らかな真円）を使う。
             let center = viewport.world_to_screen(rect, circle.center);
-            let radius = (circle.radius * viewport.zoom) as f32;
-            painter.circle_stroke(center, radius, stroke);
+            if matches!(linetype, Linetype::Continuous) {
+                let radius = (circle.radius * viewport.zoom) as f32;
+                painter.circle_stroke(center, radius, stroke);
+            } else {
+                let points: Vec<Pos2> = (0..=ARC_SEGMENTS)
+                    .map(|i| {
+                        let t = i as f64 / ARC_SEGMENTS as f64;
+                        let angle = t * std::f64::consts::TAU;
+                        let p = Point2::new(
+                            circle.center.x + circle.radius * angle.cos(),
+                            circle.center.y + circle.radius * angle.sin(),
+                        );
+                        viewport.world_to_screen(rect, p)
+                    })
+                    .collect();
+                stroke_polyline(painter, points, stroke, linetype, k, viewport.zoom, rect);
+            }
         }
         Shape::Arc(arc) => {
-            draw_arc(painter, rect, viewport, arc, stroke);
+            draw_arc(painter, rect, viewport, arc, stroke, linetype, k);
         }
         Shape::Polyline(polyline) => {
-            draw_polyline(painter, rect, viewport, polyline, stroke);
+            draw_polyline(painter, rect, viewport, polyline, stroke, linetype, k);
         }
     }
 }
@@ -3010,7 +3553,15 @@ fn draw_text(
 }
 
 /// 円弧を開始角〜終了角まで [`ARC_SEGMENTS`] 分割のポリラインで近似描画する。
-fn draw_arc(painter: &egui::Painter, rect: Rect, viewport: &Viewport, arc: &Arc, stroke: Stroke) {
+fn draw_arc(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    arc: &Arc,
+    stroke: Stroke,
+    linetype: Linetype,
+    k: f64,
+) {
     let sweep = arc.sweep();
     let points: Vec<Pos2> = (0..=ARC_SEGMENTS)
         .map(|i| {
@@ -3020,7 +3571,7 @@ fn draw_arc(painter: &egui::Painter, rect: Rect, viewport: &Viewport, arc: &Arc,
             viewport.world_to_screen(rect, p)
         })
         .collect();
-    painter.line(points, stroke);
+    stroke_polyline(painter, points, stroke, linetype, k, viewport.zoom, rect);
 }
 
 /// ポリラインを描画する。閉じている場合は末尾から先頭への辺も描く。
@@ -3030,6 +3581,8 @@ fn draw_polyline(
     viewport: &Viewport,
     polyline: &Polyline,
     stroke: Stroke,
+    linetype: Linetype,
+    k: f64,
 ) {
     if polyline.vertices.is_empty() {
         return;
@@ -3042,7 +3595,7 @@ fn draw_polyline(
     if polyline.closed && polyline.vertices.len() >= 2 {
         points.push(points[0]);
     }
-    painter.line(points, stroke);
+    stroke_polyline(painter, points, stroke, linetype, k, viewport.zoom, rect);
 }
 
 fn main() -> anyhow::Result<()> {
@@ -4418,5 +4971,227 @@ mod tests {
         assert_eq!(drawn, vec![visible_id]);
         assert!(!drawn.contains(&hidden_id));
         assert!(!drawn.contains(&far_id));
+    }
+
+    // ---- M8 タスク36: 線幅解決の回帰テスト（DESIGN.md 設計判断6 検収(b)） ----
+    //
+    // 旧描画は `stroke_px = max(width_px, 1.0)`（ズーム非依存の固定 px）だった。
+    // 判断6 は「旧 `.mcad` の線幅（px）を `width_mm = 0.35mm * max(width_px, 1.0)`
+    // へ移行し、`zoom = 1 / 0.35`（k=1.0 の 1:1 図面）で `resolve_stroke_px` が
+    // 旧描画と厳密一致する」ことを要求する。ここでは 35b の移行規則が生成する
+    // 具体的な `width_mm` 値（クランプなしの4ケース）を直接使い、
+    // `resolve_stroke_px(width_mm, k=1.0, zoom) == max(width_px, 1.0)` を検証する。
+
+    /// 旧 `.mcad` の `width_px`（px）を、判断6 規則2・3の実効表示幅換算で
+    /// `width_mm`（紙 mm）へ変換する（クランプ前提: 呼び出し側が範囲内のケースのみ渡す）。
+    fn legacy_width_px_to_width_mm(width_px: f32) -> f32 {
+        0.35 * width_px.max(1.0)
+    }
+
+    #[test]
+    fn resolve_stroke_px_matches_legacy_v3_migration_at_reference_zoom() {
+        // 判断6 の7ケースのうち、上限クランプが掛からない（黙って値を変えない）
+        // 4ケース。ケース1(1.0→None=ByLayer 0.35mm)は下の rule2 テストでカバーする。
+        // ケース6(20.0→クランプ+計上)・ケース7(Infinity→パースエラー)は io 層
+        // （35b）の担当でありここでは対象外。
+        let legacy_width_px_cases = [2.5_f32, 0.5, -3.0, 5.0 / 0.35];
+        let k = 1.0; // 1:1 図面。
+        for width_px in legacy_width_px_cases {
+            let width_mm = legacy_width_px_to_width_mm(width_px);
+            let legacy_px = width_px.max(1.0);
+            let resolved = resolve_stroke_px(width_mm, k, LEGACY_WIDTH_PX_REFERENCE_ZOOM);
+            assert!(
+                (resolved - legacy_px).abs() < 1e-3,
+                "width_px={width_px}: resolved={resolved}, legacy={legacy_px}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_stroke_px_rule2_bylayer_matches_legacy_across_zoom_range() {
+        // 判断6 規則2: 明示指定なし（旧 width_px == 1.0）は ByLayer(既定0.35mm) へ
+        // 移行する。レイヤー幅が既定のままなら、`zoom <= 1/0.35` の全域で旧描画
+        // （常に1px）と一致する（判断6 検収(b)後半）。
+        let k = 1.0;
+        let default_layer_width_mm = WidthMm::DEFAULT.mm();
+        assert_eq!(default_layer_width_mm, 0.35);
+        let sample_zooms = [
+            0.01,
+            0.1,
+            0.5,
+            1.0,
+            2.0,
+            LEGACY_WIDTH_PX_REFERENCE_ZOOM / 2.0,
+            LEGACY_WIDTH_PX_REFERENCE_ZOOM,
+        ];
+        for zoom in sample_zooms {
+            assert!(zoom <= LEGACY_WIDTH_PX_REFERENCE_ZOOM);
+            let resolved = resolve_stroke_px(default_layer_width_mm, k, zoom);
+            assert!(
+                (resolved - 1.0).abs() < 1e-4,
+                "zoom={zoom}: resolved={resolved}, expected legacy 1.0px"
+            );
+        }
+
+        // 境界を超えると新しい可視差（高ズームで太くなる）が意図どおり現れる
+        // （判断6「高ズームで太くなるのは M8 の目的そのもの」）。
+        let beyond = resolve_stroke_px(
+            default_layer_width_mm,
+            k,
+            LEGACY_WIDTH_PX_REFERENCE_ZOOM * 2.0,
+        );
+        assert!(beyond > 1.0 + 1e-4);
+    }
+
+    #[test]
+    fn resolve_stroke_px_clamps_to_min_stroke_px() {
+        // ズームアウトで width_mm * k * zoom が 1px を割り込んでも下限で止まる
+        // （細線が消えないための下限。出力側はこの下限を適用しない）。
+        let resolved = resolve_stroke_px(WidthMm::MIN_MM, 1.0, 0.001);
+        assert_eq!(resolved, MIN_STROKE_PX);
+    }
+
+    #[test]
+    fn resolve_stroke_px_grows_with_zoom_beyond_min() {
+        // 判断6 検収(c): 高ズームで太くなることの土台となる単調性。
+        let low = resolve_stroke_px(1.0, 1.0, 1.0);
+        let high = resolve_stroke_px(1.0, 1.0, 10.0);
+        assert!(high > low);
+    }
+
+    #[test]
+    fn dash_pattern_px_is_none_for_continuous() {
+        assert!(dash_pattern_px(Linetype::Continuous, 1.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn dash_pattern_px_falls_back_to_solid_when_period_too_small() {
+        // ズームアウトでダッシュ周期が MIN_DASH_PERIOD_PX を割り込むと実線
+        // フォールバックする（判断5 検収(c)。極小シェイプの大量生成を防ぐ）。
+        let tiny_zoom = 1e-6;
+        assert!(dash_pattern_px(Linetype::Dashed, 1.0, tiny_zoom).is_none());
+        assert!(dash_pattern_px(Linetype::DashDot, 1.0, tiny_zoom).is_none());
+        assert!(dash_pattern_px(Linetype::DashDotDot, 1.0, tiny_zoom).is_none());
+    }
+
+    #[test]
+    fn dash_pattern_px_scales_dashed_pattern_with_k_and_zoom() {
+        let k = 2.0;
+        let zoom = 3.0;
+        let (dash_lengths, gap_lengths) = dash_pattern_px(Linetype::Dashed, k, zoom).unwrap();
+        assert_eq!(dash_lengths, vec![DASH_PATTERN_MM[0] * (k * zoom) as f32]);
+        assert_eq!(gap_lengths, vec![DASH_PATTERN_MM[1] * (k * zoom) as f32]);
+    }
+
+    #[test]
+    fn dash_pattern_px_splits_dash_dot_pattern_into_alternating_arrays() {
+        let k = 1.0;
+        let zoom = 10.0;
+        let (dash_lengths, gap_lengths) = dash_pattern_px(Linetype::DashDot, k, zoom).unwrap();
+        let scale = (k * zoom) as f32;
+        assert_eq!(
+            dash_lengths,
+            vec![
+                DASH_DOT_PATTERN_MM[0] * scale,
+                DASH_DOT_PATTERN_MM[2] * scale
+            ]
+        );
+        assert_eq!(
+            gap_lengths,
+            vec![
+                DASH_DOT_PATTERN_MM[1] * scale,
+                DASH_DOT_PATTERN_MM[3] * scale
+            ]
+        );
+    }
+
+    // ---- M8 タスク36 差し戻し対応: ビューポートクリップの回帰テスト ----
+    //
+    // Codex 一次レビュー指摘: `stroke_polyline` がスクリーン座標の点列をクリップ
+    // せずダッシュ化すると、高ズームで画面外まで伸びる線の全長が周期の桁違いに
+    // 大きくなり、生成シェイプ数が爆発してフリーズしうる。クリップ後の総延長を
+    // ビューポート寸法程度に抑えることで再発を防ぐ。
+
+    #[test]
+    fn clip_segment_to_rect_keeps_fully_inside_segment_unchanged() {
+        let clip = Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let (a, b) = (Pos2::new(10.0, 10.0), Pos2::new(90.0, 80.0));
+        let (ca, cb) = clip_segment_to_rect(a, b, clip).unwrap();
+        assert!(points_nearly_equal(ca, a));
+        assert!(points_nearly_equal(cb, b));
+    }
+
+    #[test]
+    fn clip_segment_to_rect_drops_segment_entirely_outside() {
+        let clip = Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let (a, b) = (Pos2::new(200.0, 200.0), Pos2::new(300.0, 300.0));
+        assert!(clip_segment_to_rect(a, b, clip).is_none());
+    }
+
+    #[test]
+    fn clip_segment_to_rect_truncates_segment_crossing_boundary() {
+        let clip = Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let (a, b) = (Pos2::new(-50.0, 50.0), Pos2::new(150.0, 50.0));
+        let (ca, cb) = clip_segment_to_rect(a, b, clip).unwrap();
+        assert!(points_nearly_equal(ca, Pos2::new(0.0, 50.0)));
+        assert!(points_nearly_equal(cb, Pos2::new(100.0, 50.0)));
+    }
+
+    #[test]
+    fn clip_polyline_runs_is_empty_for_line_entirely_off_screen() {
+        // (b) 完全に画面外の線分はクリップ後 0 区間になる。
+        let clip = Rect::from_min_size(Pos2::ZERO, egui::vec2(2000.0, 1500.0));
+        let points = vec![Pos2::new(1.0e7, 1.0e7), Pos2::new(2.0e7, 2.0e7)];
+        assert!(clip_polyline_runs(&points, clip).is_empty());
+    }
+
+    #[test]
+    fn clip_polyline_runs_matches_unclipped_for_fully_visible_line() {
+        // (c) 画面内に完全に収まる線分はクリップ前後で同じ点列になる。
+        let clip = Rect::from_min_size(Pos2::ZERO, egui::vec2(2000.0, 1500.0));
+        let points = vec![Pos2::new(10.0, 10.0), Pos2::new(500.0, 800.0)];
+        let runs = clip_polyline_runs(&points, clip);
+        assert_eq!(runs.len(), 1);
+        assert!(points_nearly_equal(runs[0][0], points[0]));
+        assert!(points_nearly_equal(*runs[0].last().unwrap(), points[1]));
+    }
+
+    #[test]
+    fn clip_polyline_runs_splits_into_multiple_runs_when_leaving_and_reentering() {
+        // 画面外へ出て別の場所で再び入る折れ線は、独立した複数区間になる
+        // （stroke_polyline はこの各区間ごとにダッシュ位相をリセットする）。
+        let clip = Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let points = vec![
+            Pos2::new(50.0, -50.0),  // 画面外(上)
+            Pos2::new(50.0, 50.0),   // 画面内(中央) — 1本目の区間の終端
+            Pos2::new(200.0, 50.0),  // 画面外(右) — ここで区間が切れる
+            Pos2::new(200.0, 500.0), // 画面外のまま
+            Pos2::new(50.0, 500.0),  // 画面外のまま
+            Pos2::new(50.0, 50.0),   // 画面内へ再突入 — 2本目の区間の始端
+            Pos2::new(50.0, 100.0),  // 画面内(下端)
+        ];
+        let runs = clip_polyline_runs(&points, clip);
+        assert_eq!(runs.len(), 2, "runs={runs:?}");
+    }
+
+    #[test]
+    fn clip_bounds_dash_generation_for_line_extending_far_beyond_viewport() {
+        // (a) 高ズームで画面外まで大きくはみ出す線（クリップなしなら 1e7px 級の
+        // 全長になりダッシュ片数が爆発しうる）でも、クリップ後の総延長は
+        // ビューポート寸法程度に収まり、見積もりダッシュ片数が MAX_DASH_SEGMENTS を
+        // 大幅に下回る。
+        let clip = Rect::from_min_size(Pos2::ZERO, egui::vec2(2000.0, 1500.0));
+        let points = vec![Pos2::new(-1.0e7, 500.0), Pos2::new(1.0e7, 500.0)];
+        let period = 4.5_f32; // stroke_polyline のマージン計算と同じ想定周期。
+        let margin = 1.0 + period; // 線幅1px相当 + 1周期分。
+        let runs = clip_polyline_runs(&points, clip.expand(margin));
+        let total_len = total_path_length(&runs);
+        // クリップ矩形の幅(2000px)+マージン程度が上限の目安。
+        assert!(total_len < 3000.0, "total_len={total_len}");
+        let estimated_dashes = total_len / period;
+        assert!(
+            estimated_dashes < MAX_DASH_SEGMENTS as f32,
+            "estimated_dashes={estimated_dashes}"
+        );
     }
 }

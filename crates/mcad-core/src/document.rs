@@ -18,7 +18,9 @@
 
 use slotmap::SlotMap;
 
-use crate::{Command, CoreError, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb, SheetMeta};
+use crate::{
+    Command, CoreError, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb, SheetMeta, Style,
+};
 
 /// 実行済みコマンドの逆操作可能な記録（内部専用）。
 ///
@@ -39,6 +41,11 @@ enum Applied {
         id: EntityId,
         before: EntityGeom,
         after: EntityGeom,
+    },
+    SetEntityStyle {
+        id: EntityId,
+        before: Style,
+        after: Style,
     },
     AddLayer {
         id: LayerId,
@@ -443,6 +450,21 @@ impl Document {
                     changed,
                 ))
             }
+            Command::SetEntityStyle { id, style } => {
+                self.require_editable_entity(id)?;
+                let slot = self.live_entity_mut(id);
+                let before = std::mem::replace(&mut slot.style, style);
+                // 同一スタイルへの差し替えは意味的 no-op（履歴を汚さない）。
+                let changed = before != style;
+                Ok(ExecuteOutcome::conditional(
+                    Applied::SetEntityStyle {
+                        id,
+                        before,
+                        after: style,
+                    },
+                    changed,
+                ))
+            }
             Command::AddLayer(layer) => {
                 let id = self.layers.insert(Some(layer.clone()));
                 // 追加は常に状態を変えるので changed = true。
@@ -555,6 +577,7 @@ impl Document {
             Applied::AddEntity { id, .. } => self.set_entity(*id, None),
             Applied::RemoveEntity { id, entity } => self.set_entity(*id, Some(entity.clone())),
             Applied::ModifyEntity { id, before, .. } => self.set_entity_geom(*id, before.clone()),
+            Applied::SetEntityStyle { id, before, .. } => self.set_entity_style(*id, *before),
             Applied::AddLayer { id, .. } => self.set_layer(*id, None),
             Applied::RemoveLayer { id, layer } => self.set_layer(*id, Some(layer.clone())),
             Applied::SetLayerProps { id, before, .. } => self.set_layer(*id, Some(before.clone())),
@@ -575,6 +598,7 @@ impl Document {
             Applied::AddEntity { id, entity } => self.set_entity(*id, Some(entity.clone())),
             Applied::RemoveEntity { id, .. } => self.set_entity(*id, None),
             Applied::ModifyEntity { id, after, .. } => self.set_entity_geom(*id, after.clone()),
+            Applied::SetEntityStyle { id, after, .. } => self.set_entity_style(*id, *after),
             Applied::AddLayer { id, layer } => self.set_layer(*id, Some(layer.clone())),
             Applied::RemoveLayer { id, .. } => self.set_layer(*id, None),
             Applied::SetLayerProps { id, after, .. } => self.set_layer(*id, Some(after.clone())),
@@ -701,6 +725,11 @@ impl Document {
     /// 生存エンティティの幾何のみ差し替える。生存を前提とする。
     fn set_entity_geom(&mut self, id: EntityId, geom: EntityGeom) {
         self.live_entity_mut(id).geom = geom;
+    }
+
+    /// 生存エンティティのスタイルのみ差し替える。生存を前提とする。
+    fn set_entity_style(&mut self, id: EntityId, style: Style) {
+        self.live_entity_mut(id).style = style;
     }
 }
 
@@ -831,6 +860,79 @@ mod tests {
 
         assert!(doc.redo());
         assert_eq!(doc.entity(id).unwrap().geom, line(5.0));
+    }
+
+    #[test]
+    fn set_entity_style_undo_redo_swaps_style() {
+        // M8 タスク36: エンティティの線幅・線種上書き UI が経由するコマンド。
+        // SetLayerProps と同じ「まとめて差し替え・undo/redo で前後を入れ替える」流儀。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+        assert_eq!(doc.entity(id).unwrap().style, Style::inherited());
+
+        let overridden = Style {
+            color: None,
+            width_mm: Some(WidthMm::new(0.7).unwrap()),
+            linetype: Some(Linetype::Dashed),
+        };
+        doc.apply(Command::SetEntityStyle {
+            id,
+            style: overridden,
+        })
+        .unwrap();
+        assert_eq!(doc.entity(id).unwrap().style, overridden);
+        // geom は巻き込まれていない。
+        assert_eq!(doc.entity(id).unwrap().geom, line(0.0));
+
+        assert!(doc.undo());
+        assert_eq!(doc.entity(id).unwrap().style, Style::inherited());
+
+        assert!(doc.redo());
+        assert_eq!(doc.entity(id).unwrap().style, overridden);
+    }
+
+    #[test]
+    fn set_entity_style_with_identical_style_is_noop() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+
+        let undo_len_before = doc.undo_stack.len();
+        let generation_before = doc.generation();
+
+        assert_eq!(
+            doc.apply(Command::SetEntityStyle {
+                id,
+                style: Style::inherited(),
+            }),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.generation(), generation_before);
+    }
+
+    #[test]
+    fn set_entity_style_on_locked_layer_is_rejected() {
+        // ModifyEntity/RemoveEntity と同じ require_editable_entity を通るので、
+        // ロック中のレイヤーへのスタイル上書きも拒否される。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+        lock_layer(&mut doc, layer);
+
+        assert_eq!(
+            doc.apply(Command::SetEntityStyle {
+                id,
+                style: Style {
+                    color: None,
+                    width_mm: Some(WidthMm::new(0.7).unwrap()),
+                    linetype: None,
+                },
+            }),
+            Err(CoreError::LayerLocked(layer))
+        );
+        assert_eq!(doc.entity(id).unwrap().style, Style::inherited());
     }
 
     #[test]

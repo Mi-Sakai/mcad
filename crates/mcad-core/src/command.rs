@@ -1,6 +1,6 @@
 //! ドキュメントを変更する唯一の手段である [`Command`]。
 
-use crate::{Entity, EntityGeom, EntityId, Layer, LayerId, SheetMeta};
+use crate::{Entity, EntityGeom, EntityId, Layer, LayerId, SheetMeta, Style};
 
 /// ドキュメントへの変更を表すコマンド。
 ///
@@ -29,6 +29,16 @@ pub enum Command {
         id: EntityId,
         /// 差し替え後の幾何。
         new_geom: EntityGeom,
+    },
+
+    /// エンティティの描画スタイル（色・線幅・線種の個別上書き）を差し替える
+    /// （M8 タスク36。[`Command::SetLayerProps`] と同じ「まとめて差し替え」流儀。
+    /// フィールドを `None` に戻すと ByLayer へ復帰する）。
+    SetEntityStyle {
+        /// 対象エンティティ。
+        id: EntityId,
+        /// 差し替え後のスタイル一式。
+        style: Style,
     },
 
     /// レイヤーを追加する。

@@ -9,6 +9,7 @@
 
 mod dimension;
 mod fonts;
+mod frame;
 mod ortho;
 mod snap;
 mod tool;
@@ -20,10 +21,13 @@ use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
     Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, Layer, LayerId,
-    Linetype, Rgb, Style, TextGeom, WidthMm,
+    Linetype, Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, Style, TextGeom,
+    TitleBlockFields, TitleBlockKind, WidthMm,
 };
 use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
+
+use frame::{frame_layout, paper_to_world, parse_scale_input};
 
 use tool::{
     ArcTool, CircleTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool, FilletTool,
@@ -121,6 +125,14 @@ const DEFAULT_EXTRA_LAYERS: [(&str, Rgb); 1] = [("Text", LAYER_COLOR_PALETTE[3])
 
 /// ステータスメッセージの文字色（エラー通知が主用途なので警告寄りの赤）。
 const STATUS_MESSAGE_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
+
+/// 図面枠（輪郭・表題欄の罫線・欄文字）の色。グリッドより明るく、通常のエンティティ
+/// 色よりは控えめな中間グレーで、印刷対象と分かる程度に主張する（タスク38）。
+const FRAME_COLOR: Color32 = Color32::from_gray(150);
+
+/// 用紙縁（用紙の外形矩形）の色。**印刷対象ではない画面専用ヒント**であることが
+/// 一目で分かるよう、グリッドと同じ流儀の控えめなグレーにする（タスク38）。
+const PAPER_EDGE_COLOR: Color32 = Color32::from_gray(90);
 
 /// 線幅の画面 px 下限（DESIGN.md M8 設計判断5・6）。
 ///
@@ -686,6 +698,21 @@ struct McadApp {
     /// 直前フレームで Text 入力欄を表示していたか。false→true の遷移フレームで文字列欄へ
     /// フォーカスを移すのに使う（アンカー確定直後すぐタイプできるように）。
     text_field_shown: bool,
+    /// 表題欄編集ダイアログの作業コピー。`Some` の間はモーダルが開いている
+    /// （[`McadApp::modal_open`]、M8タスク38）。「表題欄を編集…」ボタンで開き、
+    /// OK で `Command::SetSheet` 1回（ダイアログセッション全体が undo 1単位）、
+    /// キャンセル/モーダル外クリックで破棄する。
+    sheet_dialog: Option<TitleBlockDialogState>,
+    /// 図面セクションの尺度コンボで「カスタム」が選ばれているか（M8タスク38）。
+    /// プリセットに一致しない尺度（ファイル読込等）では、この値に関わらず表示上は
+    /// カスタム扱いになる（`sheet_panel` 参照）。
+    scale_custom_selected: bool,
+    /// 尺度カスタム入力欄の文字列（`N:M` 形式）。セッション中保持する
+    /// （[`McadApp::reset_transient_ui_state`] でクリア）。
+    scale_custom_input: String,
+    /// 尺度カスタム入力の直近の拒否理由（インライン赤字表示用）。適用成功・
+    /// プリセット選択・入力欄変更のたびにクリアする。
+    scale_input_error: Option<String>,
 }
 
 /// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
@@ -870,7 +897,19 @@ impl McadApp {
             text_content_input: String::new(),
             text_height_input: DEFAULT_TEXT_HEIGHT.to_owned(),
             text_field_shown: false,
+            sheet_dialog: None,
+            scale_custom_selected: false,
+            scale_custom_input: String::new(),
+            scale_input_error: None,
         }
+    }
+
+    /// モーダル（未保存確認 / 表題欄編集ダイアログ）が開いているか。
+    ///
+    /// キャンバス入力・ショートカット（F3/F8/F9/Home 含む）のゲートをこの1関数へ
+    /// 集約する（M8タスク38。旧 `confirm_state != ConfirmState::Idle` 直書きの集約先）。
+    fn modal_open(&self) -> bool {
+        self.confirm_state != ConfirmState::Idle || self.sheet_dialog.is_some()
     }
 
     /// 選択集合・進行中の作図ツール・スナップマーカーをリセットする。
@@ -892,6 +931,11 @@ impl McadApp {
         self.text_height_input = DEFAULT_TEXT_HEIGHT.to_owned();
         self.text_field_shown = false;
         self.snap_marker = None;
+        // 表題欄編集ダイアログ・尺度カスタム入力も別図面へ持ち越さない。
+        self.sheet_dialog = None;
+        self.scale_custom_selected = false;
+        self.scale_custom_input.clear();
+        self.scale_input_error = None;
     }
 
     /// undo/redo が成功した直後の UI 状態の後始末。
@@ -976,7 +1020,9 @@ impl McadApp {
     /// フィット対象がないため、その場で [`Viewport::new`] の既定ビューへリセットする
     /// （DESIGN.md 6章タスク13: 「空文書は既定ビューへリセット」）。
     fn request_zoom_fit(&mut self) {
-        if self.document.entity_count() > 0 {
+        // 枠 ON のときは、エンティティが0件でも用紙矩形がフィット対象になる
+        // （`fit_target_aabb` の doc 参照）。
+        if self.document.entity_count() > 0 || self.document.sheet().frame_visible {
             self.pending_zoom_fit = true;
         } else {
             self.viewport = Viewport::new();
@@ -1368,18 +1414,39 @@ fn document_aabb(document: &Document) -> Option<Aabb> {
         .reduce(|acc, bb| acc.union(&bb))
 }
 
+/// ズームフィット対象の AABB（M8タスク38: 枠考慮）。
+///
+/// `sheet.frame_visible` が ON のとき、[`document_aabb`] へ用紙矩形（ワールド
+/// `(0,0)〜(W*k, H*k)`）を合併する。枠 ON で図形が1件もない図面でも、用紙全体が
+/// フィット対象になる（ユーザー確定の挙動。[`McadApp::request_zoom_fit`] の判定も
+/// これに合わせて拡張している）。
+fn fit_target_aabb(document: &Document) -> Option<Aabb> {
+    let doc_aabb = document_aabb(document);
+    let sheet = document.sheet();
+    if !sheet.frame_visible {
+        return doc_aabb;
+    }
+    let (w, h) = sheet.paper_extent_mm();
+    let k = sheet.scale.world_mm_per_paper_mm();
+    let paper_aabb = Aabb::new(
+        paper_to_world(Point2::new(0.0, 0.0), k),
+        paper_to_world(Point2::new(w, h), k),
+    );
+    Some(doc_aabb.map_or(paper_aabb, |a| a.union(&paper_aabb)))
+}
+
 /// アプリのグローバルキーボードショートカット（undo/redo・ファイル操作・Ctrl+D 複製・
 /// ツール切替・Delete 等）を処理してよいか。
 ///
-/// - 未保存確認モーダル表示中（`confirm_state != Idle`）は、裏でドキュメントが変わる副作用を
-///   防ぐため抑止する。
+/// - モーダル表示中（未保存確認 / 表題欄編集ダイアログ。[`McadApp::modal_open`]）は、
+///   裏でドキュメントが変わる副作用を防ぐため抑止する。
 /// - テキスト入力欄にフォーカスがある間（オフセット距離入力欄の編集中など）は抑止する。
 ///   タイプした `Ctrl+Z` がドキュメントを undo する、`d` でツールが切り替わる、といった
 ///   テキスト入力とショートカットの競合を防ぐ（DESIGN.md M5 設計判断5 の 2026-07-19 追記）。
 ///
 /// egui のフォーカス判定を `bool` で受け取り、この方針を GUI なしで単体テストできるようにする。
-fn app_shortcuts_enabled(confirm_state: ConfirmState, text_focused: bool) -> bool {
-    confirm_state == ConfirmState::Idle && !text_focused
+fn app_shortcuts_enabled(modal_open: bool, text_focused: bool) -> bool {
+    !modal_open && !text_focused
 }
 
 impl eframe::App for McadApp {
@@ -1396,7 +1463,7 @@ impl eframe::App for McadApp {
         // 例えば「閉じる」確認中に `confirm_state` が `ConfirmingNew` へ上書きされ、
         // モーダルの文言が終了確認から新規文書確認へすり替わってしまうため。
         // 加えて、テキスト入力欄の編集中も全ショートカットを抑止する（上記フォーカスゲート）。
-        if app_shortcuts_enabled(self.confirm_state, text_focused) {
+        if app_shortcuts_enabled(self.modal_open(), text_focused) {
             // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y で undo/redo。ツール切替キーより先に処理する
             // （handle_tool_shortcut_keys は修飾キー付きの入力を無視するので衝突はしないが、
             // 「履歴操作が最優先」という意図を並び順でも示す）。undo/redo はエンティティを
@@ -1465,12 +1532,13 @@ impl eframe::App for McadApp {
             }
         }
 
-        // 未保存確認モーダルが出ている間は配置モード（Ctrl+D 複製等）を解除する。
-        // モーダル表示中はキャンバス入力がゲートされ配置を進められないため、宙ぶらりんの
-        // 配置ステートを残さない（DESIGN.md 設計判断2: モーダル表示は配置モードを解除）。
+        // モーダル（未保存確認 / 表題欄編集ダイアログ）が出ている間は配置モード
+        // （Ctrl+D 複製等）を解除する。モーダル表示中はキャンバス入力がゲートされ
+        // 配置を進められないため、宙ぶらりんの配置ステートを残さない
+        // （DESIGN.md 設計判断2: モーダル表示は配置モードを解除）。
         // Ctrl+N/Ctrl+O 等でモーダルを開いたのがこのフレームでも、上のショートカット処理で
         // `confirm_state` が更新済みなので同フレームで確実に解除できる。
-        if self.confirm_state != ConfirmState::Idle {
+        if self.modal_open() {
             if self.select_tool.is_placing() || self.select_tool.is_offsetting() {
                 self.select_tool.cancel_placement();
                 self.select_tool.cancel_offset();
@@ -1533,7 +1601,7 @@ impl eframe::App for McadApp {
         // 素の文字キーでツールが切り替わりオフセットモードが解除されるのを防ぐ
         // （AGENTS.md「テキスト入力欄がない前提」はオフセット距離欄の追加で崩れるため、
         // `app_shortcuts_enabled` の共通ゲートで抑止する）。
-        if app_shortcuts_enabled(self.confirm_state, text_focused) {
+        if app_shortcuts_enabled(self.modal_open(), text_focused) {
             handle_tool_shortcut_keys(
                 ui,
                 &mut self.tool_kind,
@@ -1547,7 +1615,7 @@ impl eframe::App for McadApp {
         // ツール切替と同じ `app_shortcuts_enabled`（テキスト欄フォーカス中は抑止）
         // ゲートに合わせる。読込直後の自動フィットと同じ判定・計算を
         // `request_zoom_fit` の再利用で行う（ロジックの二重化を避ける）。
-        if app_shortcuts_enabled(self.confirm_state, text_focused)
+        if app_shortcuts_enabled(self.modal_open(), text_focused)
             && ui.input(|i| i.key_pressed(Key::Home))
         {
             self.request_zoom_fit();
@@ -1555,7 +1623,7 @@ impl eframe::App for McadApp {
 
         // F3 でスナップの有効/無効をトグルする（作図時の吸着を一時的に切りたい場面用）。
         // ファンクションキーはテキスト入力と競合しないので、モーダル非表示中なら常に効かせる。
-        if self.confirm_state == ConfirmState::Idle && ui.input(|i| i.key_pressed(Key::F3)) {
+        if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F3)) {
             self.snap_enabled = !self.snap_enabled;
             if !self.snap_enabled {
                 self.snap_marker = None;
@@ -1565,14 +1633,14 @@ impl eframe::App for McadApp {
         // F8 で直交モード（ortho）の有効/無効をトグルする。F3 と同じガード条件
         // （モーダル非表示中は常に効く）。ortho は専用マーカーを持たない設計
         // （`ortho.rs` doc 参照）なので、トグル自体はフラグの反転のみでよい。
-        if self.confirm_state == ConfirmState::Idle && ui.input(|i| i.key_pressed(Key::F8)) {
+        if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F8)) {
             self.ortho_enabled = !self.ortho_enabled;
         }
 
         // F9 で紙基準表示（タスク37。旧: 線幅表示、タスク36b。AutoCAD の LWDISPLAY 相当）の
         // 有効/無効をトグルする。F3/F8 と同じガード条件（モーダル非表示中は常に効く）。
         // 専用マーカーは不要なので、トグル自体はフラグの反転のみでよい（ortho と同じ形）。
-        if self.confirm_state == ConfirmState::Idle && ui.input(|i| i.key_pressed(Key::F9)) {
+        if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F9)) {
             self.paper_display_enabled = !self.paper_display_enabled;
         }
 
@@ -1700,6 +1768,16 @@ impl eframe::App for McadApp {
                 &mut self.status,
                 now,
             );
+            sheet_panel(
+                ui,
+                &mut self.document,
+                &mut self.sheet_dialog,
+                &mut self.scale_custom_selected,
+                &mut self.scale_custom_input,
+                &mut self.scale_input_error,
+                &mut self.status,
+                now,
+            );
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1710,7 +1788,7 @@ impl eframe::App for McadApp {
             // スクリーン矩形（rect）が確定していないため実行できず、ここまで遅延させる
             // 必要がある（`request_zoom_fit` の doc 参照）。
             if self.pending_zoom_fit {
-                if let Some(aabb) = document_aabb(&self.document) {
+                if let Some(aabb) = fit_target_aabb(&self.document) {
                     self.viewport.fit_to_aabb(aabb, rect);
                 }
                 self.pending_zoom_fit = false;
@@ -1718,14 +1796,15 @@ impl eframe::App for McadApp {
 
             handle_pan_input(ui, &response, &mut self.viewport);
             handle_zoom_input(ui, &response, rect, &mut self.viewport);
-            // 未保存確認モーダル表示中は、キャンバスへのクリック/ドラッグ/Delete/Enter/Esc
-            // などを一切ツール・選択処理へ渡さない。素通りさせると、モーダルの裏で
-            // エンティティが削除・作図確定されてしまう（Delete/Enter は egui::Modal が
-            // 消費しないため）。パン/ズームは見るだけの操作なので許容する。
+            // モーダル（未保存確認 / 表題欄編集ダイアログ）表示中は、キャンバスへの
+            // クリック/ドラッグ/Delete/Enter/Esc などを一切ツール・選択処理へ渡さない。
+            // 素通りさせると、モーダルの裏でエンティティが削除・作図確定されてしまう
+            // （Delete/Enter は egui::Modal が消費しないため）。パン/ズームは見るだけの
+            // 操作なので許容する。
             // 距離入力欄の解析値（正の有限値のみ Some、それ以外は通過点方式へ
             // フォールバック）。入力処理とゴースト描画で同じ値を使う。
             let offset_distance = parse_offset_distance(&self.offset_distance_input);
-            if self.confirm_state == ConfirmState::Idle {
+            if !self.modal_open() {
                 if self.tool_kind == ToolKind::Select {
                     handle_select_input(
                         ui,
@@ -1769,6 +1848,20 @@ impl eframe::App for McadApp {
             let k = self.document.sheet().scale.world_mm_per_paper_mm();
 
             draw_grid(&painter, rect, &self.viewport);
+            // 図面枠は「グリッドと同格」の派生描画（判断3）。用紙縁は印刷対象ではない
+            // 画面専用ヒントなので `FrameLayout` を経由せず、枠と同じ表示条件で
+            // まとめて出す（分岐を1つに保つ）。
+            if self.document.sheet().frame_visible {
+                draw_paper_edge(&painter, rect, &self.viewport, self.document.sheet());
+                draw_frame(
+                    &painter,
+                    rect,
+                    &self.viewport,
+                    self.document.sheet(),
+                    self.paper_display_enabled,
+                    k,
+                );
+            }
             draw_entities(
                 &painter,
                 rect,
@@ -1867,6 +1960,100 @@ impl eframe::App for McadApp {
             // モーダル外クリック / Esc はキャンセル扱い（実行しない）。
             if modal.should_close() {
                 self.confirm_state = ConfirmState::Idle;
+            }
+        }
+
+        // 表題欄編集ダイアログ（M8タスク38）。日本語領域（右パネル）から開くダイアログ
+        // なので本文も日本語（未保存確認モーダルとは別領域として扱う）。
+        if self.sheet_dialog.is_some() {
+            let mut ok_clicked = false;
+            let mut cancel_clicked = false;
+            let modal =
+                egui::Modal::new(egui::Id::new("title_block_dialog")).show(ui.ctx(), |ui| {
+                    let dialog = self
+                        .sheet_dialog
+                        .as_mut()
+                        .expect("guarded by is_some() above");
+                    ui.set_width(320.0);
+                    ui.heading("表題欄を編集");
+                    egui::Grid::new("title_block_dialog_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("図面番号:");
+                            ui.text_edit_singleline(&mut dialog.drawing_number);
+                            ui.end_row();
+
+                            ui.label("図面名称:");
+                            ui.text_edit_singleline(&mut dialog.drawing_title);
+                            ui.end_row();
+
+                            ui.label("投影法:");
+                            egui::ComboBox::from_id_salt("title_block_dialog_projection")
+                                .selected_text(match dialog.projection {
+                                    ProjectionMethod::ThirdAngle => "第三角法",
+                                    ProjectionMethod::FirstAngle => "第一角法",
+                                })
+                                .show_ui(ui, |ui| {
+                                    for (projection, label) in [
+                                        (ProjectionMethod::ThirdAngle, "第三角法"),
+                                        (ProjectionMethod::FirstAngle, "第一角法"),
+                                    ] {
+                                        if ui
+                                            .selectable_label(
+                                                dialog.projection == projection,
+                                                label,
+                                            )
+                                            .clicked()
+                                        {
+                                            dialog.projection = projection;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.label("作成者:");
+                            ui.text_edit_singleline(&mut dialog.author);
+                            ui.end_row();
+
+                            ui.label("作成日:");
+                            ui.text_edit_singleline(&mut dialog.date);
+                            ui.end_row();
+
+                            ui.label("改訂記号:");
+                            ui.text_edit_singleline(&mut dialog.revision);
+                            ui.end_row();
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            ok_clicked = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                });
+            if ok_clicked {
+                // OK でダイアログセッション全体を Command::SetSheet 1回（undo 1単位）で
+                // 適用する。作業コピーは fields 全体を置き換えるだけなので、失敗するのは
+                // ここでは事実上起こらない（SetSheet の検証対象は表題欄テンプレート寸法の
+                // みで、fields の文字列自体に不正値は無い）が、念のためステータス表示する。
+                let new_sheet = self
+                    .sheet_dialog
+                    .as_ref()
+                    .expect("ok_clicked implies Some")
+                    .to_sheet(self.document.sheet());
+                if let Err(err) = self.document.apply(Command::SetSheet(new_sheet)) {
+                    set_status(
+                        &mut self.status,
+                        now,
+                        format!("表題欄の変更に失敗しました: {err}"),
+                    );
+                }
+                self.sheet_dialog = None;
+            } else if cancel_clicked || modal.should_close() {
+                self.sheet_dialog = None;
             }
         }
     }
@@ -2632,6 +2819,281 @@ fn entity_style_panel(
     }
 }
 
+/// 用紙サイズの日本語ラベル（右パネルの用紙コンボ専用）。
+///
+/// `frame::` 側の欄文字用ラベル（横は "A4"、縦は "A4 縦" と向きを合成する）とは
+/// 別の関心事（こちらは向きを別コンボで独立して選ぶ）なので同居させない。
+fn paper_size_combo_label(paper: PaperSize) -> &'static str {
+    match paper {
+        PaperSize::A0 => "A0",
+        PaperSize::A1 => "A1",
+        PaperSize::A2 => "A2",
+        PaperSize::A3 => "A3",
+        PaperSize::A4 => "A4",
+    }
+}
+
+/// UI で提示する尺度プリセット（紙:モデル。`製図規定.md` 第3章の推奨尺度表:
+/// 倍尺 50:1〜2:1・現尺 1:1・縮尺 1:2〜1:10000）。
+const SCALE_PRESETS: [(u32, u32); 18] = [
+    (50, 1),
+    (20, 1),
+    (10, 1),
+    (5, 1),
+    (2, 1),
+    (1, 1),
+    (1, 2),
+    (1, 5),
+    (1, 10),
+    (1, 20),
+    (1, 50),
+    (1, 100),
+    (1, 200),
+    (1, 500),
+    (1, 1000),
+    (1, 2000),
+    (1, 5000),
+    (1, 10000),
+];
+
+/// 表題欄編集ダイアログの作業コピー（`SheetMeta::fields` の編集中の値、M8タスク38）。
+///
+/// OK で [`TitleBlockDialogState::to_sheet`] が組み立てる `SheetMeta` を
+/// `Command::SetSheet` 1回で適用する（ダイアログセッション全体が undo 1単位）。
+/// キャンセル/モーダル外クリックでは何も適用しない。
+struct TitleBlockDialogState {
+    drawing_number: String,
+    drawing_title: String,
+    projection: ProjectionMethod,
+    author: String,
+    date: String,
+    revision: String,
+}
+
+impl TitleBlockDialogState {
+    /// 現在の `SheetMeta::fields` から作業コピーを作る（ダイアログを開くとき）。
+    fn from_sheet(sheet: &SheetMeta) -> Self {
+        Self {
+            drawing_number: sheet.fields.drawing_number.clone(),
+            drawing_title: sheet.fields.drawing_title.clone(),
+            projection: sheet.fields.projection,
+            author: sheet.fields.author.clone(),
+            date: sheet.fields.date.clone(),
+            revision: sheet.fields.revision.clone(),
+        }
+    }
+
+    /// `base`（現在の `SheetMeta`）の `fields` だけをこの作業コピーで置き換えた新しい
+    /// `SheetMeta` を組み立てる（純関数、単体テスト対象）。尺度・用紙・様式・枠表示は
+    /// `base` のまま変えない（このダイアログの編集対象は記入欄のみ）。
+    fn to_sheet(&self, base: &SheetMeta) -> SheetMeta {
+        SheetMeta {
+            fields: TitleBlockFields {
+                drawing_number: self.drawing_number.clone(),
+                drawing_title: self.drawing_title.clone(),
+                projection: self.projection,
+                author: self.author.clone(),
+                date: self.date.clone(),
+                revision: self.revision.clone(),
+            },
+            ..base.clone()
+        }
+    }
+}
+
+/// 右パネルの「図面」セクション（M8タスク38）。用紙・向き・様式・枠表示・尺度の
+/// 変更を提供する。用紙/向き/様式コンボ・枠表示チェックボックス・尺度プリセット選択は
+/// 各変更が即 `Command::SetSheet` 1回 = 1操作 1 undo（レイヤーパネルの
+/// `SetLayerProps` と同じ粒度。core の no-op 判定が同値選択を吸収する）。
+/// 表題欄の記入自体はモーダルダイアログ（`McadApp::sheet_dialog`）へ分離する。
+///
+/// ラベル等は日本語（右パネルは既に日本語領域。日本語化は領域単位で完結させる規約）。
+#[allow(clippy::too_many_arguments)]
+fn sheet_panel(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    sheet_dialog: &mut Option<TitleBlockDialogState>,
+    scale_custom_selected: &mut bool,
+    scale_custom_input: &mut String,
+    scale_input_error: &mut Option<String>,
+    status: &mut Option<StatusMessage>,
+    now: f64,
+) {
+    ui.separator();
+    ui.heading("図面");
+
+    let sheet = document.sheet().clone();
+    let mut pending: Option<SheetMeta> = None;
+
+    ui.horizontal(|ui| {
+        ui.label("用紙:");
+        egui::ComboBox::from_id_salt("sheet_paper")
+            .selected_text(paper_size_combo_label(sheet.paper))
+            .show_ui(ui, |ui| {
+                for paper in [
+                    PaperSize::A0,
+                    PaperSize::A1,
+                    PaperSize::A2,
+                    PaperSize::A3,
+                    PaperSize::A4,
+                ] {
+                    if ui
+                        .selectable_label(paper == sheet.paper, paper_size_combo_label(paper))
+                        .clicked()
+                        && paper != sheet.paper
+                    {
+                        pending = Some(SheetMeta {
+                            paper,
+                            ..sheet.clone()
+                        });
+                    }
+                }
+            });
+
+        ui.label("向き:");
+        egui::ComboBox::from_id_salt("sheet_orientation")
+            .selected_text(match sheet.orientation {
+                Orientation::Landscape => "横",
+                Orientation::Portrait => "縦",
+            })
+            .show_ui(ui, |ui| {
+                for (orientation, label) in [
+                    (Orientation::Landscape, "横"),
+                    (Orientation::Portrait, "縦"),
+                ] {
+                    if ui
+                        .selectable_label(orientation == sheet.orientation, label)
+                        .clicked()
+                        && orientation != sheet.orientation
+                    {
+                        pending = Some(SheetMeta {
+                            orientation,
+                            ..sheet.clone()
+                        });
+                    }
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("様式:");
+        // 「ユーザー定義」は Custom の選択中表示のみで、選択肢には出さない
+        // （ユーザー確定。A/B/C を選ぶと Custom テンプレートは置換される）。
+        let is_custom = matches!(sheet.title_block, TitleBlockKind::Custom(_));
+        let selected_text = if is_custom {
+            "ユーザー定義"
+        } else {
+            match sheet.title_block {
+                TitleBlockKind::A => "A",
+                TitleBlockKind::B => "B",
+                TitleBlockKind::C => "C",
+                TitleBlockKind::Custom(_) => unreachable!("is_custom はこの腕を除外済み"),
+            }
+        };
+        egui::ComboBox::from_id_salt("sheet_title_block")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for (label, kind) in [
+                    ("A", TitleBlockKind::A),
+                    ("B", TitleBlockKind::B),
+                    ("C", TitleBlockKind::C),
+                ] {
+                    let selected = !is_custom && sheet.title_block == kind;
+                    if ui.selectable_label(selected, label).clicked() && !selected {
+                        pending = Some(SheetMeta {
+                            title_block: kind,
+                            ..sheet.clone()
+                        });
+                    }
+                }
+            });
+
+        let mut frame_visible = sheet.frame_visible;
+        if ui.checkbox(&mut frame_visible, "図面枠を表示").changed() {
+            pending = Some(SheetMeta {
+                frame_visible,
+                ..sheet.clone()
+            });
+        }
+
+        if ui.button("表題欄を編集…").clicked() {
+            *sheet_dialog = Some(TitleBlockDialogState::from_sheet(&sheet));
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("尺度:");
+        let is_preset = SCALE_PRESETS
+            .iter()
+            .any(|&(n, d)| n == sheet.scale.num() && d == sheet.scale.den());
+        let show_custom = *scale_custom_selected || !is_preset;
+        let selected_text = if show_custom {
+            "カスタム".to_owned()
+        } else {
+            format!("{}:{}", sheet.scale.num(), sheet.scale.den())
+        };
+        egui::ComboBox::from_id_salt("sheet_scale")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for &(n, d) in &SCALE_PRESETS {
+                    let selected = !show_custom && n == sheet.scale.num() && d == sheet.scale.den();
+                    if ui.selectable_label(selected, format!("{n}:{d}")).clicked() && !selected {
+                        *scale_custom_selected = false;
+                        *scale_input_error = None;
+                        // 次に「カスタム」を開いたとき現在の尺度で埋め直すため空にする
+                        // （古い入力値が残っていると、表示中の尺度と違う値を「適用」で
+                        // 意図せず復活させてしまう）。
+                        scale_custom_input.clear();
+                        pending = Some(SheetMeta {
+                            scale: Scale::new(n, d).expect("SCALE_PRESETS entries are valid"),
+                            ..sheet.clone()
+                        });
+                    }
+                }
+                if ui.selectable_label(show_custom, "カスタム").clicked() && !show_custom {
+                    *scale_custom_selected = true;
+                    // 開いた時点の図面の尺度で同期する（下の「空なら埋める」は
+                    // プリセットから切り替えた直後にも効くが、明示しておく）。
+                    *scale_custom_input = format!("{}:{}", sheet.scale.num(), sheet.scale.den());
+                    *scale_input_error = None;
+                }
+            });
+
+        if show_custom {
+            if scale_custom_input.is_empty() {
+                *scale_custom_input = format!("{}:{}", sheet.scale.num(), sheet.scale.den());
+            }
+            ui.add(egui::TextEdit::singleline(scale_custom_input).desired_width(64.0));
+            if ui.button("適用").clicked() {
+                match parse_scale_input(scale_custom_input) {
+                    Ok(scale) => {
+                        *scale_input_error = None;
+                        pending = Some(SheetMeta {
+                            scale,
+                            ..sheet.clone()
+                        });
+                    }
+                    Err(err) => {
+                        *scale_input_error = Some(err);
+                    }
+                }
+            }
+            // 不正尺度入力時は SetSheet を発行せず（履歴・世代とも不変）、入力文字列は
+            // 保持して修正させる。ステータスバーは10秒で消える一時通知のためフォーム
+            // 検証には使わず、入力欄横のインライン赤字ラベルで表示する。
+            if let Some(err) = scale_input_error {
+                ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+            }
+        }
+    });
+
+    if let Some(new_sheet) = pending
+        && let Err(err) = document.apply(Command::SetSheet(new_sheet))
+    {
+        set_status(status, now, format!("図面設定の変更に失敗しました: {err}"));
+    }
+}
+
 /// 素のカーソル位置 `raw` にスナップを掛ける。有効かつ候補が見つかれば
 /// `(スナップ先, Some(結果))`、無効または候補なしなら `(raw, None)` を返す。
 ///
@@ -3195,6 +3657,76 @@ fn draw_grid_lines(
         let sy = viewport.world_to_screen(rect, Point2::new(0.0, y)).y;
         painter.hline(rect.x_range(), sy, stroke);
         y += step;
+    }
+}
+
+/// 図面枠（輪郭・表題欄の罫線・欄文字）を描く（DESIGN.md M8 設計判断3。タスク38）。
+///
+/// `frame_layout` が生成する紙 mm 座標を [`paper_to_world`] でワールド座標へ変換して
+/// から画面へ写す。**枠は「グリッドと同格」の派生描画**であり `Document::entities()`
+/// を経由しないため、選択・ピック・スナップの対象にならない。
+///
+/// 枠線の線幅は [`resolve_stroke_px_with_toggle`] に従う（F9 OFF = 1px 固定、
+/// ON = 紙 mm 比例。判断4/5 の分岐を1関数へ集約する方針を踏襲）。欄文字の高さは
+/// トグル非依存で常に紙 mm × `k`（Text エンティティと同根の理由。判断4 実装時追記の
+/// (c) 参照）。線分・文字とも高々数十件なのでカリングは行わない。
+fn draw_frame(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    sheet: &SheetMeta,
+    paper_display_enabled: bool,
+    k: f64,
+) {
+    let layout = frame_layout(sheet);
+    for line in &layout.lines {
+        let a = viewport.world_to_screen(rect, paper_to_world(line.a, k));
+        let b = viewport.world_to_screen(rect, paper_to_world(line.b, k));
+        let stroke_px =
+            resolve_stroke_px_with_toggle(paper_display_enabled, line.width_mm, k, viewport.zoom);
+        painter.line_segment([a, b], Stroke::new(stroke_px, FRAME_COLOR));
+    }
+    for text in &layout.texts {
+        let anchor = paper_to_world(text.anchor_mm, k);
+        // セル幅を超える長い文字列はクリップせずはみ出したまま描く（判断7と同じ流儀。
+        // M8 ではクリップ機構を持たない）。`draw_text` はそのまま呼べば足りる。
+        let geom = TextGeom {
+            anchor,
+            content: text.content.clone(),
+            height: text.height_mm,
+            angle: 0.0,
+        };
+        draw_text(
+            painter,
+            rect,
+            viewport,
+            &geom,
+            text.height_mm * k,
+            FRAME_COLOR,
+        );
+    }
+}
+
+/// 用紙縁（用紙の外形矩形）を描く。**印刷対象ではない画面専用ヒント**
+/// （[`frame::FrameLayout`] には含めない。タスク39 では紙自体がページなので
+/// 縁線は不要になる、という区別を今から構造に入れる）。グリッドと同じ流儀の
+/// 固定 1px グレー線で描く（[`resolve_stroke_px_with_toggle`] を介さない）。
+fn draw_paper_edge(painter: &egui::Painter, rect: Rect, viewport: &Viewport, sheet: &SheetMeta) {
+    let (w, h) = sheet.paper_extent_mm();
+    let k = sheet.scale.world_mm_per_paper_mm();
+    let min = viewport.world_to_screen(rect, paper_to_world(Point2::new(0.0, 0.0), k));
+    let max = viewport.world_to_screen(rect, paper_to_world(Point2::new(w, h), k));
+    // world_to_screen は y 軸を反転するので、min/max の大小関係は画面座標では
+    // 入れ替わりうる。4辺を個別に線分として描けば向きを気にする必要がない。
+    let corners = [
+        Pos2::new(min.x, min.y),
+        Pos2::new(max.x, min.y),
+        Pos2::new(max.x, max.y),
+        Pos2::new(min.x, max.y),
+    ];
+    let stroke = Stroke::new(1.0, PAPER_EDGE_COLOR);
+    for i in 0..4 {
+        painter.line_segment([corners[i], corners[(i + 1) % 4]], stroke);
     }
 }
 
@@ -4066,13 +4598,117 @@ mod tests {
     #[test]
     fn app_shortcuts_gated_by_modal_and_text_focus() {
         // モーダル非表示かつテキスト欄フォーカスなしのときだけショートカットを処理する。
-        assert!(app_shortcuts_enabled(ConfirmState::Idle, false));
+        assert!(app_shortcuts_enabled(false, false));
         // 距離入力欄などテキスト欄フォーカス中は、undo/redo・ファイル操作・Ctrl+D・
         // ツール切替を一括で抑止する（Ctrl+Z がドキュメントを undo する等の競合防止）。
-        assert!(!app_shortcuts_enabled(ConfirmState::Idle, true));
-        // 未保存確認モーダル表示中は（フォーカス有無に関わらず）抑止する。
-        assert!(!app_shortcuts_enabled(ConfirmState::ConfirmingClose, false));
-        assert!(!app_shortcuts_enabled(ConfirmState::ConfirmingNew, true));
+        assert!(!app_shortcuts_enabled(false, true));
+        // モーダル表示中は（フォーカス有無に関わらず）抑止する。未保存確認・表題欄編集
+        // ダイアログのどちらも `McadApp::modal_open()` へ集約されるため、ここでは
+        // 集約後の bool のみを扱う（M8タスク38）。
+        assert!(!app_shortcuts_enabled(true, false));
+        assert!(!app_shortcuts_enabled(true, true));
+    }
+
+    #[test]
+    fn modal_open_covers_confirm_state_and_sheet_dialog() {
+        let mut app = McadApp::new();
+        assert!(!app.modal_open());
+
+        app.confirm_state = ConfirmState::ConfirmingNew;
+        assert!(app.modal_open());
+        app.confirm_state = ConfirmState::Idle;
+        assert!(!app.modal_open());
+
+        app.sheet_dialog = Some(TitleBlockDialogState::from_sheet(app.document.sheet()));
+        assert!(app.modal_open());
+        app.sheet_dialog = None;
+        assert!(!app.modal_open());
+    }
+
+    #[test]
+    fn title_block_dialog_to_sheet_replaces_only_fields() {
+        // OK で fields 全置換の SheetMeta が1つできる。尺度・用紙・様式・枠表示は
+        // base のまま変わらない（表題欄の記入内容だけを編集するダイアログのため）。
+        let mut base = SheetMeta {
+            scale: Scale::new(1, 2).unwrap(),
+            paper: PaperSize::A3,
+            title_block: TitleBlockKind::C,
+            frame_visible: true,
+            ..SheetMeta::default()
+        };
+        base.fields.drawing_number = "OLD-1".to_owned();
+
+        let mut dialog = TitleBlockDialogState::from_sheet(&base);
+        assert_eq!(dialog.drawing_number, "OLD-1");
+        dialog.drawing_number = "NEW-2".to_owned();
+        dialog.drawing_title = "新図面".to_owned();
+        dialog.projection = ProjectionMethod::FirstAngle;
+        dialog.author = "almaz".to_owned();
+        dialog.date = "2026-08-09".to_owned();
+        dialog.revision = "B".to_owned();
+
+        let updated = dialog.to_sheet(&base);
+        assert_eq!(updated.fields.drawing_number, "NEW-2");
+        assert_eq!(updated.fields.drawing_title, "新図面");
+        assert_eq!(updated.fields.projection, ProjectionMethod::FirstAngle);
+        assert_eq!(updated.fields.author, "almaz");
+        assert_eq!(updated.fields.date, "2026-08-09");
+        assert_eq!(updated.fields.revision, "B");
+        // fields 以外は base のまま。
+        assert_eq!(updated.scale, base.scale);
+        assert_eq!(updated.paper, base.paper);
+        assert_eq!(updated.title_block, base.title_block);
+        assert_eq!(updated.frame_visible, base.frame_visible);
+    }
+
+    #[test]
+    fn title_block_dialog_ok_applies_one_set_sheet_undo_unit_cancel_leaves_document_unchanged() {
+        // ダイアログ確定ロジック: OK で SheetMeta が1回の Command::SetSheet として
+        // 適用され undo 1単位になる。キャンセル相当（sheet_dialog を捨てるだけ）では
+        // document の世代が変わらないことを固定する（M8タスク38 完了条件 9）。
+        let mut document = Document::new();
+        let generation_before = document.generation();
+
+        let dialog = TitleBlockDialogState {
+            drawing_number: "MCAD-100".to_owned(),
+            drawing_title: "テスト図面".to_owned(),
+            projection: ProjectionMethod::FirstAngle,
+            author: "almaz".to_owned(),
+            date: "2026-08-09".to_owned(),
+            revision: "A".to_owned(),
+        };
+
+        // キャンセル: SheetMeta を組み立てずダイアログを破棄するだけなので document は不変。
+        assert_eq!(document.generation(), generation_before);
+
+        // OK: 1回の SetSheet で確定し、undo 1回で元に戻る。
+        let new_sheet = dialog.to_sheet(document.sheet());
+        document.apply(Command::SetSheet(new_sheet)).unwrap();
+        let generation_after_ok = document.generation();
+        assert_ne!(generation_after_ok, generation_before);
+        assert_eq!(document.sheet().fields.drawing_number, "MCAD-100");
+
+        assert!(document.undo());
+        assert_eq!(document.generation(), generation_before);
+        assert_eq!(document.sheet().fields.drawing_number, "");
+    }
+
+    #[test]
+    fn invalid_scale_input_does_not_issue_set_sheet() {
+        // M8タスク38 完了条件10: 不正尺度入力時に SetSheet を発行しない
+        // （document 世代・履歴とも不変）。`sheet_panel` の適用ボタンが行うのと同じ
+        // 「まず parse_scale_input で検証してから SetSheet」の流れを document レベルで
+        // 固定する。
+        let document = Document::new();
+        let generation_before = document.generation();
+
+        for bad in ["", "1", "1:2:3", "0:1", "1:0", "abc:1"] {
+            let result = frame::parse_scale_input(bad);
+            assert!(result.is_err(), "\"{bad}\" should be rejected");
+            // 拒否された場合、呼び出し側は SetSheet を組み立てない（アプリの
+            // sheet_panel と同じ分岐）ので document は一切変化しない。
+            assert_eq!(document.generation(), generation_before);
+        }
     }
 
     #[test]
@@ -4308,6 +4944,54 @@ mod tests {
     }
 
     #[test]
+    fn request_zoom_fit_also_fires_for_empty_document_when_frame_is_visible() {
+        // M8タスク38: 枠 ON のときは空文書でも用紙矩形がフィット対象になるため、
+        // エンティティ0件でも pending_zoom_fit が立つ（枠 OFF は既存挙動のまま）。
+        let mut app = McadApp::new();
+        app.document = Document::new();
+
+        app.viewport.zoom = 7.0;
+        app.request_zoom_fit();
+        assert!(!app.pending_zoom_fit, "枠 OFF は従来どおりリセットのみ");
+        assert_eq!(app.viewport, Viewport::new());
+
+        let mut sheet = app.document.sheet().clone();
+        sheet.frame_visible = true;
+        app.document.apply(Command::SetSheet(sheet)).unwrap();
+
+        app.viewport.zoom = 7.0;
+        app.pending_zoom_fit = false;
+        app.request_zoom_fit();
+        assert!(app.pending_zoom_fit, "枠 ON なら空文書でも pending が立つ");
+    }
+
+    #[test]
+    fn fit_target_aabb_unions_document_and_paper_when_frame_visible() {
+        // 枠 OFF: document_aabb のみ（既定挙動）。
+        let document = Document::new();
+        assert!(fit_target_aabb(&document).is_none());
+
+        // 枠 ON・空文書: 用紙矩形そのもの（A4横・1:1 の既定 = (0,0)-(297,210)）。
+        let mut document = Document::new();
+        let mut sheet = document.sheet().clone();
+        sheet.frame_visible = true;
+        document.apply(Command::SetSheet(sheet)).unwrap();
+        let aabb = fit_target_aabb(&document).expect("frame visible provides a paper aabb");
+        assert_eq!(aabb.min, Point2::new(0.0, 0.0));
+        assert_eq!(aabb.max, Point2::new(297.0, 210.0));
+
+        // 枠 ON・エンティティあり: document_aabb と用紙矩形の合併。
+        let mut document = sample_document();
+        let mut sheet = document.sheet().clone();
+        sheet.frame_visible = true;
+        document.apply(Command::SetSheet(sheet)).unwrap();
+        let doc_only = document_aabb(&document).unwrap();
+        let unioned = fit_target_aabb(&document).unwrap();
+        let paper = Aabb::new(Point2::new(0.0, 0.0), Point2::new(297.0, 210.0));
+        assert_eq!(unioned, doc_only.union(&paper));
+    }
+
+    #[test]
     fn new_document_resets_viewport_to_default() {
         let mut app = McadApp::new();
         app.viewport.zoom = 5.0;
@@ -4378,6 +5062,23 @@ mod tests {
 
         assert_eq!(app.text_height_input, DEFAULT_TEXT_HEIGHT);
         assert!(app.text_content_input.is_empty());
+    }
+
+    #[test]
+    fn reset_transient_ui_state_clears_sheet_dialog_and_scale_input() {
+        // M8タスク38: 表題欄編集ダイアログ・尺度カスタム入力も別図面へ持ち越さない。
+        let mut app = McadApp::new();
+        app.sheet_dialog = Some(TitleBlockDialogState::from_sheet(app.document.sheet()));
+        app.scale_custom_selected = true;
+        app.scale_custom_input = "1:2".to_owned();
+        app.scale_input_error = Some("dummy".to_owned());
+
+        app.reset_transient_ui_state();
+
+        assert!(app.sheet_dialog.is_none());
+        assert!(!app.scale_custom_selected);
+        assert!(app.scale_custom_input.is_empty());
+        assert!(app.scale_input_error.is_none());
     }
 
     #[test]

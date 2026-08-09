@@ -20,6 +20,9 @@
 //! - `draw_preview` は `Viewport::world_to_screen` がスクリーン矩形を引数に取る
 //!   （`Viewport` 自身はスクリーン矩形を保持しない設計、`viewport.rs` 参照）ため、
 //!   `rect: egui::Rect` を追加引数として受け取る
+//! - `draw_preview` は紙基準表示トグル（タスク37）の分岐を寸法プレビューへ渡すため、
+//!   `paper_display: bool, k: f64` も追加引数として受け取る（`crate::dim_sizes` 参照）。
+//!   寸法ツール以外の実装は無視してよい
 //! - 入力 `InputEvent` はワールド座標（[`Point2`]）とキー操作のみからなる軽量な列挙型
 //!   にし、egui の生入力（`egui::Event` 等）に依存しない。これにより GUI なしで
 //!   ツールの状態遷移を単体テストできる（本ファイル末尾の `tests` 参照）
@@ -180,7 +183,14 @@ pub trait Tool {
     fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult;
 
     /// 未確定の途中経過（クリック済み点・マウス追従中の線など）をプレビュー描画する。
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport);
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        paper_display: bool,
+        k: f64,
+    );
 
     /// 作図中（未確定）の頂点列。スナップエンジン（`crate::snap::snap`）が端点
     /// （最優先）候補として扱う。まだ `Document` に存在しない自分自身の頂点へも
@@ -344,7 +354,14 @@ impl Tool for PointTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         if let Some(p) = self.cursor {
             draw_shape(
                 painter,
@@ -414,7 +431,14 @@ impl Tool for LineTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         if let (LineState::WaitingSecond(first), Some(cursor)) = (&self.state, self.cursor) {
             draw_shape(
                 painter,
@@ -493,7 +517,14 @@ impl Tool for CircleTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         if let (CircleState::WaitingRadiusPoint(center), Some(cursor)) = (&self.state, self.cursor)
         {
             let radius = center.distance(cursor);
@@ -603,7 +634,14 @@ impl Tool for ArcTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         match (&self.state, self.cursor) {
             (ArcState::WaitingP2(p1), Some(cursor)) => {
                 draw_shape(
@@ -717,7 +755,14 @@ impl Tool for PolylineTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         if self.vertices.is_empty() {
             return;
         }
@@ -810,7 +855,14 @@ impl Tool for TextTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         // アンカー確定後はその位置に小さな十字マーカーを描く（文字列プレビューは
         // 文字列・高さを持つ app 層が別途描く）。未確定時はカーソルにマーカーを描く。
         let mark = match self.state {
@@ -913,7 +965,14 @@ impl Tool for DimLinearTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        paper_display: bool,
+        k: f64,
+    ) {
         match (self.state, self.cursor) {
             // p2 待ち: 計測線の暫定（p1→カーソル）を細線で示す。
             (DimLinearState::WaitingP2(p1), Some(cursor)) => {
@@ -931,7 +990,7 @@ impl Tool for DimLinearTool {
             (DimLinearState::WaitingLine(p1, p2), Some(cursor)) => {
                 let offset = linear_offset(p1, p2, cursor);
                 let dim = DimLinear { p1, p2, offset };
-                let (arrow_len, text_height) = crate::dim_sizes(viewport.zoom);
+                let (arrow_len, text_height) = crate::dim_sizes(paper_display, k, viewport.zoom);
                 let ex = crate::dimension::expand_linear(&dim, arrow_len, text_height);
                 crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
             }
@@ -1013,7 +1072,14 @@ impl Tool for DimRadialTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        paper_display: bool,
+        k: f64,
+    ) {
         if let (DimRadialState::WaitingLeader { center, radius }, Some(cursor)) =
             (self.state, self.cursor)
         {
@@ -1028,7 +1094,7 @@ impl Tool for DimRadialTool {
                 radius,
                 leader_angle,
             };
-            let (arrow_len, text_height) = crate::dim_sizes(viewport.zoom);
+            let (arrow_len, text_height) = crate::dim_sizes(paper_display, k, viewport.zoom);
             let ex = crate::dimension::expand_radial(&dim, arrow_len, text_height);
             crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
         }
@@ -1237,7 +1303,14 @@ impl BoundaryTargetTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         // 選択済みの境界だけをハイライトして「今どちらを選んだか」を示す。カーソル追従の
         // ライブプレビューは行わない（上記のとおり）。
         if let BoundaryTargetState::WaitingTarget { boundary } = &self.state {
@@ -1316,8 +1389,16 @@ macro_rules! impl_tool_for_boundary_target {
                 self.0.on_input(ev)
             }
 
-            fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
-                self.0.draw_preview(painter, rect, viewport);
+            fn draw_preview(
+                &self,
+                painter: &Painter,
+                rect: Rect,
+                viewport: &Viewport,
+                paper_display: bool,
+                k: f64,
+            ) {
+                self.0
+                    .draw_preview(painter, rect, viewport, paper_display, k);
             }
 
             fn wants_shape_pick(&self) -> bool {
@@ -1472,7 +1553,14 @@ impl Tool for FilletTool {
         }
     }
 
-    fn draw_preview(&self, painter: &Painter, rect: Rect, viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         // 選んだ 1 本目だけをハイライトする（トリム・延長が境界を示すのと同じ流儀）。
         if let FilletState::WaitingSecondLine { first, .. } = &self.state {
             draw_shape(
@@ -1579,7 +1667,14 @@ impl Tool for SplitTool {
         }
     }
 
-    fn draw_preview(&self, _painter: &Painter, _rect: Rect, _viewport: &Viewport) {
+    fn draw_preview(
+        &self,
+        _painter: &Painter,
+        _rect: Rect,
+        _viewport: &Viewport,
+        _paper_display: bool,
+        _k: f64,
+    ) {
         // 単一状態でハイライトすべき「選択済みの一部」が無いため、他ツールと違い
         // プレビュー描画自体を持たない。
     }
@@ -1964,10 +2059,14 @@ impl SelectTool {
         // そちらを優先できる）。寸法は展開線分（寸法線・補助線・引出線）への最近距離
         // （`dimension` の純関数）。いずれも「tol 以内で最も近いものを拾う」統一比較に
         // 素直に載る連続距離で、2 値判定（線の上/外）にはしない（M6 タスク23 の教訓）。
+        let k = document.sheet().scale.world_mm_per_paper_mm();
         pick_nearest(document, tol, |id, entity| {
             let d = match &entity.geom {
                 EntityGeom::Shape(shape) => distance_to(shape, world),
-                EntityGeom::Text(_) => entity.geom.aabb().distance_to_point(world),
+                // Text は紙基準表示（タスク37）の判断(g): ピック形状（AABB）は
+                // height×k のワールド AABB へ追従させる（判断(c)により Text は
+                // トグル非依存で常に height×k）。
+                EntityGeom::Text(text) => crate::text_world_aabb(text, k).distance_to_point(world),
                 EntityGeom::DimLinear(dim) => crate::dimension::linear_distance(dim, world),
                 EntityGeom::DimRadial(dim) => crate::dimension::radial_distance(dim, world),
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は近似 aabb への
@@ -2025,10 +2124,17 @@ impl SelectTool {
             return;
         };
         let rect = Aabb::from_corners(start, world);
+        let k = document.sheet().scale.world_mm_per_paper_mm();
+        let entity_aabb = |e: &Entity| match &e.geom {
+            // Text は紙基準表示（タスク37）の判断(g): 矩形選択の内包判定も
+            // height×k のワールド AABB を使う。
+            EntityGeom::Text(text) => crate::text_world_aabb(text, k),
+            _ => e.geom.aabb(),
+        };
         self.selection = document
             .entities()
             .filter(|(_, e)| layer_visible(document, e))
-            .filter(|(_, e)| rect.contains(&e.geom.aabb()))
+            .filter(|(_, e)| rect.contains(&entity_aabb(e)))
             .map(|(id, _)| id)
             .collect();
     }
@@ -4465,6 +4571,52 @@ mod tests {
         // tol が距離未満なら依然ヒットしない。
         let mut tool = SelectTool::default();
         tool.on_click(&doc, Point2::new(-2.1, 1.0), 0.05, false);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn pick_text_follows_sheet_scale_paper_display_aabb() {
+        // タスク37 判断(g): Text のピック形状（AABB）は尺度（k）に追従する。
+        // Text "Ab" 高さ 2、アンカー原点。1:1 の近似 aabb は x∈[0,2.2], y∈[0,2]。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let entity = Entity::new(
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::ORIGIN,
+                content: "Ab".to_owned(),
+                height: 2.0,
+                angle: 0.0,
+            }),
+            layer,
+            Style::inherited(),
+        );
+        let t = doc.apply(Command::AddEntity(entity)).unwrap().entities[0];
+        let click = Point2::new(3.0, 3.0);
+        let tol = 0.01;
+
+        // 1:1（既定尺度）: click は aabb（x∈[0,2.2], y∈[0,2]）の外側で tol 未満 → 拾わない。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, click, tol, false);
+        assert!(tool.selection().is_empty());
+
+        // 1:2（k=2）: aabb が x∈[0,4.4], y∈[0,4] へ広がり click を内包 → 拾う。
+        doc.apply(Command::SetSheet(mcad_core::SheetMeta {
+            scale: mcad_core::Scale::new(1, 2).unwrap(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, click, tol, false);
+        assert_eq!(tool.selection(), &[t]);
+
+        // 2:1（k=0.5）: aabb が x∈[0,1.1], y∈[0,1] へ縮み click は依然 tol 外 → 拾わない。
+        doc.apply(Command::SetSheet(mcad_core::SheetMeta {
+            scale: mcad_core::Scale::new(2, 1).unwrap(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, click, tol, false);
         assert!(tool.selection().is_empty());
     }
 

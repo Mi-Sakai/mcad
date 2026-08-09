@@ -16,8 +16,10 @@
 //! （矢印・文字の見かけの大きさに依存しない。M6 タスク23 の Text ヒットテストで得た教訓）。
 //!
 //! 寸法線・補助線・引出線の **位置は保存データだけで決まる**（矢先と文字の *大きさ* のみ
-//! スクリーン固定 px をズームで割ったワールド長で与える）。したがって pick 用の線分
-//! （[`linear_pick_segments`] / [`radial_pick_segments`]）は矢印・文字サイズを引数に取らない。
+//! ワールド長で与える。紙基準表示トグル（タスク37、`main.rs` の `dim_sizes`）に応じて
+//! スクリーン固定 px をズームで割るモードと、紙 mm 定数を `k` 倍するモードの 2 通りが
+//! ある）。したがって pick 用の線分（[`linear_pick_segments`] / [`radial_pick_segments`]）
+//! は矢印・文字サイズを引数に取らない。
 
 use mcad_core::{DimLinear, DimRadial, TextGeom};
 use mcad_geom::{LineSeg, Point2, Vec2};
@@ -91,8 +93,10 @@ pub fn linear_distance(dim: &DimLinear, p: Point2) -> f64 {
     }
 }
 
-/// 長さ寸法を展開する。`arrow_len`・`text_height` はワールド長（呼び出し側がスクリーン
-/// 固定 px ÷ ズームで与える）。値ラベルは `{:.2}`（DESIGN.md M6 設計判断2）。
+/// 長さ寸法を展開する。`arrow_len`・`text_height` はワールド長。呼び出し側（`main.rs`
+/// の `dim_sizes`）は紙基準表示トグル（タスク37）に応じて 2 通りで与える:
+/// 紙基準表示 OFF はスクリーン固定 px ÷ ズーム、ON は紙 mm 定数 × `k`。値ラベルは
+/// `{:.2}`（DESIGN.md M6 設計判断2）。
 #[must_use]
 pub fn expand_linear(dim: &DimLinear, arrow_len: f64, text_height: f64) -> DimExpansion {
     // 退化時も破綻しない安全な既定方向（+x）を使う。通常はツールが p1≈p2 を弾く。

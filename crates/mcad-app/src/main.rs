@@ -184,7 +184,8 @@ fn resolve_stroke_px(width_mm: f32, k: f64, zoom: f64) -> f32 {
     raw_px.max(f64::from(MIN_STROKE_PX)) as f32
 }
 
-/// 線幅表示（タスク36b、AutoCAD の LWDISPLAY 相当）の ON/OFF を反映して画面 px の
+/// 紙基準表示（タスク36b で「線幅表示」として導入、タスク37 で寸法注記・Text も含む
+/// 「紙基準表示」へ拡張、AutoCAD の LWDISPLAY 相当）の ON/OFF を反映して画面 px の
 /// 線幅を決める。OFF なら `width_mm`・`k`・`zoom` に関わらず常に [`MIN_STROKE_PX`]
 /// （タスク36 以前と同じ固定 1px）、ON なら [`resolve_stroke_px`] をそのまま使う
 /// （紙 mm 基準・ズーム比例）。
@@ -193,13 +194,8 @@ fn resolve_stroke_px(width_mm: f32, k: f64, zoom: f64) -> f32 {
 /// （常に紙 mm 基準のまま。DESIGN.md M8 設計判断5 実装時追記）。分岐をこの関数へ
 /// 集約し、`draw_entities` 側で形状・寸法（`DimLinear`/`DimRadial`）の両方に
 /// 同じ規則を適用する。GUI 非依存の純関数なので単体テストできる。
-fn resolve_stroke_px_with_toggle(
-    lineweight_display: bool,
-    width_mm: f32,
-    k: f64,
-    zoom: f64,
-) -> f32 {
-    if lineweight_display {
+fn resolve_stroke_px_with_toggle(paper_display: bool, width_mm: f32, k: f64, zoom: f64) -> f32 {
+    if paper_display {
         resolve_stroke_px(width_mm, k, zoom)
     } else {
         MIN_STROKE_PX
@@ -442,12 +438,21 @@ const MIN_TEXT_PX: f64 = 1.0;
 /// 防ぐため、描画サイズをここで頭打ちにする（ワールド固定サイズの近似上限）。
 const MAX_TEXT_PX: f64 = 4096.0;
 
-/// 寸法の矢先の長さ（スクリーンピクセル）。ワールド長へは `DIM_ARROW_PX / zoom` で換算する。
-/// 注釈（矢印・文字）は縮尺に関わらず読める大きさに保つため、ピック許容量と同じく
-/// スクリーン固定 px をズームで割る（DESIGN.md M6 設計判断2 の展開は純関数側、大きさは app 側）。
+/// 寸法の矢先の長さ（紙基準表示 OFF 時の画面固定ピクセル）。ワールド長へは
+/// `DIM_ARROW_PX / zoom` で換算する。OFF のときは注釈（矢印・文字）を縮尺に関わらず
+/// 読める大きさに保つため、ピック許容量と同じくスクリーン固定 px をズームで割る
+/// （DESIGN.md M6 設計判断2 の展開は純関数側、大きさは app 側）。ON 時は
+/// [`DIM_ARROW_MM`] を使う（タスク37、[`dim_sizes`] 参照）。
 const DIM_ARROW_PX: f64 = 12.0;
-/// 寸法値ラベルの文字高さ（スクリーンピクセル）。ワールド高さへは `DIM_TEXT_PX / zoom`。
+/// 寸法値ラベルの文字高さ（紙基準表示 OFF 時の画面固定ピクセル）。ワールド高さへは
+/// `DIM_TEXT_PX / zoom`。ON 時は [`DIM_TEXT_MM`] を使う（タスク37、[`dim_sizes`] 参照）。
 const DIM_TEXT_PX: f64 = 14.0;
+/// 寸法値ラベルの文字高さ（紙 mm）。製図規定 第6章の呼び 3.5。紙基準表示 ON 時に
+/// [`dim_sizes`] が `k` 倍してワールド長へ換算する（タスク37）。
+const DIM_TEXT_MM: f64 = 3.5;
+/// 寸法の矢先の長さ（紙 mm）。紙基準表示 ON 時に [`dim_sizes`] が `k` 倍してワールド長へ
+/// 換算する（タスク37）。
+const DIM_ARROW_MM: f64 = 3.0;
 
 /// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O の3経路で共有）。
 ///
@@ -609,14 +614,18 @@ struct McadApp {
     /// 水平・垂直な方向へ拘束する（`ortho.rs`、`resolve_click_point` 参照）。
     /// `snap_enabled` と同じく実行時フィールドのみで永続化しない（M8まで）。
     ortho_enabled: bool,
-    /// 線幅表示（タスク36b、AutoCAD の LWDISPLAY 相当）の有効/無効。`F9` でトグルする
-    /// （既定は無効 = OFF）。OFF のときは全エンティティを [`MIN_STROKE_PX`] 固定
-    /// （ズーム非依存）で描く。ON のときはタスク36 の紙 mm 基準 `resolve_stroke_px`
-    /// をそのまま使う（ズームに比例して太くなる）。タスク38 の図面枠実線・タスク39/40
-    /// の SVG/PDF 出力が紙 mm 基準を前提とするため、画面と出力の一致確認に ON が要る
-    /// （DESIGN.md M8 設計判断5 実装時追記）。`ortho_enabled` と同じく実行時フィールド
+    /// 紙基準表示（タスク37。旧: 線幅表示、タスク36b）の有効/無効。`F9` でトグルする
+    /// （既定は無効 = OFF）。OFF のときは全エンティティの線幅を [`MIN_STROKE_PX`] 固定
+    /// （ズーム非依存）で描き、寸法注記（矢印・文字）と線幅はスクリーン固定 px
+    /// （[`DIM_ARROW_PX`]/[`DIM_TEXT_PX`]）のまま。ON のときは線幅がタスク36 の紙 mm 基準
+    /// `resolve_stroke_px`（ズームに比例して太くなる）、寸法注記が紙 mm 定数
+    /// （[`DIM_ARROW_MM`]/[`DIM_TEXT_MM`]）を `k` 倍したワールド長になる（`dim_sizes`）。
+    /// タスク38 の図面枠実線・タスク39/40 の SVG/PDF 出力が紙 mm 基準を前提とするため、
+    /// 画面と出力の一致確認に ON が要る（DESIGN.md M8 設計判断5 実装時追記・判断4
+    /// 実装時追記）。Text エンティティの表示（`height * k`）はこのトグルの影響を受けない
+    /// （判断4 実装時追記、常に紙 mm 解釈）。`ortho_enabled` と同じく実行時フィールド
     /// のみで永続化しない（タスク41 で config.json へ相乗りする予定）。
-    lineweight_display_enabled: bool,
+    paper_display_enabled: bool,
     /// ステータスバーに一時表示するメッセージ（主にコア操作のエラー通知）。
     /// メッセージごとに保持している表示時間（[`StatusMessage::duration_secs`]、通常は
     /// [`STATUS_MESSAGE_SECS`]、ファイル入出力の結果は [`STATUS_MESSAGE_SECS_IMPORTANT`]）
@@ -708,7 +717,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "Esc=Cancel",
     "F3=Snap",
     "F8=Ortho",
-    "F9=Lineweight Display",
+    "F9=Paper View",
     "Ctrl+Z=Undo",
     "Ctrl+Y=Redo",
     "Ctrl+N=New",
@@ -850,7 +859,7 @@ impl McadApp {
             snap_enabled: true,
             snap_marker: None,
             ortho_enabled: false,
-            lineweight_display_enabled: false,
+            paper_display_enabled: false,
             status: None,
             current_path: None,
             confirm_state: ConfirmState::Idle,
@@ -1344,10 +1353,18 @@ fn ensure_dxf_extension(path: PathBuf) -> PathBuf {
 
 /// ドキュメント中の全エンティティを包む AABB。エンティティが1つもなければ `None`
 /// （M4タスク13: ズームフィット対象の算出。[`Viewport::fit_to_aabb`] に渡す）。
+///
+/// Text は表示上のワールド AABB（[`text_world_aabb`]、`height * k`）を使う（タスク37。
+/// 判断(c)により Text はトグル非依存で常に `height * k` のため、ズームフィットも
+/// これに合わせないと拡大された文字がフィット範囲からはみ出す）。
 fn document_aabb(document: &Document) -> Option<Aabb> {
+    let k = document.sheet().scale.world_mm_per_paper_mm();
     document
         .entities()
-        .map(|(_, entity)| entity.geom.aabb())
+        .map(|(_, entity)| match &entity.geom {
+            EntityGeom::Text(text) => text_world_aabb(text, k),
+            _ => entity.geom.aabb(),
+        })
         .reduce(|acc, bb| acc.union(&bb))
 }
 
@@ -1552,11 +1569,11 @@ impl eframe::App for McadApp {
             self.ortho_enabled = !self.ortho_enabled;
         }
 
-        // F9 で線幅表示（タスク36b、AutoCAD の LWDISPLAY 相当）の有効/無効をトグルする。
-        // F3/F8 と同じガード条件（モーダル非表示中は常に効く）。専用マーカーは不要
-        // なので、トグル自体はフラグの反転のみでよい（ortho と同じ形）。
+        // F9 で紙基準表示（タスク37。旧: 線幅表示、タスク36b。AutoCAD の LWDISPLAY 相当）の
+        // 有効/無効をトグルする。F3/F8 と同じガード条件（モーダル非表示中は常に効く）。
+        // 専用マーカーは不要なので、トグル自体はフラグの反転のみでよい（ortho と同じ形）。
         if self.confirm_state == ConfirmState::Idle && ui.input(|i| i.key_pressed(Key::F9)) {
-            self.lineweight_display_enabled = !self.lineweight_display_enabled;
+            self.paper_display_enabled = !self.paper_display_enabled;
         }
 
         // 表示時間を過ぎたステータスメッセージは消す。
@@ -1586,8 +1603,8 @@ impl eframe::App for McadApp {
                     ));
                     ui.separator();
                     ui.label(format!(
-                        "Lineweight: {}",
-                        if self.lineweight_display_enabled {
+                        "Paper view: {}",
+                        if self.paper_display_enabled {
                             "ON"
                         } else {
                             "OFF"
@@ -1746,13 +1763,18 @@ impl eframe::App for McadApp {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 0.0, Color32::from_gray(30));
 
+            // 紙 1mm あたりのワールド mm（判断4）。線幅（`draw_entities`）・寸法注記
+            // （`draw_selection`・`tool.draw_preview`）・Text（`draw_text`）が共通で使う
+            // （タスク37）。
+            let k = self.document.sheet().scale.world_mm_per_paper_mm();
+
             draw_grid(&painter, rect, &self.viewport);
             draw_entities(
                 &painter,
                 rect,
                 &self.document,
                 &self.viewport,
-                self.lineweight_display_enabled,
+                self.paper_display_enabled,
             );
             draw_selection(
                 &painter,
@@ -1761,12 +1783,21 @@ impl eframe::App for McadApp {
                 &self.viewport,
                 &self.select_tool,
                 offset_distance,
+                self.paper_display_enabled,
+                k,
             );
             if let Some(tool) = &self.tool {
-                tool.draw_preview(&painter, rect, &self.viewport);
+                tool.draw_preview(
+                    &painter,
+                    rect,
+                    &self.viewport,
+                    self.paper_display_enabled,
+                    k,
+                );
             }
             // Text ツールでアンカー確定後は、入力中の文字列を実サイズ・実位置でプレビューする
             // （文字列・高さを持つ app 層でしか描けないため、tool.draw_preview とは別にここで）。
+            // Text はトグル非依存で常に `height * k`（判断(c)）。
             if self.tool_kind == ToolKind::Text
                 && let Some(anchor) = self.tool.as_ref().and_then(|t| t.pending_text_anchor())
                 && let Some(height) = parse_text_height(&self.text_height_input)
@@ -1778,7 +1809,14 @@ impl eframe::App for McadApp {
                     height,
                     angle: 0.0,
                 };
-                draw_text(&painter, rect, &self.viewport, &preview, TEXT_PREVIEW_COLOR);
+                draw_text(
+                    &painter,
+                    rect,
+                    &self.viewport,
+                    &preview,
+                    preview.height * k,
+                    TEXT_PREVIEW_COLOR,
+                );
             }
             if let Some(marker) = &self.snap_marker {
                 draw_snap_marker(&painter, rect, &self.viewport, marker);
@@ -3169,19 +3207,29 @@ fn draw_grid_lines(
 ///   （＝エンティティの追加順）のまま。[`Vec::sort_by_key`] が安定ソートであることに
 ///   依存している。
 ///
-/// 性能: 並べ替えるのはカリング後の可視エンティティ `k` 件のみで、全エンティティは
-/// ソートしない（`O(k log k)`）。将来 `k` が数万規模になったら「重ね順やエンティティ
-/// 集合が変わったときだけ再計算するキャッシュ」が対策になるが、現状の作図規模では
-/// フレーム時間に測れる影響がないため先回りしない。
+/// 性能: 並べ替えるのはカリング後の可視エンティティの件数のみで、全エンティティは
+/// ソートしない（`O(n log n)`、`n` は可視件数）。将来 `n` が数万規模になったら
+/// 「重ね順やエンティティ集合が変わったときだけ再計算するキャッシュ」が対策になるが、
+/// 現状の作図規模ではフレーム時間に測れる影響がないため先回りしない。
+///
+/// `k` は紙 1mm あたりのワールド mm（判断4）。Text のカリング判定は表示上のワールド
+/// AABB（[`text_world_aabb`]、`height * k`）で行う（タスク37。判断(c)により Text は
+/// トグル非依存で常に `height * k` を使う）。
 fn entities_in_draw_order<'a>(
     document: &'a Document,
     visible: &Aabb,
+    k: f64,
 ) -> Vec<(EntityId, &'a Entity, &'a Layer)> {
+    let entity_aabb = |entity: &Entity| match &entity.geom {
+        EntityGeom::Text(text) => text_world_aabb(text, k),
+        _ => entity.geom.aabb(),
+    };
     let mut drawable: Vec<(EntityId, &Entity, &Layer)> = document
         .entities()
         .filter_map(|(id, entity)| {
             let layer = document.layer(entity.layer)?;
-            (layer.visible && entity.geom.aabb().intersects(visible)).then_some((id, entity, layer))
+            (layer.visible && entity_aabb(entity).intersects(visible))
+                .then_some((id, entity, layer))
         })
         .collect();
     drawable.sort_by_key(|(_, _, layer)| layer.order);
@@ -3199,33 +3247,53 @@ fn draw_entities(
     rect: Rect,
     document: &Document,
     viewport: &Viewport,
-    lineweight_display_enabled: bool,
+    paper_display_enabled: bool,
 ) {
     let visible = viewport.visible_aabb(rect);
     let k = document.sheet().scale.world_mm_per_paper_mm();
-    for (_id, entity, layer) in entities_in_draw_order(document, &visible) {
+    for (_id, entity, layer) in entities_in_draw_order(document, &visible, k) {
         let color = to_color32(entity.style.effective_color(layer.color));
         let width_mm = entity.style.effective_width(layer.width_mm).mm();
         let stroke_px =
-            resolve_stroke_px_with_toggle(lineweight_display_enabled, width_mm, k, viewport.zoom);
+            resolve_stroke_px_with_toggle(paper_display_enabled, width_mm, k, viewport.zoom);
         let linetype = entity.style.effective_linetype(layer.linetype);
         match &entity.geom {
             EntityGeom::Shape(shape) => {
                 let stroke = Stroke::new(stroke_px, color);
                 draw_shape(painter, rect, viewport, shape, stroke, linetype, k);
             }
-            EntityGeom::Text(text) => draw_text(painter, rect, viewport, text, color),
+            // Text はトグル非依存で常に `height * k`（判断(c)、二重換算防止は
+            // `draw_text` のワールド高さ明示引数化で担保する）。
+            EntityGeom::Text(text) => {
+                draw_text(painter, rect, viewport, text, text.height * k, color)
+            }
             EntityGeom::DimLinear(dim) => {
                 // 寸法は製図慣行として常に実線で描く（線種は形状エンティティのみが
                 // 対象。DESIGN.md M8 タスク36 は `draw_shape` が扱う形状に限定）。
                 // 線幅の紙 mm 解決はここでも同じ式を適用し、既定 0.35mm 相当で
                 // 従来と同じ見た目を保つ。
                 let stroke = Stroke::new(stroke_px, color);
-                draw_dim_linear(painter, rect, viewport, dim, stroke);
+                draw_dim_linear(
+                    painter,
+                    rect,
+                    viewport,
+                    dim,
+                    stroke,
+                    paper_display_enabled,
+                    k,
+                );
             }
             EntityGeom::DimRadial(dim) => {
                 let stroke = Stroke::new(stroke_px, color);
-                draw_dim_radial(painter, rect, viewport, dim, stroke);
+                draw_dim_radial(
+                    painter,
+                    rect,
+                    viewport,
+                    dim,
+                    stroke,
+                    paper_display_enabled,
+                    k,
+                );
             }
             // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
             _ => {}
@@ -3233,10 +3301,19 @@ fn draw_entities(
     }
 }
 
-/// 寸法の矢先の長さ・文字高さ（ワールド）。スクリーン固定 px をズームで割る
-/// （[`DIM_ARROW_PX`] / [`DIM_TEXT_PX`] の doc 参照）。
-fn dim_sizes(zoom: f64) -> (f64, f64) {
-    (DIM_ARROW_PX / zoom, DIM_TEXT_PX / zoom)
+/// 寸法の矢先の長さ・文字高さをワールド長で解決する（戻り値: `(arrow_len, text_height)`）。
+///
+/// 紙基準表示 ON（`paper_display`）: 紙 mm 定数（[`DIM_ARROW_MM`]/[`DIM_TEXT_MM`]）× `k`
+/// （ズーム非依存 → 図形と一緒に拡縮し、タスク39/40 の SVG/PDF 出力と一致する）。
+/// OFF: 画面固定 px（[`DIM_ARROW_PX`]/[`DIM_TEXT_PX`]）÷ `zoom`（タスク36b までの現行の
+/// 見た目）。ON モードの注記サイズに px 下限クランプは設けない（[`draw_text`] 既存の
+/// [`MIN_TEXT_PX`] 未満スキップに任せる）。タスク37。
+fn dim_sizes(paper_display: bool, k: f64, zoom: f64) -> (f64, f64) {
+    if paper_display {
+        (DIM_ARROW_MM * k, DIM_TEXT_MM * k)
+    } else {
+        (DIM_ARROW_PX / zoom, DIM_TEXT_PX / zoom)
+    }
 }
 
 /// 長さ寸法を描画する（純関数 helper [`dimension::expand_linear`] の展開を Painter へ）。
@@ -3246,8 +3323,10 @@ fn draw_dim_linear(
     viewport: &Viewport,
     dim: &DimLinear,
     stroke: Stroke,
+    paper_display: bool,
+    k: f64,
 ) {
-    let (arrow_len, text_height) = dim_sizes(viewport.zoom);
+    let (arrow_len, text_height) = dim_sizes(paper_display, k, viewport.zoom);
     let ex = dimension::expand_linear(dim, arrow_len, text_height);
     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
 }
@@ -3259,8 +3338,10 @@ fn draw_dim_radial(
     viewport: &Viewport,
     dim: &DimRadial,
     stroke: Stroke,
+    paper_display: bool,
+    k: f64,
 ) {
-    let (arrow_len, text_height) = dim_sizes(viewport.zoom);
+    let (arrow_len, text_height) = dim_sizes(paper_display, k, viewport.zoom);
     let ex = dimension::expand_radial(dim, arrow_len, text_height);
     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
 }
@@ -3268,6 +3349,11 @@ fn draw_dim_radial(
 /// 寸法の展開結果（線分・矢先・文字）を Painter へ描く。プレビュー（`tool.rs` の
 /// `draw_preview`）と確定描画・選択ハイライトが共有する（`crate::draw_dim_expansion`）。
 /// 矢先は `stroke.color` で塗りつぶし、文字は既存の [`draw_text`] を再利用する。
+///
+/// `ex.text.height` は [`dimension::expand_linear`]/[`dimension::expand_radial`] が
+/// `dim_sizes` の戻り値（既にワールド長）から組み立てた `TextGeom` の高さなので、
+/// ここでは**そのまま** `draw_text` のワールド高さ引数へ渡す（`k` を掛けると二重換算に
+/// なる。タスク37 判断(d)）。
 fn draw_dim_expansion(
     painter: &egui::Painter,
     rect: Rect,
@@ -3287,12 +3373,20 @@ fn draw_dim_expansion(
             .collect();
         painter.add(egui::Shape::convex_polygon(pts, stroke.color, Stroke::NONE));
     }
-    draw_text(painter, rect, viewport, &ex.text, stroke.color);
+    draw_text(
+        painter,
+        rect,
+        viewport,
+        &ex.text,
+        ex.text.height,
+        stroke.color,
+    );
 }
 
 /// 選択ハイライトと、進行中のプレビュー（矩形選択枠・複製/移動配置の仮表示）を描画する。
 ///
 /// `draw_entities` の後に呼び、選択エンティティを強調色で上書きする（[`draw_shape`] 再利用）。
+#[allow(clippy::too_many_arguments)]
 fn draw_selection(
     painter: &egui::Painter,
     rect: Rect,
@@ -3300,6 +3394,8 @@ fn draw_selection(
     viewport: &Viewport,
     select_tool: &SelectTool,
     offset_distance: Option<f64>,
+    paper_display: bool,
+    k: f64,
 ) {
     let highlight = Stroke::new(SELECTION_WIDTH, SELECTION_COLOR);
 
@@ -3308,7 +3404,16 @@ fn draw_selection(
     // 位置ではゴーストを描かない（設計判断5）。オフセットは通常の配置・矩形選択とは
     // 排他なので、こちらを最優先で処理する。
     if select_tool.is_offsetting() {
-        draw_selected(painter, rect, document, viewport, select_tool, highlight);
+        draw_selected(
+            painter,
+            rect,
+            document,
+            viewport,
+            select_tool,
+            highlight,
+            paper_display,
+            k,
+        );
         if let Some(ghost) = select_tool.offset_preview(document, offset_distance) {
             let preview = Stroke::new(SELECTION_WIDTH, OFFSET_PREVIEW_COLOR);
             draw_shape(
@@ -3341,14 +3446,22 @@ fn draw_selection(
                             1.0,
                         );
                     }
+                    // Text はトグル非依存で常に `height * k`（判断(c)）。
                     EntityGeom::Text(text) => {
-                        draw_text(painter, rect, viewport, &text, highlight.color);
+                        draw_text(
+                            painter,
+                            rect,
+                            viewport,
+                            &text,
+                            text.height * k,
+                            highlight.color,
+                        );
                     }
                     EntityGeom::DimLinear(dim) => {
-                        draw_dim_linear(painter, rect, viewport, &dim, highlight);
+                        draw_dim_linear(painter, rect, viewport, &dim, highlight, paper_display, k);
                     }
                     EntityGeom::DimRadial(dim) => {
-                        draw_dim_radial(painter, rect, viewport, &dim, highlight);
+                        draw_dim_radial(painter, rect, viewport, &dim, highlight, paper_display, k);
                     }
                     // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
                     _ => {}
@@ -3362,7 +3475,16 @@ fn draw_selection(
     match select_tool.placement_preview() {
         // 複製: 元の選択を強調したまま、複製先を重ねて仮表示する。
         Some(PlacementPreview::Duplicate { delta }) => {
-            draw_selected(painter, rect, document, viewport, select_tool, highlight);
+            draw_selected(
+                painter,
+                rect,
+                document,
+                viewport,
+                select_tool,
+                highlight,
+                paper_display,
+                k,
+            );
             draw_ghost(&|g| g.translated(delta));
             return;
         }
@@ -3386,7 +3508,16 @@ fn draw_selection(
     match select_tool.drag_preview() {
         Some(DragPreview::Rect { start, current }) => {
             // 矩形選択中: 現在の選択はそのまま強調しつつ、ドラッグ矩形を描く。
-            draw_selected(painter, rect, document, viewport, select_tool, highlight);
+            draw_selected(
+                painter,
+                rect,
+                document,
+                viewport,
+                select_tool,
+                highlight,
+                paper_display,
+                k,
+            );
             let a = viewport.world_to_screen(rect, start);
             let b = viewport.world_to_screen(rect, current);
             let r = Rect::from_two_pos(a, b);
@@ -3397,11 +3528,21 @@ fn draw_selection(
             painter.line_segment([r.right_bottom(), r.left_bottom()], outline);
             painter.line_segment([r.left_bottom(), r.left_top()], outline);
         }
-        None => draw_selected(painter, rect, document, viewport, select_tool, highlight),
+        None => draw_selected(
+            painter,
+            rect,
+            document,
+            viewport,
+            select_tool,
+            highlight,
+            paper_display,
+            k,
+        ),
     }
 }
 
 /// 選択エンティティを、その実位置に強調色 `stroke` で重ね描きする。
+#[allow(clippy::too_many_arguments)]
 fn draw_selected(
     painter: &egui::Painter,
     rect: Rect,
@@ -3409,6 +3550,8 @@ fn draw_selected(
     viewport: &Viewport,
     select_tool: &SelectTool,
     stroke: Stroke,
+    paper_display: bool,
+    k: f64,
 ) {
     for &id in select_tool.selection() {
         if let Some(entity) = document.entity(id) {
@@ -3425,13 +3568,19 @@ fn draw_selected(
                     );
                 }
                 EntityGeom::Text(text) => {
-                    // 文字を強調色で上書きし、加えて近似 aabb の枠を描く（ヒットテストが
-                    // aabb 近似であることを可視化し、選択が分かりやすいように）。
-                    draw_text(painter, rect, viewport, text, stroke.color);
-                    draw_aabb_outline(painter, rect, viewport, &entity.geom.aabb(), stroke);
+                    // 文字を強調色で上書きし、加えて表示上のワールド AABB（`height * k`、
+                    // 判断(c)）の枠を描く（ヒットテストがこの AABB 近似であることを可視化し、
+                    // 選択が分かりやすいように）。
+                    draw_text(painter, rect, viewport, text, text.height * k, stroke.color);
+                    let aabb = text_world_aabb(text, k);
+                    draw_aabb_outline(painter, rect, viewport, &aabb, stroke);
                 }
-                EntityGeom::DimLinear(dim) => draw_dim_linear(painter, rect, viewport, dim, stroke),
-                EntityGeom::DimRadial(dim) => draw_dim_radial(painter, rect, viewport, dim, stroke),
+                EntityGeom::DimLinear(dim) => {
+                    draw_dim_linear(painter, rect, viewport, dim, stroke, paper_display, k)
+                }
+                EntityGeom::DimRadial(dim) => {
+                    draw_dim_radial(painter, rect, viewport, dim, stroke, paper_display, k)
+                }
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
                 _ => {}
             }
@@ -3572,13 +3721,42 @@ fn draw_shape(
     }
 }
 
+/// Text の表示上のワールド AABB（判断4: `height` は紙 mm、ワールド高さ = `height * k`）。
+///
+/// `mcad_core::EntityGeom::aabb()`（1:1 解釈、以下「元 AABB」）を anchor 基準に `k` 倍する。
+/// この相似拡大が厳密に正しい理由: 元 AABB は `text_aabb` が組む局所 4 隅（`anchor` を
+/// 原点として `width`・`text.height` に比例するベクトルをベースライン角で回転したもの）の
+/// 外接矩形であり、`width` 自体も文字数 × 係数 × `height` で `height` に**線形**に比例する。
+/// したがって `height` を `height * k` に置き換えた（＝「height×k の TextGeom」の）4 隅は、
+/// 元の 4 隅を `anchor + k * (corner − anchor)` へ写した点に厳密一致する。この写像は
+/// 各軸ごとに単調（`k > 0`、`Scale` の値域は正）なので、4 隅を包む外接矩形（min/max）も
+/// 同じ写像で移る。すなわち「`anchor` 基準に元 AABB の min/max を `k` 倍」と
+/// 「height×k の TextGeom の aabb()」は同じ結果になる（`mcad-core` 側の実装は
+/// 変更しない。tcad が path 依存しているため）。
+fn text_world_aabb(text: &TextGeom, k: f64) -> Aabb {
+    let local = EntityGeom::Text(text.clone()).aabb();
+    let scale_from_anchor = |p: Point2| text.anchor + (p - text.anchor) * k;
+    Aabb {
+        min: scale_from_anchor(local.min),
+        max: scale_from_anchor(local.max),
+    }
+}
+
 /// テキスト 1 つを Painter へ描画する（M6 タスク23、[`epaint::TextShape`] 使用）。
 ///
 /// # フォントサイズ
 ///
-/// `height（ワールド） × zoom` を px として毎フレーム計算し、ズームで文字も拡大縮小する
-/// （ワールド固定サイズ = CAD の期待動作。DESIGN.md M6 設計判断3）。判読不能な極小は描かず、
-/// 過大サイズはフォントアトラス肥大を防ぐため [`MAX_TEXT_PX`] で頭打ちにする。
+/// `world_height（ワールド） × zoom` を px として毎フレーム計算し、ズームで文字も
+/// 拡大縮小する（ワールド固定サイズ = CAD の期待動作。DESIGN.md M6 設計判断3）。
+/// 判読不能な極小は描かず、過大サイズはフォントアトラス肥大を防ぐため [`MAX_TEXT_PX`]
+/// で頭打ちにする。
+///
+/// `world_height` は呼び出し側がワールド長として明示的に渡す（タスク37 判断(d)）。
+/// `TextGeom::height` を直接使わず引数化しているのは二重換算防止のため:
+/// - Text エンティティ・プレビュー・ゴースト・選択ハイライトは `text.height * k` を渡す
+///   （判断(c)、`k` = 紙 1mm あたりのワールド mm）。
+/// - `draw_dim_expansion` は `dimension::expand_linear`/`expand_radial` が既にワールド長で
+///   組み立てた `ex.text.height` を**そのまま**渡す（ここでさらに `k` を掛けると二重換算）。
 ///
 /// # 位置と角度
 ///
@@ -3590,12 +3768,13 @@ fn draw_text(
     rect: Rect,
     viewport: &Viewport,
     text: &TextGeom,
+    world_height: f64,
     color: Color32,
 ) {
     if text.content.is_empty() {
         return;
     }
-    let font_px = text.height * viewport.zoom;
+    let font_px = world_height * viewport.zoom;
     if !font_px.is_finite() || font_px < MIN_TEXT_PX {
         return;
     }
@@ -4962,7 +5141,7 @@ mod tests {
         let base_second = add_point(&mut document, base, 3.0);
         let front_second = add_point(&mut document, front, 4.0);
 
-        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &whole_world())
+        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &whole_world(), 1.0)
             .into_iter()
             .map(|(id, _, _)| id)
             .collect();
@@ -4999,7 +5178,7 @@ mod tests {
         let b_first = add_point(&mut document, same_b, 2.0);
         let base_second = add_point(&mut document, base, 3.0);
 
-        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &whole_world())
+        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &whole_world(), 1.0)
             .into_iter()
             .map(|(id, _, _)| id)
             .collect();
@@ -5025,7 +5204,7 @@ mod tests {
 
         // 可視範囲は原点付近のみ。非表示レイヤーと範囲外エンティティは落ちる。
         let view = Aabb::new(Point2::new(-10.0, -10.0), Point2::new(10.0, 10.0));
-        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &view)
+        let drawn: Vec<EntityId> = entities_in_draw_order(&document, &view, 1.0)
             .into_iter()
             .map(|(id, _, _)| id)
             .collect();
@@ -5153,6 +5332,122 @@ mod tests {
             let legacy = resolve_stroke_px(width_mm, k, zoom);
             assert_eq!(toggled, legacy, "width_mm={width_mm}, k={k}, zoom={zoom}");
         }
+    }
+
+    // ---- M8 タスク37: dim_sizes（紙基準表示トグル拡張）----
+
+    #[test]
+    fn dim_sizes_off_matches_legacy_screen_fixed_px_regardless_of_k() {
+        // OFF は k に依存しない（現行挙動の回帰固定）。
+        for k in [0.5_f64, 1.0, 2.0] {
+            for zoom in [0.1_f64, 1.0, 10.0] {
+                let (arrow_len, text_height) = dim_sizes(false, k, zoom);
+                assert!(
+                    (arrow_len - DIM_ARROW_PX / zoom).abs() < 1e-9,
+                    "k={k}, zoom={zoom}"
+                );
+                assert!(
+                    (text_height - DIM_TEXT_PX / zoom).abs() < 1e-9,
+                    "k={k}, zoom={zoom}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dim_sizes_on_scales_with_k_and_ignores_zoom() {
+        for k in [0.5_f64, 1.0, 2.0] {
+            for zoom in [0.1_f64, 1.0, 10.0] {
+                let (arrow_len, text_height) = dim_sizes(true, k, zoom);
+                assert!(
+                    (arrow_len - DIM_ARROW_MM * k).abs() < 1e-9,
+                    "k={k}, zoom={zoom}"
+                );
+                assert!(
+                    (text_height - DIM_TEXT_MM * k).abs() < 1e-9,
+                    "k={k}, zoom={zoom}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dim_sizes_on_at_scale_one_to_one_matches_paper_mm_constants() {
+        for zoom in [0.1_f64, 1.0, 10.0] {
+            let (arrow_len, text_height) = dim_sizes(true, 1.0, zoom);
+            assert!((arrow_len - DIM_ARROW_MM).abs() < 1e-9);
+            assert!((text_height - DIM_TEXT_MM).abs() < 1e-9);
+        }
+    }
+
+    // ---- M8 タスク37: text_world_aabb（Text の紙基準ワールド AABB）----
+
+    #[test]
+    fn text_world_aabb_at_k_one_matches_core_aabb() {
+        // k=1 恒等（回転 Text 含む）。
+        for angle in [0.0_f64, 0.3, std::f64::consts::FRAC_PI_2] {
+            let text = TextGeom {
+                anchor: Point2::new(10.0, 20.0),
+                content: "abc".to_owned(),
+                height: 5.0,
+                angle,
+            };
+            let expected = EntityGeom::Text(text.clone()).aabb();
+            let actual = text_world_aabb(&text, 1.0);
+            assert!((actual.min.x - expected.min.x).abs() < 1e-9);
+            assert!((actual.min.y - expected.min.y).abs() < 1e-9);
+            assert!((actual.max.x - expected.max.x).abs() < 1e-9);
+            assert!((actual.max.y - expected.max.y).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn text_world_aabb_at_k_two_matches_aabb_of_doubled_height_text() {
+        let text = TextGeom {
+            anchor: Point2::new(10.0, 20.0),
+            content: "abc".to_owned(),
+            height: 5.0,
+            angle: 0.4,
+        };
+        let scaled = TextGeom {
+            height: text.height * 2.0,
+            ..text.clone()
+        };
+        let expected = EntityGeom::Text(scaled).aabb();
+        let actual = text_world_aabb(&text, 2.0);
+        assert!((actual.min.x - expected.min.x).abs() < 1e-9);
+        assert!((actual.min.y - expected.min.y).abs() < 1e-9);
+        assert!((actual.max.x - expected.max.x).abs() < 1e-9);
+        assert!((actual.max.y - expected.max.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn document_aabb_includes_text_scaled_bounds_at_sheet_scale() {
+        // 1:2 の図面では Text の表示上のワールド AABB は height×2 分だけ広がる
+        // （タスク37 検収項目7）。
+        let mut document = Document::new();
+        document
+            .apply(Command::SetSheet(mcad_core::SheetMeta {
+                scale: mcad_core::Scale::new(1, 2).unwrap(),
+                ..Default::default()
+            }))
+            .unwrap();
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::Text(TextGeom {
+                    anchor: Point2::new(0.0, 0.0),
+                    content: "hi".to_owned(),
+                    height: 5.0,
+                    angle: 0.0,
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        let aabb = document_aabb(&document).expect("document has a text entity");
+        // 1:1 解釈での高さは 5.0、1:2（k=2）では 10.0 まで広がる。
+        assert!(aabb.max.y >= 10.0 - 1e-9, "aabb={aabb:?}");
     }
 
     #[test]

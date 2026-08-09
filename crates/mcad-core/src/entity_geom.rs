@@ -27,7 +27,11 @@ pub struct TextGeom {
     pub anchor: Point2,
     /// 表示する文字列。
     pub content: String,
-    /// 文字高さ（ワールド単位）。
+    /// 文字高さ（紙 mm。DESIGN.md M8 設計判断4）。ワールド高さは
+    /// `height * k`（`k` = `Scale::world_mm_per_paper_mm`）で導出する。既定尺度 1:1 では
+    /// `k = 1` なので数値・見た目とも従来（ワールド単位解釈）と一致する。この換算は
+    /// `mcad-app` 側の責務（[`EntityGeom::aabb`] は 1:1 解釈のまま。表示・選択判定用の
+    /// 尺度反映 AABB は app 層の `text_world_aabb` が担う）。
     pub height: f64,
     /// ベースラインの回転角（ラジアン、CCW）。
     pub angle: f64,
@@ -121,6 +125,12 @@ impl EntityGeom {
     ///
     /// テキストの境界は文字数×高さの **近似**（CJK≈1.0×height、ASCII≈0.55×height）で、
     /// zoom fit 用途を想定する。正確な選択判定は app 層の責務（DESIGN.md M6 設計判断1）。
+    ///
+    /// **Text は `height` を 1:1（`k=1`）で解釈する**（`height` の紙 mm 意味論は判断4）。
+    /// 尺度を反映した表示上のワールド AABB（`height * k`）は `mcad-app` の
+    /// `text_world_aabb` が、この AABB を anchor 基準に `k` 倍する相似拡大として提供する
+    /// （DESIGN.md M8 タスク37 実装時追記。tcad が本メソッドへ path 依存しているため、
+    /// シグネチャ・実装ともここでは変更しない）。
     #[must_use]
     pub fn aabb(&self) -> Aabb {
         match self {

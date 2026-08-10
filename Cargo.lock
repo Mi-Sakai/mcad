@@ -1881,6 +1881,7 @@ dependencies = [
  "mcad-geom",
  "mcad-io",
  "rfd",
+ "ttf-parser",
 ]
 
 [[package]]

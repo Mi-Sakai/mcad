@@ -11,6 +11,7 @@ mod dimension;
 mod fonts;
 mod frame;
 mod ortho;
+mod plot;
 mod snap;
 mod tool;
 mod viewport;
@@ -28,6 +29,10 @@ use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use frame::{frame_layout, paper_to_world, parse_scale_input};
+
+// 紙 mm 基準の定数は「画面と出力の唯一の出所」として `plot` に置く（M8 タスク39）。
+// 画面側（`dash_pattern_px` / `dim_sizes`）はここから参照するだけで、挙動は変えない。
+use plot::{DIM_ARROW_MM, DIM_TEXT_MM, dash_pattern_mm};
 
 use tool::{
     ArcTool, CircleTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool, FilletTool,
@@ -82,6 +87,12 @@ const DEFAULT_FILE_NAME: &str = "Untitled.mcad";
 
 /// DXF エクスポートダイアログの初期ファイル名（`current_path` が未定のとき）。
 const DEFAULT_DXF_FILE_NAME: &str = "Untitled.dxf";
+
+/// SVG ファイルの拡張子（ファイルダイアログのフィルタ・拡張子補完の両方で使う）。
+const SVG_EXTENSION: &str = "svg";
+
+/// SVG エクスポートダイアログの初期ファイル名（`current_path` が未定のとき）。
+const DEFAULT_SVG_FILE_NAME: &str = "Untitled.svg";
 
 /// DXF importで生成した文書に割り当てる `saved_generation` の番兵値。
 ///
@@ -153,25 +164,6 @@ const MIN_STROKE_PX: f32 = 1.0;
 /// 2px を境界にした）。DESIGN.md M8 設計判断5 検収(c)。
 const MIN_DASH_PERIOD_PX: f32 = 2.0;
 
-/// 破線のダッシュパターン（紙 mm 基準: ダッシュ長・ギャップ長）。
-///
-/// `製図規定.md` 4-1 は破線・一点鎖線・二点鎖線の「形状」（パターン長）を規定して
-/// いない（線の太さのみ規定）。JIS Z 8312/ISO 128 も具体的なパターン長までは
-/// 定めていないため、多くの CAD 実装が採用する一般的な値
-/// （破線: 短いダッシュ + 短いギャップ）を採用する。紙 mm 基準なので `k * zoom`
-/// を掛けるだけで尺度・ズームへ追従する（判断5）。
-const DASH_PATTERN_MM: [f32; 2] = [3.0, 1.5];
-
-/// 一点鎖線のダッシュパターン（紙 mm 基準: 長ダッシュ・ギャップ・ドット・ギャップ）。
-///
-/// 中心線は破線よりも視認性を上げるため長いダッシュ（6.0mm）を使い、短い
-/// ドット（0.6mm）を挟む一般的な描画慣行に合わせた（[`DASH_PATTERN_MM`] の doc 参照）。
-const DASH_DOT_PATTERN_MM: [f32; 4] = [6.0, 1.2, 0.6, 1.2];
-
-/// 二点鎖線のダッシュパターン（紙 mm 基準）。[`DASH_DOT_PATTERN_MM`] にドットを
-/// もう1つ加えた形（長ダッシュ・ギャップ・ドット・ギャップ・ドット・ギャップ）。
-const DASH_DOT_DOT_PATTERN_MM: [f32; 6] = [6.0, 1.2, 0.6, 1.2, 0.6, 1.2];
-
 /// v3 `.mcad` の線幅移行規則（DESIGN.md M8 設計判断6）と旧描画 `max(width_px, 1.0)`
 /// が厳密一致することを保証する基準ズーム。判断6 検収(b)が要求する名前付き定数。
 ///
@@ -211,20 +203,6 @@ fn resolve_stroke_px_with_toggle(paper_display: bool, width_mm: f32, k: f64, zoo
         resolve_stroke_px(width_mm, k, zoom)
     } else {
         MIN_STROKE_PX
-    }
-}
-
-/// 線種のダッシュパターンを紙 mm 基準で返す（`Continuous` は `None` = 実線）。
-///
-/// [`Linetype`] は `#[non_exhaustive]` なので、将来の追加は未知の腕として
-/// ワイルドカードで実線へフォールバックする（描画が壊れるより保守的な既定）。
-fn dash_pattern_mm(linetype: Linetype) -> Option<&'static [f32]> {
-    match linetype {
-        Linetype::Continuous => None,
-        Linetype::Dashed => Some(&DASH_PATTERN_MM),
-        Linetype::DashDot => Some(&DASH_DOT_PATTERN_MM),
-        Linetype::DashDotDot => Some(&DASH_DOT_DOT_PATTERN_MM),
-        _ => None,
     }
 }
 
@@ -459,12 +437,9 @@ const DIM_ARROW_PX: f64 = 12.0;
 /// 寸法値ラベルの文字高さ（紙基準表示 OFF 時の画面固定ピクセル）。ワールド高さへは
 /// `DIM_TEXT_PX / zoom`。ON 時は [`DIM_TEXT_MM`] を使う（タスク37、[`dim_sizes`] 参照）。
 const DIM_TEXT_PX: f64 = 14.0;
-/// 寸法値ラベルの文字高さ（紙 mm）。製図規定 第6章の呼び 3.5。紙基準表示 ON 時に
-/// [`dim_sizes`] が `k` 倍してワールド長へ換算する（タスク37）。
-const DIM_TEXT_MM: f64 = 3.5;
-/// 寸法の矢先の長さ（紙 mm）。紙基準表示 ON 時に [`dim_sizes`] が `k` 倍してワールド長へ
-/// 換算する（タスク37）。
-const DIM_ARROW_MM: f64 = 3.0;
+// 紙 mm 側の対（[`DIM_TEXT_MM`]/[`DIM_ARROW_MM`]）は `plot` にある（タスク39 で
+// 画面と出力の出所を1箇所へ集約した）。紙基準表示 ON 時に [`dim_sizes`] が
+// `k` 倍してワールド長へ換算する用途は変わっていない（タスク37）。
 
 /// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O の3経路で共有）。
 ///
@@ -753,6 +728,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "Ctrl+Shift+S=Save As",
     "Ctrl+Shift+O=Import DXF",
     "Ctrl+E=Export DXF",
+    "Ctrl+Shift+E=Export SVG",
     "Home=Zoom Fit",
 ];
 
@@ -1313,6 +1289,46 @@ impl McadApp {
         }
     }
 
+    /// Ctrl+Shift+E: ネイティブの保存ダイアログで選んだ先へ現在のドキュメントを SVG
+    /// として書き出す。
+    ///
+    /// DXF エクスポートと同じく読み取り専用操作なので、未保存の変更があっても確認
+    /// モーダルは出さず、成功しても `current_path`・`saved_generation` は変更しない
+    /// （M8 タスク39-3。SVG は plot IR の直列化であって「保存」ではない）。
+    fn export_svg_file(&mut self, now: f64) {
+        self.cancel_placement_for_file_op();
+        let default_name = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|n| n.to_str())
+            .map_or_else(
+                || DEFAULT_SVG_FILE_NAME.to_string(),
+                |stem| format!("{stem}.{SVG_EXTENSION}"),
+            );
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("svg", &[SVG_EXTENSION])
+            .set_file_name(&default_name);
+        if let Some(dir) = self.dialog_start_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        self.remember_dialog_dir(&path);
+        let path = ensure_svg_extension(path);
+        let page = plot::plot_page(&self.document);
+        let svg = plot::to_svg(&page);
+        match std::fs::write(&path, svg) {
+            Ok(()) => {
+                set_status_important(&mut self.status, now, "Exported SVG file");
+            }
+            Err(err) => {
+                set_status_important(&mut self.status, now, format!("SVG export failed: {err}"));
+            }
+        }
+    }
+
     /// Ctrl+S: 開いているファイルパスへ上書き保存する。パスが未定なら
     /// 「名前を付けて保存」（[`McadApp::save_document_as`]）と同じ扱いにする。
     fn save_document(&mut self, now: f64) {
@@ -1394,6 +1410,18 @@ fn ensure_dxf_extension(path: PathBuf) -> PathBuf {
         path
     } else {
         path.with_extension(DXF_EXTENSION)
+    }
+}
+
+/// パスの拡張子が `.svg`（大小無視）でなければ付け直す。
+fn ensure_svg_extension(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(SVG_EXTENSION))
+    {
+        path
+    } else {
+        path.with_extension(SVG_EXTENSION)
     }
 }
 
@@ -1487,6 +1515,7 @@ impl eframe::App for McadApp {
 
             // Ctrl+N/Ctrl+O/Ctrl+S/Ctrl+Shift+S: 新規/開く/保存/名前を付けて保存。
             // Ctrl+Shift+O/Ctrl+E: DXF を開く/DXF へ書き出す。
+            // Ctrl+Shift+E: SVG へ書き出す（M8 タスク39-3）。
             // undo/redo と同様、ツール切替キー（`handle_tool_shortcut_keys`）は Ctrl 併用を
             // 無視するので衝突しない。
             let (
@@ -1496,6 +1525,7 @@ impl eframe::App for McadApp {
                 save_as_pressed,
                 open_dxf_pressed,
                 export_dxf_pressed,
+                export_svg_pressed,
                 duplicate_pressed,
             ) = ui.input(|i| {
                 let cmd = i.modifiers.command;
@@ -1506,6 +1536,7 @@ impl eframe::App for McadApp {
                     cmd && i.modifiers.shift && i.key_pressed(Key::S),
                     cmd && i.modifiers.shift && i.key_pressed(Key::O),
                     cmd && !i.modifiers.shift && i.key_pressed(Key::E),
+                    cmd && i.modifiers.shift && i.key_pressed(Key::E),
                     cmd && !i.modifiers.shift && i.key_pressed(Key::D),
                 )
             });
@@ -1526,6 +1557,9 @@ impl eframe::App for McadApp {
             }
             if export_dxf_pressed {
                 self.export_dxf_file(now);
+            }
+            if export_svg_pressed {
+                self.export_svg_file(now);
             }
             if duplicate_pressed {
                 self.request_duplicate(now);
@@ -4390,6 +4424,9 @@ mod tests {
     use super::*;
     use mcad_core::Entity;
     use mcad_geom::{Circle, LineSeg};
+    // 紙 mm のダッシュパターン定数は `plot` が持つ（タスク39）。画面側の px 換算
+    // （[`dash_pattern_px`]）の回帰テストが元の値と突き合わせるために参照する。
+    use crate::plot::{DASH_DOT_PATTERN_MM, DASH_PATTERN_MM};
 
     // rfd のファイルダイアログ（`open_document`/`save_document*` のダイアログ経路）は
     // ネイティブ UI を開くため headless では自動テストできない。未保存確認は

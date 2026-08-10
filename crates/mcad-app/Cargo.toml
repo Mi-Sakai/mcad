@@ -12,3 +12,8 @@ mcad-core = { workspace = true }
 mcad-geom = { workspace = true }
 mcad-io = { workspace = true }
 rfd = "0.17.2"
+# 文字アウトライン化（`plot::text_outline`）用。依存グラフには既に 0.25.1 が
+# 入っている（winit → sctk-adwaita → ab_glyph → owned_ttf_parser → ttf-parser）ので
+# dedup され、ビルドコストはほぼ増えない。Noto Sans JP は OTF(CFF) だが
+# CFF アウトラインの取得は feature flag 不要のコア機能。
+ttf-parser = "0.25"

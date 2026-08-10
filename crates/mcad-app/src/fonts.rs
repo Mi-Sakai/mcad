@@ -20,6 +20,18 @@ static NOTO_SANS_JP: &[u8] = include_bytes!("../assets/fonts/NotoSansJP-Regular.
 /// フォント登録名。
 const FONT_NAME: &str = "noto_sans_jp";
 
+/// 埋め込みフォント（Noto Sans JP Regular）の生バイト列を返す。
+///
+/// egui へのフォント登録（[`install_fallback_fonts`]）とは別に、SVG/PDF 出力の
+/// 文字アウトライン化（`crate::plot::text_outline`）が同じバイト列を
+/// `ttf-parser` へ渡すために使う。**画面と出力で同一のフォントを使う**ことを
+/// 「同じ `static` を共有する」形で担保するための getter であり、egui 側の
+/// 登録挙動には一切影響しない（読み取り専用の参照を返すだけ）。
+#[must_use]
+pub fn embedded_font_bytes() -> &'static [u8] {
+    NOTO_SANS_JP
+}
+
 /// CJK フォールバックフォントを egui コンテキストへ登録する。
 ///
 /// 既定フォント（ラテン文字はそのまま）の **後ろ** へフォールバックとして追加するため、

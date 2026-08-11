@@ -23,3 +23,10 @@ ttf-parser = "0.25"
 # bitflags/itoa/memchr/ryu の4クレートのみで実質ゼロに近い（itoa は既存 Cargo.lock に
 # 既に存在）。
 pdf-writer = "0.15"
+# 設定永続化(config.json)の置き場所解決用(DESIGN.md M8 設計判断8)。
+# プラットフォーム標準の設定ディレクトリ(Linux: ~/.config 等)のみに使う。
+dirs = "6.0"
+# config.json の直列化用。core/io と同じバージョン指定で依存グラフに既に存在するため
+# dedupされビルドコストはほぼ増えない。
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

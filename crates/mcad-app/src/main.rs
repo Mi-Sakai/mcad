@@ -7,6 +7,7 @@
 //! クリック/Enter/Escで確定・キャンセルできるようにする。後続タスクで
 //! 選択・編集ツールとスナップエンジンを追加する。
 
+mod config;
 mod dimension;
 mod fonts;
 mod frame;
@@ -597,28 +598,27 @@ struct McadApp {
     /// 選択・編集ツール。選択集合を所有し、`tool_kind == Select` のとき有効。
     /// 選択集合はアプリ UI 状態でありドキュメント履歴には積まない（[`SelectTool`] の doc 参照）。
     select_tool: SelectTool,
-    /// スナップの有効/無効。`F3` でトグルする（既定は有効）。
-    snap_enabled: bool,
-    /// 直近フレームで作図ツールのカーソルがスナップした先。マーカー描画に使う。
-    /// スナップしていない・作図ツール非アクティブ・スナップ無効のときは `None`。
-    snap_marker: Option<snap::SnapResult>,
-    /// 直交モード（ortho、v0.7.1）の有効/無効。`F8` でトグルする（既定は無効）。
+    /// アプリ設定（トグル・既定用紙/尺度/様式・最近使ったファイル）。実行時の唯一の
+    /// 置き場（M8 タスク41）。スナップ有効/無効（`F3`）・直交モード（`F8`、v0.7.1。
     /// `Line`/`Polyline`/`Arc` の作図中、スナップ候補が無い場所でだけ直前の点から
-    /// 水平・垂直な方向へ拘束する（`ortho.rs`、`resolve_click_point` 参照）。
-    /// `snap_enabled` と同じく実行時フィールドのみで永続化しない（M8まで）。
-    ortho_enabled: bool,
-    /// 紙基準表示（タスク37。旧: 線幅表示、タスク36b）の有効/無効。`F9` でトグルする
-    /// （既定は無効 = OFF）。OFF のときは全エンティティの線幅を [`MIN_STROKE_PX`] 固定
-    /// （ズーム非依存）で描き、寸法注記（矢印・文字）と線幅はスクリーン固定 px
+    /// 水平・垂直な方向へ拘束する。`ortho.rs`、`resolve_click_point` 参照）・
+    /// 紙基準表示（`F9`、タスク37。旧: 線幅表示、タスク36b）の3トグルもここに含む。
+    /// 紙基準表示 OFF のときは全エンティティの線幅を [`MIN_STROKE_PX`] 固定（ズーム
+    /// 非依存）で描き、寸法注記（矢印・文字）と線幅はスクリーン固定 px
     /// （[`DIM_ARROW_PX`]/[`DIM_TEXT_PX`]）のまま。ON のときは線幅がタスク36 の紙 mm 基準
     /// `resolve_stroke_px`（ズームに比例して太くなる）、寸法注記が紙 mm 定数
     /// （[`DIM_ARROW_MM`]/[`DIM_TEXT_MM`]）を `k` 倍したワールド長になる（`dim_sizes`）。
     /// タスク38 の図面枠実線・タスク39/40 の SVG/PDF 出力が紙 mm 基準を前提とするため、
     /// 画面と出力の一致確認に ON が要る（DESIGN.md M8 設計判断5 実装時追記・判断4
     /// 実装時追記）。Text エンティティの表示（`height * k`）はこのトグルの影響を受けない
-    /// （判断4 実装時追記、常に紙 mm 解釈）。`ortho_enabled` と同じく実行時フィールド
-    /// のみで永続化しない（タスク41 で config.json へ相乗りする予定）。
-    paper_display_enabled: bool,
+    /// （判断4 実装時追記、常に紙 mm 解釈）。
+    config: config::Config,
+    /// config.json の保存先。`None` なら保存不能（起動時に警告済み。以後の保存は
+    /// 黙ってスキップする）。
+    config_path: Option<PathBuf>,
+    /// 直近フレームで作図ツールのカーソルがスナップした先。マーカー描画に使う。
+    /// スナップしていない・作図ツール非アクティブ・スナップ無効のときは `None`。
+    snap_marker: Option<snap::SnapResult>,
     /// ステータスバーに一時表示するメッセージ（主にコア操作のエラー通知）。
     /// メッセージごとに保持している表示時間（[`StatusMessage::duration_secs`]、通常は
     /// [`STATUS_MESSAGE_SECS`]、ファイル入出力の結果は [`STATUS_MESSAGE_SECS_IMPORTANT`]）
@@ -811,7 +811,13 @@ fn open_status(clamped_widths: usize) -> String {
 ///
 /// [`Command::AddLayer`] は検証を持たない（core の `execute` 参照）ので、この経路で
 /// 失敗することはない。
-fn fresh_document() -> Document {
+///
+/// `sheet` は新規文書の図面メタデータ（既定用紙/尺度/様式。M8 タスク41で
+/// [`config::Config::default_sheet_meta`] から渡される）。[`Command::SetSheet`] で
+/// 適用する — 「ドキュメントの変更は必ず Command 経由」の不変条件（AGENTS.md）を
+/// レイヤー追加と同様に守る。標準様式 A/B/C は常に妥当なテンプレートなので
+/// （[`SheetMeta::validate`]）、この経路で `SetSheet` が失敗することはない。
+fn fresh_document(sheet: SheetMeta) -> Document {
     let mut document = Document::new();
     for (index, (name, color)) in DEFAULT_EXTRA_LAYERS.iter().enumerate() {
         let mut layer = Layer::new(*name, *color);
@@ -821,8 +827,12 @@ fn fresh_document() -> Document {
             .apply(Command::AddLayer(layer))
             .expect("AddLayer on a fresh document cannot fail");
     }
-    // 既定レイヤーの追加自体を Ctrl+Z で巻き戻せてはいけない（読込と同じ扱い）。
-    // 呼び出し側は clear_history 後の世代（0）を saved_generation の基準点にする。
+    document
+        .apply(Command::SetSheet(sheet))
+        .expect("standard title block templates are always valid");
+    // 既定レイヤー・図面メタデータの適用自体を Ctrl+Z で巻き戻せてはいけない（読込と
+    // 同じ扱い）。呼び出し側は clear_history 後の世代（0）を saved_generation の
+    // 基準点にする。
     document.clear_history();
     document
 }
@@ -856,9 +866,20 @@ impl McadApp {
     /// といった典型的な運用を初期状態で満たすためで、既定セットを core ではなく app 側に
     /// 置いた理由（ファイル読込時にレイヤーが増えるのを避ける）は [`fresh_document`] の
     /// doc を参照。**読込経路は従来どおり `Document::new()` ベースで再構築する。**
+    /// 設定ファイルの実 IO を伴わない既定構成で作る。IO を伴う起動経路は
+    /// [`McadApp::with_config`]（`main()` が使う）。既存のテスト・[`Default`] 相当の
+    /// 用途はすべてこちら経由のまま（`config::Startup::default()` は既定 [`config::Config`]
+    /// を持ち、`config_path` は `None`）。
     fn new() -> Self {
-        let document = fresh_document();
-        Self {
+        Self::with_config(config::Startup::default())
+    }
+
+    /// 起動時に読み込んだ設定 `startup` を使ってアプリを作る（`main()` 専用の実 IO
+    /// 経路）。設定の読込・保存先解決は事前に [`config::load_startup`] が済ませている
+    /// ため、ここでは結果を配線するだけでよい。
+    fn with_config(startup: config::Startup) -> Self {
+        let document = fresh_document(startup.config.default_sheet_meta());
+        let mut app = Self {
             // 起動直後（空文書）の世代を保存済み基準点とし、未保存扱いにしない。
             saved_generation: document.generation(),
             document,
@@ -866,10 +887,9 @@ impl McadApp {
             tool_kind: ToolKind::Select,
             tool: None,
             select_tool: SelectTool::default(),
-            snap_enabled: true,
+            config: startup.config,
+            config_path: startup.path,
             snap_marker: None,
-            ortho_enabled: false,
-            paper_display_enabled: false,
             status: None,
             current_path: None,
             confirm_state: ConfirmState::Idle,
@@ -884,7 +904,14 @@ impl McadApp {
             scale_custom_selected: false,
             scale_custom_input: String::new(),
             scale_input_error: None,
+        };
+        if let Some(warning) = startup.warning {
+            // 起動時はまだ egui の InputState が無いため now=0.0（[`STATUS_MESSAGE_SECS_IMPORTANT`]
+            // 経過後の消去判定は最初のフレームの `now` との比較になる。0.0 起点でも
+            // 実用上問題ない — 起動直後の1フレーム目は必ず本物の `now` が極めて小さい値）。
+            set_status_important(&mut app.status, 0.0, warning);
         }
+        app
     }
 
     /// モーダル（未保存確認 / 表題欄編集ダイアログ）が開いているか。
@@ -1126,13 +1153,29 @@ impl McadApp {
         self.text_field_shown = shown;
     }
 
+    /// 設定を config.json へ書く（M8 タスク41）。保存先不明（`config_path` が `None`。
+    /// 設定ディレクトリが解決できない環境で起動時に警告済み）なら何もしない。
+    /// 書込み失敗はステータスバーへ通知するのみで、アプリの動作は継続する。
+    fn persist_config(&mut self, now: f64) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        if let Err(err) = config::save(&path, &self.config) {
+            set_status_important(
+                &mut self.status,
+                now,
+                format!("Settings save failed: {err}"),
+            );
+        }
+    }
+
     /// 新規ドキュメントへ置き換える（エンティティは一切追加せず、レイヤーは既定セット
     /// [`DEFAULT_EXTRA_LAYERS`] のみ。[`McadApp::new`] / [`fresh_document`] の doc 参照）。
     ///
     /// 未保存の変更があるかどうかは確認しない。呼び出し側（[`McadApp::request_new_document`]
     /// または確認モーダルの「破棄して続行」選択）が確認済みであることを前提とする。
     fn new_document(&mut self, now: f64) {
-        self.document = fresh_document();
+        self.document = fresh_document(self.config.default_sheet_meta());
         self.current_path = None;
         // 新規ドキュメントの現在世代を保存済み基準点にする（読込直後は未保存でない）。
         self.saved_generation = self.document.generation();
@@ -1716,24 +1759,27 @@ impl eframe::App for McadApp {
         // F3 でスナップの有効/無効をトグルする（作図時の吸着を一時的に切りたい場面用）。
         // ファンクションキーはテキスト入力と競合しないので、モーダル非表示中なら常に効かせる。
         if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F3)) {
-            self.snap_enabled = !self.snap_enabled;
-            if !self.snap_enabled {
+            self.config.snap_enabled = !self.config.snap_enabled;
+            if !self.config.snap_enabled {
                 self.snap_marker = None;
             }
+            self.persist_config(now);
         }
 
         // F8 で直交モード（ortho）の有効/無効をトグルする。F3 と同じガード条件
         // （モーダル非表示中は常に効く）。ortho は専用マーカーを持たない設計
         // （`ortho.rs` doc 参照）なので、トグル自体はフラグの反転のみでよい。
         if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F8)) {
-            self.ortho_enabled = !self.ortho_enabled;
+            self.config.ortho_enabled = !self.config.ortho_enabled;
+            self.persist_config(now);
         }
 
         // F9 で紙基準表示（タスク37。旧: 線幅表示、タスク36b。AutoCAD の LWDISPLAY 相当）の
         // 有効/無効をトグルする。F3/F8 と同じガード条件（モーダル非表示中は常に効く）。
         // 専用マーカーは不要なので、トグル自体はフラグの反転のみでよい（ortho と同じ形）。
         if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F9)) {
-            self.paper_display_enabled = !self.paper_display_enabled;
+            self.config.paper_display_enabled = !self.config.paper_display_enabled;
+            self.persist_config(now);
         }
 
         // 表示時間を過ぎたステータスメッセージは消す。
@@ -1754,17 +1800,25 @@ impl eframe::App for McadApp {
                     ui.separator();
                     ui.label(format!(
                         "Snap: {}",
-                        if self.snap_enabled { "ON" } else { "OFF" }
+                        if self.config.snap_enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
                     ));
                     ui.separator();
                     ui.label(format!(
                         "Ortho: {}",
-                        if self.ortho_enabled { "ON" } else { "OFF" }
+                        if self.config.ortho_enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
                     ));
                     ui.separator();
                     ui.label(format!(
                         "Paper view: {}",
-                        if self.paper_display_enabled {
+                        if self.config.paper_display_enabled {
                             "ON"
                         } else {
                             "OFF"
@@ -1860,7 +1914,7 @@ impl eframe::App for McadApp {
                 &mut self.status,
                 now,
             );
-            sheet_panel(
+            let sheet_changed = sheet_panel(
                 ui,
                 &mut self.document,
                 &mut self.sheet_dialog,
@@ -1870,6 +1924,13 @@ impl eframe::App for McadApp {
                 &mut self.status,
                 now,
             );
+            if sheet_changed
+                && self
+                    .config
+                    .remember_sheet_defaults(&self.document.sheet().clone())
+            {
+                self.persist_config(now);
+            }
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1905,7 +1966,7 @@ impl eframe::App for McadApp {
                         &self.viewport,
                         &mut self.document,
                         &mut self.select_tool,
-                        self.snap_enabled,
+                        self.config.snap_enabled,
                         &mut self.snap_marker,
                         &mut self.status,
                         now,
@@ -1921,9 +1982,9 @@ impl eframe::App for McadApp {
                         &mut self.tool_kind,
                         &mut self.tool,
                         &mut self.select_tool,
-                        self.snap_enabled,
+                        self.config.snap_enabled,
                         &mut self.snap_marker,
-                        self.ortho_enabled,
+                        self.config.ortho_enabled,
                         &mut self.status,
                         now,
                         parse_fillet_radius(&self.fillet_radius_input),
@@ -1950,7 +2011,7 @@ impl eframe::App for McadApp {
                     rect,
                     &self.viewport,
                     self.document.sheet(),
-                    self.paper_display_enabled,
+                    self.config.paper_display_enabled,
                     k,
                 );
             }
@@ -1959,7 +2020,7 @@ impl eframe::App for McadApp {
                 rect,
                 &self.document,
                 &self.viewport,
-                self.paper_display_enabled,
+                self.config.paper_display_enabled,
             );
             draw_selection(
                 &painter,
@@ -1968,7 +2029,7 @@ impl eframe::App for McadApp {
                 &self.viewport,
                 &self.select_tool,
                 offset_distance,
-                self.paper_display_enabled,
+                self.config.paper_display_enabled,
                 k,
             );
             if let Some(tool) = &self.tool {
@@ -1976,7 +2037,7 @@ impl eframe::App for McadApp {
                     &painter,
                     rect,
                     &self.viewport,
-                    self.paper_display_enabled,
+                    self.config.paper_display_enabled,
                     k,
                 );
             }
@@ -3001,6 +3062,11 @@ impl TitleBlockDialogState {
 ///
 /// ラベル等は日本語（右パネルは既に日本語領域。日本語化は領域単位で完結させる規約）。
 #[allow(clippy::too_many_arguments)]
+/// 図面（用紙・向き・様式・尺度・図面枠表示）のパネルを描く。
+///
+/// 戻り値は「`Command::SetSheet` が適用され成功したか」（M8 タスク41）。呼び出し側は
+/// これが `true` のときだけ [`config::Config::remember_sheet_defaults`] を呼び、既定への
+/// 追随が実際に必要か判断する。
 fn sheet_panel(
     ui: &mut egui::Ui,
     document: &mut Document,
@@ -3010,7 +3076,7 @@ fn sheet_panel(
     scale_input_error: &mut Option<String>,
     status: &mut Option<StatusMessage>,
     now: f64,
-) {
+) -> bool {
     ui.separator();
     ui.heading("図面");
 
@@ -3179,10 +3245,15 @@ fn sheet_panel(
         }
     });
 
-    if let Some(new_sheet) = pending
-        && let Err(err) = document.apply(Command::SetSheet(new_sheet))
-    {
-        set_status(status, now, format!("図面設定の変更に失敗しました: {err}"));
+    match pending {
+        Some(new_sheet) => match document.apply(Command::SetSheet(new_sheet)) {
+            Ok(_) => true,
+            Err(err) => {
+                set_status(status, now, format!("図面設定の変更に失敗しました: {err}"));
+                false
+            }
+        },
+        None => false,
     }
 }
 
@@ -4471,7 +4542,7 @@ fn main() -> anyhow::Result<()> {
             // 文書内 Text の CJK グリフ用に、既定フォントの後ろへ Noto Sans JP を追加する
             // （M6 タスク23。M8 以降は UI ラベルの日本語もこの登録で描画される）。
             fonts::install_fallback_fonts(&cc.egui_ctx);
-            Ok(Box::new(McadApp::new()))
+            Ok(Box::new(McadApp::with_config(config::load_startup())))
         }),
     )
     .map_err(|err| anyhow::anyhow!("failed to run mcad-app: {err}"))
@@ -5641,7 +5712,7 @@ mod tests {
 
     #[test]
     fn fresh_document_has_default_layer_set_in_order_with_clean_history() {
-        let document = fresh_document();
+        let document = fresh_document(config::Config::default().default_sheet_meta());
 
         // "0"（デフォルト、order=0）が最背面で、既定レイヤーが配列順に手前へ載る。
         let mut expected = vec!["0".to_owned()];
@@ -5669,6 +5740,77 @@ mod tests {
         assert!(!document.can_redo());
         assert_eq!(document.generation(), 0);
         assert_eq!(document.entity_count(), 0);
+    }
+
+    // ---- 設定永続化（M8 タスク41-1） ----
+
+    #[test]
+    fn fresh_document_applies_non_default_sheet_meta_without_leaving_undo_history() {
+        let sheet = SheetMeta {
+            unit: mcad_core::Unit::Millimeter,
+            scale: Scale::new(1, 2).unwrap(),
+            paper: PaperSize::A2,
+            orientation: Orientation::Portrait,
+            title_block: TitleBlockKind::C,
+            fields: mcad_core::TitleBlockFields::default(),
+            frame_visible: false,
+        };
+        let document = fresh_document(sheet.clone());
+
+        assert_eq!(document.sheet(), &sheet);
+        // レイヤー追加と同じく、SetSheet の適用も Ctrl+Z で巻き戻せてはいけない。
+        assert!(!document.can_undo());
+        assert!(!document.can_redo());
+        assert_eq!(document.generation(), 0);
+    }
+
+    #[test]
+    fn with_config_applies_toggles_and_default_sheet_and_reports_warning() {
+        let startup = config::Startup {
+            config: config::Config {
+                snap_enabled: false,
+                ortho_enabled: true,
+                paper_display_enabled: true,
+                default_paper: PaperSize::A1,
+                default_orientation: Orientation::Portrait,
+                default_scale: Scale::new(1, 5).unwrap(),
+                default_title_block: config::TitleBlockChoice::A,
+                recent_files: Vec::new(),
+            },
+            path: Some(PathBuf::from("/tmp/mcad-app-test/config.json")),
+            warning: Some("something went wrong".to_owned()),
+        };
+        let app = McadApp::with_config(startup);
+
+        assert!(!app.config.snap_enabled);
+        assert!(app.config.ortho_enabled);
+        assert!(app.config.paper_display_enabled);
+        assert_eq!(app.document.sheet().paper, PaperSize::A1);
+        assert_eq!(app.document.sheet().orientation, Orientation::Portrait);
+        assert_eq!(app.document.sheet().scale, Scale::new(1, 5).unwrap());
+        assert_eq!(app.document.sheet().title_block, TitleBlockKind::A);
+        assert_eq!(
+            app.config_path,
+            Some(PathBuf::from("/tmp/mcad-app-test/config.json"))
+        );
+        let status = app.status.expect("warning should be surfaced on startup");
+        assert_eq!(status.text, "something went wrong");
+    }
+
+    #[test]
+    fn new_matches_previous_hardcoded_defaults() {
+        let app = McadApp::new();
+
+        assert!(app.config.snap_enabled);
+        assert!(!app.config.ortho_enabled);
+        assert!(!app.config.paper_display_enabled);
+        assert_eq!(app.config, config::Config::default());
+        assert_eq!(app.config_path, None);
+        assert!(app.status.is_none());
+        assert_eq!(
+            app.document.sheet(),
+            &config::Config::default().default_sheet_meta()
+        );
     }
 
     #[test]
@@ -5745,7 +5887,7 @@ mod tests {
     #[test]
     fn front_order_change_is_a_single_undo_step() {
         // Front/Back は専用コマンドを持たず SetLayerProps 1発なので undo も1回で戻る。
-        let mut document = fresh_document();
+        let mut document = fresh_document(config::Config::default().default_sheet_meta());
         let back = document.default_layer();
         let others: Vec<i32> = document
             .layers()

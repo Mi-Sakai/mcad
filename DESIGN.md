@@ -1584,6 +1584,18 @@ core/io/geom にも及ぶ構成へ拡大している(2026-08-01)。
    内容: グリッド間隔・スナップ ON/OFF・直交モード・既定用紙/尺度/様式・最近使ったファイル
    (最大5件、存在しないパスは表示時に除外)。**図面の内容(undo 対象)は含めない**。
    読み書き失敗は起動を妨げず既定値で続行(ステータスバー表示)。
+   - **実装時追記(2026-08-11、タスク41)**: `config.json` の内容は上記列挙のうち**グリッド間隔を
+     除く**、`snap_enabled`/`ortho_enabled`/`paper_display_enabled`(F9、タスク36bが本タスクへ
+     相乗り)/`default_paper`/`default_orientation`/`default_scale`/`default_title_block`
+     (A/B/Cのみ、Customは除く)/`recent_files`(`.mcad`のみ、最大5件)。**グリッド間隔は
+     永続化対象外に変更**: 現状の間隔は `nice_grid_step(zoom, GRID_TARGET_PX)` によるズーム
+     派生値であり、ユーザーが設定する値が存在しない(判断8の字面は保存対象として列挙していたが、
+     采配役がユーザーへ確認のうえ表示のみで確定)。A-2 の痛点への回答として上部パネルへの
+     ステータスバー表示のみ実装した(`format_grid_step`)。既定用紙/尺度/様式の更新トリガーは
+     「sheet_panel での `SetSheet` 成功時に自動追随」で確定(専用の保存 UI は設けない)。保存先は
+     `dirs::config_dir()/mcad/config.json`。dialog_start_dir へ recent 由来のフォールバックを
+     追加した(任意採用)。41 は 41-1(config 基盤)/41-2(最近使ったファイル)/
+     41-3(グリッド間隔表示 + 本追記)の3コミットへ分割して実装した。
 9. **小物の同時回収**(随時対応の相乗い分): 手動ズームフィット(`Home` キー予定、未使用確認を
    タスク内で行う)/`FIT_MIN_MARGIN` の画面 px 基準化(単位系確定に伴い)/ステータスバーへの
    グリッド間隔表示(A-2)/geom の退化判定を絶対 EPS から相対 EPS(`intersect.rs` の

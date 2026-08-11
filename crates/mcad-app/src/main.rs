@@ -51,6 +51,15 @@ const WHEEL_ZOOM_SPEED: f64 = 0.0015;
 /// グリッドの目標スクリーン間隔（ピクセル）。
 const GRID_TARGET_PX: f64 = 48.0;
 
+/// グリッド間隔(mm)を表示用に整形する。`{:.6}`で固定小数化してから末尾の余分な
+/// '0'と'.'を落とす(10f64.powf由来の浮動小数アーティファクトを丸めて確実に短い
+/// 表記にする)。
+fn format_grid_step(step: f64) -> String {
+    let s = format!("{step:.6}");
+    let s = s.trim_end_matches('0');
+    s.trim_end_matches('.').to_owned()
+}
+
 /// 選択ヒットテストのピック許容量（スクリーンピクセル）。ワールド単位へは
 /// `PICK_TOLERANCE_PX / viewport.zoom` で変換する。
 const PICK_TOLERANCE_PX: f64 = 6.0;
@@ -1906,6 +1915,9 @@ impl eframe::App for McadApp {
                             "OFF"
                         }
                     ));
+                    ui.separator();
+                    let grid_step = viewport::nice_grid_step(self.viewport.zoom, GRID_TARGET_PX);
+                    ui.label(format!("Grid: {} mm", format_grid_step(grid_step)));
                     ui.separator();
                     // オフセット距離入力欄（設計判断5）。モーダルにせず上部パネルへ常設だが、
                     // 画面を圧迫しないようオフセットモード中のみ表示する。空欄なら通過点方式
@@ -4658,6 +4670,21 @@ mod tests {
     // `ConfirmingOpen` 分岐）はここでは検証しない。ここでは GUI コンテキストを
     // 要しない部分（拡張子補完・世代ベースの dirty 判定・確認モーダルへの状態遷移・
     // 新規文書のリセット内容）のみを検証する。
+
+    #[test]
+    fn format_grid_step_trims_trailing_zeros() {
+        assert_eq!(format_grid_step(50.0), "50");
+        assert_eq!(format_grid_step(0.05), "0.05");
+        assert_eq!(format_grid_step(0.00005), "0.00005");
+    }
+
+    #[test]
+    fn format_grid_step_rounds_float_artifacts() {
+        // 10f64.powf(-1.0) * 2.0 は浮動小数演算の丸め誤差で 0.2 ちょうどにならない
+        // ことがある。{:.6} で固定小数化してから整形することで "0.2" に丸まる。
+        let step = 2.0 * 10f64.powf(-1.0);
+        assert_eq!(format_grid_step(step), "0.2");
+    }
 
     /// 複数種のエンティティ（線分・円・円弧・ポリライン）を追加したドキュメントを作る。
     ///

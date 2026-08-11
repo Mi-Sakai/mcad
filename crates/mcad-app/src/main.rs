@@ -94,6 +94,12 @@ const SVG_EXTENSION: &str = "svg";
 /// SVG エクスポートダイアログの初期ファイル名（`current_path` が未定のとき）。
 const DEFAULT_SVG_FILE_NAME: &str = "Untitled.svg";
 
+/// PDF ファイルの拡張子（ファイルダイアログのフィルタ・拡張子補完の両方で使う）。
+const PDF_EXTENSION: &str = "pdf";
+
+/// PDF エクスポートダイアログの初期ファイル名（`current_path` が未定のとき）。
+const DEFAULT_PDF_FILE_NAME: &str = "Untitled.pdf";
+
 /// DXF importで生成した文書に割り当てる `saved_generation` の番兵値。
 ///
 /// `load_dxf`（内部で `clear_history()` を呼ぶ）が返す `Document` の世代は必ず `0`
@@ -729,6 +735,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "Ctrl+Shift+O=Import DXF",
     "Ctrl+E=Export DXF",
     "Ctrl+Shift+E=Export SVG",
+    "Ctrl+P=Export PDF",
     "Home=Zoom Fit",
 ];
 
@@ -1329,6 +1336,46 @@ impl McadApp {
         }
     }
 
+    /// Ctrl+P: ネイティブの保存ダイアログで選んだ先へ現在のドキュメントを PDF
+    /// として書き出す。
+    ///
+    /// DXF/SVG エクスポートと同じく読み取り専用操作なので、未保存の変更があっても
+    /// 確認モーダルは出さず、成功しても `current_path`・`saved_generation` は変更
+    /// しない（M8 タスク40。PDF は plot IR の直列化であって「保存」ではない）。
+    fn export_pdf_file(&mut self, now: f64) {
+        self.cancel_placement_for_file_op();
+        let default_name = self
+            .current_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|n| n.to_str())
+            .map_or_else(
+                || DEFAULT_PDF_FILE_NAME.to_string(),
+                |stem| format!("{stem}.{PDF_EXTENSION}"),
+            );
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("pdf", &[PDF_EXTENSION])
+            .set_file_name(&default_name);
+        if let Some(dir) = self.dialog_start_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        self.remember_dialog_dir(&path);
+        let path = ensure_pdf_extension(path);
+        let page = plot::plot_page(&self.document);
+        let bytes = plot::to_pdf(&page);
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                set_status_important(&mut self.status, now, "Exported PDF file");
+            }
+            Err(err) => {
+                set_status_important(&mut self.status, now, format!("PDF export failed: {err}"));
+            }
+        }
+    }
+
     /// Ctrl+S: 開いているファイルパスへ上書き保存する。パスが未定なら
     /// 「名前を付けて保存」（[`McadApp::save_document_as`]）と同じ扱いにする。
     fn save_document(&mut self, now: f64) {
@@ -1401,28 +1448,32 @@ fn ensure_mcad_extension(path: PathBuf) -> PathBuf {
     }
 }
 
-/// パスの拡張子が `.dxf`（大小無視）でなければ付け直す。
-fn ensure_dxf_extension(path: PathBuf) -> PathBuf {
+/// パスの拡張子が `ext`（大小無視）でなければ付け直す（`ensure_dxf_extension` 等の
+/// 共通実装。M8 タスク40 で3例目の `ensure_pdf_extension` を作る前に共通化した）。
+fn ensure_extension(path: PathBuf, ext: &str) -> PathBuf {
     if path
         .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case(DXF_EXTENSION))
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
     {
         path
     } else {
-        path.with_extension(DXF_EXTENSION)
+        path.with_extension(ext)
     }
+}
+
+/// パスの拡張子が `.dxf`（大小無視）でなければ付け直す。
+fn ensure_dxf_extension(path: PathBuf) -> PathBuf {
+    ensure_extension(path, DXF_EXTENSION)
 }
 
 /// パスの拡張子が `.svg`（大小無視）でなければ付け直す。
 fn ensure_svg_extension(path: PathBuf) -> PathBuf {
-    if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case(SVG_EXTENSION))
-    {
-        path
-    } else {
-        path.with_extension(SVG_EXTENSION)
-    }
+    ensure_extension(path, SVG_EXTENSION)
+}
+
+/// パスの拡張子が `.pdf`（大小無視）でなければ付け直す。
+fn ensure_pdf_extension(path: PathBuf) -> PathBuf {
+    ensure_extension(path, PDF_EXTENSION)
 }
 
 /// ドキュメント中の全エンティティを包む AABB。エンティティが1つもなければ `None`
@@ -1516,8 +1567,10 @@ impl eframe::App for McadApp {
             // Ctrl+N/Ctrl+O/Ctrl+S/Ctrl+Shift+S: 新規/開く/保存/名前を付けて保存。
             // Ctrl+Shift+O/Ctrl+E: DXF を開く/DXF へ書き出す。
             // Ctrl+Shift+E: SVG へ書き出す（M8 タスク39-3）。
+            // Ctrl+P: PDF へ書き出す（M8 タスク40）。
             // undo/redo と同様、ツール切替キー（`handle_tool_shortcut_keys`）は Ctrl 併用を
-            // 無視するので衝突しない。
+            // 無視するので衝突しない（P 単押しは Polyline ツール切替だが、Ctrl 併用は
+            // `handle_tool_shortcut_keys` 側の command 早期 return で除外される）。
             let (
                 new_pressed,
                 open_pressed,
@@ -1526,6 +1579,7 @@ impl eframe::App for McadApp {
                 open_dxf_pressed,
                 export_dxf_pressed,
                 export_svg_pressed,
+                export_pdf_pressed,
                 duplicate_pressed,
             ) = ui.input(|i| {
                 let cmd = i.modifiers.command;
@@ -1537,6 +1591,7 @@ impl eframe::App for McadApp {
                     cmd && i.modifiers.shift && i.key_pressed(Key::O),
                     cmd && !i.modifiers.shift && i.key_pressed(Key::E),
                     cmd && i.modifiers.shift && i.key_pressed(Key::E),
+                    cmd && !i.modifiers.shift && i.key_pressed(Key::P),
                     cmd && !i.modifiers.shift && i.key_pressed(Key::D),
                 )
             });
@@ -1560,6 +1615,9 @@ impl eframe::App for McadApp {
             }
             if export_svg_pressed {
                 self.export_svg_file(now);
+            }
+            if export_pdf_pressed {
+                self.export_pdf_file(now);
             }
             if duplicate_pressed {
                 self.request_duplicate(now);
@@ -4832,6 +4890,30 @@ mod tests {
         assert_eq!(
             ensure_dxf_extension(PathBuf::from("/tmp/drawing.DXF")),
             PathBuf::from("/tmp/drawing.DXF")
+        );
+    }
+
+    #[test]
+    fn ensure_pdf_extension_appends_when_missing() {
+        assert_eq!(
+            ensure_pdf_extension(PathBuf::from("/tmp/drawing")),
+            PathBuf::from("/tmp/drawing.pdf")
+        );
+    }
+
+    #[test]
+    fn ensure_pdf_extension_replaces_other_extension() {
+        assert_eq!(
+            ensure_pdf_extension(PathBuf::from("/tmp/drawing.mcad")),
+            PathBuf::from("/tmp/drawing.pdf")
+        );
+    }
+
+    #[test]
+    fn ensure_pdf_extension_is_case_insensitive_noop() {
+        assert_eq!(
+            ensure_pdf_extension(PathBuf::from("/tmp/drawing.PDF")),
+            PathBuf::from("/tmp/drawing.PDF")
         );
     }
 

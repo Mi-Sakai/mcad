@@ -1533,6 +1533,50 @@ core/io/geom にも及ぶ構成へ拡大している(2026-08-01)。
      付けた(削除して doc を書き直すより、ベジエ近似の根拠として名前を残す方が読み手に
      親切という判断)。
 
+   **実装時追記(2026-08-11、タスク40)**: `plot/pdf.rs` を新設し、`plot/mod.rs` の IR
+   (`PlotPage`/`PlotPath`/`PathCmd`)・`plot/svg.rs` は変更せずそのまま参照した。
+   - **`cm` 変換1回 + mm 直書きの契約**: PDF ユーザー空間の既定単位は 1/72 インチだが、
+     IR は紙 mm。毎回の座標を pt へ換算する代わりに、コンテンツストリーム先頭で
+     `cm` 演算子により座標系を `[K 0 0 K 0 0]`(`K = 72/25.4`)でスケールし、以降の
+     パス座標・線幅・破線長は紙 mm の数値をそのまま書く(`cm` が等方スケールなので
+     線幅にも同じ係数がかかる)。
+   - **`q`/`Q` を各パスで自己完結**させ、グラフィックス状態のリークを防いだ。PDF の
+     線幅・色・破線パターンはパスをまたいで持続する(SVG の `<path>` 要素が独立した
+     属性を持つのとは違う、SVG との最大の構造差)。無対策だとある破線パスの設定が
+     破線を持たない後続パスへ意図せず伝播するため、`push_path` は必ず
+     `save_state`(`q`)で始め `restore_state`(`Q`)で終える形にした。回帰テスト
+     (`dash_pattern_does_not_leak_into_following_path`)で固定。
+   - **描画演算子は `(stroke, fill)` の組でちょうど1回**: `stroke` のみ→`S`、`fill`
+     のみ→`f`(nonzero)、両方→`B`(`fill_nonzero_and_stroke`)。evenodd 版
+     (`f*`/`B*`)は使わない — IR の fill-rule は常に nonzero(文字アウトラインの穴が
+     正しく抜けるため、SVG 側と同じ理由)。
+   - **miter limit を `4 M` で明示**した。SVG の既定 `stroke-miterlimit` は 4 だが PDF
+     の既定は 10 のため、両バックエンドの見た目を揃える。`cm` の直後・最初の `q`/`Q`
+     より前(コンテンツ先頭)に置くことで、各パスの `Q` で消えずページ全体に効く。
+   - **決定性(info 辞書なし)・無圧縮**: `CreationDate` 等の info 辞書は一切書かない
+     (タイムスタンプを含めると同じ入力から生成したファイルが毎回異なるバイト列になり、
+     決定性テストが成立しなくなる)。コンテンツストリームも圧縮しない(テストがストリームを
+     直接文字列として検証するため)。
+   - **`pdf-writer = "0.15"` を `mcad-app` へ直接追加**(workspace.dependencies には
+     置かない、`ttf-parser` の前例踏襲)。低レベル API のみでフォント埋め込み機能を
+     使わない(文字は `text_outline` で既にアウトラインパス化済みのため不要)。依存
+     グラフへの純増分は `bitflags`/`itoa`/`memchr`/`ryu` の4クレートのみ(`itoa` は
+     既存 `Cargo.lock` に既に存在)で実測確認した。
+   - **PDF 数値直列化は SVG と異なる**ため、テストは文字列完全一致ではなくトークン
+     分解 + 数値近似比較で行った(`pdf-writer` は「整数化できる値は整数表記、それ以外
+     はryuの最短表現」で書くため `10.0` → `10` になる。SVG の `{:.3}` 固定小数とは
+     異なる)。
+   - **main.rs 配線は `export_svg_file` を厳密にミラー**した(`Ctrl+P`、rfd 保存
+     ダイアログ→ `ensure_pdf_extension` → `plot::plot_page` → `plot::to_pdf` →
+     `std::fs::write`)。3例目の拡張子ヘルパーを機に `ensure_dxf_extension`/
+     `ensure_svg_extension`/`ensure_pdf_extension` を共通の `ensure_extension(path, ext)`
+     へ統合した(挙動不変、既存テストは無変更で通過)。`Ctrl+P` は修飾キーなしの
+     `P`(Polyline ツール切替、`handle_tool_shortcut_keys`)と衝突しない — 同関数は
+     `i.modifiers.command` で早期 return するため Ctrl 併用の入力は素通しされない。
+   - テストは 632本 → `plot/pdf.rs` 11本 + `main.rs` 拡張子テスト3本(`ensure_pdf_extension`
+     の appends/replaces/case-insensitive-noop)を追加して 646本。egui 非依存
+     (`egui::` 未 import)を grep で確認済み。
+
 8. **設定永続化は自前の `config.json`**(eframe の persistence 機能ではなく)。理由: 保存内容を
    明示的に選べてテスト可能・手で読める・egui のバージョン更新に影響されない。`dirs` クレートで
    プラットフォーム標準の設定ディレクトリ(`~/.config/mcad/config.json` 等)に置く。

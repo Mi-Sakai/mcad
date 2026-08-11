@@ -17,3 +17,9 @@ rfd = "0.17.2"
 # dedup され、ビルドコストはほぼ増えない。Noto Sans JP は OTF(CFF) だが
 # CFF アウトラインの取得は feature flag 不要のコア機能。
 ttf-parser = "0.25"
+# PDF 直列化（`plot::to_pdf`）用。低レベルな PDF オブジェクト/コンテンツストリーム
+# 組み立てのみを提供するライブラリで、フォント埋め込み機能は使わない（文字は
+# plot::text_outline で既にアウトラインパス化済みのため不要）。依存グラフへの純増分は
+# bitflags/itoa/memchr/ryu の4クレートのみで実質ゼロに近い（itoa は既存 Cargo.lock に
+# 既に存在）。
+pdf-writer = "0.15"

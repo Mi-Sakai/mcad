@@ -68,9 +68,11 @@
 //! エンティティ色は [`mcad_core::Style::effective_color`] をそのまま使うが、
 //! **純白のみ黒へ再マップする**（[`plot_color`]）。図面枠・表題欄は常に黒。
 
+pub mod pdf;
 pub mod svg;
 pub mod text_outline;
 
+pub use pdf::to_pdf;
 pub use svg::to_svg;
 
 use std::f64::consts::FRAC_PI_2;

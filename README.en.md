@@ -2,7 +2,7 @@
 
 *[日本語版 README](./README.md)*
 
-A 2D CAD application built with Rust and egui. Current version: **v0.7.2**.
+A 2D CAD application built with Rust and egui. Current version: **v0.8.0**.
 
 > **Note on language.** The project's design documents (`DESIGN.md`, `AGENTS.md`,
 > `CHANGELOG.md`) are written in Japanese, and the application UI is being migrated
@@ -28,8 +28,10 @@ for the design and [`AGENTS.md`](./AGENTS.md) for the development conventions
 - **Snapping**: endpoint, intersection, midpoint, center and grid candidates chosen by priority, with a distinct marker per kind
 - **Layers**: color, visibility, lock, stacking order (front / back buttons), managed in a dedicated panel
 - **Undo/redo**: built on the command pattern
-- **File I/O**: save and load `.mcad` (JSON), import and export DXF
-- **Viewport**: cursor-centered zoom, pan, and a grid that follows the zoom level
+- **Drawing frame and title block**: paper size, scale and title-block style (A/B/C) live in the sheet metadata and are drawn automatically; fields are filled in via a dedicated dialog
+- **Line width and linetype**: per-layer or per-entity line width (ISO 128 series) and linetype (continuous / dashed / dash-dot / dash-dot-dot), resolved against paper mm and reflected on screen
+- **File I/O**: save and load `.mcad` (JSON), import and export DXF, export to SVG/PDF (true scale)
+- **Viewport**: cursor-centered zoom, pan, a grid that follows the zoom level, and manual zoom-to-fit
 
 ## Getting started
 
@@ -49,6 +51,8 @@ For everyday use, a release build is recommended: `cargo run --release -p mcad-a
 | `Ctrl+S` | Save |
 | `Ctrl+Shift+S` | Save as |
 | `Ctrl+E` | Export to DXF |
+| `Ctrl+Shift+E` | Export to SVG |
+| `Ctrl+P` | Export to PDF |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | `Ctrl+D` | Duplicate the selection (two clicks: base point, then destination) |
 | `S` | Selection tool |
@@ -70,18 +74,35 @@ For everyday use, a release build is recommended: `cargo run --release -p mcad-a
 | `Esc` | Cancel drawing or placement / discard a rubber-band drag / clear the selection |
 | `F3` | Toggle snapping |
 | `F8` | Toggle orthogonal mode (constrains to horizontal/vertical from the previous point; an available snap candidate takes precedence) |
+| `F9` | Toggle paper-based display (line width and annotation size shown at paper mm scale vs. fixed screen px) |
+| `Home` | Manual zoom-to-fit (fits the whole drawing in view) |
 | Wheel | Cursor-centered zoom |
 | Middle-drag / `Space`+left-drag | Pan |
 | Click | On a shape: add to the selection (clicking empty space does nothing) |
 | `Shift`+click | On a shape: remove it from the selection; on empty space: clear the selection |
 
 Creating a new document, opening a file, or closing the window while there are
-unsaved changes brings up a modal asking whether to discard them.
+unsaved changes brings up a modal asking whether to discard them. The state of
+`F3`/`F8`/`F9` and the default paper size/scale/title-block style are saved to
+a settings file and restored on the next launch (see "Settings" below).
 
 ## File formats
 
-- **`.mcad`**: the native JSON format. As of v0.7.2 the schema is v3; v1 and v2 files still load (backward compatible)
+- **`.mcad`**: the native JSON format. As of v0.8.0 the schema is v4; v1 through v3 files still load (backward compatible)
 - **New drawings** start with two layers, `"0"` and `"Text"`. `"Text"` can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
+
+## Settings
+
+Application settings are stored separately from `.mcad` files, in the OS's
+standard config directory (via the `dirs` crate; `~/.config/mcad/config.json`
+on Linux). No drawing content is ever stored there.
+
+- Snap (`F3`) / orthogonal mode (`F8`) / paper-based display (`F9`) on/off state
+- Default paper size, orientation, scale and title-block style for new documents
+- Recently used files (the "Recent" menu in the top panel, up to 5 entries; updated on every open/save, missing files are excluded)
+
+If the settings file is missing or corrupted, mcad falls back to defaults and
+still starts normally.
 
 ## Notes on DXF
 
@@ -91,8 +112,9 @@ format — the original DXF file is never overwritten. Be aware of the following
 - **Colors**: approximated to the 9-color ACI palette (RGB is rounded to the nearest color)
 - **Layer locks**: lost on a round trip, since DXF has no such field
 - **Layer stacking order**: lost on a round trip, since DXF has no z-index field
-- **Line width**: not preserved on a round trip; falls back to the default
-- **TEXT**: position, height and rotation are mapped. Strings containing CJK are written and restored as UTF-8 (the DXF header is R2007). TEXT with a non-standard justification — anything other than horizontal Left plus vertical Baseline — is skipped
+- **Line width**: per-entity line width round-trips, but a layer's default line width is not preserved and falls back to the default (0.35mm) — a limitation of the `dxf` crate 0.6.1
+- **Linetype**: continuous / dashed / dash-dot / dash-dot-dot round-trips for both layers and entities. Unknown linetype names fall back to continuous
+- **TEXT**: position, height and rotation are mapped. Height is converted against the drawing's scale, in paper mm. Strings containing CJK are written and restored as UTF-8 (the DXF header is R2007). TEXT with a non-standard justification — anything other than horizontal Left plus vertical Baseline — is skipped
 - **DIMENSION**: mcad dimensions are not exported to DXF, as there is no corresponding primitive; the number of skipped entities is shown in the status bar. They are saved normally in `.mcad`. Importing DXF DIMENSION is planned for M9
 - **CJK text in other applications**: CJK written by mcad may appear garbled in other CAD software (confirmed with LibreCAD). DXF cannot embed the font itself, so rendering depends on the fonts installed on the receiving side
 

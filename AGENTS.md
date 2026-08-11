@@ -9,14 +9,14 @@
 
 ## プロジェクト概要
 
-Rust + egui の 2D CAD。現在 **v0.7.0(M7「修正系ジオメトリ演算」完了)**。
-M7 は トリム・延長・フィレット・分割の4つの修正ツールを実装。次は M8「出力と設定永続化」を予定。
+Rust + egui の 2D CAD。現在 **v0.8.0(M8「出力と設定永続化」完了)**。
+M8 は SVG/PDF エクスポート・線幅/線種の画面反映・図面枠/表題欄・設定永続化を実装。次のマイルストーンは未定。
 
 ## ビルド・検証
 
 ```bash
 cargo build                                  # ワークスペース全体
-cargo test --workspace                       # 全テスト(v0.7.0時点で446本)
+cargo test --workspace                       # 全テスト(v0.8.0時点で672本)
 cargo clippy --workspace --all-targets       # 警告ゼロを維持
 cargo fmt --all --check                      # 整形チェック
 ```

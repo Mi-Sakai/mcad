@@ -16,11 +16,6 @@ use mcad_core::{Orientation, PaperSize, Scale, SheetMeta, TitleBlockKind};
 use serde::{Deserialize, Serialize};
 
 /// 「最近使ったファイル」の保持件数上限。
-///
-/// M8 タスク41-1（config 基盤）の時点では UI 配線（Recent メニュー・
-/// `push_recent` 呼び出し）は未着手（タスク41-2 の担当）。それまでは
-/// non-test ビルドから未参照になるため `#[allow(dead_code)]`。
-#[allow(dead_code)]
 pub const MAX_RECENT_FILES: usize = 5;
 
 /// 既定表題欄様式の選択肢（config.json 用）。
@@ -156,10 +151,6 @@ impl Config {
 
     /// 「最近使ったファイル」を更新する。既存の同一パスを取り除いてから先頭へ挿入し、
     /// [`MAX_RECENT_FILES`] 件を超えた分は末尾から切り詰める。
-    ///
-    /// タスク41-2（Recent メニュー UI）で呼び出す。41-1 の時点では non-test ビルドから
-    /// 未参照になるため `#[allow(dead_code)]`（[`MAX_RECENT_FILES`] と同じ理由）。
-    #[allow(dead_code)]
     pub fn push_recent(&mut self, path: PathBuf) {
         self.recent_files.retain(|p| p != &path);
         self.recent_files.insert(0, path);

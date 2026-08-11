@@ -468,6 +468,9 @@ enum ConfirmState {
     ConfirmingOpen,
     /// Ctrl+Shift+O（DXFを開く）の確認モーダルを表示中。
     ConfirmingOpenDxf,
+    /// Recent メニュー経由（「開く」）の確認モーダルを表示中。対象パスは
+    /// [`McadApp::pending_recent_path`] 側に持つ（M8 タスク41-2）。
+    ConfirmingOpenRecent,
     /// ユーザーが破棄を選択済み。以降の close 要求はキャンセルせず通す。
     Closing,
 }
@@ -490,6 +493,10 @@ impl ConfirmState {
             )),
             ConfirmState::ConfirmingOpenDxf => Some((
                 "Discard unsaved changes and import a DXF file?",
+                "Discard and continue",
+            )),
+            ConfirmState::ConfirmingOpenRecent => Some((
+                "Discard unsaved changes and open a recent file?",
                 "Discard and continue",
             )),
             ConfirmState::Idle | ConfirmState::Closing => None,
@@ -657,6 +664,10 @@ struct McadApp {
     /// アプリ再起動をまたぐ永続化はロードマップM8「設定保存」の範囲であり、ここでは
     /// 行わない。
     last_dialog_dir: Option<PathBuf>,
+    /// Recent メニュー経由の「開く」で未保存確認中のパス。
+    /// `ConfirmState::ConfirmingOpenRecent` へ入るとき必ず上書きするので、古い値が
+    /// 残っても無害（M8 タスク41-2）。
+    pending_recent_path: Option<PathBuf>,
     /// オフセット距離入力欄の文字列（設計判断5）。空・0・非数なら通過点方式へ
     /// フォールバックし、正の有限値なら距離固定＋クリックは側の決定のみに使う
     /// （[`parse_offset_distance`]）。欄はオフセットモード中のみ上部パネルに表示するが、
@@ -895,6 +906,7 @@ impl McadApp {
             confirm_state: ConfirmState::Idle,
             pending_zoom_fit: false,
             last_dialog_dir: None,
+            pending_recent_path: None,
             offset_distance_input: String::new(),
             fillet_radius_input: String::new(),
             text_content_input: String::new(),
@@ -1000,14 +1012,25 @@ impl McadApp {
     ///
     /// 優先順位: このセッション中に最後にダイアログで確定したディレクトリ
     /// （[`McadApp::last_dialog_dir`]）→ 現在開いているファイルの親ディレクトリ
-    /// （[`McadApp::current_path`]）→ どちらもなければ `None`（rfd の既定に任せる）。
+    /// （[`McadApp::current_path`]）→ 「最近使ったファイル」先頭の親ディレクトリ
+    /// （[`config::Config::recent_files`]、M8 タスク41-2）→ どちらもなければ `None`
+    /// （rfd の既定に任せる）。
     fn dialog_start_dir(&self) -> Option<PathBuf> {
-        self.last_dialog_dir.clone().or_else(|| {
-            self.current_path
-                .as_deref()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-        })
+        self.last_dialog_dir
+            .clone()
+            .or_else(|| {
+                self.current_path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
+            .or_else(|| {
+                self.config
+                    .recent_files
+                    .first()
+                    .and_then(|p| p.parent())
+                    .map(Path::to_path_buf)
+            })
     }
 
     /// ファイルダイアログでユーザーが確定したパスから、その親ディレクトリを
@@ -1078,6 +1101,18 @@ impl McadApp {
             self.confirm_state = ConfirmState::ConfirmingOpenDxf;
         } else {
             self.open_dxf(now);
+        }
+    }
+
+    /// Recent メニュー: 未保存の変更があれば確認モーダルを出し、なければ即座に
+    /// `path` を読み込む。ネイティブダイアログは一切開かない（M8 タスク41-2）。
+    fn request_open_recent(&mut self, path: PathBuf, now: f64) {
+        self.cancel_placement_for_file_op();
+        if self.is_dirty() {
+            self.pending_recent_path = Some(path);
+            self.confirm_state = ConfirmState::ConfirmingOpenRecent;
+        } else {
+            self.open_document_at(&path, now);
         }
     }
 
@@ -1201,19 +1236,34 @@ impl McadApp {
         let Some(path) = dialog.pick_file() else {
             return;
         };
-        self.remember_dialog_dir(&path);
-        match load_mcad(&path) {
+        self.open_document_at(&path, now);
+    }
+
+    /// [`McadApp::open_document`] のダイアログ非依存部分。ネイティブダイアログを
+    /// 一切開かないため headless テストで直接検証できる（Recent メニュー
+    /// （[`McadApp::request_open_recent`]）からも呼ぶ、M8 タスク41-2）。
+    ///
+    /// 未保存の変更があるかどうかは確認しない。呼び出し側が確認済みであることを
+    /// 前提とする。成功時は「最後にダイアログで確定したディレクトリ」
+    /// （[`McadApp::remember_dialog_dir`]）と「最近使ったファイル」
+    /// （[`config::Config::push_recent`]）を更新し、config.json へ保存する
+    /// （[`McadApp::persist_config`]）。失敗時はドキュメント・設定を一切変更しない。
+    fn open_document_at(&mut self, path: &Path, now: f64) {
+        self.remember_dialog_dir(path);
+        match load_mcad(path) {
             Ok(LoadSummary {
                 document,
                 clamped_widths,
             }) => {
                 self.document = document;
-                self.current_path = Some(path);
+                self.current_path = Some(path.to_path_buf());
                 // load_mcad は再構築後に clear_history 済みで世代が基準点に戻っている。
                 // 読込直後を未保存でない状態にするため、その世代へ合わせる。
                 self.saved_generation = self.document.generation();
                 self.reset_transient_ui_state();
                 self.request_zoom_fit();
+                self.config.push_recent(path.to_path_buf());
+                self.persist_config(now);
                 set_status_important(&mut self.status, now, open_status(clamped_widths));
             }
             Err(err) => {
@@ -1464,6 +1514,8 @@ impl McadApp {
                 self.current_path = Some(path.to_path_buf());
                 // 保存成功時点の世代を記録する。以後この世代と一致する限り未保存でない。
                 self.saved_generation = self.document.generation();
+                self.config.push_recent(path.to_path_buf());
+                self.persist_config(now);
                 set_status_important(&mut self.status, now, "Saved");
             }
             Err(err) => {
@@ -1791,10 +1843,40 @@ impl eframe::App for McadApp {
             self.status = None;
         }
 
+        // Recent メニュー（M8 タスク41-2）。対象は `.mcad` のみ（DXF import は対象外、
+        // AGENTS.md/DESIGN.md 判断8参照）。クリックはこのパネルクロージャの外
+        // （既存のショートカット処理と同じ流儀）で処理する。
+        let mut clicked_recent: Option<PathBuf> = None;
         egui::Panel::top("tool_status").show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("File: {file_label}{dirty_marker}"));
+                    ui.separator();
+                    ui.menu_button("Recent", |ui| {
+                        let existing: Vec<&PathBuf> = self
+                            .config
+                            .recent_files
+                            .iter()
+                            .filter(|p| p.exists())
+                            .collect();
+                        if existing.is_empty() {
+                            ui.label("(no recent files)");
+                        }
+                        for path in existing {
+                            let label = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map_or_else(|| path.display().to_string(), str::to_owned);
+                            if ui
+                                .button(label)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                clicked_recent = Some(path.clone());
+                                ui.close();
+                            }
+                        }
+                    });
                     ui.separator();
                     ui.label(format!("Tool: {}", self.tool_kind.label()));
                     ui.separator();
@@ -1904,6 +1986,9 @@ impl eframe::App for McadApp {
                 });
             });
         });
+        if let Some(path) = clicked_recent {
+            self.request_open_recent(path, now);
+        }
 
         egui::Panel::right("layer_panel").show(ui, |ui| {
             layer_panel(ui, &mut self.document, &mut self.status, now);
@@ -2102,17 +2187,25 @@ impl eframe::App for McadApp {
                                     self.confirm_state = ConfirmState::Idle;
                                     self.open_dxf(now);
                                 }
+                                ConfirmState::ConfirmingOpenRecent => {
+                                    self.confirm_state = ConfirmState::Idle;
+                                    if let Some(path) = self.pending_recent_path.take() {
+                                        self.open_document_at(&path, now);
+                                    }
+                                }
                                 ConfirmState::Idle | ConfirmState::Closing => {}
                             }
                         }
                         if ui.button("Cancel").clicked() {
                             self.confirm_state = ConfirmState::Idle;
+                            self.pending_recent_path = None;
                         }
                     });
                 });
             // モーダル外クリック / Esc はキャンセル扱い（実行しない）。
             if modal.should_close() {
                 self.confirm_state = ConfirmState::Idle;
+                self.pending_recent_path = None;
             }
         }
 
@@ -5396,6 +5489,23 @@ mod tests {
     }
 
     #[test]
+    fn dialog_start_dir_falls_back_to_recent_files_head() {
+        let mut app = McadApp::new();
+        app.config
+            .recent_files
+            .push(PathBuf::from("/tmp/recent/dir/drawing.mcad"));
+        // last_dialog_dir も current_path も無ければ recent_files 先頭の親へ落ちる。
+        assert_eq!(
+            app.dialog_start_dir(),
+            Some(PathBuf::from("/tmp/recent/dir"))
+        );
+
+        // current_path があれば、recent_files より優先する。
+        app.current_path = Some(PathBuf::from("/tmp/some/dir/other.mcad"));
+        assert_eq!(app.dialog_start_dir(), Some(PathBuf::from("/tmp/some/dir")));
+    }
+
+    #[test]
     fn remember_dialog_dir_stores_parent_of_confirmed_path() {
         let mut app = McadApp::new();
         assert_eq!(app.last_dialog_dir, None);
@@ -5406,6 +5516,102 @@ mod tests {
             app.last_dialog_dir,
             Some(PathBuf::from("/home/user/project"))
         );
+    }
+
+    // --- M8タスク41-2（Recent メニュー・最近使ったファイル）---
+    //
+    // rfd のネイティブダイアログは headless で開けないため、[`McadApp::open_document_at`]
+    // （ダイアログ非依存の読込本体）と [`McadApp::save_to`] を実在の一時ファイルへ
+    // 直接呼び出して検証する（`config.rs` の `unique_temp_path` と同じ流儀）。
+
+    /// テストごとに一意な一時 `.mcad` ファイルパスを作る
+    /// （`std::env::temp_dir()/mcad-app-test-main/<counter>-<name>.mcad`）。
+    fn unique_temp_mcad_path(name: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join("mcad-app-test-main");
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        dir.join(format!("{n}-{name}.mcad"))
+    }
+
+    #[test]
+    fn open_document_at_success_updates_recent_files() {
+        let path = unique_temp_mcad_path("open-recent");
+        save_mcad(&Document::new(), &path).expect("write a real .mcad file to open");
+
+        let mut app = McadApp::new();
+        assert!(app.config.recent_files.is_empty());
+
+        app.open_document_at(&path, 0.0);
+
+        assert_eq!(app.current_path, Some(path.clone()));
+        assert!(!app.is_dirty());
+        assert_eq!(app.config.recent_files.first(), Some(&path));
+    }
+
+    #[test]
+    fn open_document_at_failure_leaves_document_and_recent_files_unchanged() {
+        let path = unique_temp_mcad_path("does-not-exist");
+        let mut app = McadApp::new();
+        let path_before = app.current_path.clone();
+
+        app.open_document_at(&path, 0.0);
+
+        assert_eq!(app.current_path, path_before);
+        assert!(app.config.recent_files.is_empty());
+    }
+
+    #[test]
+    fn save_to_success_updates_recent_files() {
+        let path = unique_temp_mcad_path("save-recent");
+        let mut app = McadApp::new();
+        assert!(app.config.recent_files.is_empty());
+
+        app.save_to(&path, 0.0);
+
+        assert!(path.exists());
+        assert_eq!(app.current_path, Some(path.clone()));
+        assert_eq!(app.config.recent_files.first(), Some(&path));
+    }
+
+    #[test]
+    fn request_open_recent_defers_to_modal_when_dirty() {
+        let path = unique_temp_mcad_path("dirty-defer");
+        save_mcad(&Document::new(), &path).expect("write a real .mcad file to open");
+
+        let mut app = McadApp::new();
+        // ドキュメントに変更を加えて dirty にする。
+        app.document
+            .apply(Command::AddLayer(Layer::new("Extra", Rgb::new(0, 0, 0))))
+            .expect("AddLayer should succeed on a fresh document");
+        assert!(app.is_dirty());
+
+        app.request_open_recent(path.clone(), 0.0);
+
+        // dirty のときはダイアログ非依存の読込を即座に呼ばず、モーダルへ遷移する。
+        assert_eq!(app.confirm_state, ConfirmState::ConfirmingOpenRecent);
+        assert_eq!(app.pending_recent_path, Some(path));
+        assert_ne!(app.current_path, Some(PathBuf::new()));
+    }
+
+    #[test]
+    fn request_open_recent_opens_immediately_when_not_dirty() {
+        let path = unique_temp_mcad_path("clean-immediate");
+        save_mcad(&Document::new(), &path).expect("write a real .mcad file to open");
+
+        let mut app = McadApp::new();
+        assert!(!app.is_dirty());
+
+        app.request_open_recent(path.clone(), 0.0);
+
+        // dirty でないときは即座に open_document_at を呼び、実ファイルを読み込む。
+        assert_eq!(app.confirm_state, ConfirmState::Idle);
+        assert_eq!(app.current_path, Some(path));
+    }
+
+    #[test]
+    fn confirming_open_recent_prompt_is_some() {
+        assert!(ConfirmState::ConfirmingOpenRecent.prompt().is_some());
     }
 
     // --- M7ツールのコミット失敗時の状態保持（Codex adversarial review 2026-07-26 指摘の回帰） ---

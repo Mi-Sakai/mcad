@@ -2,7 +2,7 @@
 
 *[English README](./README.en.md)*
 
-Rust + egui で開発している2D CADソフトウェアです。現在 **v0.8.0**。
+Rust + egui で開発している2D CADソフトウェアです。現在 **v0.8.1**。
 
 ## 開発の経緯
 

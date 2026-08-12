@@ -9,14 +9,14 @@
 
 ## プロジェクト概要
 
-Rust + egui の 2D CAD。現在 **v0.8.0(M8「出力と設定永続化」完了)**。
-M8 は SVG/PDF エクスポート・線幅/線種の画面反映・図面枠/表題欄・設定永続化を実装。次のマイルストーンは未定。
+Rust + egui の 2D CAD。現在 **v0.8.1(M8「出力と設定永続化」完了、v0.8.x 番号外対応含む)**。
+M8 は SVG/PDF エクスポート・線幅/線種の画面反映・図面枠/表題欄・設定永続化を実装。v0.8.1 は出力モノクロ化・分割スナップ・ズームパン操作追加を実装。
 
 ## ビルド・検証
 
 ```bash
 cargo build                                  # ワークスペース全体
-cargo test --workspace                       # 全テスト(v0.8.0時点で672本)
+cargo test --workspace                       # 全テスト(v0.8.1時点で709本)
 cargo clippy --workspace --all-targets       # 警告ゼロを維持
 cargo fmt --all --check                      # 整形チェック
 ```

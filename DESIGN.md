@@ -450,6 +450,75 @@ M5 の内容と順序は現状の実測(編集操作が移動・削除のみ)に
       README・CHANGELOG(Unreleased、3ツールのマーカー抑止は挙動変更として明記)も更新済み。
       fmt / clippy(警告ゼロ) / workspace test(`snaps_shape_pick` の既定 false / Split true
       を含む)通過。GUI 変更のため実ウィンドウでの手動スモークテストは別途依頼。
+  - **ズーム・パンの追加操作手段 — 設計確定(2026-08-12、design-fable 案)**: 本欄の 2026-08-09 要望
+    (修飾キー+マウス移動でズーム/パン)を v0.8.x 番号外の3件目として消化する。変更は app 層
+    (viewport.rs / main.rs)に閉じ、geom・core・io・保存データ(`.mcad`/DXF)・既存のズーム/パン/
+    ショートカットの挙動には一切触れない(純追加。既存挙動の変更ゼロ)。
+    - **(a) 修飾キーは Alt(ズーム)/ Shift+Alt(パン)**: Alt はアプリ内で完全に未使用(grep 実測:
+      `modifiers.alt`・`Key::Alt` とも使用ゼロ)で、既存バインドと衝突しない。Ctrl(command)は
+      Ctrl+S/Z/D 等を押す瞬間の手ブレが誤ズームになるため不採用。Shift 単独は Shift+クリック
+      (除外選択)へ向かうカーソル移動中に誤発火するため不採用。「Space+移動(ボタン無し)を
+      パン化」する案は、Space を押してから左ドラッグ位置へカーソルを合わせる既存操作が勝手に
+      パンする挙動変更を伴うため不採用。有効条件はホイールズームと同じ「キャンバス hovered かつ
+      hover_pos あり」に加えて「ポインタボタンがどれも押されていない」(`pointer.any_down()` が
+      false)と「command 非押下」。前者により矩形選択・中ボタン/Space パン・作図ドラッグ等の
+      既存ドラッグとは構造的に相互作用せず(ボタン押下中は Alt が完全に不活性)、Linux WM の
+      Alt+ドラッグ(ウィンドウ移動)グラブもボタン併用時のみなので干渉しない。後者で AltGr が
+      Ctrl+Alt として報告される系(Windows)を除外する。Windows のメニューバー Alt はネイティブ
+      メニュー非使用のため無関係。Alt+文字キーのツール切替(既存挙動: command のみ除外)は
+      キーイベントとポインタ移動で経路が別なので衝突せず無変更。呼び出し位置は
+      handle_pan_input / handle_zoom_input の隣(モーダルゲートの外)で、モーダル中の扱いも
+      既存パン/ズームの「見るだけの操作」と揃える。なおトラックパッドは二本指スクロールが
+      既存ホイール経路に乗るため既にズーム可能。ピンチ(egui の `zoom_delta`)対応は今回
+      スコープ外(必要になったら1経路の追加で済む)。
+    - **(b) 変換はホイールと同型の指数写像**: `factor = exp(delta_x * MOTION_ZOOM_SPEED)`
+      (`delta_x` は egui の `pointer.delta().x`、右が正)。指数形は移動量に対して合成的
+      (`exp(a)·exp(b) = exp(a+b)`)なので、右へ N px→左へ N px の「揺らし」でビューが元へ戻る
+      (クランプ非到達域では zoom・center とも復元される。アンカー固定(下記(c))との合わせ技)。
+      右=拡大。`MOTION_ZOOM_SPEED = 0.003`(px⁻¹、100 px で約1.35倍・800 px で約11倍)を初期値
+      として viewport.rs に定数1箇所で置き、体感は手動スモークテストで確認して必要なら調整する。
+      クランプは既存 `zoom_at` の MIN_ZOOM/MAX_ZOOM に乗り、非有限入力も `zoom_at` の既存ガードで
+      無害(新設のガードを作らない)。
+    - **(c) ズーム中心は「ジェスチャ開始時のカーソル位置」に固定**: ホイールズームの「狙った点へ
+      寄る」カーソル中心の意味論に揃える(ビュー中心は不採用)。ただし本ジェスチャではカーソル
+      自体が操作入力として左右へ動くため、毎フレーム現在カーソルへ再アンカーすると水平ドリフト
+      (パン混入)が生じ、往復可逆性も壊れる。開始時の hover 位置を `alt_zoom_anchor:
+      Option<Pos2>` としてアプリへ保持し、ジェスチャ継続中は固定する(開始時にアンカーへ写って
+      いたワールド点が、ジェスチャ全体を通して同じスクリーン位置に留まる)。
+    - **(d) 開始・終了は「条件を満たしている間だけ有効」**: 毎フレーム (a) の有効条件を評価し、
+      ズーム条件(Alt、Shift なし)ならそのフレームの `pointer.delta().x` を適用、パン条件
+      (Shift+Alt)なら 2軸 delta を既存 `pan_by_screen_delta` へ渡す(左右限定はズームのみの
+      規約。パンは2軸が自然で、既存パンと同じ「掴んだ点がついてくる」意味論)。条件を満たさなく
+      なったらアンカーを破棄する。ジェスチャ中の Shift 押下/解放でズーム↔パンが切り替わる
+      (切替時はアンカー再取得)。アンカーは `reset_transient_ui_state()` でも破棄する(読込後に
+      押しっぱなしの Alt が旧アンカーを引きずらないため)。
+    - **新設 API は `Viewport::zoom_by_horizontal_motion(screen_rect, anchor, delta_x)` の1つ**:
+      内部で factor を計算し既存 `zoom_at` へ委譲する薄い純関数(タスク36〜38 の流儀で viewport.rs
+      に置き headless テスト)。パン側は既存 `pan_by_screen_delta` を再利用し新設しない。
+    - **タスク分割**(いずれも implement-sonnet。設計判断は本欄で確定済みのため定型実装):
+      1. **ズームパン-1(viewport 層)**: `MOTION_ZOOM_SPEED` 定数と
+         `Viewport::zoom_by_horizontal_motion` 追加+doc(方向規約・指数形の可逆性・定数の調整
+         余地)。テスト: +dx で拡大/−dx で縮小/dx=0 で不変/アンカーのワールド座標がジェスチャ
+         を通して固定/+dx→−dx の往復で zoom・center とも復元(許容誤差つき)/極端な dx で
+         MIN_ZOOM/MAX_ZOOM にクランプ/非有限 dx は無視。完了条件: fmt / clippy / workspace test
+         通過。
+      2. **ズームパン-2(app 配線+ドキュメント)**: アプリへ `alt_zoom_anchor: Option<Pos2>` 追加、
+         ゲート判定を純関数 `modifier_view_gesture(alt, shift, command, any_down, hovered) ->
+         Option<Zoom|Pan>`(名称仮)に切り出して真理値表テストを付け、
+         `handle_modifier_view_input`(仮名)を handle_pan_input / handle_zoom_input の隣
+         (モーダルゲートの外)へ新設して (a)(d) のとおりズーム/パンを配線、
+         `reset_transient_ui_state` でのアンカー破棄、README キーバインド表の更新(ズーム行を
+         追加し、既存パン行へ `Shift+Alt`+マウス移動を追記)、CHANGELOG(Unreleased)。
+         完了条件: fmt / clippy / workspace test 通過。GUI 変更のため手動スモークテスト
+         (下記検収基準)をユーザーへ依頼し記録する。依存: ズームパン-1。
+    - **検収基準**: (i) Alt+右移動で開始点を中心に拡大、左移動で縮小、同量の往復で元の表示に戻る。
+      (ii) Alt を離して押し直すと現在のカーソル位置で再アンカーされる。(iii) Shift+Alt+移動で
+      パンでき、ジェスチャ中の Shift 切替でズーム↔パンが移行する。(iv) パネル上・ボタン押下中
+      (矩形選択・中ボタン/Space パン・作図ドラッグ)では新ジェスチャが発火しない。(v) ホイール
+      ズーム・中ボタン/Space パン・全キーボードショートカットの既存挙動が無変更。(vi) ズーム
+      方向・速度の体感が妥当(不満なら MOTION_ZOOM_SPEED を調整して再確認)。(vii) fmt / clippy /
+      workspace test 通過、手動スモークテスト記録。リリース(バージョン更新・タグ)は番号外3件の
+      消化方針の采配に従う(前2項と同じ)。
 
 ### M5: 編集操作の充実(v0.5.0)の設計
 

@@ -714,6 +714,23 @@ struct McadApp {
     /// 尺度カスタム入力の直近の拒否理由（インライン赤字表示用）。適用成功・
     /// プリセット選択・入力欄変更のたびにクリアする。
     scale_input_error: Option<String>,
+    /// Alt(+Shift)修飾キージェスチャ（ズーム/パン）の開始時カーソル位置
+    /// （DESIGN.md 7章「ズーム・パンの追加操作手段」設計判断(c)(d)）。
+    ///
+    /// `modifier_view_gesture` が `Some` を返した瞬間（直前フレームが `None` だった、
+    /// またはズーム↔パンが切り替わった）にその時点の hover 位置で上書きし、
+    /// ジェスチャ継続中は固定する。条件を満たさなくなったフレームで `None` へ戻す。
+    /// [`McadApp::reset_transient_ui_state`] でも破棄する（読込後に押しっぱなしの Alt が
+    /// 旧アンカーを引きずらないため）。
+    alt_zoom_anchor: Option<Pos2>,
+    /// 直前フレームで有効だった Alt(+Shift)修飾キージェスチャの種類。
+    ///
+    /// `alt_zoom_anchor` はアンカー座標だけを持ち、ジェスチャの種類（ズーム/パン）を
+    /// 区別しない。ジェスチャ中の Shift 切替（ズーム↔パン移行）を検知してアンカーを
+    /// 再取得する（DESIGN.md 設計判断(d)）ために、直前フレームの種類をここに保持する。
+    /// `alt_zoom_anchor` と常に一体で扱い、[`McadApp::reset_transient_ui_state`] でも
+    /// 一緒に破棄する。
+    alt_view_gesture: Option<ViewGesture>,
 }
 
 /// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
@@ -925,6 +942,8 @@ impl McadApp {
             scale_custom_selected: false,
             scale_custom_input: String::new(),
             scale_input_error: None,
+            alt_zoom_anchor: None,
+            alt_view_gesture: None,
         };
         if let Some(warning) = startup.warning {
             // 起動時はまだ egui の InputState が無いため now=0.0（[`STATUS_MESSAGE_SECS_IMPORTANT`]
@@ -967,6 +986,8 @@ impl McadApp {
         self.scale_custom_selected = false;
         self.scale_custom_input.clear();
         self.scale_input_error = None;
+        self.alt_zoom_anchor = None;
+        self.alt_view_gesture = None;
     }
 
     /// undo/redo が成功した直後の UI 状態の後始末。
@@ -2050,6 +2071,14 @@ impl eframe::App for McadApp {
 
             handle_pan_input(ui, &response, &mut self.viewport);
             handle_zoom_input(ui, &response, rect, &mut self.viewport);
+            handle_modifier_view_input(
+                ui,
+                &response,
+                rect,
+                &mut self.viewport,
+                &mut self.alt_zoom_anchor,
+                &mut self.alt_view_gesture,
+            );
             // モーダル（未保存確認 / 表題欄編集ダイアログ）表示中は、キャンバスへの
             // クリック/ドラッグ/Delete/Enter/Esc などを一切ツール・選択処理へ渡さない。
             // 素通りさせると、モーダルの裏でエンティティが削除・作図確定されてしまう
@@ -3964,6 +3993,101 @@ fn handle_zoom_input(
     viewport.zoom_at(rect, cursor, zoom_factor);
 }
 
+/// Alt(+Shift)修飾キー+マウス移動によるジェスチャの種類
+/// （DESIGN.md 7章「ズーム・パンの追加操作手段」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewGesture {
+    /// Alt のみ: 水平移動でズーム（[`Viewport::zoom_by_horizontal_motion`]）。
+    Zoom,
+    /// Shift+Alt: 2軸移動でパン（既存 [`Viewport::pan_by_screen_delta`]）。
+    Pan,
+}
+
+/// Alt(+Shift)修飾キージェスチャの有効/種類判定を行う純関数
+/// （DESIGN.md 設計判断(a)(d)）。
+///
+/// 有効化の必要条件は「キャンバスが hovered かつポインタボタンがどれも押されていない
+/// （`any_down` が false）かつ command 非押下」。これにより矩形選択・中ボタン/Space
+/// パン・作図ドラッグ等の既存ドラッグとは構造的に相互作用しない（ボタン押下中は Alt が
+/// 完全に不活性）。command 除外は AltGr が Ctrl+Alt として報告される系（Windows）を弾く。
+/// 必要条件を満たした上で `alt` が立っていなければ `None`、`alt && !shift` で
+/// [`ViewGesture::Zoom`]、`alt && shift` で [`ViewGesture::Pan`] を返す。
+fn modifier_view_gesture(
+    alt: bool,
+    shift: bool,
+    command: bool,
+    any_down: bool,
+    hovered: bool,
+) -> Option<ViewGesture> {
+    if !hovered || any_down || command || !alt {
+        return None;
+    }
+    if shift {
+        Some(ViewGesture::Pan)
+    } else {
+        Some(ViewGesture::Zoom)
+    }
+}
+
+/// Alt(+Shift)+マウス移動によるズーム/パン（DESIGN.md 設計判断(a)〜(d)）。
+///
+/// 毎フレーム [`modifier_view_gesture`] を評価する。`None` または種類が異なる状態から
+/// `Some` へ遷移した瞬間（ジェスチャ開始、またはジェスチャ中の Shift 切替による
+/// ズーム↔パン移行）に現在の hover 位置を `anchor` へ記録し、以後ジェスチャが継続する
+/// 限り固定する。ズーム中は `pointer.delta().x` を
+/// [`Viewport::zoom_by_horizontal_motion`] へ、パン中は `pointer.delta()`（2軸）を
+/// 既存 [`Viewport::pan_by_screen_delta`] へそのまま渡す。条件を満たさなくなったら
+/// `anchor` を破棄する。
+///
+/// 呼び出し位置は `handle_pan_input`/`handle_zoom_input` の隣（モーダルゲートの外）。
+/// 既存のホイールズーム・中ボタン/Space パン等とは `modifier_view_gesture` の
+/// `any_down` 条件により排他的なので、既存挙動には触れない。
+fn handle_modifier_view_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    rect: Rect,
+    viewport: &mut Viewport,
+    anchor: &mut Option<Pos2>,
+    active_gesture: &mut Option<ViewGesture>,
+) {
+    let hovered = response.hovered();
+    let (alt, shift, command, any_down, delta) = ui.input(|i| {
+        (
+            i.modifiers.alt,
+            i.modifiers.shift,
+            i.modifiers.command,
+            i.pointer.any_down(),
+            i.pointer.delta(),
+        )
+    });
+    let gesture = modifier_view_gesture(alt, shift, command, any_down, hovered);
+
+    // ジェスチャの開始（直前フレームが None）、またはジェスチャ中の Shift 切替
+    // （直前フレームと種類が異なる）の両方でアンカーを再取得する。
+    if let Some(current) = gesture
+        && *active_gesture != Some(current)
+    {
+        *anchor = response.hover_pos();
+    }
+
+    match gesture {
+        Some(ViewGesture::Zoom) => {
+            if let Some(cursor) = *anchor {
+                viewport.zoom_by_horizontal_motion(rect, cursor, delta.x);
+            }
+        }
+        Some(ViewGesture::Pan) => {
+            if anchor.is_some() {
+                viewport.pan_by_screen_delta(delta);
+            }
+        }
+        None => {
+            *anchor = None;
+        }
+    }
+    *active_gesture = gesture;
+}
+
 /// ズームレベルに応じて間引いたグリッド線を描画する。
 ///
 /// 副グリッド（`nice_grid_step` が返す基本間隔）と、その5倍の主グリッドの2段。
@@ -5458,6 +5582,58 @@ mod tests {
 
         assert_eq!(app.text_height_input, DEFAULT_TEXT_HEIGHT);
         assert!(app.text_content_input.is_empty());
+    }
+
+    #[test]
+    fn reset_transient_ui_state_clears_alt_view_gesture_state() {
+        // 読込後に押しっぱなしの Alt が旧アンカー/旧ジェスチャ種別を引きずらないこと
+        // （DESIGN.md 7章「ズーム・パンの追加操作手段」設計判断(d)）。
+        let mut app = McadApp::new();
+        app.alt_zoom_anchor = Some(Pos2::new(12.0, 34.0));
+        app.alt_view_gesture = Some(ViewGesture::Pan);
+
+        app.reset_transient_ui_state();
+
+        assert!(app.alt_zoom_anchor.is_none());
+        assert!(app.alt_view_gesture.is_none());
+    }
+
+    /// `modifier_view_gesture` の真理値表（DESIGN.md 設計判断(a)(d)）。
+    ///
+    /// 有効化の必要条件（hovered かつボタン非押下かつ command 非押下）を満たさない
+    /// 組み合わせはすべて `None`、満たした上で `alt` が立っていなければ `None`、
+    /// `alt && !shift` で `Zoom`、`alt && shift` で `Pan` になることを固定する。
+    #[test]
+    fn modifier_view_gesture_truth_table() {
+        // (alt, shift, command, any_down, hovered) -> expected
+        type Case = (bool, bool, bool, bool, bool, Option<ViewGesture>);
+        let cases: &[Case] = &[
+            // 必要条件を満たし、alt のみ → Zoom。
+            (true, false, false, false, true, Some(ViewGesture::Zoom)),
+            // 必要条件を満たし、alt+shift → Pan。
+            (true, true, false, false, true, Some(ViewGesture::Pan)),
+            // alt が立っていなければ shift/command/any_down/hovered に関わらず None。
+            (false, false, false, false, true, None),
+            (false, true, false, false, true, None),
+            // ポインタボタンが1つでも押されていたら None（矩形選択等との非干渉）。
+            (true, false, false, true, true, None),
+            (true, true, false, true, true, None),
+            // command 押下時は None（AltGr=Ctrl+Alt 系の除外）。
+            (true, false, true, false, true, None),
+            (true, true, true, false, true, None),
+            // hovered でなければ None（パネル上等）。
+            (true, false, false, false, false, None),
+            (true, true, false, false, false, None),
+            // 何も条件を満たさない基準ケース。
+            (false, false, false, false, false, None),
+        ];
+        for &(alt, shift, command, any_down, hovered, expected) in cases {
+            assert_eq!(
+                modifier_view_gesture(alt, shift, command, any_down, hovered),
+                expected,
+                "alt={alt} shift={shift} command={command} any_down={any_down} hovered={hovered}"
+            );
+        }
     }
 
     #[test]

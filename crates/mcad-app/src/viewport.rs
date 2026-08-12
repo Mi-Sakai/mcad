@@ -35,6 +35,13 @@ const FIT_MARGIN_RATIO: f64 = 0.1;
 /// 余白は常に画面上で意味のある大きさを保つ）。
 const FIT_MARGIN_MIN_PX: f64 = 24.0;
 
+/// [`Viewport::zoom_by_horizontal_motion`] の感度（px⁻¹）。
+///
+/// `factor = exp(delta_x * MOTION_ZOOM_SPEED)` の指数に掛かる係数。100px の水平移動で
+/// 約1.35倍、800px で約11倍になる初期値であり、体感（手動スモークテスト）次第で
+/// 調整の余地がある値として1箇所にまとめてある。
+const MOTION_ZOOM_SPEED: f64 = 0.003;
+
 /// ワールド(f64)↔スクリーン(egui, f32)変換とズーム/パン状態を保持するビューポート。
 ///
 /// `zoom` はワールド単位→スクリーンピクセルの倍率、`center` は画面中心が指す
@@ -103,6 +110,37 @@ impl Viewport {
         // world_before が再び cursor の位置に来るよう center を平行移動する。
         self.center.x += world_before.x - world_after.x;
         self.center.y += world_before.y - world_after.y;
+    }
+
+    /// 水平方向の移動量 `delta_x`（スクリーン px、右が正）から指数写像でズームする
+    /// （DESIGN.md 7章「ズーム・パンの追加操作手段」設計判断(b)）。
+    ///
+    /// `factor = exp(delta_x * MOTION_ZOOM_SPEED)` を計算し [`Self::zoom_at`] へ委譲する
+    /// 薄い実装。`anchor`（ジェスチャ開始時のカーソル位置）が指すワールド座標は、
+    /// ズーム後も同じスクリーン位置に留まる（`zoom_at` のアンカー固定の意味論をそのまま
+    /// 継承する）。
+    ///
+    /// # 方向規約
+    /// 右へ動かす（`delta_x > 0`）と拡大、左へ動かす（`delta_x < 0`）と縮小する。
+    /// ホイールズームと同じ「狙った点へ寄る」感覚に揃えている。
+    ///
+    /// # 指数形の可逆性
+    /// `factor` が `delta_x` に対して指数写像（`exp`）であるため、`exp(a) * exp(b) =
+    /// exp(a + b)` が成り立つ。したがって右へ N px 動かした直後に左へ同じ N px
+    /// 動かす「揺らし」ジェスチャは、合成した delta_x の合計がゼロになり
+    /// `factor` が 1.0 に戻るので、（[`MIN_ZOOM`]/[`MAX_ZOOM`] のクランプに当たらない
+    /// 範囲では）`zoom` も `center` も呼び出し前の値へ正確に復元される。`anchor` を
+    /// ジェスチャ全体を通して固定していることも、この可逆性が成り立つための前提
+    /// （毎フレーム現在のカーソル位置へ再アンカーすると、この復元性は壊れる）。
+    ///
+    /// # クランプ・非有限入力
+    /// 新たなガードは設けない。`factor` の計算結果をそのまま [`Self::zoom_at`] へ渡すため、
+    /// `zoom` のクランプ（[`MIN_ZOOM`]..=[`MAX_ZOOM`]）や非有限・非正 `factor` の無視は
+    /// すべて `zoom_at` 側の既存ガードに委ねる（`delta_x` が非有限でも `exp` の結果は
+    /// 非有限または非正になり `zoom_at` が無視するため、ここで個別に弾く必要はない）。
+    pub fn zoom_by_horizontal_motion(&mut self, screen_rect: Rect, anchor: Pos2, delta_x: f32) {
+        let factor = (f64::from(delta_x) * MOTION_ZOOM_SPEED).exp();
+        self.zoom_at(screen_rect, anchor, factor);
     }
 
     /// スクリーン空間の変位 `screen_delta`（ドラッグ量）だけパンする。
@@ -641,6 +679,105 @@ mod tests {
         // 幅・高さが 0 のスクリーン矩形（レイアウト確定前を模す）。
         let degenerate_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(0.0, 0.0));
         vp.fit_to_aabb(aabb, degenerate_rect);
+        assert_eq!(vp, before);
+    }
+
+    #[test]
+    fn zoom_by_horizontal_motion_positive_dx_zooms_in() {
+        let mut vp = Viewport::new();
+        let r = rect(800.0, 600.0);
+        let anchor = Pos2::new(500.0, 300.0);
+        vp.zoom_by_horizontal_motion(r, anchor, 100.0);
+        assert!(vp.zoom > 1.0);
+    }
+
+    #[test]
+    fn zoom_by_horizontal_motion_negative_dx_zooms_out() {
+        let mut vp = Viewport::new();
+        let r = rect(800.0, 600.0);
+        let anchor = Pos2::new(500.0, 300.0);
+        vp.zoom_by_horizontal_motion(r, anchor, -100.0);
+        assert!(vp.zoom < 1.0);
+    }
+
+    #[test]
+    fn zoom_by_horizontal_motion_zero_dx_is_no_op() {
+        let mut vp = Viewport {
+            zoom: 2.5,
+            center: Point2::new(3.0, -1.0),
+        };
+        let before = vp;
+        let r = rect(800.0, 600.0);
+        let anchor = Pos2::new(500.0, 300.0);
+        vp.zoom_by_horizontal_motion(r, anchor, 0.0);
+        assert!((vp.zoom - before.zoom).abs() < 1e-9);
+        assert!((vp.center.x - before.center.x).abs() < 1e-9);
+        assert!((vp.center.y - before.center.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_by_horizontal_motion_keeps_anchor_world_position_fixed() {
+        let mut vp = Viewport {
+            zoom: 1.4,
+            center: Point2::new(5.0, -3.0),
+        };
+        let r = rect(1000.0, 800.0);
+        let anchor = Pos2::new(650.0, 200.0);
+
+        let world_before = vp.screen_to_world(r, anchor);
+        vp.zoom_by_horizontal_motion(r, anchor, 137.0);
+        let world_after = vp.screen_to_world(r, anchor);
+
+        assert!((world_before.x - world_after.x).abs() < 1e-9);
+        assert!((world_before.y - world_after.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zoom_by_horizontal_motion_round_trip_restores_zoom_and_center() {
+        let mut vp = Viewport {
+            zoom: 1.0,
+            center: Point2::new(2.0, 7.0),
+        };
+        let before = vp;
+        let r = rect(1024.0, 768.0);
+        let anchor = Pos2::new(300.0, 500.0);
+
+        vp.zoom_by_horizontal_motion(r, anchor, 180.0);
+        vp.zoom_by_horizontal_motion(r, anchor, -180.0);
+
+        assert!((vp.zoom - before.zoom).abs() < 1e-9);
+        assert!((vp.center.x - before.center.x).abs() < 1e-6);
+        assert!((vp.center.y - before.center.y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_by_horizontal_motion_extreme_dx_clamps_to_bounds() {
+        let mut vp = Viewport::new();
+        let r = rect(800.0, 600.0);
+        let anchor = r.center();
+
+        vp.zoom_by_horizontal_motion(r, anchor, 1.0e7);
+        assert!(vp.zoom <= MAX_ZOOM);
+
+        vp.zoom = 1.0;
+        vp.zoom_by_horizontal_motion(r, anchor, -1.0e7);
+        assert!(vp.zoom >= MIN_ZOOM);
+    }
+
+    #[test]
+    fn zoom_by_horizontal_motion_ignores_non_finite_dx() {
+        let mut vp = Viewport::new();
+        let r = rect(800.0, 600.0);
+        let anchor = r.center();
+        let before = vp;
+
+        vp.zoom_by_horizontal_motion(r, anchor, f32::NAN);
+        assert_eq!(vp, before);
+
+        vp.zoom_by_horizontal_motion(r, anchor, f32::INFINITY);
+        assert_eq!(vp, before);
+
+        vp.zoom_by_horizontal_motion(r, anchor, f32::NEG_INFINITY);
         assert_eq!(vp, before);
     }
 

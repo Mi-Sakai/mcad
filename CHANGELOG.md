@@ -28,6 +28,16 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
   割られる点を対象限定マーカーで表示する(`Tool::snaps_shape_pick`、`SplitTool` のみ
   override)。`F3` OFF なら従来どおり raw クリック位置で分割する。M7 で見送られていた
   対応(DESIGN.md 7章「分割ツールのスナップ対応」)を番号外で消化。
+- ズーム・パンの追加操作手段として `Alt`+マウス左右移動でのズーム、`Shift+Alt`+マウス
+  移動でのパンを追加(`Viewport::zoom_by_horizontal_motion` を新設し、`main.rs` の
+  `handle_modifier_view_input` から配線)。ズームはジェスチャ開始時のカーソル位置を
+  中心に、ホイールと同型の指数写像(`factor = exp(delta_x * MOTION_ZOOM_SPEED)`、右へ
+  動かすと拡大)で行い、往復の揺らしでビューが元へ戻る可逆性を持つ。パンは既存の
+  `pan_by_screen_delta` を再利用する。有効条件は「キャンバス hovered かつポインタ
+  ボタン非押下かつ command 非押下」で、矩形選択・中ボタン/Space パン・作図ドラッグ等の
+  既存ドラッグとは構造的に相互作用しない(純追加、既存のホイールズーム・パン・
+  キーボードショートカットは無変更)。ジェスチャ中の Shift 切替でズーム↔パンが移行する
+  (DESIGN.md 7章「ズーム・パンの追加操作手段」)。
 
 ### 変更
 

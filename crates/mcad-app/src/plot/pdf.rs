@@ -62,6 +62,10 @@ use super::{PathCmd, PlotPage, PlotPath};
 const MM_TO_PT: f64 = 72.0 / 25.4;
 
 /// [`PlotPage`] を単一ページの PDF バイト列へ直列化する。
+///
+/// [`PlotPage::background`] が白（[`Rgb::WHITE`]）以外のとき（青図モード）だけ、
+/// コンテンツストリームの先頭に用紙全面の塗り rect を `q`/`Q` で自己完結させて描く。
+/// PDF のページは元来白なので、白背景では何も描かず既存出力のバイト列を変えない。
 #[must_use]
 pub fn to_pdf(page: &PlotPage) -> Vec<u8> {
     let k = MM_TO_PT as f32;
@@ -71,6 +75,9 @@ pub fn to_pdf(page: &PlotPage) -> Vec<u8> {
     // SVG の既定 stroke-miterlimit（4）に合わせる。q/Q の外（コンテンツ先頭）に
     // 置くことで、各パスの Q で消えずページ全体へ効く。
     content.set_miter_limit(4.0);
+    if page.background != Rgb::WHITE {
+        push_background(&mut content, page.width_mm, page.height_mm, page.background);
+    }
     for path in &page.paths {
         push_path(&mut content, path);
     }
@@ -102,6 +109,19 @@ pub fn to_pdf(page: &PlotPage) -> Vec<u8> {
 
     // CreationDate 等の info 辞書は書かない（決定性のため、モジュール doc 参照）。
     pdf.finish()
+}
+
+/// 用紙全面を塗る矩形を先頭へ書く（青図モードなど背景が白でないときのみ呼ばれる）。
+///
+/// `q`/`Q` で自己完結させる（[`push_path`] と同じ流儀）ため、後続パスの
+/// 塗り色設定へリークしない。座標は紙 mm のまま（コンテンツ先頭の `cm` 変換が
+/// 効いている）。
+fn push_background(content: &mut Content, width_mm: f64, height_mm: f64, color: Rgb) {
+    content.save_state();
+    set_rgb_fill(content, color);
+    content.rect(0.0, 0.0, width_mm as f32, height_mm as f32);
+    content.fill_nonzero();
+    content.restore_state();
 }
 
 /// 1 本の `PlotPath` をコンテンツストリームへ書く。`q`/`Q` で自己完結させ、
@@ -193,6 +213,7 @@ mod tests {
         PlotPage {
             width_mm,
             height_mm,
+            background: Rgb::WHITE,
             paths,
         }
     }
@@ -639,5 +660,133 @@ mod tests {
                 + text.matches("/Type /Page ").count(),
             1
         );
+    }
+
+    // ---- 12: 背景は PlotPage::background に従う（白では出さない・非白では全面塗り） ----
+
+    #[test]
+    fn white_background_emits_no_fill_rect_and_matches_prior_byte_output() {
+        // 既存の非破壊確認: 背景が白（既定）のときは背景塗りの `re`/`f` が一切
+        // 現れない（従来の PDF 出力は背景を描いていなかったため、既存出力の
+        // バイト列を変えない）。
+        let p = page(210.0, 297.0, vec![]);
+        let stream = content_stream(&to_pdf(&p));
+        let tokens = tokenize(&stream);
+        assert!(!tokens.contains(&Token::Other("re".to_string())));
+        assert!(!tokens.contains(&Token::Other("f".to_string())));
+        assert!(!tokens.contains(&Token::Other("q".to_string())));
+    }
+
+    #[test]
+    fn non_white_background_is_drawn_as_a_self_contained_full_page_rect_first() {
+        let bg = Rgb::new(0x00, 0x31, 0x53);
+        let mut p = page(210.0, 297.0, vec![]);
+        p.background = bg;
+        let bytes = to_pdf(&p);
+        let stream = content_stream(&bytes);
+        let tokens = tokenize(&stream);
+
+        // 背景塗り用の rg（塗り色）と re（矩形）と f（塗り）が出る。
+        assert!(tokens.contains(&Token::Other("rg".to_string())));
+        assert!(tokens.contains(&Token::Other("re".to_string())));
+        assert!(tokens.contains(&Token::Other("f".to_string())));
+
+        // q/Q で自己完結している（背景用の 1 組）。
+        let q_count = tokens
+            .iter()
+            .filter(|t| *t == &Token::Other("q".to_string()))
+            .count();
+        let big_q_count = tokens
+            .iter()
+            .filter(|t| *t == &Token::Other("Q".to_string()))
+            .count();
+        assert_eq!(q_count, 1);
+        assert_eq!(big_q_count, 1);
+
+        // 背景の rg は指定色そのもの。
+        let rg_idx = tokens
+            .iter()
+            .position(|t| t == &Token::Other("rg".to_string()))
+            .unwrap();
+        let (Token::Num(r), Token::Num(g), Token::Num(b)) = (
+            tokens[rg_idx - 3].clone(),
+            tokens[rg_idx - 2].clone(),
+            tokens[rg_idx - 1].clone(),
+        ) else {
+            panic!("rg の直前3つが数値でない")
+        };
+        assert!(approx(r, f64::from(bg.r) / 255.0));
+        assert!(approx(g, f64::from(bg.g) / 255.0));
+        assert!(approx(b, f64::from(bg.b) / 255.0));
+
+        // re は用紙全面（0 0 W H）。
+        let re_idx = tokens
+            .iter()
+            .position(|t| t == &Token::Other("re".to_string()))
+            .unwrap();
+        assert_eq!(tokens[re_idx - 4], Token::Num(0.0));
+        assert_eq!(tokens[re_idx - 3], Token::Num(0.0));
+        assert_approx_num(&tokens[re_idx - 2], 210.0, "背景幅");
+        assert_approx_num(&tokens[re_idx - 1], 297.0, "背景高さ");
+
+        // 背景が先頭（cm/M ヘッダの直後、最初の q より前に他の描画演算子が無い）。
+        let first_q = tokens
+            .iter()
+            .position(|t| t == &Token::Other("q".to_string()))
+            .unwrap();
+        assert!(
+            !tokens[..first_q]
+                .iter()
+                .any(|t| t == &Token::Other("m".to_string())),
+            "背景より前にパス描画があってはいけない"
+        );
+    }
+
+    #[test]
+    fn background_rect_does_not_leak_fill_color_into_following_path() {
+        let bg = Rgb::new(0x00, 0x31, 0x53);
+        let mut p = page(
+            100.0,
+            100.0,
+            vec![PlotPath::stroked(
+                vec![
+                    PathCmd::MoveTo(Point2::new(0.0, 0.0)),
+                    PathCmd::LineTo(Point2::new(1.0, 0.0)),
+                ],
+                PlotStroke {
+                    width_mm: 0.35,
+                    color: Rgb::BLACK,
+                    dash_mm: None,
+                },
+            )],
+        );
+        p.background = bg;
+        let bytes = to_pdf(&p);
+        let stream = content_stream(&bytes);
+        let tokens = tokenize(&stream);
+
+        // q/Q が背景用 + パス用の 2 組になる。
+        let q_count = tokens
+            .iter()
+            .filter(|t| *t == &Token::Other("q".to_string()))
+            .count();
+        assert_eq!(q_count, 2);
+
+        // 2 番目のブロック（作図パス）は stroke のみで fill 演算子を持たない。
+        let q_positions: Vec<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| *t == &Token::Other("q".to_string()))
+            .map(|(i, _)| i)
+            .collect();
+        let big_q_positions: Vec<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| *t == &Token::Other("Q".to_string()))
+            .map(|(i, _)| i)
+            .collect();
+        let second_block = &tokens[q_positions[1]..=big_q_positions[1]];
+        assert!(!second_block.contains(&Token::Other("f".to_string())));
+        assert!(second_block.contains(&Token::Other("S".to_string())));
     }
 }

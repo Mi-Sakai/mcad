@@ -65,8 +65,18 @@
 //!
 //! # 色
 //!
-//! エンティティ色は [`mcad_core::Style::effective_color`] をそのまま使うが、
-//! **純白のみ黒へ再マップする**（[`plot_color`]）。図面枠・表題欄は常に黒。
+//! 出力色モード [`PlotColorMode`] を選択式で持つ（既定 `Monochrome`）。エンティティ色・
+//! 枠/表題欄色・用紙背景色はすべてこのモードから導出する（[`plot_color`]・
+//! [`frame_plot_color`]・[`PlotPage::background`]）:
+//!
+//! - `Monochrome`（既定）: 作図線・枠は常に黒、背景は白。
+//! - `Blueprint`（青図）: 作図線・枠は常に白、背景はプルシアンブルー（[`BLUEPRINT_BACKGROUND`]）。
+//! - `Color`（元の色）: [`mcad_core::Style::effective_color`] をそのまま使うが、
+//!   **純白のみ黒へ再マップする**（無対策だと既定レイヤー `"0"` の白が白紙で不可視に
+//!   なるため）。背景は白。
+//!
+//! 線色と背景色は独立の軸にせず、モード 1 つから両方を導出する（黒線/青背景のような
+//! 無意味な組合せを型で排除する。DESIGN.md 7章「随時対応」の設計確定(a)）。
 
 pub mod pdf;
 pub mod svg;
@@ -79,10 +89,28 @@ use std::f64::consts::FRAC_PI_2;
 
 use mcad_core::{Document, Entity, EntityGeom, Layer, Linetype, Rgb, TextGeom};
 use mcad_geom::{Arc, Point2, Polyline, Shape, Vec2};
+use serde::{Deserialize, Serialize};
 
 use crate::dimension::{self, DimExpansion};
 use crate::frame::{FrameLayout, frame_layout};
 use text_outline::GlyphOutliner;
+
+/// 出力（SVG/PDF）の色モード。図面の属性ではなく、エクスポート設定＋
+/// `config.json` の既定値として持つ（印刷色は表現の選択であり図面内容ではないため、
+/// `SheetMeta` には入れない。DESIGN.md 7章「随時対応」参照）。
+///
+/// レイヤーごと・エンティティごとの出力色オーバーライドは非対応（non-goal）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PlotColorMode {
+    /// 黒（モノクロ）。作図線・枠は黒、背景は白（既定）。
+    #[default]
+    Monochrome,
+    /// 青図（白線）。作図線・枠は白、背景はプルシアンブルー。
+    Blueprint,
+    /// 元の色。[`mcad_core::Style::effective_color`] をそのまま使う（純白のみ黒へ
+    /// 再マップ）。枠は黒、背景は白。
+    Color,
+}
 
 // ---------------------------------------------------------------------
 // 紙 mm 基準の共有定数（画面描画と出力の唯一の出所）
@@ -116,11 +144,31 @@ pub const DIM_TEXT_MM: f64 = 3.5;
 /// 寸法の矢先の長さ（紙 mm）。[`DIM_TEXT_MM`] と同じ扱いで、紙の上では常に 3.0mm。
 pub const DIM_ARROW_MM: f64 = 3.0;
 
-/// 図面枠・表題欄の出力色。
+/// 青図（Blueprint）モードの用紙背景色（プルシアンブルー `#003153`）。
+///
+/// トーンは手動スモークテストで確認して必要なら調整する（DESIGN.md 7章
+/// 「随時対応」設計確定(a)）。
+const BLUEPRINT_BACKGROUND: Rgb = Rgb::new(0x00, 0x31, 0x53);
+
+/// 図面枠・表題欄の出力色をモードから導出する。
 ///
 /// 画面の `FRAME_COLOR`（gray150）は暗い背景で見やすくするための **表示色** であって
-/// 印刷色ではない。紙の上では黒で描く。
-const FRAME_PLOT_COLOR: Rgb = Rgb::BLACK;
+/// 印刷色ではない。`Blueprint` では白（プルシアンブルー背景の上で見えるように）、
+/// それ以外は黒で描く。
+fn frame_plot_color(mode: PlotColorMode) -> Rgb {
+    match mode {
+        PlotColorMode::Blueprint => Rgb::WHITE,
+        PlotColorMode::Monochrome | PlotColorMode::Color => Rgb::BLACK,
+    }
+}
+
+/// 出力モードから用紙背景色を導出する（[`PlotPage::background`]）。
+fn background_for_mode(mode: PlotColorMode) -> Rgb {
+    match mode {
+        PlotColorMode::Blueprint => BLUEPRINT_BACKGROUND,
+        PlotColorMode::Monochrome | PlotColorMode::Color => Rgb::WHITE,
+    }
+}
 
 /// 3 次ベジエで 90° の円弧を近似するときの制御点距離係数
 /// （`4/3 * tan(π/8)` ≒ 0.5523、半径に対する比）。
@@ -223,13 +271,20 @@ impl PlotPath {
 
 /// 出力 1 ページ分（= 用紙 1 枚）。
 ///
-/// **用紙全面の白背景は含まない** — SVG バックエンドの責務（PDF はページ自体が白）。
+/// **用紙全面の背景塗りつぶし自体は含まない** — SVG/PDF バックエンドの責務
+/// （`svg.rs` は毎回背景 rect を描く。`pdf.rs` は `background` が白のときだけ
+/// 省略する。PDF のページは元来白なので、白背景なら描かなくても既存出力と
+/// 同じ見た目になる）。[`background`](PlotPage::background) はモードから導出した
+/// 「その背景の上に何色で線を描くべきか」を決めるための値であって、単なる
+/// 演出ではない（[`PlotColorMode`]・モジュール doc「# 色」節参照）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlotPage {
     /// 用紙幅（紙 mm、向き反映済み）。
     pub width_mm: f64,
     /// 用紙高さ（紙 mm、向き反映済み）。
     pub height_mm: f64,
+    /// 用紙背景色。出力モードから導出する（[`background_for_mode`]）。
+    pub background: Rgb,
     /// 描画するパス列。**奥→手前の描画順**（後の要素が手前）。
     pub paths: Vec<PlotPath>,
 }
@@ -240,9 +295,11 @@ pub struct PlotPage {
 
 /// [`Document`] を出力用の中間表現へ変換する（純関数、このモジュールの唯一の入口）。
 ///
-/// 単位・座標系・含める要素の規約はモジュール doc を参照。
+/// 単位・座標系・含める要素の規約はモジュール doc を参照。`mode` は出力色モード
+/// （[`PlotColorMode`]）— 隠れた既定値を持つラッパは作らないため、呼び出し側が
+/// 常に明示する。
 #[must_use]
-pub fn plot_page(document: &Document) -> PlotPage {
+pub fn plot_page(document: &Document, mode: PlotColorMode) -> PlotPage {
     let sheet = document.sheet();
     let (width_mm, height_mm) = sheet.paper_extent_mm();
     let k = sheet.scale.world_mm_per_paper_mm();
@@ -252,15 +309,16 @@ pub fn plot_page(document: &Document) -> PlotPage {
 
     // 枠は画面と同じく最背面（`McadApp::ui` は grid → frame → entities の順に描く）。
     if sheet.frame_visible {
-        push_frame(&mut paths, &frame_layout(sheet), outliner.as_ref());
+        push_frame(&mut paths, &frame_layout(sheet), outliner.as_ref(), mode);
     }
     for (entity, layer) in entities_in_plot_order(document) {
-        push_entity(&mut paths, entity, layer, k, outliner.as_ref());
+        push_entity(&mut paths, entity, layer, k, outliner.as_ref(), mode);
     }
 
     PlotPage {
         width_mm,
         height_mm,
+        background: background_for_mode(mode),
         paths,
     }
 }
@@ -273,17 +331,26 @@ fn world_to_paper(p: Point2, k: f64) -> Point2 {
     Point2::new(p.x / k, p.y / k)
 }
 
-/// 出力する色。**純白のみ黒へ再マップし、他の色は素通しする。**
+/// 出力する色をモードから導出する。
 ///
-/// 既定レイヤー `"0"` の色は [`Rgb::WHITE`]（暗い画面背景に合わせた表示色）なので、
-/// 無対策だと白紙に白線を書いて何も見えなくなる。AutoCAD の ACI 7（white/black の
-/// 双対）と同じ慣行で、mcad の DXF export も白は ACI 7 へ落ちる。
-/// 純白以外（薄いグレー等）は作図者が明示的に選んだ色とみなして触らない。
-fn plot_color(color: Rgb) -> Rgb {
-    if color == Rgb::WHITE {
-        Rgb::BLACK
-    } else {
-        color
+/// - `Monochrome`: 常に黒。
+/// - `Blueprint`: 常に白。
+/// - `Color`: **純白のみ黒へ再マップし、他の色は素通しする**（現行規則）。既定
+///   レイヤー `"0"` の色は [`Rgb::WHITE`]（暗い画面背景に合わせた表示色）なので、
+///   無対策だと白紙に白線を書いて何も見えなくなる。AutoCAD の ACI 7（white/black
+///   の双対）と同じ慣行で、mcad の DXF export も白は ACI 7 へ落ちる。純白以外
+///   （薄いグレー等）は作図者が明示的に選んだ色とみなして触らない。
+fn plot_color(mode: PlotColorMode, color: Rgb) -> Rgb {
+    match mode {
+        PlotColorMode::Monochrome => Rgb::BLACK,
+        PlotColorMode::Blueprint => Rgb::WHITE,
+        PlotColorMode::Color => {
+            if color == Rgb::WHITE {
+                Rgb::BLACK
+            } else {
+                color
+            }
+        }
     }
 }
 
@@ -315,8 +382,9 @@ fn push_entity(
     layer: &Layer,
     k: f64,
     outliner: Option<&GlyphOutliner>,
+    mode: PlotColorMode,
 ) {
-    let color = plot_color(entity.style.effective_color(layer.color));
+    let color = plot_color(mode, entity.style.effective_color(layer.color));
     let width_mm = entity.style.effective_width(layer.width_mm).mm();
     let linetype = entity.style.effective_linetype(layer.linetype);
 
@@ -448,11 +516,17 @@ fn push_dim(
 ///
 /// [`FrameLayout`] は **既に紙 mm**（原点=用紙左下、y-up）なので座標変換は不要。
 /// 欄文字もアウトライン化してパスにする（`FrameText::height_mm` も紙 mm なので換算不要）。
-fn push_frame(paths: &mut Vec<PlotPath>, layout: &FrameLayout, outliner: Option<&GlyphOutliner>) {
+fn push_frame(
+    paths: &mut Vec<PlotPath>,
+    layout: &FrameLayout,
+    outliner: Option<&GlyphOutliner>,
+    mode: PlotColorMode,
+) {
+    let color = frame_plot_color(mode);
     for line in &layout.lines {
         let stroke = PlotStroke {
             width_mm: line.width_mm,
-            color: FRAME_PLOT_COLOR,
+            color,
             dash_mm: None,
         };
         let cmds = vec![PathCmd::MoveTo(line.a), PathCmd::LineTo(line.b)];
@@ -466,7 +540,7 @@ fn push_frame(paths: &mut Vec<PlotPath>, layout: &FrameLayout, outliner: Option<
             text.anchor_mm,
             text.height_mm,
             0.0,
-            FRAME_PLOT_COLOR,
+            color,
         );
     }
 }
@@ -691,7 +765,7 @@ mod tests {
                 Point2::new(100.0, 50.0),
             )),
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
 
         // 用紙は A4 横。
         close_to(page.width_mm, 297.0);
@@ -715,7 +789,7 @@ mod tests {
             &mut half,
             Shape::Line(LineSeg::new(Point2::ORIGIN, Point2::new(100.0, 0.0))),
         );
-        let (_, b) = endpoints(stroked(&plot_page(&half))[0]);
+        let (_, b) = endpoints(stroked(&plot_page(&half, PlotColorMode::Color))[0]);
         point_close_to(b, 50.0, 0.0);
 
         // 2:1（k = 0.5、拡大図）: ワールド 10 → 紙 20mm。
@@ -724,7 +798,7 @@ mod tests {
             &mut double,
             Shape::Line(LineSeg::new(Point2::ORIGIN, Point2::new(10.0, 0.0))),
         );
-        let (_, b) = endpoints(stroked(&plot_page(&double))[0]);
+        let (_, b) = endpoints(stroked(&plot_page(&double, PlotColorMode::Color))[0]);
         point_close_to(b, 20.0, 0.0);
     }
 
@@ -761,7 +835,7 @@ mod tests {
                     offset: 10.0,
                 }),
             );
-            let page = plot_page(&document);
+            let page = plot_page(&document, PlotColorMode::Color);
 
             // 破線パターンは紙 mm 定数のまま（尺度でスケールしない）。
             let dashed: Vec<&PlotPath> = stroked(&page)
@@ -819,7 +893,7 @@ mod tests {
                 leader_angle: 0.0,
             }),
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         // 引出線 1 本 + 矢先 1 つ + ラベル 1 つ。
         assert_eq!(stroked(&page).len(), 1);
         let arrows: Vec<&PlotPath> = filled(&page)
@@ -849,7 +923,7 @@ mod tests {
                 angle: 0.0,
             }),
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         let outlines = filled(&page);
         assert_eq!(outlines.len(), 1);
 
@@ -874,7 +948,7 @@ mod tests {
                 ..Style::inherited()
             },
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         let stroke = stroked(&page)[0].stroke.unwrap();
         // 画面の 1px 下限（`MIN_STROKE_PX`）は出力には掛からない。
         assert_eq!(stroke.width_mm, 0.05);
@@ -889,7 +963,7 @@ mod tests {
             &mut document,
             Shape::Circle(Circle::new(Point2::new(5.0, 7.0), 10.0)),
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         let cmds = &stroked(&page)[0].cmds;
 
         // MoveTo + CurveTo×4 + Close。
@@ -941,7 +1015,7 @@ mod tests {
             &mut document,
             Shape::Arc(Arc::new(Point2::ORIGIN, 4.0, 0.0, 3.0 * FRAC_PI_2)),
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         let cmds = &stroked(&page)[0].cmds;
         // MoveTo + CurveTo×3（円弧は閉じない）。
         assert_eq!(cmds.len(), 4);
@@ -965,7 +1039,7 @@ mod tests {
             &mut document,
             Shape::Arc(Arc::new(Point2::new(20.0, 0.0), 8.0, 0.0, FRAC_PI_4)),
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         let cmds = &stroked(&page)[0].cmds;
         assert_eq!(cmds.len(), 2); // 45° は 1 セグメント。
         let PathCmd::MoveTo(start) = cmds[0] else {
@@ -993,7 +1067,7 @@ mod tests {
             &mut document,
             Shape::Polyline(Polyline::new(vertices.clone(), true)),
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         let cmds = &stroked(&page)[0].cmds;
 
         assert_eq!(cmds.len(), 4); // MoveTo + LineTo×2 + Close（先頭点の複製なし）。
@@ -1006,7 +1080,7 @@ mod tests {
             &mut open_doc,
             Shape::Polyline(Polyline::new(vertices, false)),
         );
-        let open_page = plot_page(&open_doc);
+        let open_page = plot_page(&open_doc, PlotColorMode::Color);
         let open_cmds = &stroked(&open_page)[0].cmds;
         assert_eq!(open_cmds.len(), 3);
         assert!(!open_cmds.contains(&PathCmd::Close));
@@ -1018,14 +1092,14 @@ mod tests {
     fn frame_is_emitted_only_when_visible_and_drawn_in_black() {
         let mut document = document_with_scale(1, 1);
         assert!(!document.sheet().frame_visible);
-        assert!(plot_page(&document).paths.is_empty());
+        assert!(plot_page(&document, PlotColorMode::Color).paths.is_empty());
 
         let sheet = SheetMeta {
             frame_visible: true,
             ..document.sheet().clone()
         };
         document.apply(Command::SetSheet(sheet)).unwrap();
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
 
         // 罫線 15 本（輪郭4 + 表題欄外枠4 + 区切り7。様式B・A4横）。
         let lines = stroked(&page);
@@ -1076,7 +1150,7 @@ mod tests {
             &mut document,
             Shape::Line(LineSeg::new(Point2::ORIGIN, Point2::new(1.0, 0.0))),
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         // 画面（grid → frame → entities）と同じく、枠は最背面 = 配列の前方。
         let last = stroked(&page).pop().unwrap();
         let (a, b) = endpoints(last);
@@ -1132,7 +1206,7 @@ mod tests {
                 .unwrap();
         }
 
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         let xs: Vec<f64> = stroked(&page).iter().map(|p| endpoints(p).0.x).collect();
         // order 昇順（back(-5) → base(0) は追加順 → locked(2) → front(5)）。
         // 非表示レイヤー（x = 3）だけが落ち、ロックレイヤー（x = 4）は残る。
@@ -1142,13 +1216,13 @@ mod tests {
     // ---- 10: 色 ----
 
     #[test]
-    fn pure_white_is_remapped_to_black_and_other_colors_pass_through() {
-        // 既定レイヤー "0" は白なので、そのままだと白紙に白線になる。
-        assert_eq!(plot_color(Rgb::WHITE), Rgb::BLACK);
-        assert_eq!(plot_color(Rgb::BLACK), Rgb::BLACK);
+    fn color_mode_remaps_only_pure_white_to_black_and_passes_through_others() {
+        // Color モードは現行規則（純白のみ黒へ再マップ）そのまま。
+        assert_eq!(plot_color(PlotColorMode::Color, Rgb::WHITE), Rgb::BLACK);
+        assert_eq!(plot_color(PlotColorMode::Color, Rgb::BLACK), Rgb::BLACK);
         // 純白以外は 1 成分違うだけでも素通し（作図者が選んだ色として尊重する）。
         let near_white = Rgb::new(254, 255, 255);
-        assert_eq!(plot_color(near_white), near_white);
+        assert_eq!(plot_color(PlotColorMode::Color, near_white), near_white);
 
         let mut document = document_with_scale(1, 1);
         add(
@@ -1163,10 +1237,102 @@ mod tests {
                 ..Style::inherited()
             },
         );
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
         let lines = stroked(&page);
         assert_eq!(lines[0].stroke.unwrap().color, Rgb::BLACK);
         assert_eq!(lines[1].stroke.unwrap().color, Rgb::new(200, 30, 40));
+    }
+
+    /// モード × 色のマトリクス: `plot_color` の全 9 組（3 モード × 3 色）を固定する。
+    #[test]
+    fn plot_color_matrix_across_modes_and_colors() {
+        let sample_colors = [Rgb::WHITE, Rgb::BLACK, Rgb::new(200, 30, 40)];
+
+        for color in sample_colors {
+            assert_eq!(plot_color(PlotColorMode::Monochrome, color), Rgb::BLACK);
+            assert_eq!(plot_color(PlotColorMode::Blueprint, color), Rgb::WHITE);
+        }
+        assert_eq!(plot_color(PlotColorMode::Color, Rgb::WHITE), Rgb::BLACK);
+        assert_eq!(plot_color(PlotColorMode::Color, Rgb::BLACK), Rgb::BLACK);
+        assert_eq!(
+            plot_color(PlotColorMode::Color, Rgb::new(200, 30, 40)),
+            Rgb::new(200, 30, 40)
+        );
+    }
+
+    /// `frame_plot_color`・`background_for_mode` の全モードの組合せを固定する。
+    #[test]
+    fn frame_color_and_background_follow_the_mode() {
+        assert_eq!(frame_plot_color(PlotColorMode::Monochrome), Rgb::BLACK);
+        assert_eq!(frame_plot_color(PlotColorMode::Blueprint), Rgb::WHITE);
+        assert_eq!(frame_plot_color(PlotColorMode::Color), Rgb::BLACK);
+
+        assert_eq!(background_for_mode(PlotColorMode::Monochrome), Rgb::WHITE);
+        assert_eq!(
+            background_for_mode(PlotColorMode::Blueprint),
+            BLUEPRINT_BACKGROUND
+        );
+        assert_eq!(background_for_mode(PlotColorMode::Color), Rgb::WHITE);
+    }
+
+    /// `PlotColorMode` の既定値は `Monochrome`。
+    #[test]
+    fn plot_color_mode_default_is_monochrome() {
+        assert_eq!(PlotColorMode::default(), PlotColorMode::Monochrome);
+    }
+
+    /// 青図モードでは作図線・矢先・文字（寸法値ラベル）・枠（罫線・欄文字）がすべて白になり、
+    /// 用紙背景がプルシアンブルーになる（SVG rect・PDF 全面 rect の両方は svg.rs/pdf.rs 側の
+    /// テストで確認する。ここは IR レベルでの色・背景の確認）。
+    #[test]
+    fn blueprint_mode_makes_lines_and_frame_white_with_prussian_blue_background() {
+        let mut document = document_with_scale(1, 1);
+        let sheet = SheetMeta {
+            frame_visible: true,
+            ..document.sheet().clone()
+        };
+        document.apply(Command::SetSheet(sheet)).unwrap();
+        add(
+            &mut document,
+            Shape::Line(LineSeg::new(Point2::ORIGIN, Point2::new(10.0, 0.0))),
+        );
+        add(
+            &mut document,
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::ORIGIN,
+                p2: Point2::new(10.0, 0.0),
+                offset: 5.0,
+            }),
+        );
+        let page = plot_page(&document, PlotColorMode::Blueprint);
+
+        assert_eq!(page.background, BLUEPRINT_BACKGROUND);
+        for path in &page.paths {
+            if let Some(stroke) = path.stroke {
+                assert_eq!(stroke.color, Rgb::WHITE, "stroke must be white");
+            }
+            if let Some(fill) = path.fill {
+                assert_eq!(fill, Rgb::WHITE, "fill must be white");
+            }
+        }
+        // 枠（罫線+欄文字）・作図線・寸法（線+矢先+文字）がいずれも存在すること。
+        assert!(!stroked(&page).is_empty());
+        assert!(!filled(&page).is_empty());
+    }
+
+    /// Monochrome・Color モードでは（既定）背景が白であることを確認する
+    /// （PDF が背景 rect を出さないことは pdf.rs 側で確認する）。
+    #[test]
+    fn monochrome_and_color_modes_use_white_background() {
+        let document = document_with_scale(1, 1);
+        assert_eq!(
+            plot_page(&document, PlotColorMode::Monochrome).background,
+            Rgb::WHITE
+        );
+        assert_eq!(
+            plot_page(&document, PlotColorMode::Color).background,
+            Rgb::WHITE
+        );
     }
 
     // ---- 11: グリフ ----
@@ -1258,7 +1424,7 @@ mod tests {
     fn point_entity_becomes_a_filled_circle_of_line_width_radius() {
         let mut document = document_with_scale(1, 2); // k = 2
         add(&mut document, Shape::Point(Point2::new(10.0, 20.0)));
-        let page = plot_page(&document);
+        let page = plot_page(&document, PlotColorMode::Color);
 
         assert!(stroked(&page).is_empty());
         let dots = filled(&page);

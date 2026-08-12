@@ -1426,7 +1426,7 @@ impl McadApp {
         };
         self.remember_dialog_dir(&path);
         let path = ensure_svg_extension(path);
-        let page = plot::plot_page(&self.document);
+        let page = plot::plot_page(&self.document, self.config.plot_color_mode);
         let svg = plot::to_svg(&page);
         match std::fs::write(&path, svg) {
             Ok(()) => {
@@ -1466,7 +1466,7 @@ impl McadApp {
         };
         self.remember_dialog_dir(&path);
         let path = ensure_pdf_extension(path);
-        let page = plot::plot_page(&self.document);
+        let page = plot::plot_page(&self.document, self.config.plot_color_mode);
         let bytes = plot::to_pdf(&page);
         match std::fs::write(&path, bytes) {
             Ok(()) => {
@@ -2011,13 +2011,14 @@ impl eframe::App for McadApp {
                 &mut self.status,
                 now,
             );
-            let sheet_changed = sheet_panel(
+            let (sheet_changed, plot_color_mode_changed) = sheet_panel(
                 ui,
                 &mut self.document,
                 &mut self.sheet_dialog,
                 &mut self.scale_custom_selected,
                 &mut self.scale_custom_input,
                 &mut self.scale_input_error,
+                &mut self.config.plot_color_mode,
                 &mut self.status,
                 now,
             );
@@ -2026,6 +2027,9 @@ impl eframe::App for McadApp {
                     .config
                     .remember_sheet_defaults(&self.document.sheet().clone())
             {
+                self.persist_config(now);
+            }
+            if plot_color_mode_changed {
                 self.persist_config(now);
             }
         });
@@ -3169,9 +3173,15 @@ impl TitleBlockDialogState {
 #[allow(clippy::too_many_arguments)]
 /// 図面（用紙・向き・様式・尺度・図面枠表示）のパネルを描く。
 ///
-/// 戻り値は「`Command::SetSheet` が適用され成功したか」（M8 タスク41）。呼び出し側は
-/// これが `true` のときだけ [`config::Config::remember_sheet_defaults`] を呼び、既定への
-/// 追随が実際に必要か判断する。
+/// 戻り値は `(sheet_changed, plot_color_mode_changed)`。
+///
+/// `sheet_changed` は「`Command::SetSheet` が適用され成功したか」（M8 タスク41）。
+/// 呼び出し側はこれが `true` のときだけ [`config::Config::remember_sheet_defaults`] を
+/// 呼び、既定への追随が実際に必要か判断する。
+///
+/// `plot_color_mode_changed` は出力色コンボの選択が変わったか（モノクロ化-2）。
+/// 出力色は `SheetMeta` ではなく `config.json` の設定なので `Command::SetSheet` は
+/// 通さない — 呼び出し側はこれが `true` のときだけ `persist_config` を呼ぶ。
 fn sheet_panel(
     ui: &mut egui::Ui,
     document: &mut Document,
@@ -3179,9 +3189,10 @@ fn sheet_panel(
     scale_custom_selected: &mut bool,
     scale_custom_input: &mut String,
     scale_input_error: &mut Option<String>,
+    plot_color_mode: &mut plot::PlotColorMode,
     status: &mut Option<StatusMessage>,
     now: f64,
-) -> bool {
+) -> (bool, bool) {
     ui.separator();
     ui.heading("図面");
 
@@ -3350,7 +3361,37 @@ fn sheet_panel(
         }
     });
 
-    match pending {
+    // 出力色（モノクロ化-2）: 図面データではなく config.json の設定なので
+    // `Command::SetSheet` は通さない。画面表示・図面データには無影響。
+    let mut plot_color_mode_changed = false;
+    ui.horizontal(|ui| {
+        ui.label("出力色:");
+        egui::ComboBox::from_id_salt("plot_color_mode")
+            .selected_text(plot_color_mode_combo_label(*plot_color_mode))
+            .show_ui(ui, |ui| {
+                for mode in [
+                    plot::PlotColorMode::Monochrome,
+                    plot::PlotColorMode::Blueprint,
+                    plot::PlotColorMode::Color,
+                ] {
+                    if ui
+                        .selectable_label(
+                            mode == *plot_color_mode,
+                            plot_color_mode_combo_label(mode),
+                        )
+                        .clicked()
+                        && mode != *plot_color_mode
+                    {
+                        *plot_color_mode = mode;
+                        plot_color_mode_changed = true;
+                    }
+                }
+            })
+            .response
+            .on_hover_text("SVG/PDF 出力の線色。画面表示と図面データには影響しません。");
+    });
+
+    let sheet_changed = match pending {
         Some(new_sheet) => match document.apply(Command::SetSheet(new_sheet)) {
             Ok(_) => true,
             Err(err) => {
@@ -3359,6 +3400,16 @@ fn sheet_panel(
             }
         },
         None => false,
+    };
+    (sheet_changed, plot_color_mode_changed)
+}
+
+/// 出力色コンボの選択肢ラベル（モノクロ化-2、日本語）。
+fn plot_color_mode_combo_label(mode: plot::PlotColorMode) -> &'static str {
+    match mode {
+        plot::PlotColorMode::Monochrome => "黒(モノクロ)",
+        plot::PlotColorMode::Blueprint => "青図(白線)",
+        plot::PlotColorMode::Color => "元の色",
     }
 }
 
@@ -6009,6 +6060,7 @@ mod tests {
                 default_scale: Scale::new(1, 5).unwrap(),
                 default_title_block: config::TitleBlockChoice::A,
                 recent_files: Vec::new(),
+                plot_color_mode: plot::PlotColorMode::default(),
             },
             path: Some(PathBuf::from("/tmp/mcad-app-test/config.json")),
             warning: Some("something went wrong".to_owned()),

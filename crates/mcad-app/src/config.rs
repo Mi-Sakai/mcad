@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use mcad_core::{Orientation, PaperSize, Scale, SheetMeta, TitleBlockKind};
 use serde::{Deserialize, Serialize};
 
+use crate::plot::PlotColorMode;
+
 /// 「最近使ったファイル」の保持件数上限。
 pub const MAX_RECENT_FILES: usize = 5;
 
@@ -82,6 +84,11 @@ pub struct Config {
     pub default_title_block: TitleBlockChoice,
     /// 最近使った `.mcad` ファイルのパス（先頭が最新、最大 [`MAX_RECENT_FILES`] 件）。
     pub recent_files: Vec<PathBuf>,
+    /// SVG/PDF 出力の色モード（画面表示・図面データには無影響。DESIGN.md 7章
+    /// 「随時対応」モノクロ化-2）。旧バージョンの config.json（このフィールドが
+    /// 存在しない）はコンテナの `#[serde(default)]` により
+    /// [`PlotColorMode::default`]（`Monochrome`）へ補完される。
+    pub plot_color_mode: PlotColorMode,
 }
 
 impl Default for Config {
@@ -95,6 +102,7 @@ impl Default for Config {
             default_scale: Scale::default(),
             default_title_block: TitleBlockChoice::default(),
             recent_files: Vec::new(),
+            plot_color_mode: PlotColorMode::default(),
         }
     }
 }
@@ -285,6 +293,7 @@ mod tests {
         assert_eq!(config.default_scale, Scale::ONE);
         assert_eq!(config.default_title_block, TitleBlockChoice::B);
         assert!(config.recent_files.is_empty());
+        assert_eq!(config.plot_color_mode, PlotColorMode::Monochrome);
     }
 
     #[test]
@@ -298,6 +307,7 @@ mod tests {
             default_scale: Scale::new(1, 2).unwrap(),
             default_title_block: TitleBlockChoice::C,
             recent_files: vec![PathBuf::from("/tmp/a.mcad"), PathBuf::from("/tmp/b.mcad")],
+            plot_color_mode: PlotColorMode::Blueprint,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let parsed: Config = serde_json::from_str(&json).unwrap();
@@ -330,6 +340,27 @@ mod tests {
     fn invalid_scale_value_fails_to_load() {
         let path = unique_temp_path("invalid-scale");
         fs::write(&path, r#"{"default_scale": {"num": 0, "den": 1}}"#).unwrap();
+        let result = load(&path);
+        assert!(result.is_err());
+    }
+
+    /// 旧バージョンの config.json（`plot_color_mode` フィールドが存在しない）を
+    /// 読み込んだとき、[`PlotColorMode::default`]（`Monochrome`）へ補完される
+    /// （モノクロ化-2、DESIGN.md 7章「随時対応」検収基準）。
+    #[test]
+    fn missing_plot_color_mode_field_defaults_to_monochrome() {
+        let config: Config =
+            serde_json::from_str(r#"{"snap_enabled": false, "default_paper": "A1"}"#).unwrap();
+        assert_eq!(config.plot_color_mode, PlotColorMode::Monochrome);
+    }
+
+    /// `plot_color_mode` に存在しない値（不正値）が入っている config.json は、
+    /// 既存の「不正値で `load` が `Err` になる」規約に従う（起動時は
+    /// [`load_startup`] の既定+警告経路が働く）。
+    #[test]
+    fn invalid_plot_color_mode_value_fails_to_load() {
+        let path = unique_temp_path("invalid-plot-color-mode");
+        fs::write(&path, r#"{"plot_color_mode": "Rainbow"}"#).unwrap();
         let result = load(&path);
         assert!(result.is_err());
     }

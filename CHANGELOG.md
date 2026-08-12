@@ -2,6 +2,26 @@
 
 mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠する。
 
+## [Unreleased]
+
+### 追加
+
+- 出力(SVG/PDF)の色モード `PlotColorMode`(`Monochrome`/`Blueprint`/`Color`、既定
+  `Monochrome`)を plot 層(`crates/mcad-app/src/plot/`)に追加。`plot_color(mode, color)` /
+  `frame_plot_color(mode)` がモードから作図線・枠の色を導出し、`PlotPage::background` が
+  用紙背景色(`Monochrome`/`Color` は白、`Blueprint` はプルシアンブルー `#003153`)を持つ。
+  `svg.rs` は背景 rect の色を `page.background` から書くよう変更、`pdf.rs` は背景が白
+  以外のときだけ全面塗り rect を自己完結(`q`/`Q`)で先頭に描く(白背景では従来どおり
+  何も描かず、既存の PDF 出力バイト列は変わらない)。`plot_page(document, mode)` へ
+  シグネチャを変更(呼び出し元は `main.rs` の export 2 箇所)。
+  DESIGN.md M8 判断7「色は純白のみ黒へ再マップ」は Color モード選択時限定の規則へ改訂。
+- 出力色モードを右パネル「図面」セクション末尾の「出力色:」コンボ(「黒(モノクロ)」/
+  「青図(白線)」/「元の色」)から選択できるようにした。選択は `config.json`
+  (`Config::plot_color_mode`)へ永続化し(F3/F8/F9 トグルと同じ `persist_config` 経路)、
+  `Ctrl+Shift+E`(SVG)/`Ctrl+P`(PDF)エクスポート双方に反映する。図面データではないため
+  `Command::SetSheet` は通さず、画面表示・`.mcad`・DXF には無影響。旧バージョンの
+  `config.json`(このフィールドが存在しない)は既定の `Monochrome` へ補完される。
+
 ## [0.8.0] - 2026-08-11 — 出力と設定永続化(M8)
 
 SVG/PDF エクスポート・線幅/線種の画面反映・図面枠/表題欄・設定永続化を実装。M8 タスク35a〜44 を完了。GUI 変更は実ウィンドウでの手動スモークテストで確認済み(タスク36・37・38・39・40・41-1〜41-3・42のすべてで問題なし。詳細は DESIGN.md M8 章の検収基準を参照)。

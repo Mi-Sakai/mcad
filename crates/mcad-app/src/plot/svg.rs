@@ -15,8 +15,9 @@ use super::{PathCmd, PlotPage, PlotPath};
 ///
 /// - ルートは `width="{W}mm" height="{H}mm" viewBox="0 0 {W} {H}"`
 ///   （1 user unit = 1mm の実寸）。
-/// - 用紙全面の白背景 rect を最初に置く（IR には含まれない。暗テーマのビューア対策 +
-///   用紙の表現）。
+/// - 用紙全面の背景 rect を [`PlotPage::background`] の色で最初に置く（IR には
+///   パスとして含まれない。暗テーマのビューア対策 + 用紙の表現。青図モードでは
+///   プルシアンブルーになる）。
 /// - `paths` は奥→手前の順のまま書けば SVG の文書順（後勝ち）と一致する。
 /// - 数値はすべて `{:.3}`（0.001mm 精度）で決定的に出力する。
 #[must_use]
@@ -34,12 +35,13 @@ pub fn to_svg(page: &PlotPage) -> String {
         fmt_num(h)
     ));
 
-    // 用紙全面の白背景（暗テーマのビューア対策 + 用紙の表現。PDF はページ自体が
-    // 白なのでタスク40 では不要）。
+    // 用紙全面の背景（暗テーマのビューア対策 + 用紙の表現。色はモードから導出済み。
+    // PDF はページ自体が白なので、白背景のときだけ省略する — `pdf.rs` 参照）。
     out.push_str(&format!(
-        "<rect x=\"0\" y=\"0\" width=\"{}\" height=\"{}\" fill=\"#ffffff\"/>\n",
+        "<rect x=\"0\" y=\"0\" width=\"{}\" height=\"{}\" fill=\"{}\"/>\n",
         fmt_num(w),
-        fmt_num(h)
+        fmt_num(h),
+        fmt_color(page.background)
     ));
 
     for path in &page.paths {
@@ -137,6 +139,7 @@ mod tests {
         PlotPage {
             width_mm,
             height_mm,
+            background: Rgb::WHITE,
             paths,
         }
     }
@@ -355,5 +358,18 @@ mod tests {
         );
         let p = page(297.0, 210.0, vec![path]);
         assert_eq!(to_svg(&p), to_svg(&p));
+    }
+
+    // ---- 8: 背景色は PlotPage::background に従う（青図モード） ----
+
+    #[test]
+    fn background_rect_uses_page_background_color() {
+        let mut p = page(210.0, 297.0, vec![]);
+        p.background = Rgb::new(0x00, 0x31, 0x53);
+        let svg = to_svg(&p);
+        assert!(svg.contains(
+            "<rect x=\"0\" y=\"0\" width=\"210.000\" height=\"297.000\" fill=\"#003153\"/>"
+        ));
+        assert!(!svg.contains("fill=\"#ffffff\""));
     }
 }

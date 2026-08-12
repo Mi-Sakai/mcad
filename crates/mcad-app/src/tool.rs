@@ -265,6 +265,38 @@ pub trait Tool {
         ToolResult::Continue
     }
 
+    /// [`Tool::wants_shape_pick`] が `true` のツールのうち、ピック成功後にさらに
+    /// 対象エンティティ上へスナップを掛けて `click` を差し替えるべきなら `true`。
+    /// 既定は `false`（対象外）。app 層（`handle_tool_input`）はこれが `true` のときだけ
+    /// [`crate::snap::snap_split_position`] を呼び、ヒットすればホバーマーカー表示と
+    /// クリック時の `click` 差し替えの両方に使う（DESIGN.md 7章「分割ツールのスナップ
+    /// 対応」論点(2)(3)(4)）。
+    ///
+    /// # なぜ分割だけ `true` を返すのか
+    ///
+    /// [`Tool::wants_shape_pick`] 系4ツール（トリム・延長・フィレット・分割）はいずれも
+    /// クリックで「どの形状を」ヒットテストするかを決めるが、`click` 座標そのものの
+    /// 意味がツールごとに違う。トリム・延長・フィレットのクリック点は「対象のどちら側／
+    /// どの端を残すか」を示す **側の指定**であり、既存エンティティ上の実位置で判定する
+    /// 必要がある（吸着させると本来通るはずの操作が交点直上クリックとして拒否され得る。
+    /// `handle_tool_input` の該当コメントも参照）。一方、分割のクリック点は**分割位置
+    /// そのもの**であり、中点・交点などのキリのよい座標へ吸着させる方が使い勝手が良い。
+    /// この意味の違いにより、4ツール中 [`SplitTool`] だけがこの拡張点を override する
+    /// （M7 では見送られ、v0.8.x 番号外で「分割ツールのスナップ対応」として追設された
+    /// 経緯は DESIGN.md 7章「随時対応」欄を参照）。
+    ///
+    /// # なぜ [`Tool::snap_points`] を流用しないのか
+    ///
+    /// [`Tool::snap_points`] は「作図中の未確定頂点を図面全体スナップへ端点候補として
+    /// 供給する」向きの拡張点で、対象限定の候補生成という逆向きの制御には使えない
+    /// （[`Tool::ortho_origin`] の「なぜ `snap_points()` を流用しないのか」doc と同型の
+    /// 理由）。対象限定スナップの計算自体は `Document` を要するため、ツール側ではなく
+    /// app 層（`handle_tool_input`）が担う（[`Tool::wants_circle_pick`] 以来の「ヒット
+    /// テストは app 層」の役割分担を踏襲）。
+    fn snaps_shape_pick(&self) -> bool {
+        false
+    }
+
     /// 直前の [`ToolResult::Commit`] が `Document` へ適用された直後に呼ばれ、選択集合を
     /// 置き換えたい場合にその ID 列を返す。`None`（既定）は「選択集合に触らない」。
     ///
@@ -1680,6 +1712,11 @@ impl Tool for SplitTool {
     }
 
     fn wants_shape_pick(&self) -> bool {
+        true
+    }
+
+    /// 分割だけがスナップ対象になる理由は [`Tool::snaps_shape_pick`] の doc を参照。
+    fn snaps_shape_pick(&self) -> bool {
         true
     }
 
@@ -5967,5 +6004,20 @@ mod tests {
         let mut tool = SelectTool::default();
         tool.on_click(&doc, Point2::new(2.0, 0.02), 0.1, false);
         assert_eq!(tool.selection(), &[dim]);
+    }
+
+    // --- snaps_shape_pick（分割ツールのスナップ対応） ---
+
+    #[test]
+    fn snaps_shape_pick_default_is_false() {
+        // wants_shape_pick 系4ツールのうち、分割以外は既定のまま false であること。
+        assert!(!TrimTool::default().snaps_shape_pick());
+        assert!(!ExtendTool::default().snaps_shape_pick());
+        assert!(!FilletTool::default().snaps_shape_pick());
+    }
+
+    #[test]
+    fn snaps_shape_pick_true_only_for_split() {
+        assert!(SplitTool::default().snaps_shape_pick());
     }
 }

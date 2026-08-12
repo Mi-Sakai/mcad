@@ -34,8 +34,8 @@
 //! ある以上その所属エンティティも実質的に画面内なので、絞り込みの有無で結果は
 //! 変わらない。
 
-use mcad_core::{Document, Entity, EntityGeom};
-use mcad_geom::{Aabb, Point2, Shape, intersect};
+use mcad_core::{Document, Entity, EntityGeom, EntityId};
+use mcad_geom::{Aabb, Point2, Shape, intersect, point_tol};
 
 /// スナップ候補の種別。優先度は Endpoint > Intersection > Midpoint > Center > Grid
 /// （DESIGN.md 3.4）。数値優先度は [`SnapKind::priority`] が返す。
@@ -151,6 +151,117 @@ pub fn snap(
     best.finish()
 }
 
+/// 分割ツール専用のスナップ候補列挙（DESIGN.md 7章「分割ツールのスナップ対応」論点(1)）。
+///
+/// 図面全体を対象にする [`snap`] と異なり、候補を **対象エンティティ `target` 上に
+/// 限定** する。対象上に無い点（別エンティティの端点・[`SnapKind::Center`]・
+/// [`SnapKind::Grid`]）へ吸着すると、マーカー位置と `mcad_geom::split` が実際に使う
+/// 分割位置が乖離してマーカーが嘘をつくため、この2種別は候補にしない
+/// （DESIGN.md 同節・論点(1)）。
+///
+/// 候補は以下の3種類のみ:
+/// - [`SnapKind::Midpoint`]: [`Shape::Line`] の中点・[`Shape::Polyline`] 各辺の中点。
+/// - [`SnapKind::Endpoint`]: [`Shape::Polyline`] の **中間頂点のみ**。先頭・末尾頂点、
+///   および [`Shape::Line`]／[`Shape::Arc`] の両端点は除外する。`mcad_geom::split` は
+///   これらを常に `SplitError::TooCloseToEndpoint` で拒否するため、マーカーを出すと
+///   「表示→クリック→拒否」の無意味な誘導になる（中間頂点での分割は頂点重複の無い
+///   正当な操作なので候補にする）。
+/// - [`SnapKind::Intersection`]: `target`（`target_id`）と他の可視 [`Shape`] エンティティ
+///   （`target_id` 自身は除く）との交点。[`snap`] と同じカーソル近傍 AABB カリングを
+///   踏襲する（絞り込みが無損失である理由は本モジュール doc を参照）。**target の全体端点
+///   （Line/Arc の両端、開いた Polyline の先頭・末尾頂点）の近傍にある交点は除外する**
+///   （端点候補と同じ理由 — `split` がそこを常に `TooCloseToEndpoint` で拒否するため）。
+///
+/// `target` が `mcad_geom::split` の `SplitError::Unsupported` を返す形状
+/// （[`Shape::Circle`]・閉じた [`Shape::Polyline`]・[`Shape::Point`]）の場合は候補列挙
+/// 自体を行わず `None` を返す（拒否確定の対象にマーカーを出さない）。
+// 「分割スナップ-2」で `SplitTool`（`Tool::snaps_shape_pick`）/`handle_tool_input`
+// （main.rs）へ配線済み（DESIGN.md 7章「分割ツールのスナップ対応」タスク分割）。
+#[must_use]
+pub fn snap_split_position(
+    document: &Document,
+    target_id: EntityId,
+    target: &Shape,
+    cursor: Point2,
+    radius: f64,
+) -> Option<SnapResult> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    // split が Unsupported を返す対象は候補列挙自体を行わない。
+    if matches!(target, Shape::Point(_) | Shape::Circle(_))
+        || matches!(target, Shape::Polyline(pl) if pl.closed)
+    {
+        return None;
+    }
+
+    let r2 = radius * radius;
+    let mut best = Best::default();
+
+    match target {
+        Shape::Line(s) => {
+            best.consider(SnapKind::Midpoint, s.a.midpoint(s.b), cursor, r2);
+        }
+        Shape::Polyline(pl) => {
+            // 中間頂点のみ（先頭・末尾は split が TooCloseToEndpoint で拒否するため除外）。
+            if pl.vertices.len() > 2 {
+                for &v in &pl.vertices[1..pl.vertices.len() - 1] {
+                    best.consider(SnapKind::Endpoint, v, cursor, r2);
+                }
+            }
+            for seg in pl.segments() {
+                best.consider(SnapKind::Midpoint, seg.a.midpoint(seg.b), cursor, r2);
+            }
+        }
+        // Arc は端点(始終点)が除外対象なので中点・端点候補を持たない（交点のみ）。
+        // Point・閉じた Polyline・Circle はここへ来ない（上の Unsupported ガードで弾く）。
+        Shape::Arc(_) | Shape::Point(_) | Shape::Circle(_) => {}
+    }
+
+    // target の全体端点（Line/Arc は両端、開いた Polyline は先頭・末尾頂点）。
+    // split はこれらの近傍を必ず TooCloseToEndpoint で拒否するため、他エンティティとの
+    // 交点がたまたまここに載っても候補にしない（中点・端点候補と同じ除外規約。
+    // Codex レビュー指摘: 除外していないと「マーカー→クリック→拒否」が交点経由で再発する）。
+    let overall_endpoints: &[Point2] = match target {
+        Shape::Line(s) => &[s.a, s.b],
+        Shape::Arc(a) => &[a.start_point(), a.end_point()],
+        Shape::Polyline(pl) if pl.vertices.len() >= 2 => {
+            &[pl.vertices[0], pl.vertices[pl.vertices.len() - 1]]
+        }
+        _ => &[],
+    };
+    let near_overall_endpoint = |p: Point2| {
+        overall_endpoints
+            .iter()
+            .any(|&e| p.distance(e) <= point_tol(p, e))
+    };
+
+    // 交点: target とカーソル近傍 AABB が交差する他エンティティのみを事前絞り込みし、
+    // target_id 自身は除外する。絞り込みが無損失である理由は本モジュール doc を参照。
+    let cursor_box = Aabb::from_point(cursor).expanded(radius);
+    if target.aabb().intersects(&cursor_box) {
+        for (id, entity) in document.entities() {
+            if id == target_id || !layer_visible(document, entity) {
+                continue;
+            }
+            let Some(other) = entity.geom.as_shape() else {
+                continue;
+            };
+            if !other.aabb().intersects(&cursor_box) {
+                continue;
+            }
+            for p in intersect(target, other) {
+                if near_overall_endpoint(p) {
+                    continue;
+                }
+                best.consider(SnapKind::Intersection, p, cursor, r2);
+            }
+        }
+    }
+
+    best.finish()
+}
+
 /// 1 エンティティの端点・中点・中心の候補を [`Best`] に投入する。
 ///
 /// 各種別の割り当て:
@@ -232,7 +343,7 @@ impl Best {
 mod tests {
     use super::*;
     use mcad_core::{Command, Entity, Style};
-    use mcad_geom::{Circle, LineSeg, Shape};
+    use mcad_geom::{Circle, LineSeg, Polyline, Shape};
 
     /// カレントレイヤーに `shape` を追加する。
     fn add(doc: &mut Document, shape: Shape) {
@@ -243,6 +354,20 @@ mod tests {
             Style::inherited(),
         )))
         .expect("current layer must accept entity");
+    }
+
+    /// カレントレイヤーに `shape` を追加し、発行された [`EntityId`] を返す
+    /// （分割スナップのテストで target_id が要る）。
+    fn add_id(doc: &mut Document, shape: Shape) -> EntityId {
+        let layer = doc.current_layer();
+        let new_ids = doc
+            .apply(Command::AddEntity(Entity::new(
+                shape,
+                layer,
+                Style::inherited(),
+            )))
+            .expect("current layer must accept entity");
+        new_ids.entities[0]
     }
 
     fn line(ax: f64, ay: f64, bx: f64, by: f64) -> Shape {
@@ -451,5 +576,284 @@ mod tests {
         let r = snap(&doc, Point2::new(0.1, -0.1), 0.5, 1.0, &extra).unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
         assert_eq!(r.point, Point2::new(0.0, 0.0));
+    }
+
+    // --- snap_split_position (分割ツール専用スナップ) ---
+
+    #[test]
+    fn split_line_midpoint_is_candidate() {
+        let mut doc = Document::new();
+        let shape = line(0.0, 0.0, 4.0, 0.0);
+        let id = add_id(&mut doc, shape.clone());
+
+        let r = snap_split_position(&doc, id, &shape, Point2::new(2.1, 0.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Midpoint);
+        assert_eq!(r.point, Point2::new(2.0, 0.0));
+    }
+
+    #[test]
+    fn split_polyline_edge_midpoint_is_candidate() {
+        let mut doc = Document::new();
+        let shape = Shape::Polyline(Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(4.0, 0.0),
+                Point2::new(4.0, 4.0),
+            ],
+            false,
+        ));
+        let id = add_id(&mut doc, shape.clone());
+
+        // 2 本目の辺 (4,0)-(4,4) の中点 (4,2)。
+        let r = snap_split_position(&doc, id, &shape, Point2::new(4.1, 2.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Midpoint);
+        assert_eq!(r.point, Point2::new(4.0, 2.0));
+    }
+
+    #[test]
+    fn split_polyline_middle_vertex_is_candidate_and_beats_midpoint() {
+        let mut doc = Document::new();
+        // 中間頂点 (4,0) の近くには辺の中点は無い(端点 (2,0) と (4,2) の中点はそれぞれ遠い)。
+        let shape = Shape::Polyline(Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(4.0, 0.0),
+                Point2::new(4.0, 4.0),
+            ],
+            false,
+        ));
+        let id = add_id(&mut doc, shape.clone());
+
+        let r = snap_split_position(&doc, id, &shape, Point2::new(4.1, 0.1), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Endpoint);
+        assert_eq!(r.point, Point2::new(4.0, 0.0));
+    }
+
+    #[test]
+    fn split_line_x_intersection_is_candidate() {
+        let mut doc = Document::new();
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let id = add_id(&mut doc, target.clone());
+        add(&mut doc, line(5.0, -5.0, 5.0, 5.0));
+
+        // 交点 (5,0)。target の中点も (5,0) だが、優先度で交点(=端点相当の高優先度)が勝つ。
+        let r = snap_split_position(&doc, id, &target, Point2::new(5.1, 0.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Intersection);
+        assert_eq!(r.point, Point2::new(5.0, 0.0));
+    }
+
+    #[test]
+    fn split_t_contact_intersection_is_candidate() {
+        // T字接触: 他線分 B の端点 (5,0) が target A の内部に載る。
+        let mut doc = Document::new();
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let id = add_id(&mut doc, target.clone());
+        add(&mut doc, line(5.0, 0.0, 5.0, 5.0));
+
+        let r = snap_split_position(&doc, id, &target, Point2::new(5.1, 0.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Intersection);
+        assert_eq!(r.point, Point2::new(5.0, 0.0));
+    }
+
+    #[test]
+    fn split_intersection_at_target_overall_endpoint_is_not_a_candidate() {
+        // 他線分が target の全体端点 (0,0) ちょうどを通る（T字接触が target の端点上で
+        // 起きるケース）。この交点を候補にすると、split が必ず TooCloseToEndpoint で
+        // 拒否する点にマーカーを出す「表示→クリック→拒否」が交点経由で再発する
+        // （Codex レビュー指摘、2026-08-12）。
+        let mut doc = Document::new();
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let id = add_id(&mut doc, target.clone());
+        add(&mut doc, line(0.0, 0.0, 0.0, 5.0));
+
+        assert_eq!(
+            snap_split_position(&doc, id, &target, Point2::new(0.1, 0.0), 0.5),
+            None
+        );
+    }
+
+    #[test]
+    fn split_arc_intersection_at_overall_endpoint_is_not_a_candidate() {
+        use mcad_geom::Arc;
+        use std::f64::consts::FRAC_PI_2;
+
+        // 他線分が弧の始点 (5,0) ちょうどを通る。
+        let mut doc = Document::new();
+        let arc = Arc::new(Point2::new(0.0, 0.0), 5.0, 0.0, FRAC_PI_2);
+        let shape = Shape::Arc(arc);
+        let id = add_id(&mut doc, shape.clone());
+        add(&mut doc, line(5.0, 0.0, 5.0, 5.0));
+
+        assert_eq!(
+            snap_split_position(&doc, id, &shape, Point2::new(4.9, 0.0), 0.3),
+            None
+        );
+    }
+
+    #[test]
+    fn split_polyline_intersection_at_overall_endpoint_is_not_a_candidate() {
+        // 他線分が Polyline の先頭頂点 (0,0) ちょうどを通る。
+        let mut doc = Document::new();
+        let shape = Shape::Polyline(Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(4.0, 0.0),
+                Point2::new(4.0, 4.0),
+            ],
+            false,
+        ));
+        let id = add_id(&mut doc, shape.clone());
+        add(&mut doc, line(0.0, 0.0, 0.0, 5.0));
+
+        assert_eq!(
+            snap_split_position(&doc, id, &shape, Point2::new(0.1, 0.0), 0.5),
+            None
+        );
+    }
+
+    #[test]
+    fn split_line_full_endpoints_are_not_candidates() {
+        let mut doc = Document::new();
+        let shape = line(0.0, 0.0, 4.0, 0.0);
+        let id = add_id(&mut doc, shape.clone());
+
+        // 端点 (0,0) の近傍。線分全体の端点は候補にならない。
+        assert_eq!(
+            snap_split_position(&doc, id, &shape, Point2::new(0.1, 0.0), 0.5),
+            None
+        );
+    }
+
+    #[test]
+    fn split_arc_full_endpoints_are_not_candidates() {
+        use mcad_geom::Arc;
+        use std::f64::consts::FRAC_PI_2;
+
+        let mut doc = Document::new();
+        let arc = Arc::new(Point2::new(0.0, 0.0), 5.0, 0.0, FRAC_PI_2);
+        let shape = Shape::Arc(arc);
+        let id = add_id(&mut doc, shape.clone());
+
+        // 弧の始点 (5,0) 近傍には、端点・中点候補が無い(弧は候補を持たない)。
+        assert_eq!(
+            snap_split_position(&doc, id, &shape, Point2::new(4.9, 0.0), 0.3),
+            None
+        );
+    }
+
+    #[test]
+    fn split_center_is_not_a_candidate() {
+        // Circle は target とは別エンティティで、target からも離れた位置にある
+        // (交点も生じない)。円の中心近傍にカーソルを置いても、snap_split_position は
+        // Center 種別を持たないため候補が無い(通常の snap() なら Center にスナップする
+        // 状況)。グリッドは引数自体が無いため型シグネチャ上そもそも候補になり得ない。
+        let mut doc = Document::new();
+        let shape = line(0.0, 0.0, 4.0, 0.0);
+        let id = add_id(&mut doc, shape.clone());
+        add(
+            &mut doc,
+            Shape::Circle(Circle::new(Point2::new(10.0, 10.0), 1.0)),
+        );
+
+        let r = snap_split_position(&doc, id, &shape, Point2::new(10.0, 10.0), 0.5);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn split_candidate_outside_radius_is_ignored() {
+        let mut doc = Document::new();
+        let shape = line(0.0, 0.0, 4.0, 0.0);
+        let id = add_id(&mut doc, shape.clone());
+
+        // 中点 (2,0) から半径 0.1 だけ離れた位置。半径 0.05 では届かない。
+        assert_eq!(
+            snap_split_position(&doc, id, &shape, Point2::new(2.1, 0.0), 0.05),
+            None
+        );
+    }
+
+    #[test]
+    fn split_hidden_layer_entity_is_not_intersection_source() {
+        let mut doc = Document::new();
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let id = add_id(&mut doc, target.clone());
+
+        // 交差する別レイヤーの線分を追加し、そのレイヤーを非表示にする。
+        let hidden_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "hidden",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        doc.apply(Command::AddEntity(Entity::new(
+            line(5.0, -5.0, 5.0, 5.0),
+            hidden_layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        let mut props = doc.layer(hidden_layer).unwrap().clone();
+        props.visible = false;
+        doc.apply(Command::SetLayerProps {
+            id: hidden_layer,
+            props,
+        })
+        .unwrap();
+
+        // 交点(5,0)は非表示レイヤー由来なので候補にならない。target の中点も(5,0)なので、
+        // 交点として拾われていないことを確認するには半径をごく小さくして中点との
+        // 距離差が出ない位置を選ぶ必要はなく、ここでは中点自体が候補として残る
+        // (=Intersection でなく Midpoint になる、あるいは同一種別優先の中点が採用される)
+        // ことを確認する。
+        let r = snap_split_position(&doc, id, &target, Point2::new(5.0, 0.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Midpoint);
+        assert_eq!(r.point, Point2::new(5.0, 0.0));
+    }
+
+    #[test]
+    fn split_target_itself_is_not_paired_for_intersection() {
+        // target 自身との intersect() 呼び出しを避けていることを確認する。target_id と
+        // 同じ id のエンティティがドキュメント内にあっても、それは除外される。
+        let mut doc = Document::new();
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let id = add_id(&mut doc, target.clone());
+
+        // 半径内には target 自身しかない(中点(5,0)のみが候補になるはず)。
+        let r = snap_split_position(&doc, id, &target, Point2::new(5.0, 0.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Midpoint);
+        assert_eq!(r.point, Point2::new(5.0, 0.0));
+    }
+
+    #[test]
+    fn split_unsupported_targets_return_none() {
+        let mut doc = Document::new();
+
+        let point_shape = Shape::Point(Point2::new(0.0, 0.0));
+        let id = add_id(&mut doc, point_shape.clone());
+        assert_eq!(
+            snap_split_position(&doc, id, &point_shape, Point2::new(0.0, 0.0), 1.0),
+            None
+        );
+
+        let circle_shape = Shape::Circle(Circle::new(Point2::new(0.0, 0.0), 1.0));
+        let id = add_id(&mut doc, circle_shape.clone());
+        assert_eq!(
+            snap_split_position(&doc, id, &circle_shape, Point2::new(1.0, 0.0), 1.0),
+            None
+        );
+
+        let closed_polyline = Shape::Polyline(Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(1.0, 0.0),
+                Point2::new(1.0, 1.0),
+            ],
+            true,
+        ));
+        let id = add_id(&mut doc, closed_polyline.clone());
+        assert_eq!(
+            snap_split_position(&doc, id, &closed_polyline, Point2::new(0.5, 0.0), 1.0),
+            None
+        );
     }
 }

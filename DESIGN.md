@@ -372,6 +372,84 @@ M5 の内容と順序は現状の実測(編集操作が移動・削除のみ)に
       出力が改修前実装とバイト一致。(iv) モードは画面描画・`.mcad`・DXF へ無影響。(v) fmt / clippy /
       workspace test 通過、手動スモークテスト記録。リリース(バージョン更新・タグ)は番号外3件の
       消化方針(まとめて v0.8.1 か個別か)の采配に従う。
+  - **分割ツールのスナップ対応 — 設計確定(2026-08-12、design-fable 案)**: 本欄冒頭の M7 見送り分
+    (Codex M7 レビュー(2026-07-26)指摘)を v0.8.x 番号外として消化する。変更は app 層
+    (snap.rs / tool.rs / main.rs)に閉じ、geom・core・io・保存データ(`.mcad`/DXF)・
+    他ツールのクリック挙動・`SplitTool::on_shape_pick` 本体には触れない。
+    - **(1) スナップ候補は対象エンティティ上に限定する**: 図面全体のスナップ+`closest_point`
+      射影の案は、対象上に無い点(別エンティティの端点・Center・Grid)へ吸着した瞬間に
+      「マーカー位置」と「射影後の実分割位置」が乖離してマーカーが嘘をつくため採らない。
+      `snap.rs` へ分割専用の純関数 `snap_split_position(document, target_id, target, cursor,
+      radius) -> Option<SnapResult>` を新設し、候補は (i) 中点 = Line の中点・Polyline 各辺の
+      中点、(ii) 端点 = Polyline の中間頂点のみ(Line/Arc の両端・開いた Polyline の先頭末尾
+      頂点は除外 — `split` が必ず `TooCloseToEndpoint` で拒否する点にマーカーを出すと
+      「表示→クリック→拒否」の無意味な誘導になる。中間頂点での分割は頂点重複なしの正当な
+      操作)、(iii) 交点 = 対象×他の可視 Shape エンティティ(既存 `intersect` +カーソル近傍
+      AABB カリングの流儀を踏襲。T字接触(他線分の端点が対象内部に載る)は `seg_seg` の
+      EPS 込み区間判定 `-EPS..=1.0+EPS` が交点として返すことを実装確認済み)。Center・Grid は
+      対象上に無いため除外。優先度・同種内最近傍は既存 `Best`(端点>交点>中点)を再利用し、
+      戻り値を `SnapResult` にするので既存の `draw_snap_marker` がそのまま使える。分割が
+      `Unsupported` を返す対象(Circle・閉じた Polyline・Point)は候補列挙自体を行わず None
+      (拒否確定の対象にマーカーを出さない。`split` の対応表と 3 行だけ重複するが、doc で
+      `mcad_geom::split` を相互参照して同期を保つ)。既知の限界(スコープ外): 弧上の中点
+      (既存スナップエンジンも候補にしない)・共線接触(既存 `intersect` が平行を空で返す
+      仕様)・自己交差。
+    - **(2) 対象決定は raw クリック、分割位置決定でスナップ**: 分割の 1 クリックは「どれを
+      割るか」と「どこで割るか」を兼ねる。前者は従来どおり raw の `pick_shape_entity`
+      (他の3ツールと同じ対象決定規則を維持)、後者はピック成功後に `snap_split_position` を
+      掛け、ヒットすれば `ShapePick.click` をその点へ差し替える(外れれば raw のまま)。
+      `SplitTool::on_shape_pick` は無変更(従来どおり `closest_point` 射影→`split`。候補は
+      構成上対象上の点なので射影は FP 誤差の正規化として無害に残り、geom 側の前提も保たれる)。
+      「スナップ点をそのまま分割位置にする」案との実質差は無く、ツール側の変更ゼロで済む本案を
+      採る。F3(スナップ)OFF なら計算ごと省略して完全に従来挙動。ortho は shape-pick 経路に
+      元々効かない(`ortho_origin` は None のまま。相互作用なし)。
+    - **(3) 4ツールの差分はマーカー表示の有無で伝える(文言追加なし)**: 現行の
+      `handle_tool_input` ホバー経路は wants_shape_pick 系ツールでも図面全体スナップの
+      マーカーを表示するが、クリックはそれを使わない(マーカーが吸着を約束しない既存の
+      不整合)。本対応で「マーカー=クリックが実際に使う点」の不変条件を張る: 分割はホバー時に
+      `pick_shape_entity`→`snap_split_position` の結果(=実際に割られる点)をマーカー表示し、
+      トリム・延長・フィレットはホバーマーカーを抑止する(3ツールのクリック挙動は無変更)。
+      ステータスバー・ヒント文言の追加はしない。DimRadial の 1 クリック目(wants_circle_pick)
+      にも同種のマーカー不整合が残るが、今回はスコープ外とする。
+    - **(4) Tool トレイトへ既定実装つきオプトイン拡張点を 1 つ追加**: `snap_points()` は
+      「作図中の未確定頂点を図面全体スナップへ端点候補として供給する」入力であり、対象限定の
+      候補生成という逆向きの制御には流用できない(`ortho_origin` の「なぜ snap_points() を
+      流用しないのか」doc と同型の理由)。`fn snaps_shape_pick(&self) -> bool { false }` を
+      追加し `SplitTool` のみ true を返す。対象限定スナップは Document を要するため計算は
+      app 層(`handle_tool_input`)が担う(`wants_circle_pick` 以来の「ヒットテストは app 層」
+      の役割分担を踏襲)。
+    - **タスク分割**(いずれも implement-sonnet。設計判断は本欄で確定済みのため定型実装):
+      1. **分割スナップ-1(snap 層)**: `snap_split_position` 新設+ doc(候補範囲と除外理由を
+         明記)。headless テスト: 線分中点/Polyline 辺中点・中間頂点(端点扱いで中点に優先)/
+         X字・T字の交点/線分・弧の全体端点、Center、Grid が候補にならない/半径外は無視/
+         非表示レイヤーは交点源にしない/対象自身をペアにしない/Circle・閉じた Polyline・
+         Point は None。完了条件: fmt / clippy / workspace test 通過。
+      2. **分割スナップ-2(トレイト+配線+ドキュメント)**: `snaps_shape_pick` 追加(doc に
+         「なぜ分割だけか」= クリック点の意味の差と M7 見送り経緯)+ `SplitTool` の override、
+         `handle_tool_input` のクリック経路(ピック成功後、`snaps_shape_pick() && snap_enabled`
+         のとき既存の探索半径(`SNAP_RADIUS_PX / zoom`)で `click` を差し替え)・ホバー経路
+         (分割=対象限定マーカー、トリム・延長・フィレット=マーカー抑止)、既存コメント
+         (「ここもスナップは掛けず raw を使う」)の更新、README(`B` 行・スナップ節)・
+         CHANGELOG 未リリース節(3ツールのマーカー抑止は挙動変更として明記)・本欄への消化済み
+         注記。テスト: `snaps_shape_pick` の既定 false / Split true。完了条件: fmt / clippy /
+         workspace test 通過。GUI 変更のため手動スモークテスト(下記検収基準の GUI 項目)を
+         ユーザーへ依頼し記録する。依存: 分割スナップ-1。
+    - **検収基準**: (i) F3 ON で線分の中点近傍クリックがちょうど中点で 2 分割され、ホバー時
+      マーカーが中点に出る。(ii) 交差点・T字接触点でも同様に吸着して分割される。(iii) Polyline
+      の中間頂点で頂点重複なく 2 分割される。(iv) 端点近傍ではマーカーが出ず、クリックは従来
+      挙動。(v) Circle・閉じた Polyline ではマーカーが出ず、拒否文言は従来どおり。(vi) F3 OFF
+      で完全に従来挙動。(vii) トリム・延長・フィレットのホバーにスナップマーカーが出なくなる
+      (クリック挙動は無変更)。(viii) 作図ツールのスナップ・直交・作図中頂点スナップは無変更。
+      (ix) fmt / clippy / workspace test 通過、手動スモークテスト記録。リリース(バージョン
+      更新・タグ)は番号外3件の消化方針(まとめて v0.8.1 か個別か)の采配に従う(出力
+      モノクロ化の項と同じ)。
+    - **実装完了(分割スナップ-1・2、implement-sonnet)**: `snap_split_position`(snap.rs)、
+      `Tool::snaps_shape_pick`(既定 false、`SplitTool` のみ override)、
+      `handle_tool_input` のクリック経路(ピック成功後にスナップ差し替え)・ホバー経路
+      (分割=対象限定マーカー、トリム・延長・フィレット=マーカー抑止)を配線済み。
+      README・CHANGELOG(Unreleased、3ツールのマーカー抑止は挙動変更として明記)も更新済み。
+      fmt / clippy(警告ゼロ) / workspace test(`snaps_shape_pick` の既定 false / Split true
+      を含む)通過。GUI 変更のため実ウィンドウでの手動スモークテストは別途依頼。
 
 ### M5: 編集操作の充実(v0.5.0)の設計
 
@@ -1835,7 +1913,7 @@ M8 完了(2026-08-11)を受けてそのまま M9 として起こした(旧 M9 �
 #### タスク分割
 
 番号外(本マイルストーン着手前、v0.8.x): 出力モノクロ化(implement-sonnet)/分割ツールのスナップ
-対応(implement-sonnet)/ズーム・パンの追加操作手段(implement-sonnet)。番号はこの3件の完了後に
+対応(implement-sonnet、設計・タスク分割は7章「随時対応」の当該項目で確定済み、2026-08-12)/ズーム・パンの追加操作手段(implement-sonnet)。番号はこの3件の完了後に
 タスク45から採番する。
 
 | # | タスク | 内容 | 担当 | 依存 |

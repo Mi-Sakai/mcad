@@ -2451,18 +2451,39 @@ fn handle_tool_input(
     // 描画のために記録する（ホバーしていなければマーカーを消す）。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let extra_points = active.snap_points();
-        let (_, marker) = apply_snap(
-            document,
-            snap_enabled,
-            raw,
-            radius,
-            grid_step,
-            &extra_points,
-        );
-        *snap_marker = marker;
-        let world = resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin());
-        let _ = active.on_input(&ctx, InputEvent::Move(world));
+        if active.wants_shape_pick() {
+            // wants_shape_pick 系4ツール（トリム・延長・フィレット・分割）は、クリックが
+            // raw のままヒットテストされる（下の Click 節のコメント参照）ため、図面全体
+            // スナップのマーカーを出すと「マーカーはクリックが使わない点」という不整合が
+            // 生じる（DESIGN.md 7章「分割ツールのスナップ対応」論点(3)）。分割だけは
+            // クリック点そのものが分割位置であり実際にスナップを掛ける
+            // （`snaps_shape_pick()`）ので、対象上に限定したマーカー（実際に割られる点）を
+            // 表示する。トリム・延長・フィレットはマーカー自体を出さない（クリック挙動は
+            // 無変更）。
+            *snap_marker = if snap_enabled && active.snaps_shape_pick() {
+                tool::pick_shape_entity(document, raw, pick_tol).and_then(|hit| {
+                    snap::snap_split_position(document, hit.id, &hit.shape, raw, radius)
+                })
+            } else {
+                None
+            };
+            // Move は Move(_) を無視する仕様（tool.rs 各ツールの on_input 参照）なので
+            // raw をそのまま渡してよい。
+            let _ = active.on_input(&ctx, InputEvent::Move(raw));
+        } else {
+            let extra_points = active.snap_points();
+            let (_, marker) = apply_snap(
+                document,
+                snap_enabled,
+                raw,
+                radius,
+                grid_step,
+                &extra_points,
+            );
+            *snap_marker = marker;
+            let world = resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin());
+            let _ = active.on_input(&ctx, InputEvent::Move(world));
+        }
     } else {
         *snap_marker = None;
     }
@@ -2487,12 +2508,26 @@ fn handle_tool_input(
             }
         } else if active.wants_shape_pick() {
             // 汎用エンティティピック（M7 タスク30）: wants_circle_pick と同じ配線。トリム・
-            // 延長（タスク31）が境界・対象の両クリックで使う。ここもスナップは掛けず raw を
-            // 使う: 既存エンティティの実位置で当てる必要があるうえ、トリムの `click` は
-            // 「捨てる側」を示す意味を持つため、交点へ吸着すると本来通るはずの操作が
-            // 交点直上クリックとして拒否されてしまう。
+            // 延長（タスク31）が境界・対象の両クリックで使う。対象決定（どれを当てるか）は
+            // raw のまま行う: 既存エンティティの実位置で当てる必要があるうえ、トリムの
+            // `click` は「捨てる側」を示す意味を持つため、交点へ吸着すると本来通るはずの
+            // 操作が交点直上クリックとして拒否されてしまう（トリム・延長・フィレットは
+            // ここで終わり、以降のスナップ差し替えは行わない）。
+            //
+            // 分割（`snaps_shape_pick()`）だけは対象決定の後、分割位置そのものを対象上へ
+            // スナップさせる（DESIGN.md 7章「分割ツールのスナップ対応」論点(2)）。ヒットすれば
+            // `click` をスナップ先へ差し替え、外れれば raw のまま `on_shape_pick` へ渡す。
             match tool::pick_shape_entity(document, raw, pick_tol) {
-                Some(hit) => result = active.on_shape_pick(hit),
+                Some(mut hit) => {
+                    if snap_enabled
+                        && active.snaps_shape_pick()
+                        && let Some(snapped) =
+                            snap::snap_split_position(document, hit.id, &hit.shape, raw, radius)
+                    {
+                        hit.click = snapped.point;
+                    }
+                    result = active.on_shape_pick(hit);
+                }
                 None => set_status(
                     status,
                     now,

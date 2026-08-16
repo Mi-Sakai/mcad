@@ -29,8 +29,8 @@ use mcad_geom::{LineSeg, Point2, Vec2};
 /// 決めるための割り切り。DESIGN.md M6 設計判断1 の近似方針に沿う）。
 const ASCII_CHAR_WIDTH_RATIO: f64 = 0.55;
 
-/// 矢先の半幅と長さの比。
-const ARROW_HALF_WIDTH_RATIO: f64 = 0.35;
+/// 矢先の半幅と長さの比。全開き角度15°（tan(7.5°) ≈ 0.1317）。
+const ARROW_HALF_WIDTH_RATIO: f64 = 0.1317;
 
 /// 寸法を描画・プレビュー可能な要素へ展開した結果（すべてワールド座標）。
 #[derive(Debug, Clone, PartialEq)]

@@ -12,6 +12,8 @@
 //! - 幾何クエリ: [`closest_point`], [`distance_to`], [`intersect`], [`circumcircle`]
 //! - 修正系演算: [`trim`], [`extend`]（[`trim_extend`] モジュール）、
 //!   [`fillet_lines`]（[`fillet`] モジュール）
+//! - 寸法記号: [`DimSymbol`], [`dim_symbol_glyph`]（[`symbol`] モジュール。φ・□ の
+//!   ジオメトリを生成し、他の記号はフォント文字として組版する側に委ねる）
 //! - ジオメトリ検証: [`Shape::validate`]（非有限座標・負半径・空ポリラインなどを検出）
 //! - 数値許容量: [`EPS`] と、その相対化ヘルパ [`rel_tol`] / [`point_tol`]
 //!
@@ -24,6 +26,7 @@ mod intersect;
 mod point;
 mod primitives;
 pub mod split;
+pub mod symbol;
 pub mod trim_extend;
 mod vec2;
 
@@ -35,6 +38,7 @@ pub use primitives::{
     Arc, Circle, LineSeg, OffsetError, Polyline, Shape, circumcircle, closest_point, distance_to,
 };
 pub use split::{SplitError, split};
+pub use symbol::{DimSymbol, SymbolGlyph, dim_symbol_glyph};
 pub use trim_extend::{TrimExtendError, TrimResult, extend, extend_reach, trim};
 pub use vec2::Vec2;
 

@@ -213,6 +213,7 @@ pub fn expand_radial(dim: &DimRadial, arrow_len: f64, text_height: f64) -> DimEx
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcad_core::DimAnnotation;
     use std::f64::consts::{FRAC_PI_2, PI};
 
     const T: f64 = 1e-9;
@@ -230,6 +231,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
+            annotation: DimAnnotation::default(),
         };
         let segs = linear_pick_segments(&dim);
         assert_eq!(segs.len(), 3);
@@ -250,6 +252,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: -2.0,
+            annotation: DimAnnotation::default(),
         };
         let segs = linear_pick_segments(&dim);
         assert!(approx(segs[0][0], Point2::new(0.0, -2.0)));
@@ -263,6 +266,7 @@ mod tests {
             p1: Point2::new(1.0, 1.0),
             p2: Point2::new(1.0, 1.0),
             offset: 3.0,
+            annotation: DimAnnotation::default(),
         };
         assert!(linear_pick_segments(&dim).is_empty());
         assert!((linear_distance(&dim, Point2::new(1.0, 4.0)) - 3.0).abs() < T);
@@ -274,6 +278,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
+            annotation: DimAnnotation::default(),
         };
         // 寸法線 (0,2)-(4,2) 上の点は距離 0。
         assert!(linear_distance(&dim, Point2::new(2.0, 2.0)) < T);
@@ -289,6 +294,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(3.0, 4.0), // 長さ 5
             offset: 1.0,
+            annotation: DimAnnotation::default(),
         };
         let ex = expand_linear(&dim, 0.5, 1.0);
         assert_eq!(ex.segments.len(), 3);
@@ -302,6 +308,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
+            annotation: DimAnnotation::default(),
         };
         let ex = expand_linear(&dim, 0.5, 1.0);
         // 矢先の先端（各三角形の第 1 頂点）は寸法線の両端。
@@ -316,6 +323,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
+            annotation: DimAnnotation::default(),
         };
         let ex = expand_linear(&dim, 0.5, 1.0);
         // 水平ベースライン（角 0）。
@@ -338,6 +346,7 @@ mod tests {
             p1: Point2::new(4.0, 0.0),
             p2: Point2::new(0.0, 0.0),
             offset: 2.0,
+            annotation: DimAnnotation::default(),
         };
         let ex = expand_linear(&dim, 0.5, 1.0);
         assert!(ex.text.angle.abs() < T);
@@ -350,6 +359,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(0.0, 4.0),
             offset: 2.0,
+            annotation: DimAnnotation::default(),
         };
         let ex = expand_linear(&dim, 0.5, 1.0);
         assert!((ex.text.angle - FRAC_PI_2).abs() < T);
@@ -364,6 +374,7 @@ mod tests {
             center: Point2::ORIGIN,
             radius: 5.0,
             leader_angle: 0.0,
+            annotation: DimAnnotation::default(),
         };
         let segs = radial_pick_segments(&dim);
         assert_eq!(segs.len(), 1);
@@ -377,6 +388,7 @@ mod tests {
             center: Point2::ORIGIN,
             radius: 5.0,
             leader_angle: 0.0,
+            annotation: DimAnnotation::default(),
         };
         // 引出線 (0,0)-(5,0) 上。
         assert!(radial_distance(&dim, Point2::new(2.0, 0.0)) < T);
@@ -390,6 +402,7 @@ mod tests {
             center: Point2::ORIGIN,
             radius: 12.5,
             leader_angle: 0.0,
+            annotation: DimAnnotation::default(),
         };
         let ex = expand_radial(&dim, 0.5, 1.0);
         assert_eq!(ex.segments.len(), 1);
@@ -410,6 +423,7 @@ mod tests {
             center: Point2::ORIGIN,
             radius: 3.0,
             leader_angle: FRAC_PI_2,
+            annotation: DimAnnotation::default(),
         };
         let ex = expand_radial(&dim, 0.5, 1.0);
         assert!(approx(ex.segments[0][1], Point2::new(0.0, 3.0)));
@@ -422,6 +436,7 @@ mod tests {
             center: Point2::ORIGIN,
             radius: 4.0,
             leader_angle: PI,
+            annotation: DimAnnotation::default(),
         };
         let ex = expand_radial(&dim, 0.5, 1.0);
         assert!(approx(ex.segments[0][1], Point2::new(-4.0, 0.0)));

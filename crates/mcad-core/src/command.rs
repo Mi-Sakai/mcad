@@ -1,6 +1,6 @@
 //! ドキュメントを変更する唯一の手段である [`Command`]。
 
-use crate::{Entity, EntityGeom, EntityId, Layer, LayerId, SheetMeta, Style};
+use crate::{DimStyle, Entity, EntityGeom, EntityId, Layer, LayerId, SheetMeta, Style};
 
 /// ドキュメントへの変更を表すコマンド。
 ///
@@ -73,6 +73,19 @@ pub enum Command {
     /// 弾かれるため、このコマンドに載ることはない。実行前に検証するのは
     /// ユーザー定義の表題欄様式の寸法のみ（[`crate::SheetMeta::validate`]）。
     SetSheet(SheetMeta),
+
+    /// 文書単位の寸法スタイル（文字高さ・矢先長さ・桁数など）をまとめて差し替える
+    /// （M9 タスク47-3。DESIGN.md M9 設計判断4）。
+    ///
+    /// 名前付き複数スタイルは non-goal で、図面に 1 つだけ持つ。[`Command::SetSheet`] と
+    /// 同じ流儀（no-op 判定は `before == after` なら履歴を汚さない。実行前チェックは
+    /// [`crate::DimStyle::validate`]）。
+    ///
+    /// 既存の寸法エンティティが持つ `decimals_override: None` の桁数は、この文書スタイルへの
+    /// **生きた参照**（[`crate::DimStyle::resolve_decimals`]）なので、このコマンドを適用すると
+    /// 即座に反映される。`Some(n)` の明示上書きを持つ寸法は影響を受けない（DESIGN.md M9
+    /// 設計判断4 実装時追記）。このコマンドはエンティティの `annotation` 自体には一切触れない。
+    SetDimStyle(DimStyle),
 
     /// 複数のサブコマンドを **1 つの操作** としてまとめて適用する複合コマンド。
     ///

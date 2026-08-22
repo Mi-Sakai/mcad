@@ -55,6 +55,20 @@ pub enum CoreError {
     #[error("invalid line width: {0}")]
     InvalidLineWidth(String),
 
+    /// はめあい記号が不正（空・組合せ表記 `"H7/g6"`・等級の欠落など）で拒否した。
+    ///
+    /// 判定条件は [`crate::FitClass::new`]（DESIGN.md M9 設計判断2）。
+    #[error("invalid fit class: {0}")]
+    InvalidFitClass(String),
+
+    /// 寸法注記が不正（種別に許されない寸法補助記号、`upper < lower` の公差、非有限値、
+    /// 桁数上書きの上限超過など）で拒否した。
+    ///
+    /// 判定条件は [`crate::DimAnnotation::validate`] と [`crate::SizeTolerance::validate`]
+    /// （DESIGN.md M9 設計判断2）。
+    #[error("invalid dimension annotation: {0}")]
+    InvalidDimAnnotation(String),
+
     /// 図面メタデータが不正（ユーザー定義の表題欄様式の寸法が非有限・非正など）で
     /// 拒否した。
     ///
@@ -62,4 +76,12 @@ pub enum CoreError {
     /// チェックで返る。
     #[error("invalid sheet metadata: {0}")]
     InvalidSheet(String),
+
+    /// 寸法スタイルが不正（非有限・非正の紙 mm 値、桁数上限超過、公差文字縮小率が
+    /// `(0, 1]` の範囲外など）で拒否した。
+    ///
+    /// 判定条件は [`crate::DimStyle::validate`]（DESIGN.md M9 設計判断4）。
+    /// `Command::SetDimStyle` の実行前チェックで返る。
+    #[error("invalid dimension style: {0}")]
+    InvalidDimStyle(String),
 }

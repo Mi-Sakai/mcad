@@ -19,7 +19,8 @@
 use slotmap::SlotMap;
 
 use crate::{
-    Command, CoreError, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb, SheetMeta, Style,
+    Command, CoreError, DimStyle, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb, SheetMeta,
+    Style,
 };
 
 /// 実行済みコマンドの逆操作可能な記録（内部専用）。
@@ -67,6 +68,10 @@ enum Applied {
     SetSheet {
         before: Box<SheetMeta>,
         after: Box<SheetMeta>,
+    },
+    SetDimStyle {
+        before: DimStyle,
+        after: DimStyle,
     },
     /// 複合コマンドの逆操作記録。サブコマンドの [`Applied`] を **適用順** に保持する。
     /// undo は逆順・redo は正順に適用することで、バッチ全体が 1 単位で戻る/やり直せる。
@@ -162,6 +167,8 @@ pub struct Document {
     default_layer: LayerId,
     /// 図面メタデータ（尺度・用紙・表題欄）。変更は [`Command::SetSheet`] 経由のみ。
     sheet: SheetMeta,
+    /// 文書単位の寸法スタイル。変更は [`Command::SetDimStyle`] 経由のみ。
+    dim_style: DimStyle,
     /// undo スタック（末尾が直近の操作）。
     undo_stack: Vec<HistoryEntry>,
     /// redo スタック（末尾が次に redo する操作）。
@@ -193,6 +200,7 @@ impl Document {
             current_layer: default_layer,
             default_layer,
             sheet: SheetMeta::default(),
+            dim_style: DimStyle::default(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             generation: 0,
@@ -220,6 +228,14 @@ impl Document {
     #[must_use]
     pub fn sheet(&self) -> &SheetMeta {
         &self.sheet
+    }
+
+    /// 文書単位の寸法スタイル（文字高さ・矢先長さ・桁数など）。
+    ///
+    /// 変更は [`Command::SetDimStyle`] 経由で行う（undo 対象。DESIGN.md M9 設計判断4）。
+    #[must_use]
+    pub fn dim_style(&self) -> &DimStyle {
+        &self.dim_style
     }
 
     /// 指定 ID のエンティティを参照する。存在しない/削除済みなら `None`。
@@ -536,6 +552,21 @@ impl Document {
                     changed,
                 ))
             }
+            Command::SetDimStyle(style) => {
+                // 不正なスタイル（非有限・非正の紙 mm 値、桁数上限超過など）は、
+                // 差し替えより先に検証することで、失敗時に状態を変えない。
+                style.validate().map_err(CoreError::InvalidDimStyle)?;
+                let before = std::mem::replace(&mut self.dim_style, style);
+                // 同一スタイルの設定は意味的 no-op（履歴を汚さない）。
+                let changed = before != style;
+                Ok(ExecuteOutcome::conditional(
+                    Applied::SetDimStyle {
+                        before,
+                        after: style,
+                    },
+                    changed,
+                ))
+            }
             Command::Batch(subs) => {
                 let mut applied: Vec<Applied> = Vec::with_capacity(subs.len());
                 let mut new_ids = NewIds::default();
@@ -583,6 +614,7 @@ impl Document {
             Applied::SetLayerProps { id, before, .. } => self.set_layer(*id, Some(before.clone())),
             Applied::SetCurrentLayer { before, .. } => self.current_layer = *before,
             Applied::SetSheet { before, .. } => self.sheet = (**before).clone(),
+            Applied::SetDimStyle { before, .. } => self.dim_style = *before,
             // バッチは逆順に各サブ逆操作を適用する（依存関係を正しく巻き戻すため）。
             Applied::Batch(applied) => {
                 for a in applied.iter().rev() {
@@ -604,6 +636,7 @@ impl Document {
             Applied::SetLayerProps { id, after, .. } => self.set_layer(*id, Some(after.clone())),
             Applied::SetCurrentLayer { after, .. } => self.current_layer = *after,
             Applied::SetSheet { after, .. } => self.sheet = (**after).clone(),
+            Applied::SetDimStyle { after, .. } => self.dim_style = *after,
             // バッチは正順に各サブ操作を再適用する（execute と同じ順序）。
             Applied::Batch(applied) => {
                 for a in applied.iter() {
@@ -743,10 +776,11 @@ impl Default for Document {
 mod tests {
     use super::*;
     use crate::{
-        Linetype, MAX_SCALE_TERM, Orientation, PaperSize, ProjectionMethod, Scale, Style,
-        TitleBlockFields, TitleBlockKind, TitleBlockTemplate, Unit, WidthMm,
+        ArrowPlacement, DimAnnotation, DimDiameter, DimLinear, DimStyle, FitClass, Linetype,
+        MAX_DIM_DECIMALS, MAX_SCALE_TERM, Orientation, PaperSize, ProjectionMethod, Scale,
+        SizeTolerance, Style, TitleBlockFields, TitleBlockKind, TitleBlockTemplate, Unit, WidthMm,
     };
-    use mcad_geom::{LineSeg, Point2, Shape};
+    use mcad_geom::{DimSymbol, LineSeg, Point2, Shape};
 
     fn line(x: f64) -> EntityGeom {
         EntityGeom::Shape(Shape::Line(LineSeg::new(
@@ -1770,6 +1804,164 @@ mod tests {
         assert_eq!(doc.undo_stack.len(), undo_len_before);
     }
 
+    // --- 寸法注記のコマンド境界拒否（DESIGN.md M9 設計判断2、タスク47-2）---
+
+    /// 注記つきの長さ寸法（`p1`-`p2` は妥当なので、拒否されるなら注記が理由）。
+    fn annotated_linear(annotation: DimAnnotation) -> EntityGeom {
+        EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 1.5,
+            annotation,
+        })
+    }
+
+    /// コマンド境界が拒否すべき注記の一覧（理由つき）。
+    fn invalid_annotations() -> Vec<(&'static str, DimAnnotation)> {
+        vec![
+            (
+                // 長さ寸法に半径系の記号（規定 5-3 / M9 判断2 の文法マトリクス）。
+                "symbol SR on a linear dimension",
+                DimAnnotation {
+                    symbol: Some(DimSymbol::SphereRadius),
+                    ..DimAnnotation::default()
+                },
+            ),
+            (
+                "upper below lower",
+                DimAnnotation {
+                    tolerance: Some(SizeTolerance::Deviations {
+                        upper: -0.2,
+                        lower: 0.1,
+                    }),
+                    ..DimAnnotation::default()
+                },
+            ),
+            (
+                "non-finite tolerance",
+                DimAnnotation {
+                    tolerance: Some(SizeTolerance::Symmetric(f64::NAN)),
+                    ..DimAnnotation::default()
+                },
+            ),
+            (
+                "non-finite text anchor",
+                DimAnnotation {
+                    text_anchor: Some(Point2::new(f64::INFINITY, 0.0)),
+                    ..DimAnnotation::default()
+                },
+            ),
+            (
+                "decimals override above the limit",
+                DimAnnotation {
+                    decimals_override: Some(MAX_DIM_DECIMALS + 1),
+                    ..DimAnnotation::default()
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn add_entity_rejects_invalid_dimension_annotations() {
+        for (why, annotation) in invalid_annotations() {
+            let mut doc = Document::new();
+            let result = doc.apply(add_line(&doc, annotated_linear(annotation)));
+            assert!(
+                matches!(result, Err(CoreError::InvalidGeometry(_))),
+                "{why}: expected rejection, got {result:?}"
+            );
+            // 部分適用がないこと。
+            assert_eq!(doc.entity_count(), 0, "{why}");
+            assert!(!doc.can_undo(), "{why}");
+            assert_eq!(doc.generation(), 0, "{why}");
+        }
+    }
+
+    #[test]
+    fn modify_entity_rejects_invalid_dimension_annotations() {
+        // 不正な Fit 文字列は `FitClass` が生成時に弾くので、この経路へは到達しえない
+        // （型で表現できない不正値は作れない ＝ M8 の Scale/WidthMm と同じ流儀）。
+        assert!(FitClass::new("H7/g6").is_err());
+
+        for (why, annotation) in invalid_annotations() {
+            let mut doc = Document::new();
+            let layer = doc.current_layer();
+            let original = annotated_linear(DimAnnotation::default());
+            let id = add_entity_get_id(
+                &mut doc,
+                Entity::new(original.clone(), layer, Style::inherited()),
+            );
+            let generation_before = doc.generation();
+            let undo_len_before = doc.undo_stack.len();
+
+            let result = doc.apply(Command::ModifyEntity {
+                id,
+                new_geom: annotated_linear(annotation),
+            });
+            assert!(
+                matches!(result, Err(CoreError::InvalidGeometry(_))),
+                "{why}: expected rejection, got {result:?}"
+            );
+            // 元の幾何・履歴・世代が変わっていないこと。
+            assert_eq!(doc.entity(id).unwrap().geom, original, "{why}");
+            assert_eq!(doc.undo_stack.len(), undo_len_before, "{why}");
+            assert_eq!(doc.generation(), generation_before, "{why}");
+        }
+    }
+
+    #[test]
+    fn valid_dimension_annotations_pass_the_command_boundary() {
+        // 拒否側だけでなく受理側も固定する（検証が常に Err を返す実装への退行防止）。
+        let mut doc = Document::new();
+        let annotation = DimAnnotation {
+            symbol: Some(DimSymbol::Diameter),
+            tolerance: Some(SizeTolerance::Fit(FitClass::new("H7").unwrap())),
+            decimals_override: Some(MAX_DIM_DECIMALS),
+            text_anchor: Some(Point2::new(1.0, 2.0)),
+            arrow_placement: ArrowPlacement::Outside,
+        };
+        let geom = annotated_linear(annotation);
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(
+            &mut doc,
+            Entity::new(geom.clone(), layer, Style::inherited()),
+        );
+        assert_eq!(doc.entity(id).unwrap().geom, geom);
+
+        // 直径寸法（新設バリアント）もコマンド境界を通る。
+        let diameter = EntityGeom::DimDiameter(DimDiameter {
+            center: Point2::new(1.0, 1.0),
+            radius: 5.0,
+            angle: 0.0,
+            annotation: DimAnnotation {
+                symbol: Some(DimSymbol::Diameter),
+                ..DimAnnotation::default()
+            },
+        });
+        let id = add_entity_get_id(
+            &mut doc,
+            Entity::new(diameter.clone(), layer, Style::inherited()),
+        );
+        assert_eq!(doc.entity(id).unwrap().geom, diameter);
+
+        // 直径寸法に R は付けられない（種別ごとの文法がここでも効く）。
+        let bad = EntityGeom::DimDiameter(DimDiameter {
+            center: Point2::new(1.0, 1.0),
+            radius: 5.0,
+            angle: 0.0,
+            annotation: DimAnnotation {
+                symbol: Some(DimSymbol::Radius),
+                ..DimAnnotation::default()
+            },
+        });
+        let before = doc.entity_count();
+        assert!(matches!(
+            doc.apply(add_line(&doc, bad)),
+            Err(CoreError::InvalidGeometry(_))
+        ));
+        assert_eq!(doc.entity_count(), before);
+    }
+
     // --- 世代カウンタ（dirty 判定の基盤、DESIGN.md M4 タスク14）---
 
     #[test]
@@ -2001,6 +2193,219 @@ mod tests {
         );
         assert_eq!(*doc.sheet(), before);
         assert!(!doc.can_undo());
+    }
+
+    // --- 文書単位の寸法スタイル（DESIGN.md M9 設計判断4、タスク47-3）---
+
+    /// 既定と全項目が異なる寸法スタイル（往復・undo の検証用）。
+    fn custom_dim_style() -> DimStyle {
+        DimStyle {
+            text_height_mm: 5.0,
+            arrow_len_mm: 4.0,
+            decimals: 3,
+            trim_trailing_zeros: false,
+            ext_gap_mm: 1.5,
+            ext_overshoot_mm: 2.5,
+            text_gap_mm: 2.0,
+            tolerance_scale: 0.5,
+        }
+    }
+
+    #[test]
+    fn new_document_dim_style_is_default() {
+        let doc = Document::new();
+        assert_eq!(*doc.dim_style(), DimStyle::default());
+    }
+
+    #[test]
+    fn set_dim_style_undo_redo() {
+        let mut doc = Document::new();
+        let before = *doc.dim_style();
+        let after = custom_dim_style();
+
+        doc.apply(Command::SetDimStyle(after)).unwrap();
+        assert_eq!(*doc.dim_style(), after);
+
+        assert!(doc.undo());
+        assert_eq!(*doc.dim_style(), before);
+
+        assert!(doc.redo());
+        assert_eq!(*doc.dim_style(), after);
+    }
+
+    #[test]
+    fn set_dim_style_with_identical_style_is_noop() {
+        // SetSheet と同じ流儀: before == after なら履歴も世代も汚さない。
+        let mut doc = Document::new();
+        doc.apply(Command::SetDimStyle(custom_dim_style())).unwrap();
+
+        let undo_len_before = doc.undo_stack.len();
+        let redo_len_before = doc.redo_stack.len();
+        let generation_before = doc.generation();
+
+        assert_eq!(
+            doc.apply(Command::SetDimStyle(custom_dim_style())),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.redo_stack.len(), redo_len_before);
+        assert_eq!(doc.generation(), generation_before);
+    }
+
+    #[test]
+    fn set_dim_style_rejects_unusable_values_without_mutating() {
+        // 非有限・非正の文字高さは DimStyle::validate が拒否する。状態も履歴も不変。
+        let mut doc = Document::new();
+        let before = *doc.dim_style();
+        let bad = DimStyle {
+            text_height_mm: -1.0,
+            ..DimStyle::default()
+        };
+
+        let result = doc.apply(Command::SetDimStyle(bad));
+        assert!(
+            matches!(result, Err(CoreError::InvalidDimStyle(_))),
+            "expected InvalidDimStyle, got {result:?}"
+        );
+        assert_eq!(*doc.dim_style(), before);
+        assert!(!doc.can_undo());
+        assert_eq!(doc.generation(), 0);
+
+        // 非有限値も同様に拒否される。
+        let bad_nan = DimStyle {
+            text_height_mm: f64::NAN,
+            ..DimStyle::default()
+        };
+        assert!(matches!(
+            doc.apply(Command::SetDimStyle(bad_nan)),
+            Err(CoreError::InvalidDimStyle(_))
+        ));
+        assert_eq!(*doc.dim_style(), before);
+        assert!(!doc.can_undo());
+        assert_eq!(doc.generation(), 0);
+    }
+
+    #[test]
+    fn set_dim_style_only_affects_entities_without_an_explicit_decimals_override() {
+        // DESIGN.md M9 設計判断4 実装時追記の桁数継承の優先順位:
+        // decimals_override が None の寸法は文書スタイルへの生きた参照、
+        // Some(n) は明示上書きで SetDimStyle の影響を受けない。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+
+        let inherit_geom = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(10.0, 0.0),
+            offset: 5.0,
+            annotation: DimAnnotation {
+                decimals_override: None,
+                ..DimAnnotation::default()
+            },
+        });
+        let override_geom = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(20.0, 0.0),
+            offset: 5.0,
+            annotation: DimAnnotation {
+                decimals_override: Some(1),
+                ..DimAnnotation::default()
+            },
+        });
+
+        let inherit_id = add_entity_get_id(
+            &mut doc,
+            Entity::new(inherit_geom.clone(), layer, Style::inherited()),
+        );
+        let override_id = add_entity_get_id(
+            &mut doc,
+            Entity::new(override_geom.clone(), layer, Style::inherited()),
+        );
+
+        assert_eq!(doc.dim_style().decimals, 2);
+        assert_eq!(doc.dim_style().resolve_decimals(None), 2);
+        assert_eq!(doc.dim_style().resolve_decimals(Some(1)), 1);
+
+        doc.apply(Command::SetDimStyle(DimStyle {
+            decimals: 4,
+            ..DimStyle::default()
+        }))
+        .unwrap();
+
+        let inherit_annotation_decimals = match &doc.entity(inherit_id).unwrap().geom {
+            EntityGeom::DimLinear(dim) => dim.annotation.decimals_override,
+            other => panic!("expected DimLinear, got {other:?}"),
+        };
+        let override_annotation_decimals = match &doc.entity(override_id).unwrap().geom {
+            EntityGeom::DimLinear(dim) => dim.annotation.decimals_override,
+            other => panic!("expected DimLinear, got {other:?}"),
+        };
+
+        // SetDimStyle はエンティティの annotation 自体には一切触れない。
+        assert_eq!(inherit_annotation_decimals, None);
+        assert_eq!(override_annotation_decimals, Some(1));
+
+        // None 側だけが新しい文書スタイルへ追従し、Some(n) 側は不変。
+        assert_eq!(
+            doc.dim_style()
+                .resolve_decimals(inherit_annotation_decimals),
+            4
+        );
+        assert_eq!(
+            doc.dim_style()
+                .resolve_decimals(override_annotation_decimals),
+            1
+        );
+
+        // 元の EntityGeom（annotation 込み）自体も一切書き換わっていないことを確認する。
+        assert_eq!(doc.entity(inherit_id).unwrap().geom, inherit_geom);
+        assert_eq!(doc.entity(override_id).unwrap().geom, override_geom);
+    }
+
+    #[test]
+    fn dim_style_is_reset_by_clear_history_semantics_symmetric_with_sheet() {
+        // clear_history はエンティティ・レイヤーの undo/redo 履歴と世代番号だけを
+        // リセットし、sheet と同様に dim_style そのものの値は変えない
+        // （SetSheet 用の既存挙動と対称）。
+        let mut doc = Document::new();
+        doc.apply(Command::SetDimStyle(custom_dim_style())).unwrap();
+        assert_eq!(*doc.dim_style(), custom_dim_style());
+
+        doc.clear_history();
+
+        assert_eq!(*doc.dim_style(), custom_dim_style());
+        assert!(!doc.can_undo());
+        assert!(!doc.can_redo());
+        assert_eq!(doc.generation(), 0);
+    }
+
+    #[test]
+    fn set_dim_style_is_part_of_an_atomic_batch() {
+        // 寸法スタイルの変更も他の内容変更と同じ 1 単位（Batch）に混ぜられる
+        // （Command::SetSheet と対称な扱い）。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let style_before = *doc.dim_style();
+        let ghost = EntityId::default();
+
+        let batch = Command::Batch(vec![
+            Command::SetDimStyle(custom_dim_style()),
+            Command::AddEntity(Entity::new(line(0.0), layer, Style::inherited())),
+        ]);
+        doc.apply(batch).unwrap();
+        assert_eq!(*doc.dim_style(), custom_dim_style());
+        assert_eq!(doc.entity_count(), 1);
+
+        assert!(doc.undo());
+        assert_eq!(*doc.dim_style(), style_before);
+        assert_eq!(doc.entity_count(), 0);
+
+        // 途中で失敗するバッチはスタイル変更も巻き戻す（原子性）。
+        let failing = Command::Batch(vec![
+            Command::SetDimStyle(custom_dim_style()),
+            Command::RemoveEntity(ghost),
+        ]);
+        assert_eq!(doc.apply(failing), Err(CoreError::EntityNotFound(ghost)));
+        assert_eq!(*doc.dim_style(), style_before);
     }
 
     #[test]

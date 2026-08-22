@@ -669,7 +669,9 @@ fn polyline_cmds(polyline: &Polyline, k: f64) -> Option<Vec<PathCmd>> {
 mod tests {
     use super::*;
     use crate::frame::{FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
-    use mcad_core::{Command, DimLinear, DimRadial, Layer, Scale, SheetMeta, Style, WidthMm};
+    use mcad_core::{
+        Command, DimAnnotation, DimLinear, DimRadial, Layer, Scale, SheetMeta, Style, WidthMm,
+    };
     use mcad_geom::{Circle, LineSeg};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
@@ -833,6 +835,7 @@ mod tests {
                     p1: Point2::ORIGIN,
                     p2: Point2::new(40.0, 0.0),
                     offset: 10.0,
+                    annotation: DimAnnotation::default(),
                 }),
             );
             let page = plot_page(&document, PlotColorMode::Color);
@@ -891,6 +894,7 @@ mod tests {
                 center: Point2::ORIGIN,
                 radius: 20.0,
                 leader_angle: 0.0,
+                annotation: DimAnnotation::default(),
             }),
         );
         let page = plot_page(&document, PlotColorMode::Color);
@@ -1302,6 +1306,7 @@ mod tests {
                 p1: Point2::ORIGIN,
                 p2: Point2::new(10.0, 0.0),
                 offset: 5.0,
+                annotation: DimAnnotation::default(),
             }),
         );
         let page = plot_page(&document, PlotColorMode::Blueprint);

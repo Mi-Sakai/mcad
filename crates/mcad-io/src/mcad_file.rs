@@ -76,6 +76,32 @@
 //! 使うため、不正値（0・負・範囲外）は serde の `try_from` が
 //! [`IoError::Json`] として読込境界で弾く。**この拒否は v4 のみ**で、v1〜v3 の
 //! 有限な旧線幅は拒否ではなく上記の規則で移行する。
+//!
+//! # 寸法注記・文書単位の寸法スタイルは v4 で永続化しない（M9 タスク47）
+//!
+//! M9 タスク47で `mcad-core` へ寸法注記（[`mcad_core::DimAnnotation`]。
+//! `DimLinear`/`DimRadial`/`DimDiameter` の `annotation` フィールド）と文書単位の
+//! 寸法スタイル（[`mcad_core::DimStyle`]、`Document::dim_style`）を追加したが、
+//! タスク47の範囲は **core 側の型定義のみ**に厳格化されており、io 層の永続化
+//! 対応は含まない。よって:
+//!
+//! - [`export_document`] は寸法の `annotation` を強制的に無注記
+//!   （[`mcad_core::DimAnnotation::unannotated`]）へリセットしてから書き出す
+//!   （`strip_dim_annotations`）。`#[serde(skip_serializing_if)]` に任せると
+//!   非デフォルトの注記だけ書き出されてしまい、「一部だけ永続化される」という
+//!   気づきにくい状態になるため、明示的に一律リセットする。
+//! - `Document::dim_style` に対応する [`FileDocument`] フィールドは存在せず、
+//!   export は単にこれを無視する。import は `Document::new()` の既定値
+//!   （[`mcad_core::DimStyle::default`]）のまま構築する。
+//!
+//! 結果として、注記つき寸法や非既定の `dim_style` を保存して再読込すると、
+//! **サイレントに既定値へ戻る**（回帰テストで固定: `mcad_file` テストモジュールの
+//! `exported_json_never_contains_dim_annotation_data` /
+//! `annotated_dimension_round_trip_resets_to_unannotated` /
+//! `dim_style_round_trip_resets_to_default`）。両者の永続化は
+//! **M9 タスク48（`.mcad` v5）で対応する**。フォーマットバージョンは v4 のまま
+//! 据え置く（`annotation` フィールド自体は core 側の型に追加済みだが、export が
+//! 常に無注記へ潰すため v4 の実際の出力内容は変わっていない）。
 
 use std::fs;
 use std::path::Path;
@@ -83,7 +109,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use mcad_core::{
-    Command, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Rgb, SheetMeta, Style, WidthMm,
+    Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, Document, Entity, EntityGeom, Layer,
+    LayerId, Linetype, Rgb, SheetMeta, Style, WidthMm,
 };
 use mcad_geom::Shape;
 
@@ -453,11 +480,44 @@ impl FileDocumentV1 {
     }
 }
 
+/// 寸法エンティティの [`DimAnnotation`] を強制的に無注記へリセットする。
+///
+/// M9 タスク47時点では寸法注記（[`DimAnnotation`]）を `.mcad` v4 へ永続化しない
+/// （モジュール doc「寸法注記・文書単位の寸法スタイルは v4 で永続化しない」参照）。
+/// `#[serde(skip_serializing_if = "DimAnnotation::is_unannotated")]` は無注記なら
+/// フィールド自体を省略するだけで、非デフォルトの注記があれば書き出してしまう。
+/// それは「一部だけ永続化される」という中途半端な状態で、後から見て
+/// 気づきにくい。ここで export 前に一律リセットすることで、v4 が注記情報を
+/// **一切**含まないことを構造的に保証する（[`EntityGeom`] は
+/// `#[non_exhaustive]` なので、寸法以外のワイルドカード腕は何もしない）。
+fn strip_dim_annotations(geom: EntityGeom) -> EntityGeom {
+    match geom {
+        EntityGeom::DimLinear(dim) => EntityGeom::DimLinear(DimLinear {
+            annotation: DimAnnotation::unannotated(),
+            ..dim
+        }),
+        EntityGeom::DimRadial(dim) => EntityGeom::DimRadial(DimRadial {
+            annotation: DimAnnotation::unannotated(),
+            ..dim
+        }),
+        EntityGeom::DimDiameter(dim) => EntityGeom::DimDiameter(DimDiameter {
+            annotation: DimAnnotation::unannotated(),
+            ..dim
+        }),
+        other => other,
+    }
+}
+
 /// ドキュメントをポータブルな [`FileDocument`] へ変換する。
 ///
 /// 生存中のレイヤー・エンティティのみを列挙する。undo/redo 履歴は含めない。
 /// `Document` の不変条件（エンティティの所属レイヤーは必ず生存、カレントレイヤーは
 /// 必ず生存）により、この変換は失敗しない。
+///
+/// **寸法注記・`dim_style` は含まない**（M9 タスク47時点の意図的な範囲外。詳細は
+/// モジュール doc）。[`strip_dim_annotations`] で寸法の `annotation` を無注記へ
+/// リセットしてから書き出す。`Document::dim_style` に対応する `FileDocument`
+/// フィールドは存在しないため、そもそも書き出されない。
 #[must_use]
 pub fn export_document(doc: &Document) -> FileDocument {
     let layers: Vec<(LayerId, Layer)> = doc.layers().map(|(id, l)| (id, l.clone())).collect();
@@ -474,7 +534,7 @@ pub fn export_document(doc: &Document) -> FileDocument {
         .map(|(_, e)| FileEntity {
             layer: layer_index(e.layer),
             style: e.style,
-            geom: e.geom.clone(),
+            geom: strip_dim_annotations(e.geom.clone()),
         })
         .collect();
 
@@ -1409,6 +1469,206 @@ mod tests {
               ]
             }}"#
         )
+    }
+
+    /// v4 の寸法 JSON（`annotation` キーを持たない）を [`v4_json`] へ差し込む。
+    fn v4_json_with_dimension(geom: &str) -> String {
+        let base = v4_json(r#"{"num": 1, "den": 1}"#, "0.35", "null");
+        let replaced = base.replace(
+            r#""geom": {"Shape": {"Point": {"x": 0.0, "y": 0.0}}}"#,
+            &format!(r#""geom": {geom}"#),
+        );
+        assert_ne!(replaced, base, "テスト前提: 置換が効いている");
+        replaced
+    }
+
+    #[test]
+    fn v4_dimensions_without_annotation_load_as_unannotated_and_write_back_unchanged() {
+        use mcad_core::{DimAnnotation, DimLinear, DimRadial};
+
+        // M9 タスク47-2 で寸法へ `annotation` を足したが、v4 以前のファイルはこのキーを
+        // 持たない。`#[serde(default)]` で無注記として補完して読め、無注記のまま書き出せば
+        // `annotation` キーは出力されない（`skip_serializing_if`）ので、v4 と同じ本文に戻る。
+        let linear_json = v4_json_with_dimension(
+            r#"{"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 4.0, "y": 0.0}, "offset": 1.5}}"#,
+        );
+        let doc = load(&linear_json).expect("annotation なしの v4 寸法は読めるべき");
+        let (_, entity) = doc.entities().next().unwrap();
+        assert_eq!(
+            entity.geom,
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::new(0.0, 0.0),
+                p2: Point2::new(4.0, 0.0),
+                offset: 1.5,
+                annotation: DimAnnotation::default(),
+            })
+        );
+        let written = to_json(&doc).unwrap();
+        assert!(
+            !written.contains("annotation"),
+            "無注記の寸法は annotation キーを書かない: {written}"
+        );
+
+        let radial_json = v4_json_with_dimension(
+            r#"{"DimRadial": {"center": {"x": 1.0, "y": 2.0}, "radius": 3.0, "leader_angle": 0.0}}"#,
+        );
+        let doc = load(&radial_json).expect("annotation なしの v4 寸法は読めるべき");
+        let (_, entity) = doc.entities().next().unwrap();
+        assert_eq!(
+            entity.geom,
+            EntityGeom::DimRadial(DimRadial {
+                center: Point2::new(1.0, 2.0),
+                radius: 3.0,
+                leader_angle: 0.0,
+                annotation: DimAnnotation::default(),
+            })
+        );
+        assert!(!to_json(&doc).unwrap().contains("annotation"));
+    }
+
+    /// 注記つき寸法を1件持つ `Document` を作る（下記のstrip系テストで共用）。
+    ///
+    /// `DimAnnotation` は M9 タスク47時点では `.mcad` v4 へ永続化しない
+    /// （モジュール doc「寸法注記・文書単位の寸法スタイルは v4 で永続化しない」）。
+    fn document_with_annotated_dim_linear() -> (Document, EntityGeom) {
+        use mcad_core::{ArrowPlacement, DimAnnotation, FitClass, SizeTolerance};
+        use mcad_geom::DimSymbol;
+
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let geom = EntityGeom::DimLinear(mcad_core::DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 1.5,
+            annotation: DimAnnotation {
+                symbol: Some(DimSymbol::Diameter),
+                tolerance: Some(SizeTolerance::Fit(FitClass::new("H7").unwrap())),
+                decimals_override: Some(1),
+                text_anchor: Some(Point2::new(2.0, 3.0)),
+                arrow_placement: ArrowPlacement::Outside,
+            },
+        });
+        doc.apply(Command::AddEntity(Entity::new(
+            geom.clone(),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        (doc, geom)
+    }
+
+    /// **意図的な回帰テスト**: M9 タスク47時点では、`export_document` は寸法の
+    /// [`mcad_core::DimAnnotation`] を無条件で無注記へリセットする（サイレントに
+    /// 情報を失わせないための固定化。Codex adversarial review 指摘）。
+    ///
+    /// このテストは「注記が失われること」自体を固定しているので、**M9 タスク48
+    /// （`.mcad` v5 で注記を永続化する）を実装したら、このテストは意図的に
+    /// 更新・削除されるべき**。そのときはこのテストではなく
+    /// 「注記が保持される」テストへ置き換える。
+    #[test]
+    fn exported_json_never_contains_dim_annotation_data() {
+        let (doc, geom) = document_with_annotated_dim_linear();
+        // テスト前提: 元の注記は非デフォルト（デフォルトなら本テストの意味がない）。
+        let EntityGeom::DimLinear(ref dim) = geom else {
+            unreachable!()
+        };
+        assert!(!dim.annotation.is_unannotated());
+
+        let json = to_json(&doc).unwrap();
+        assert!(
+            !json.contains("annotation"),
+            "export は寸法注記を書き出してはいけない: {json}"
+        );
+        // シンボル・公差・上書き桁数・引出線配置のいずれの痕跡も残らないこと。
+        assert!(!json.contains("Diameter"));
+        assert!(!json.contains("Fit"));
+        assert!(!json.contains("H7"));
+        assert!(!json.contains("Outside"));
+    }
+
+    /// **意図的な回帰テスト**（上記と同じ理由）: 注記つき寸法を export→import で
+    /// 往復させると、`annotation` は [`mcad_core::DimAnnotation::unannotated`] に
+    /// リセットされている。M9 タスク48実装時にこのテストは更新・削除されるべき。
+    #[test]
+    fn annotated_dimension_round_trip_resets_to_unannotated() {
+        use mcad_core::DimAnnotation;
+
+        let (doc, _original_geom) = document_with_annotated_dim_linear();
+        let loaded = load(&to_json(&doc).unwrap()).unwrap();
+        let EntityGeom::DimLinear(dim) = &loaded.entities().next().unwrap().1.geom else {
+            panic!("DimLinear のはず");
+        };
+        assert_eq!(dim.annotation, DimAnnotation::unannotated());
+    }
+
+    /// **意図的な回帰テスト**（上記と同じ理由）: 非既定の `Document::dim_style` は
+    /// export→import で保存されず、既定値へ戻る。`FileDocument` に対応フィールドが
+    /// 無いため（M9 タスク47時点の意図的な範囲外。M9 タスク48で `.mcad` v5 として
+    /// 対応予定。実装後はこのテストを「保持される」テストへ更新・削除すること）。
+    #[test]
+    fn dim_style_round_trip_resets_to_default() {
+        use mcad_core::DimStyle;
+
+        let custom = DimStyle {
+            text_height_mm: 5.0,
+            arrow_len_mm: 4.0,
+            decimals: 3,
+            trim_trailing_zeros: false,
+            ext_gap_mm: 1.5,
+            ext_overshoot_mm: 2.5,
+            text_gap_mm: 2.0,
+            tolerance_scale: 0.5,
+        };
+        assert_ne!(
+            custom,
+            DimStyle::default(),
+            "テスト前提: 既定値と異なること"
+        );
+
+        let mut doc = Document::new();
+        doc.apply(Command::SetDimStyle(custom)).unwrap();
+        assert_eq!(*doc.dim_style(), custom);
+
+        let loaded = load(&to_json(&doc).unwrap()).unwrap();
+        assert_eq!(*loaded.dim_style(), DimStyle::default());
+    }
+
+    #[test]
+    fn invalid_dim_annotations_are_rejected_at_the_read_boundary() {
+        use mcad_core::{DimAnnotation, DimKind};
+        use mcad_geom::DimSymbol;
+
+        // 不正な注記は読込境界で拒否される（長さ寸法に SR、不正なはめあい記号）。
+        // 前者は core の幾何検証、後者は `FitClass` の `try_from` が弾く。
+        let bad_symbol = v4_json_with_dimension(
+            r#"{"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 4.0, "y": 0.0}, "offset": 1.5,
+                "annotation": {"symbol": "SphereRadius", "tolerance": null,
+                 "decimals_override": null, "text_anchor": null, "arrow_placement": "Auto"}}}"#,
+        );
+        assert!(load(&bad_symbol).is_err());
+        // 参考: 同じ組合せは core 側でも拒否される（境界がずれていないことの確認）。
+        assert!(
+            DimAnnotation {
+                symbol: Some(DimSymbol::SphereRadius),
+                ..DimAnnotation::default()
+            }
+            .validate(DimKind::Linear)
+            .is_err()
+        );
+
+        let bad_fit = v4_json_with_dimension(
+            r#"{"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 4.0, "y": 0.0}, "offset": 1.5,
+                "annotation": {"symbol": null, "tolerance": {"Fit": "H7/g6"},
+                 "decimals_override": null, "text_anchor": null, "arrow_placement": "Auto"}}}"#,
+        );
+        assert!(matches!(load(&bad_fit), Err(IoError::Json(_))));
+
+        let bad_deviations = v4_json_with_dimension(
+            r#"{"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 4.0, "y": 0.0}, "offset": 1.5,
+                "annotation": {"symbol": null, "tolerance": {"Deviations": {"upper": -0.2, "lower": 0.1}},
+                 "decimals_override": null, "text_anchor": null, "arrow_placement": "Auto"}}}"#,
+        );
+        assert!(load(&bad_deviations).is_err());
     }
 
     #[test]

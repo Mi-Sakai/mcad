@@ -41,8 +41,8 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, LayerId, Linetype,
-    NewIds, Style,
+    Command, DimAnnotation, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, LayerId,
+    Linetype, NewIds, Style,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -981,7 +981,13 @@ impl Tool for DimLinearTool {
                 DimLinearState::WaitingLine(p1, p2) => {
                     let offset = linear_offset(p1, p2, p);
                     let cmd = Command::AddEntity(Entity::new(
-                        EntityGeom::DimLinear(DimLinear { p1, p2, offset }),
+                        EntityGeom::DimLinear(DimLinear {
+                            p1,
+                            p2,
+                            offset,
+                            // 作図直後は無注記（記号・公差は右パネルで後付けする）。
+                            annotation: DimAnnotation::default(),
+                        }),
                         ctx.layer,
                         ctx.style,
                     ));
@@ -1021,7 +1027,12 @@ impl Tool for DimLinearTool {
             // 寸法線位置待ち: カーソルで決まる offset の寸法を丸ごとプレビューする。
             (DimLinearState::WaitingLine(p1, p2), Some(cursor)) => {
                 let offset = linear_offset(p1, p2, cursor);
-                let dim = DimLinear { p1, p2, offset };
+                let dim = DimLinear {
+                    p1,
+                    p2,
+                    offset,
+                    annotation: DimAnnotation::default(),
+                };
                 let (arrow_len, text_height) = crate::dim_sizes(paper_display, k, viewport.zoom);
                 let ex = crate::dimension::expand_linear(&dim, arrow_len, text_height);
                 crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
@@ -1087,6 +1098,8 @@ impl Tool for DimRadialTool {
                                 center,
                                 radius,
                                 leader_angle,
+                                // 作図直後は無注記（R 記号は展開側が既定で付ける）。
+                                annotation: DimAnnotation::default(),
                             }),
                             ctx.layer,
                             ctx.style,
@@ -1125,6 +1138,7 @@ impl Tool for DimRadialTool {
                 center,
                 radius,
                 leader_angle,
+                annotation: DimAnnotation::default(),
             };
             let (arrow_len, text_height) = crate::dim_sizes(paper_display, k, viewport.zoom);
             let ex = crate::dimension::expand_radial(&dim, arrow_len, text_height);
@@ -4945,6 +4959,7 @@ mod tests {
                 p1: Point2::ORIGIN,
                 p2: Point2::new(1.0, 0.0),
                 offset: 0.5,
+                annotation: DimAnnotation::default(),
             }),
             doc.current_layer(),
             Style::inherited(),
@@ -5965,6 +5980,7 @@ mod tests {
                     p1: Point2::new(0.0, 0.0),
                     p2: Point2::new(4.0, 0.0),
                     offset: 2.0,
+                    annotation: DimAnnotation::default(),
                 }),
                 layer,
                 Style::inherited(),
@@ -5993,6 +6009,7 @@ mod tests {
                     center: Point2::ORIGIN,
                     radius: 5.0,
                     leader_angle: 0.0,
+                    annotation: DimAnnotation::default(),
                 }),
                 layer,
                 Style::inherited(),

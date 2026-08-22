@@ -7,6 +7,9 @@
 //!
 //! - ID: [`EntityId`], [`LayerId`]（`slotmap` キー。undo/redo をまたいでも安定）
 //! - 値型: [`Rgb`], [`WidthMm`], [`Linetype`], [`Style`], [`Layer`], [`Entity`]
+//! - 寸法の注記とスタイル: [`DimAnnotation`]（[`SizeTolerance`] / [`FitClass`] /
+//!   [`ArrowPlacement`]）と文書単位の [`DimStyle`]。文法検証は
+//!   [`DimAnnotation::validate`] に [`DimKind`] を渡して行う
 //! - 図面メタデータ: [`SheetMeta`]（[`Scale`] / [`PaperSize`] / [`Orientation`] /
 //!   [`TitleBlockKind`] / [`TitleBlockFields`]）と表題欄様式 [`TitleBlockTemplate`]
 //! - ドキュメント: [`Document`]（エンティティ・レイヤー・カレントレイヤー・
@@ -30,6 +33,7 @@
 //!   （DESIGN.md M8 設計判断2・5）。
 
 mod command;
+mod dim;
 mod document;
 mod entity;
 mod entity_geom;
@@ -41,9 +45,13 @@ mod style;
 mod title_block;
 
 pub use command::Command;
+pub use dim::{
+    ArrowPlacement, DimAnnotation, DimKind, DimStyle, FitClass, MAX_DIM_DECIMALS, MAX_DIM_STYLE_MM,
+    SizeTolerance,
+};
 pub use document::{Document, NewIds};
 pub use entity::Entity;
-pub use entity_geom::{DimLinear, DimRadial, EntityGeom, TextGeom};
+pub use entity_geom::{DimDiameter, DimLinear, DimRadial, EntityGeom, TextGeom};
 pub use error::CoreError;
 pub use id::{EntityId, LayerId};
 pub use layer::Layer;

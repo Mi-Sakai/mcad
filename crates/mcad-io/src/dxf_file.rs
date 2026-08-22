@@ -1337,7 +1337,7 @@ mod tests {
     /// （往復は `round_trip_preserves_cjk_and_ascii_text`）。
     #[test]
     fn export_writes_text_entity_and_skips_dimensions() {
-        use mcad_core::{DimLinear, DimRadial, EntityGeom, TextGeom};
+        use mcad_core::{DimAnnotation, DimDiameter, DimLinear, DimRadial, EntityGeom, TextGeom};
 
         let mut doc = Document::new();
         let layer = doc.current_layer();
@@ -1360,12 +1360,14 @@ mod tests {
             Style::inherited(),
         )))
         .unwrap();
-        // 長さ寸法・半径寸法は DXF 非対応でスキップされる。
+        // 長さ寸法・半径寸法・直径寸法は DXF 非対応でスキップされる（直径寸法は
+        // M9 タスク47-2 の新設バリアント。ワイルドカード腕でスキップ側へ乗る）。
         doc.apply(Command::AddEntity(Entity::new(
             EntityGeom::DimLinear(DimLinear {
                 p1: Point2::new(0.0, 0.0),
                 p2: Point2::new(2.0, 0.0),
                 offset: 1.0,
+                annotation: DimAnnotation::default(),
             }),
             layer,
             Style::inherited(),
@@ -1376,6 +1378,18 @@ mod tests {
                 center: Point2::new(0.0, 0.0),
                 radius: 2.0,
                 leader_angle: 0.0,
+                annotation: DimAnnotation::default(),
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimDiameter(DimDiameter {
+                center: Point2::new(0.0, 0.0),
+                radius: 2.0,
+                angle: 0.0,
+                annotation: DimAnnotation::default(),
             }),
             layer,
             Style::inherited(),
@@ -1383,8 +1397,8 @@ mod tests {
         .unwrap();
 
         let export = export_dxf(&doc);
-        // 2 件（長さ寸法 + 半径寸法）がスキップされ、Shape 1 件 + TEXT 1 件が図面へ入る。
-        assert_eq!(export.skipped_entities, 2);
+        // 3 件（長さ・半径・直径寸法）がスキップされ、Shape 1 件 + TEXT 1 件が図面へ入る。
+        assert_eq!(export.skipped_entities, 3);
         assert_eq!(export.drawing.entities().count(), 2);
 
         let text_entity = export

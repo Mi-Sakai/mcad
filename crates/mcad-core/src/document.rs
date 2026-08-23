@@ -1919,6 +1919,7 @@ mod tests {
             decimals_override: Some(MAX_DIM_DECIMALS),
             text_anchor: Some(Point2::new(1.0, 2.0)),
             arrow_placement: ArrowPlacement::Outside,
+            value_override: Some("5-10".to_string()),
         };
         let geom = annotated_linear(annotation);
         let layer = doc.current_layer();

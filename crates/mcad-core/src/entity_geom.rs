@@ -911,6 +911,7 @@ mod tests {
             decimals_override: Some(3),
             text_anchor: Some(Point2::new(1.0, 1.0)),
             arrow_placement: ArrowPlacement::Outside,
+            value_override: Some("5-10".to_string()),
         };
         let g = EntityGeom::DimLinear(DimLinear {
             annotation: annotation.clone(),
@@ -923,6 +924,7 @@ mod tests {
         assert_eq!(t.annotation.tolerance, annotation.tolerance);
         assert_eq!(t.annotation.decimals_override, annotation.decimals_override);
         assert_eq!(t.annotation.arrow_placement, annotation.arrow_placement);
+        assert_eq!(t.annotation.value_override, annotation.value_override);
     }
 
     // -----------------------------------------------------------------
@@ -978,6 +980,7 @@ mod tests {
                 decimals_override: Some(1),
                 text_anchor: Some(Point2::new(1.0, 2.0)),
                 arrow_placement: ArrowPlacement::Inside,
+                value_override: Some("5-10".to_string()),
             },
             ..diameter()
         });

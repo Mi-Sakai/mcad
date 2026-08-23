@@ -326,8 +326,6 @@ pub const MAX_DIM_DECIMALS: u8 = 4;
 ///
 /// 寸法値そのものは持たない（M6 設計判断2 のとおり、値は座標から毎回計算する）。
 /// 既定値は「無注記」＝ M8 までの描画と完全に同値（[`DimAnnotation::unannotated`]）。
-///
-/// 非比例寸法の値上書き（規定 5-10）は本サブタスクの範囲外で、M9 タスク47-2 で追加する。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DimAnnotation {
     /// 寸法補助記号（規定 5-3）。`None` は記号なし。
@@ -349,6 +347,12 @@ pub struct DimAnnotation {
     pub text_anchor: Option<Point2>,
     /// 矢の内外配置。
     pub arrow_placement: ArrowPlacement,
+    /// 非比例寸法の表示値上書き（規定 5-10）。`None` は座標から計算した値をそのまま表示する。
+    ///
+    /// `Some(s)` は寸法値テキストを `s` へ差し替える（下線を引く組版処理は描画側＝
+    /// M9 タスク49 の責務で、ここは差し替え値の保持と文法検証のみを持つ）。空文字列・
+    /// 空白のみ・制御文字を含む値は [`DimAnnotation::validate`] が拒否する。
+    pub value_override: Option<String>,
 }
 
 impl DimAnnotation {
@@ -366,6 +370,7 @@ impl DimAnnotation {
             decimals_override: None,
             text_anchor: None,
             arrow_placement: ArrowPlacement::Auto,
+            value_override: None,
         }
     }
 
@@ -384,12 +389,13 @@ impl DimAnnotation {
     /// 注記が `kind` の寸法に対して妥当か検証する。
     ///
     /// **core コマンド境界・`.mcad` 読込・UI 入力の3境界すべて**から呼ぶ
-    /// （DESIGN.md M9 設計判断2）。検証内容は次の 4 つ。
+    /// （DESIGN.md M9 設計判断2）。検証内容は次の 5 つ。
     ///
     /// 1. 種別 × 記号の文法（[`DimKind::allowed_symbols`]。例: 長さ寸法に SR は不可）
     /// 2. 公差値（[`SizeTolerance::validate`]。非有限・`upper < lower` の拒否）
     /// 3. 桁数上書きが [`MAX_DIM_DECIMALS`] 以下であること
     /// 4. 文字位置が有限座標であること（非有限が組版・SVG/PDF 座標へ流れるのを防ぐ）
+    /// 5. 値上書きが空文字列・空白のみ・制御文字混じりでないこと
     ///
     /// # Errors
     ///
@@ -419,6 +425,18 @@ impl DimAnnotation {
                 "text anchor must be finite: ({}, {})",
                 anchor.x, anchor.y
             )));
+        }
+        if let Some(value) = &self.value_override {
+            if value.trim().is_empty() {
+                return Err(CoreError::InvalidDimAnnotation(
+                    "value override must not be empty or whitespace-only".to_string(),
+                ));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(CoreError::InvalidDimAnnotation(format!(
+                    "value override must not contain control characters: {value:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -880,6 +898,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn value_override_accepts_non_blank_text() {
+        for s in ["5-10", "  50 (参考)  ", "A"] {
+            let annotation = DimAnnotation {
+                value_override: Some(s.to_string()),
+                ..DimAnnotation::default()
+            };
+            assert!(
+                annotation.validate(DimKind::Linear).is_ok(),
+                "{s:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn value_override_rejects_blank_or_control_characters() {
+        for s in ["", "   ", "\t", "50\n", "50\u{0007}mm"] {
+            let annotation = DimAnnotation {
+                value_override: Some(s.to_string()),
+                ..DimAnnotation::default()
+            };
+            assert!(
+                matches!(
+                    annotation.validate(DimKind::Linear),
+                    Err(CoreError::InvalidDimAnnotation(_))
+                ),
+                "{s:?} should be rejected"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------
     // (c) serde
     // -----------------------------------------------------------------
@@ -895,6 +944,7 @@ mod tests {
             decimals_override: Some(3),
             text_anchor: Some(Point2::new(12.5, -4.25)),
             arrow_placement: ArrowPlacement::Outside,
+            value_override: Some("5-10".to_string()),
         };
         let json = serde_json::to_string(&annotation).unwrap();
         assert_eq!(
@@ -976,6 +1026,7 @@ mod tests {
         assert_eq!(a.text_anchor, None);
         assert_eq!(a.arrow_placement, ArrowPlacement::Auto);
         assert_eq!(ArrowPlacement::default(), ArrowPlacement::Auto);
+        assert_eq!(a.value_override, None);
     }
 
     #[test]

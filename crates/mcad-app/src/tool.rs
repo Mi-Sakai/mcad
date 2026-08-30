@@ -188,8 +188,7 @@ pub trait Tool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        paper_display: bool,
-        k: f64,
+        render: crate::dimension::DimRender<'_>,
     );
 
     /// 作図中（未確定）の頂点列。スナップエンジン（`crate::snap::snap`）が端点
@@ -391,8 +390,7 @@ impl Tool for PointTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         if let Some(p) = self.cursor {
             draw_shape(
@@ -468,8 +466,7 @@ impl Tool for LineTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         if let (LineState::WaitingSecond(first), Some(cursor)) = (&self.state, self.cursor) {
             draw_shape(
@@ -554,8 +551,7 @@ impl Tool for CircleTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         if let (CircleState::WaitingRadiusPoint(center), Some(cursor)) = (&self.state, self.cursor)
         {
@@ -671,8 +667,7 @@ impl Tool for ArcTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         match (&self.state, self.cursor) {
             (ArcState::WaitingP2(p1), Some(cursor)) => {
@@ -792,8 +787,7 @@ impl Tool for PolylineTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         if self.vertices.is_empty() {
             return;
@@ -892,8 +886,7 @@ impl Tool for TextTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         // アンカー確定後はその位置に小さな十字マーカーを描く（文字列プレビューは
         // 文字列・高さを持つ app 層が別途描く）。未確定時はカーソルにマーカーを描く。
@@ -1008,8 +1001,7 @@ impl Tool for DimLinearTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        paper_display: bool,
-        k: f64,
+        render: crate::dimension::DimRender<'_>,
     ) {
         match (self.state, self.cursor) {
             // p2 待ち: 計測線の暫定（p1→カーソル）を細線で示す。
@@ -1033,8 +1025,7 @@ impl Tool for DimLinearTool {
                     offset,
                     annotation: DimAnnotation::default(),
                 };
-                let (arrow_len, text_height) = crate::dim_sizes(paper_display, k, viewport.zoom);
-                let ex = crate::dimension::expand_linear(&dim, arrow_len, text_height);
+                let ex = crate::dimension::expand_linear(&dim, render);
                 crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
             }
             _ => {}
@@ -1122,8 +1113,7 @@ impl Tool for DimRadialTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        paper_display: bool,
-        k: f64,
+        render: crate::dimension::DimRender<'_>,
     ) {
         if let (DimRadialState::WaitingLeader { center, radius }, Some(cursor)) =
             (self.state, self.cursor)
@@ -1140,8 +1130,7 @@ impl Tool for DimRadialTool {
                 leader_angle,
                 annotation: DimAnnotation::default(),
             };
-            let (arrow_len, text_height) = crate::dim_sizes(paper_display, k, viewport.zoom);
-            let ex = crate::dimension::expand_radial(&dim, arrow_len, text_height);
+            let ex = crate::dimension::expand_radial(&dim, render);
             crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
         }
     }
@@ -1354,8 +1343,7 @@ impl BoundaryTargetTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         // 選択済みの境界だけをハイライトして「今どちらを選んだか」を示す。カーソル追従の
         // ライブプレビューは行わない（上記のとおり）。
@@ -1440,11 +1428,9 @@ macro_rules! impl_tool_for_boundary_target {
                 painter: &Painter,
                 rect: Rect,
                 viewport: &Viewport,
-                paper_display: bool,
-                k: f64,
+                render: crate::dimension::DimRender<'_>,
             ) {
-                self.0
-                    .draw_preview(painter, rect, viewport, paper_display, k);
+                self.0.draw_preview(painter, rect, viewport, render);
             }
 
             fn wants_shape_pick(&self) -> bool {
@@ -1604,8 +1590,7 @@ impl Tool for FilletTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         // 選んだ 1 本目だけをハイライトする（トリム・延長が境界を示すのと同じ流儀）。
         if let FilletState::WaitingSecondLine { first, .. } = &self.state {
@@ -1718,8 +1703,7 @@ impl Tool for SplitTool {
         _painter: &Painter,
         _rect: Rect,
         _viewport: &Viewport,
-        _paper_display: bool,
-        _k: f64,
+        _render: crate::dimension::DimRender<'_>,
     ) {
         // 単一状態でハイライトすべき「選択済みの一部」が無いため、他ツールと違い
         // プレビュー描画自体を持たない。
@@ -2120,6 +2104,7 @@ impl SelectTool {
                 EntityGeom::Text(text) => crate::text_world_aabb(text, k).distance_to_point(world),
                 EntityGeom::DimLinear(dim) => crate::dimension::linear_distance(dim, world),
                 EntityGeom::DimRadial(dim) => crate::dimension::radial_distance(dim, world),
+                EntityGeom::DimDiameter(dim) => crate::dimension::diameter_distance(dim, world),
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は近似 aabb への
                 // 距離で拾う（ピック対象から黙って消えるより穏当）。
                 _ => entity.geom.aabb().distance_to_point(world),
@@ -2627,7 +2612,7 @@ impl SelectTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcad_core::{Document, TextGeom};
+    use mcad_core::{DimDiameter, Document, TextGeom};
 
     fn ctx() -> (Document, ToolCtx) {
         let doc = Document::new();
@@ -6021,6 +6006,35 @@ mod tests {
         let mut tool = SelectTool::default();
         tool.on_click(&doc, Point2::new(2.0, 0.02), 0.1, false);
         assert_eq!(tool.selection(), &[dim]);
+    }
+
+    #[test]
+    fn pick_selects_diameter_dimension_on_the_diameter_line() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let dim = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimDiameter(DimDiameter {
+                    center: Point2::ORIGIN,
+                    radius: 5.0,
+                    angle: 0.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
+        // 直径線 (−5,0)-(5,0) 上をクリックすると選択される（中心の反対側も含む）。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(-3.0, 0.02), 0.1, false);
+        assert_eq!(tool.selection(), &[dim]);
+
+        // 直径線から離れた点は拾わない（矢や文字の見かけの大きさには依存しない）。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.0, 3.0), 0.1, false);
+        assert!(tool.selection().is_empty());
     }
 
     // --- snaps_shape_pick（分割ツールのスナップ対応） ---

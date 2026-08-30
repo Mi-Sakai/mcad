@@ -132,8 +132,10 @@ fn fmt_color(color: Rgb) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plot::{PlotStroke, dash_pattern_mm};
-    use mcad_core::Linetype;
+    use crate::plot::{PlotColorMode, PlotStroke, dash_pattern_mm, plot_page};
+    use mcad_core::{
+        Command, DimAnnotation, DimDiameter, Document, Entity, EntityGeom, Linetype, Style,
+    };
 
     fn page(width_mm: f64, height_mm: f64, paths: Vec<PlotPath>) -> PlotPage {
         PlotPage {
@@ -142,6 +144,29 @@ mod tests {
             background: Rgb::WHITE,
             paths,
         }
+    }
+
+    /// 直径寸法（φ 記号のストロークつき）を 1 つだけ持つ既定文書（A4 横・1:1・枠なし）。
+    /// 値上書きで非比例寸法の下線も同時に載せる。
+    fn document_with_annotated_diameter() -> Document {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimDiameter(DimDiameter {
+                    center: Point2::new(100.0, 60.0),
+                    radius: 20.0,
+                    angle: 0.0,
+                    annotation: DimAnnotation {
+                        value_override: Some("40".to_owned()),
+                        ..DimAnnotation::default()
+                    },
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        document
     }
 
     // ---- 1: ルート要素の寸法・向き ----
@@ -361,6 +386,47 @@ mod tests {
     }
 
     // ---- 8: 背景色は PlotPage::background に従う（青図モード） ----
+
+    // ---- 9: 寸法の記号ストローク・下線が SVG まで届く（M9 タスク49-3）----
+
+    /// 寸法補助記号（φ）のストロークと非比例寸法の下線が `<path>` として書き出される。
+    ///
+    /// IR の内訳（どのパスが何か）は `crate::plot::tests` 側が固定しているので、ここでは
+    /// **IR のパスが 1 本残らず SVG 要素になっていること**と、記号ストロークの実座標が
+    /// 実際にパスデータへ現れることを見る。
+    #[test]
+    fn dimension_symbol_strokes_and_underline_reach_the_svg() {
+        let document = document_with_annotated_diameter();
+        let page = plot_page(&document, PlotColorMode::Monochrome);
+
+        // ストローク 4 本（寸法線・下線・φ の円・φ の斜線）+ 塗り 3 つ（矢先 2・値 1）。
+        assert_eq!(page.paths.iter().filter(|p| p.stroke.is_some()).count(), 4);
+        assert_eq!(page.paths.iter().filter(|p| p.fill.is_some()).count(), 3);
+
+        let svg = to_svg(&page);
+        assert_eq!(svg.matches("<path").count(), page.paths.len());
+        assert_eq!(svg.matches("fill=\"none\"").count(), 4);
+        assert!(!svg.contains("stroke-dasharray"), "寸法は常に実線");
+
+        // φ の円は 3 次ベジエ 4 本 + Z。その始点が y 反転済みで書かれている。
+        let circle = page
+            .paths
+            .iter()
+            .find(|p| p.stroke.is_some() && p.cmds.len() == 6)
+            .expect("φ の円");
+        let PathCmd::MoveTo(start) = circle.cmds[0] else {
+            unreachable!()
+        };
+        assert!(
+            svg.contains(&format!(
+                "M {},{}",
+                fmt_num(start.x),
+                fmt_num(page.height_mm - start.y)
+            )),
+            "φ の円の始点が SVG に無い"
+        );
+        assert!(circle.cmds.contains(&PathCmd::Close));
+    }
 
     #[test]
     fn background_rect_uses_page_background_color() {

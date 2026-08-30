@@ -205,8 +205,10 @@ fn set_rgb_fill(content: &mut Content, color: Rgb) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plot::{PlotStroke, dash_pattern_mm};
-    use mcad_core::Linetype;
+    use crate::plot::{PlotColorMode, PlotStroke, dash_pattern_mm, plot_page};
+    use mcad_core::{
+        Command, DimAnnotation, DimDiameter, Document, Entity, EntityGeom, Linetype, Style,
+    };
     use mcad_geom::Point2;
 
     fn page(width_mm: f64, height_mm: f64, paths: Vec<PlotPath>) -> PlotPage {
@@ -277,6 +279,14 @@ mod tests {
             Token::Num(v) => assert!(approx(*v, expected), "{what}: got {v}, want {expected}"),
             other => panic!("{what}: 数値ではない: {other:?}"),
         }
+    }
+
+    /// 演算子 `op` の出現回数。
+    fn operator_count(tokens: &[Token], op: &str) -> usize {
+        tokens
+            .iter()
+            .filter(|t| *t == &Token::Other(op.to_string()))
+            .count()
     }
 
     // ---- 1: MediaBox ----
@@ -615,6 +625,67 @@ mod tests {
         assert!(approx(r, 200.0 / 255.0));
         assert!(approx(g, 30.0 / 255.0));
         assert!(approx(b, 40.0 / 255.0));
+    }
+
+    // ---- 9b: 寸法の記号ストローク・下線が PDF まで届く（M9 タスク49-3）----
+
+    /// 寸法補助記号（φ）のストロークと非比例寸法の下線が、コンテンツストリームへ
+    /// 自分の `q`…`Q` ブロックとして書き出される。
+    ///
+    /// IR の内訳（どのパスが何か）は `crate::plot::tests` 側が固定しているので、ここでは
+    /// **IR のパスが 1 本残らずブロックになっていること**と、記号ストロークの実座標が
+    /// 実際に `m` 演算子として現れることを見る。
+    #[test]
+    fn dimension_symbol_strokes_and_underline_reach_the_pdf() {
+        // 直径寸法（φ 記号つき）に値上書きを載せ、非比例寸法の下線も同時に出す。
+        // 既定文書は A4 横・1:1・枠なしなので、パスは寸法 1 つ分だけになる。
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimDiameter(DimDiameter {
+                    center: Point2::new(100.0, 60.0),
+                    radius: 20.0,
+                    angle: 0.0,
+                    annotation: DimAnnotation {
+                        value_override: Some("40".to_owned()),
+                        ..DimAnnotation::default()
+                    },
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+
+        let page = plot_page(&document, PlotColorMode::Monochrome);
+        let bytes = to_pdf(&page);
+        let stream = content_stream(&bytes);
+        let tokens = tokenize(&stream);
+
+        // 背景は白なので背景 rect は出ない → q の数がそのままパス数。
+        assert_eq!(operator_count(&tokens, "q"), page.paths.len());
+        assert_eq!(operator_count(&tokens, "Q"), page.paths.len());
+        // ストローク 4 本（寸法線・下線・φ の円・φ の斜線）+ 塗り 3 つ（矢先 2・値 1）。
+        assert_eq!(operator_count(&tokens, "S"), 4, "{stream}");
+        assert_eq!(operator_count(&tokens, "f"), 3, "{stream}");
+        assert_eq!(operator_count(&tokens, "d"), 0, "寸法は常に実線");
+
+        // φ の円（3 次ベジエ 4 本 + `h`）の始点が `m` として書かれている（y 反転なし）。
+        let circle = page
+            .paths
+            .iter()
+            .find(|p| p.stroke.is_some() && p.cmds.len() == 6)
+            .expect("φ の円");
+        let PathCmd::MoveTo(start) = circle.cmds[0] else {
+            unreachable!()
+        };
+        let has_move = tokens.windows(3).any(|w| match (&w[0], &w[1], &w[2]) {
+            (Token::Num(x), Token::Num(y), Token::Other(op)) => {
+                op == "m" && approx(*x, start.x) && approx(*y, start.y)
+            }
+            _ => false,
+        });
+        assert!(has_move, "φ の円の始点が PDF に無い: {stream}");
     }
 
     // ---- 10: 決定性 ----

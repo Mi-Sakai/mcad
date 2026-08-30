@@ -32,7 +32,7 @@
 //! |---|---|
 //! | モデル図形の座標（ワールド） | `÷ k` |
 //! | [`mcad_core::TextGeom::height`]（**紙 mm**） | そのまま（anchor だけ `÷ k`） |
-//! | `DimExpansion` の各値（**ワールド長**） | `÷ k`（矢先 3.0mm・文字 3.5mm になる） |
+//! | `DimExpansion` の各値（**ワールド長**） | `÷ k`（[`mcad_core::DimStyle`] の紙 mm へ戻る） |
 //! | [`crate::frame::FrameText::height_mm`]（**紙 mm**） | そのまま（座標も既に紙 mm） |
 //! | 線幅 [`mcad_core::WidthMm`]（紙 mm） | そのまま（**1px 下限クランプなし**） |
 //! | 破線パターン（紙 mm 定数） | そのまま [`PlotStroke::dash_mm`] へ |
@@ -46,7 +46,8 @@
 //! 都合であって、紙の上では誤りになる（判断5「出力側はクランプしない」）。
 //!
 //! **紙基準表示トグル（F9）は出力に一切影響しない**。出力は常に紙 mm 基準で、
-//! 寸法注記は常に矢先 3.0mm・文字 3.5mm になる。
+//! 寸法注記の大きさは文書の [`mcad_core::DimStyle`]（既定で矢先 3.0mm・文字 3.5mm）が
+//! そのまま紙の上の寸法になる。
 //!
 //! 破線は幾何生成せず [`PlotStroke::dash_mm`] としてバックエンドのネイティブ機構
 //! （SVG `stroke-dasharray` / PDF `d` 演算子）へ渡す。**位相はパス先頭から 0** で、
@@ -135,14 +136,17 @@ pub const DASH_DOT_PATTERN_MM: [f32; 4] = [6.0, 1.2, 0.6, 1.2];
 /// もう1つ加えた形（長ダッシュ・ギャップ・ドット・ギャップ・ドット・ギャップ）。
 pub const DASH_DOT_DOT_PATTERN_MM: [f32; 6] = [6.0, 1.2, 0.6, 1.2, 0.6, 1.2];
 
-/// 寸法値ラベルの文字高さ（紙 mm）。製図規定 第6章の呼び 3.5。
-///
-/// 画面（紙基準表示 ON）は `k` 倍してワールド長へ換算し（タスク37、`main.rs` の
-/// `dim_sizes`）、出力は換算後に `÷ k` して戻すため、**紙の上では常に 3.5mm** になる。
-pub const DIM_TEXT_MM: f64 = 3.5;
-
-/// 寸法の矢先の長さ（紙 mm）。[`DIM_TEXT_MM`] と同じ扱いで、紙の上では常に 3.0mm。
-pub const DIM_ARROW_MM: f64 = 3.0;
+// 寸法注記の紙 mm サイズ（文字高さ・矢先長）はここに定数を持たない。**唯一の出所は
+// 文書の [`mcad_core::DimStyle`]**（既定値は [`mcad_core::DimStyle::DEFAULT`]）で、
+// 画面（`main.rs` の `dim_sizes`、紙基準表示 ON）も出力（[`plot_page`]）も同じ
+// フィールドを `k` 倍してワールド長へ換算する。
+//
+// M8 タスク39 まではここに `DIM_TEXT_MM` / `DIM_ARROW_MM` を置いていたが、M9 タスク49 で
+// 矢の内外判定（`dimension::arrows_point_outward`）と注記の表示倍率
+// （`dimension::DimRender::annotation_scale`）が `DimStyle` を読むようになり、
+// 「描かれる大きさは定数・判定はスタイル」という二重の出所になっていた。既定値が
+// たまたま一致していたので差は出ていなかったが、スタイル編集 UI（M9 タスク50）が
+// 入れば即座に破綻する組み合わせだったため、M9 タスク49-3 で定数側を削除した。
 
 /// 青図（Blueprint）モードの用紙背景色（プルシアンブルー `#003153`）。
 ///
@@ -311,8 +315,27 @@ pub fn plot_page(document: &Document, mode: PlotColorMode) -> PlotPage {
     if sheet.frame_visible {
         push_frame(&mut paths, &frame_layout(sheet), outliner.as_ref(), mode);
     }
+    // 寸法の展開パラメータ。出力は常に紙基準なので、注記の長さはスタイルの紙 mm × `k`
+    // （画面の `dim_render` が紙基準表示 ON のときに作るものと同じ）。**紙 mm の出所は
+    // 文書スタイルだけ**にする（定数を別に持つと矢の内外判定・注記の表示倍率が読む値と
+    // 食い違う。M9 タスク49-3）。
+    let dim_style = document.dim_style();
+    let dim_render = dimension::DimRender {
+        style: dim_style,
+        scale_world_per_paper_mm: k,
+        arrow_len_world: dim_style.arrow_len_mm * k,
+        text_height_world: dim_style.text_height_mm * k,
+    };
     for (entity, layer) in entities_in_plot_order(document) {
-        push_entity(&mut paths, entity, layer, k, outliner.as_ref(), mode);
+        push_entity(
+            &mut paths,
+            entity,
+            layer,
+            k,
+            outliner.as_ref(),
+            mode,
+            dim_render,
+        );
     }
 
     PlotPage {
@@ -376,6 +399,7 @@ fn entities_in_plot_order(document: &Document) -> Vec<(&Entity, &Layer)> {
 }
 
 /// エンティティ 1 つをパスへ展開して `paths` へ追加する。
+#[allow(clippy::too_many_arguments)]
 fn push_entity(
     paths: &mut Vec<PlotPath>,
     entity: &Entity,
@@ -383,6 +407,7 @@ fn push_entity(
     k: f64,
     outliner: Option<&GlyphOutliner>,
     mode: PlotColorMode,
+    dim_render: dimension::DimRender<'_>,
 ) {
     let color = plot_color(mode, entity.style.effective_color(layer.color));
     let width_mm = entity.style.effective_width(layer.width_mm).mm();
@@ -401,11 +426,15 @@ fn push_entity(
         EntityGeom::Text(text) => push_text(paths, text, color, k, outliner),
         // 寸法は製図慣行として常に実線で描く（線種は形状エンティティのみが対象）。
         EntityGeom::DimLinear(dim) => {
-            let ex = dimension::expand_linear(dim, DIM_ARROW_MM * k, DIM_TEXT_MM * k);
+            let ex = dimension::expand_linear(dim, dim_render);
             push_dim(paths, &ex, color, width_mm, k, outliner);
         }
         EntityGeom::DimRadial(dim) => {
-            let ex = dimension::expand_radial(dim, DIM_ARROW_MM * k, DIM_TEXT_MM * k);
+            let ex = dimension::expand_radial(dim, dim_render);
+            push_dim(paths, &ex, color, width_mm, k, outliner);
+        }
+        EntityGeom::DimDiameter(dim) => {
+            let ex = dimension::expand_diameter(dim, dim_render);
             push_dim(paths, &ex, color, width_mm, k, outliner);
         }
         // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は出力しない。
@@ -466,11 +495,16 @@ fn push_text(
     );
 }
 
-/// 寸法の展開結果（線分・矢先・文字）をパスへ展開する。
+/// 寸法の展開結果（線分・矢先・記号ストローク・文字）をパスへ展開する。
 ///
 /// [`DimExpansion`] の座標・長さ・文字高さは **すべてワールド長** なので `÷ k` して
-/// 紙 mm へ戻す。呼び出し側が `DIM_ARROW_MM * k` / `DIM_TEXT_MM * k` を渡しているため、
-/// 結果は尺度によらず常に矢先 3.0mm・文字 3.5mm になる。
+/// 紙 mm へ戻す。呼び出し側が `style.arrow_len_mm * k` / `style.text_height_mm * k` を
+/// 渡しているため、結果は尺度によらず常に [`mcad_core::DimStyle`] どおりの紙 mm になる。
+///
+/// 寸法は線種を持たない（製図慣行として常に実線）ので、線分・記号ストロークは同じ
+/// [`PlotStroke`] を共有する。記号ストローク（φ・□）は **形状エンティティとまったく同じ
+/// 変換経路**（[`push_shape`]）へ通す — 円は 3 次ベジエ 4 本、線分は 2 コマンドという
+/// 既存の規則をそのまま使い、記号専用の変換を書き起こさない（M9 タスク49-3）。
 fn push_dim(
     paths: &mut Vec<PlotPath>,
     ex: &DimExpansion,
@@ -500,16 +534,22 @@ fn push_dim(
         ];
         paths.push(PlotPath::filled(cmds, color));
     }
-    push_outlined_text(
-        paths,
-        outliner,
-        &ex.text.content,
-        world_to_paper(ex.text.anchor, k),
-        // ワールド高さ → 紙 mm（`TextGeom::height` と違いここは換算が要る）。
-        ex.text.height / k,
-        ex.text.angle,
-        color,
-    );
+    // 記号（φ・□）は値と同じラベルの一部なので、文字の直前へ置いて描画順を揃える。
+    for shape in &ex.symbol_strokes {
+        push_shape(paths, shape, stroke, k);
+    }
+    for text in &ex.texts {
+        push_outlined_text(
+            paths,
+            outliner,
+            &text.content,
+            world_to_paper(text.anchor, k),
+            // ワールド高さ → 紙 mm（`TextGeom::height` と違いここは換算が要る）。
+            text.height / k,
+            text.angle,
+            color,
+        );
+    }
 }
 
 /// 図面枠・表題欄をパスへ展開する。
@@ -670,9 +710,10 @@ mod tests {
     use super::*;
     use crate::frame::{FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
     use mcad_core::{
-        Command, DimAnnotation, DimLinear, DimRadial, Layer, Scale, SheetMeta, Style, WidthMm,
+        Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, DimStyle, Layer, Scale,
+        SheetMeta, SizeTolerance, Style, WidthMm,
     };
-    use mcad_geom::{Circle, LineSeg};
+    use mcad_geom::{Circle, LineSeg, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
     const T: f64 = 1e-9;
@@ -851,14 +892,14 @@ mod tests {
                 Some(&DASH_PATTERN_MM[..])
             );
 
-            // 矢先は常に紙 3.0mm。
+            // 矢先は常にスタイルどおりの紙 mm（既定 3.0mm）。
             let arrows: Vec<&PlotPath> = filled(&page)
                 .into_iter()
                 .filter(|p| p.cmds.len() == 4)
                 .collect();
             assert_eq!(arrows.len(), 2);
             for arrow in arrows {
-                close_to(arrow_length(arrow), DIM_ARROW_MM);
+                close_to(arrow_length(arrow), DimStyle::DEFAULT.arrow_len_mm);
             }
 
             // 寸法線・補助線の 3 本は実線のまま。
@@ -879,8 +920,16 @@ mod tests {
         // 尺度が違っても紙の上の文字サイズは同一。
         close_to(text_sizes[0].0, text_sizes[1].0);
         close_to(text_sizes[0].1, text_sizes[1].1);
-        // かつ「紙 3.5mm で書いた '40.00'」と同じ大きさ（＝ ÷k の戻しが効いている）。
-        let reference = bbox_size(&outliner.outline("40.00", Point2::ORIGIN, DIM_TEXT_MM, 0.0));
+        // かつ「スタイルの文字高さ（既定 3.5mm）で書いた '40'」と同じ大きさ
+        // （＝ ÷k の戻しが効いている）。値が `40.00` でなく `40` なのは、M9 タスク49 で
+        // 寸法値の組版が `DimStyle` のゼロトリム（既定 ON）に従うようになったため
+        // （DESIGN.md M9 判断5 (a)）。
+        let reference = bbox_size(&outliner.outline(
+            "40",
+            Point2::ORIGIN,
+            DimStyle::DEFAULT.text_height_mm,
+            0.0,
+        ));
         close_to(text_sizes[0].0, reference.0);
         close_to(text_sizes[0].1, reference.1);
     }
@@ -905,11 +954,258 @@ mod tests {
             .filter(|p| p.cmds.len() == 4)
             .collect();
         assert_eq!(arrows.len(), 1);
-        close_to(arrow_length(arrows[0]), DIM_ARROW_MM);
+        close_to(arrow_length(arrows[0]), DimStyle::DEFAULT.arrow_len_mm);
         // 円周点 (20,0) は紙では (10,0)。
         let (center, rim) = endpoints(stroked(&page)[0]);
         point_close_to(center, 0.0, 0.0);
         point_close_to(rim, 10.0, 0.0);
+    }
+
+    // ---- 3b: 直径寸法・記号ストローク・公差文字・非比例寸法の下線（M9 タスク49-3）----
+
+    /// 円として出ているストロークパス（`MoveTo` + `CurveTo`×4 + `Close`）。
+    /// φ 記号の円を寸法線・斜線（どちらも 2 コマンド）から区別するために使う。
+    fn stroked_circles(page: &PlotPage) -> Vec<&PlotPath> {
+        stroked(page)
+            .into_iter()
+            .filter(|p| p.cmds.len() == 6 && matches!(p.cmds[1], PathCmd::CurveTo(..)))
+            .collect()
+    }
+
+    /// 文字高さ `h`（紙 mm）の φ 記号の円の直径。**期待値の出所は mcad-geom の
+    /// `dim_symbol_glyph`** に一本化する（比率定数をテスト側へ写さない）。
+    fn phi_circle_diameter(h: f64) -> f64 {
+        match dim_symbol_glyph(mcad_geom::DimSymbol::Diameter, h)
+            .shapes
+            .first()
+        {
+            Some(Shape::Circle(circle)) => circle.radius * 2.0,
+            other => panic!("φ の 1 つ目の形状は円のはず: {other:?}"),
+        }
+    }
+
+    /// 直径寸法 1 つだけを持つ文書（中心 `center`・半径 `radius`・水平）。
+    fn document_with_diameter(
+        num: u32,
+        den: u32,
+        center: Point2,
+        radius: f64,
+        annotation: DimAnnotation,
+    ) -> Document {
+        let mut document = document_with_scale(num, den);
+        add(
+            &mut document,
+            EntityGeom::DimDiameter(DimDiameter {
+                center,
+                radius,
+                angle: 0.0,
+                annotation,
+            }),
+        );
+        document
+    }
+
+    /// 直径寸法が出力へ届き、φ 記号がストロークとして出る（タスク49-2 まで
+    /// `push_entity` に腕が無く、直径寸法は画面にしか出ていなかった）。
+    #[test]
+    fn diameter_dimension_is_plotted_with_its_phi_symbol_strokes() {
+        // k = 2。直径 60（ワールド）は紙 30mm で、ラベル + 矢 2 つが余裕で収まるので
+        // 矢は内向き＝寸法線は円周 2 点そのもの。
+        let document = document_with_diameter(
+            1,
+            2,
+            Point2::new(60.0, 40.0),
+            30.0,
+            DimAnnotation::default(),
+        );
+        let page = plot_page(&document, PlotColorMode::Color);
+
+        // ストロークは 3 本: 寸法線 1 + φ の円 1 + φ の斜線 1（直径寸法に補助線は無い）。
+        // 並びは `push_dim` の順（segments → 記号）なので先頭が寸法線。
+        let lines = stroked(&page);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines.iter().all(|p| p.stroke.unwrap().dash_mm.is_none()),
+            "寸法は常に実線"
+        );
+        let (a, b) = endpoints(lines[0]);
+        point_close_to(a, 15.0, 20.0);
+        point_close_to(b, 45.0, 20.0);
+
+        // 矢先 2 つ（紙 3.0mm）と値ラベル 1 つ。
+        let arrows: Vec<&PlotPath> = filled(&page)
+            .into_iter()
+            .filter(|p| p.cmds.len() == 4)
+            .collect();
+        assert_eq!(arrows.len(), 2);
+        for arrow in arrows {
+            close_to(arrow_length(arrow), DimStyle::DEFAULT.arrow_len_mm);
+        }
+        let labels: Vec<&PlotPath> = filled(&page)
+            .into_iter()
+            .filter(|p| p.cmds.len() > 4)
+            .collect();
+        assert_eq!(labels.len(), 1, "値 '60'（φ はストロークで別途出る）");
+
+        // φ の円は既存の `push_shape` 経路（3 次ベジエ 4 本）で出るので、外形は
+        // ちょうど直径 × 直径（制御点も外形からはみ出さない）。
+        let circles = stroked_circles(&page);
+        assert_eq!(circles.len(), 1);
+        let expected = phi_circle_diameter(DimStyle::DEFAULT.text_height_mm);
+        let (w, h) = bbox_size(&circles[0].cmds);
+        close_to(w, expected);
+        close_to(h, expected);
+    }
+
+    /// **M9 検収基準**: 尺度 1:2 と 2:1 で、記号ストロークと公差文字の紙の上の大きさが
+    /// 変わらない（`dimension_annotation_sizes_and_dash_pattern_are_scale_invariant` の
+    /// 記号・公差版）。
+    #[test]
+    fn dimension_symbol_strokes_and_tolerance_text_are_scale_invariant() {
+        let outliner = GlyphOutliner::embedded().unwrap();
+        let style = DimStyle::DEFAULT;
+        let mut symbol_sizes = Vec::new();
+        let mut tolerance_sizes = Vec::new();
+
+        for (num, den) in [(1, 2), (2, 1)] {
+            let annotation = DimAnnotation {
+                tolerance: Some(SizeTolerance::Deviations {
+                    upper: 0.2,
+                    lower: -0.1,
+                }),
+                ..DimAnnotation::default()
+            };
+            // 紙の上の寸法線長を尺度によらず 60mm に保つ（矢の内外判定を揃えるため）。
+            let k = f64::from(den) / f64::from(num);
+            let document = document_with_diameter(num, den, Point2::ORIGIN, 30.0 * k, annotation);
+            let page = plot_page(&document, PlotColorMode::Color);
+
+            let circles = stroked_circles(&page);
+            assert_eq!(circles.len(), 1, "φ の円");
+            symbol_sizes.push(bbox_size(&circles[0].cmds));
+
+            // 文字アウトラインは `push_dim` の順（値 → 上段 → 下段）に出る。
+            let labels: Vec<&PlotPath> = filled(&page)
+                .into_iter()
+                .filter(|p| p.cmds.len() > 4)
+                .collect();
+            assert_eq!(labels.len(), 3, "値 + 上下段公差");
+            tolerance_sizes.push(bbox_size(&labels[1].cmds));
+        }
+
+        // 記号ストローク: 尺度によらず同じ大きさ、かつスタイルの文字高さで組んだ φ と一致。
+        close_to(symbol_sizes[0].0, symbol_sizes[1].0);
+        close_to(symbol_sizes[0].1, symbol_sizes[1].1);
+        close_to(symbol_sizes[0].0, phi_circle_diameter(style.text_height_mm));
+
+        // 公差文字: 尺度によらず同じ大きさ、かつ 70% 縮小（規定 5-12-2 2)）が紙の上でも効く。
+        close_to(tolerance_sizes[0].0, tolerance_sizes[1].0);
+        close_to(tolerance_sizes[0].1, tolerance_sizes[1].1);
+        let reduced = bbox_size(&outliner.outline(
+            "+0.2",
+            Point2::ORIGIN,
+            style.text_height_mm * style.tolerance_scale,
+            0.0,
+        ));
+        close_to(tolerance_sizes[0].0, reduced.0);
+        close_to(tolerance_sizes[0].1, reduced.1);
+        let full = bbox_size(&outliner.outline("+0.2", Point2::ORIGIN, style.text_height_mm, 0.0));
+        assert!(
+            tolerance_sizes[0].1 < full.1,
+            "公差文字は寸法値より小さい: {} vs {}",
+            tolerance_sizes[0].1,
+            full.1
+        );
+    }
+
+    /// **M9 タスク49-3 の要点**: スタイルの文字高さ・矢先長を変えると、出力に実際に
+    /// 描かれる矢先・記号・文字の大きさが変わる（判定や組版の比率だけが変わるのではない）。
+    /// 画面側の対は `crate::tests::dim_style_drives_the_on_screen_annotation_sizes`。
+    #[test]
+    fn dim_style_drives_the_plotted_annotation_sizes() {
+        let outliner = GlyphOutliner::embedded().unwrap();
+        let large = DimStyle {
+            text_height_mm: 5.0,
+            arrow_len_mm: 6.0,
+            ..DimStyle::DEFAULT
+        };
+
+        for style in [DimStyle::DEFAULT, large] {
+            // k = 2、直径 60（ワールド）→ 紙 30mm。どちらのスタイルでも矢は内向き。
+            let mut document = document_with_diameter(
+                1,
+                2,
+                Point2::new(60.0, 40.0),
+                30.0,
+                DimAnnotation::default(),
+            );
+            document.apply(Command::SetDimStyle(style)).unwrap();
+            let page = plot_page(&document, PlotColorMode::Color);
+
+            for arrow in filled(&page).into_iter().filter(|p| p.cmds.len() == 4) {
+                close_to(arrow_length(arrow), style.arrow_len_mm);
+            }
+            let circles = stroked_circles(&page);
+            assert_eq!(circles.len(), 1);
+            close_to(
+                bbox_size(&circles[0].cmds).0,
+                phi_circle_diameter(style.text_height_mm),
+            );
+            let label = filled(&page)
+                .into_iter()
+                .find(|p| p.cmds.len() > 4)
+                .expect("値ラベル");
+            let reference =
+                bbox_size(&outliner.outline("60", Point2::ORIGIN, style.text_height_mm, 0.0));
+            close_to(bbox_size(&label.cmds).0, reference.0);
+            close_to(bbox_size(&label.cmds).1, reference.1);
+        }
+    }
+
+    /// 非比例寸法（規定 5-10）の下線は `DimExpansion::segments` に入るので、寸法線・
+    /// 補助線と同じ実線ストロークとして出力へ出る。
+    #[test]
+    fn non_proportional_dimension_adds_an_underline_stroke() {
+        let make = |annotation: DimAnnotation| {
+            let mut document = document_with_scale(1, 1);
+            add(
+                &mut document,
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::ORIGIN,
+                    p2: Point2::new(40.0, 0.0),
+                    offset: 10.0,
+                    annotation,
+                }),
+            );
+            plot_page(&document, PlotColorMode::Color)
+        };
+
+        // 値上書きなし: 寸法線 1 + 補助線 2。
+        let plain = make(DimAnnotation::default());
+        assert_eq!(stroked(&plain).len(), 3);
+
+        // 値上書きあり（同じ文字列）: 差分は下線 1 本だけ。
+        let overridden = make(DimAnnotation {
+            value_override: Some("40".to_owned()),
+            ..DimAnnotation::default()
+        });
+        let lines = stroked(&overridden);
+        assert_eq!(lines.len(), 4);
+        assert!(
+            lines.iter().all(|p| p.stroke.unwrap().dash_mm.is_none()),
+            "下線も実線"
+        );
+
+        // 下線は水平（読み方向）で、ラベル（寸法線の上側）の直下にある。
+        let underline = lines
+            .iter()
+            .find(|p| {
+                let (a, b) = endpoints(p);
+                (a.y - b.y).abs() < T && a.y > 10.0
+            })
+            .expect("下線が見つからない");
+        let (a, b) = endpoints(underline);
+        assert!(b.x > a.x, "{a:?} -> {b:?}");
     }
 
     // ---- 4: Text の height は紙 mm（二重換算防止） ----

@@ -22,18 +22,20 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, Layer, LayerId,
-    Linetype, Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, Style, TextGeom,
-    TitleBlockFields, TitleBlockKind, WidthMm,
+    Command, DimDiameter, DimLinear, DimRadial, DimStyle, Document, Entity, EntityGeom, EntityId,
+    Layer, LayerId, Linetype, Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta,
+    Style, TextGeom, TitleBlockFields, TitleBlockKind, WidthMm,
 };
 use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use frame::{frame_layout, paper_to_world, parse_scale_input};
 
-// 紙 mm 基準の定数は「画面と出力の唯一の出所」として `plot` に置く（M8 タスク39）。
-// 画面側（`dash_pattern_px` / `dim_sizes`）はここから参照するだけで、挙動は変えない。
-use plot::{DIM_ARROW_MM, DIM_TEXT_MM, dash_pattern_mm};
+// 破線パターンの紙 mm 定数は「画面と出力の唯一の出所」として `plot` に置く（M8 タスク39）。
+// 画面側（`dash_pattern_px`）はここから参照するだけで、挙動は変えない。
+// 寸法注記の紙 mm サイズは定数ではなく文書の [`DimStyle`] が唯一の出所（M9 タスク49-3、
+// [`dim_sizes`] 参照）。
+use plot::dash_pattern_mm;
 
 use tool::{
     ArcTool, CircleTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool, FilletTool,
@@ -448,14 +450,15 @@ const MAX_TEXT_PX: f64 = 4096.0;
 /// `DIM_ARROW_PX / zoom` で換算する。OFF のときは注釈（矢印・文字）を縮尺に関わらず
 /// 読める大きさに保つため、ピック許容量と同じくスクリーン固定 px をズームで割る
 /// （DESIGN.md M6 設計判断2 の展開は純関数側、大きさは app 側）。ON 時は
-/// [`DIM_ARROW_MM`] を使う（タスク37、[`dim_sizes`] 参照）。
+/// [`DimStyle::arrow_len_mm`] を使う（タスク37 / M9 タスク49-3、[`dim_sizes`] 参照）。
+///
+/// **これは画面固定 px であって紙 mm ではない**ので、[`DimStyle`] へ寄せない
+/// （スタイルは紙の上の大きさを決める設定で、画面固定モードはその外側にある）。
 const DIM_ARROW_PX: f64 = 12.0;
 /// 寸法値ラベルの文字高さ（紙基準表示 OFF 時の画面固定ピクセル）。ワールド高さへは
-/// `DIM_TEXT_PX / zoom`。ON 時は [`DIM_TEXT_MM`] を使う（タスク37、[`dim_sizes`] 参照）。
+/// `DIM_TEXT_PX / zoom`。ON 時は [`DimStyle::text_height_mm`] を使う
+/// （[`DIM_ARROW_PX`] と同じ扱い。[`dim_sizes`] 参照）。
 const DIM_TEXT_PX: f64 = 14.0;
-// 紙 mm 側の対（[`DIM_TEXT_MM`]/[`DIM_ARROW_MM`]）は `plot` にある（タスク39 で
-// 画面と出力の出所を1箇所へ集約した）。紙基準表示 ON 時に [`dim_sizes`] が
-// `k` 倍してワールド長へ換算する用途は変わっていない（タスク37）。
 
 /// 未保存確認モーダルの状態（OS の閉じるボタン / Ctrl+N / Ctrl+O の3経路で共有）。
 ///
@@ -622,8 +625,9 @@ struct McadApp {
     /// 紙基準表示 OFF のときは全エンティティの線幅を [`MIN_STROKE_PX`] 固定（ズーム
     /// 非依存）で描き、寸法注記（矢印・文字）と線幅はスクリーン固定 px
     /// （[`DIM_ARROW_PX`]/[`DIM_TEXT_PX`]）のまま。ON のときは線幅がタスク36 の紙 mm 基準
-    /// `resolve_stroke_px`（ズームに比例して太くなる）、寸法注記が紙 mm 定数
-    /// （[`DIM_ARROW_MM`]/[`DIM_TEXT_MM`]）を `k` 倍したワールド長になる（`dim_sizes`）。
+    /// `resolve_stroke_px`（ズームに比例して太くなる）、寸法注記が文書スタイルの紙 mm
+    /// （[`DimStyle::arrow_len_mm`]/[`DimStyle::text_height_mm`]）を `k` 倍したワールド長に
+    /// なる（`dim_sizes`）。
     /// タスク38 の図面枠実線・タスク39/40 の SVG/PDF 出力が紙 mm 基準を前提とするため、
     /// 画面と出力の一致確認に ON が要る（DESIGN.md M8 設計判断5 実装時追記・判断4
     /// 実装時追記）。Text エンティティの表示（`height * k`）はこのトグルの影響を受けない
@@ -2167,8 +2171,12 @@ impl eframe::App for McadApp {
                     &painter,
                     rect,
                     &self.viewport,
-                    self.config.paper_display_enabled,
-                    k,
+                    dim_render(
+                        self.document.dim_style(),
+                        self.config.paper_display_enabled,
+                        k,
+                        self.viewport.zoom,
+                    ),
                 );
             }
             // Text ツールでアンカー確定後は、入力中の文字列を実サイズ・実位置でプレビューする
@@ -4261,6 +4269,12 @@ fn draw_entities(
 ) {
     let visible = viewport.visible_aabb(rect);
     let k = document.sheet().scale.world_mm_per_paper_mm();
+    let render = dim_render(
+        document.dim_style(),
+        paper_display_enabled,
+        k,
+        viewport.zoom,
+    );
     for (_id, entity, layer) in entities_in_draw_order(document, &visible, k) {
         let color = to_color32(entity.style.effective_color(layer.color));
         let width_mm = entity.style.effective_width(layer.width_mm).mm();
@@ -4283,27 +4297,15 @@ fn draw_entities(
                 // 線幅の紙 mm 解決はここでも同じ式を適用し、既定 0.35mm 相当で
                 // 従来と同じ見た目を保つ。
                 let stroke = Stroke::new(stroke_px, color);
-                draw_dim_linear(
-                    painter,
-                    rect,
-                    viewport,
-                    dim,
-                    stroke,
-                    paper_display_enabled,
-                    k,
-                );
+                draw_dim_linear(painter, rect, viewport, dim, stroke, render);
             }
             EntityGeom::DimRadial(dim) => {
                 let stroke = Stroke::new(stroke_px, color);
-                draw_dim_radial(
-                    painter,
-                    rect,
-                    viewport,
-                    dim,
-                    stroke,
-                    paper_display_enabled,
-                    k,
-                );
+                draw_dim_radial(painter, rect, viewport, dim, stroke, render);
+            }
+            EntityGeom::DimDiameter(dim) => {
+                let stroke = Stroke::new(stroke_px, color);
+                draw_dim_diameter(painter, rect, viewport, dim, stroke, render);
             }
             // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
             _ => {}
@@ -4313,16 +4315,47 @@ fn draw_entities(
 
 /// 寸法の矢先の長さ・文字高さをワールド長で解決する（戻り値: `(arrow_len, text_height)`）。
 ///
-/// 紙基準表示 ON（`paper_display`）: 紙 mm 定数（[`DIM_ARROW_MM`]/[`DIM_TEXT_MM`]）× `k`
+/// 紙基準表示 ON（`paper_display`）: 文書スタイルの紙 mm
+/// （[`DimStyle::arrow_len_mm`]/[`DimStyle::text_height_mm`]）× `k`
 /// （ズーム非依存 → 図形と一緒に拡縮し、タスク39/40 の SVG/PDF 出力と一致する）。
 /// OFF: 画面固定 px（[`DIM_ARROW_PX`]/[`DIM_TEXT_PX`]）÷ `zoom`（タスク36b までの現行の
-/// 見た目）。ON モードの注記サイズに px 下限クランプは設けない（[`draw_text`] 既存の
-/// [`MIN_TEXT_PX`] 未満スキップに任せる）。タスク37。
-fn dim_sizes(paper_display: bool, k: f64, zoom: f64) -> (f64, f64) {
+/// 見た目。スタイルの影響を受けない画面専用モード）。ON モードの注記サイズに px 下限
+/// クランプは設けない（[`draw_text`] 既存の [`MIN_TEXT_PX`] 未満スキップに任せる）。
+///
+/// # 紙 mm の出所を [`DimStyle`] へ一本化してある（M9 タスク49-3）
+///
+/// タスク37〜39 はここで `plot::DIM_ARROW_MM` / `plot::DIM_TEXT_MM` という定数を使って
+/// いたが、M9 タスク49-2 で矢の内外判定（`dimension::arrows_point_outward`）と注記の
+/// 表示倍率（`dimension::DimRender::annotation_scale`）が [`DimStyle`] を読むように
+/// なったため、「実際に描かれる大きさは定数・判定と組版の比率はスタイル」という
+/// 二重の出所になっていた。既定値が一致していたので差は出ていなかったが、スタイル編集
+/// UI（M9 タスク50）で文字高さを変えた瞬間に両者が食い違う。ここをスタイル読みへ
+/// 揃えることで、画面・SVG・PDF の 3 経路が同じ 1 つの値から大きさを得る。
+fn dim_sizes(style: &DimStyle, paper_display: bool, k: f64, zoom: f64) -> (f64, f64) {
     if paper_display {
-        (DIM_ARROW_MM * k, DIM_TEXT_MM * k)
+        (style.arrow_len_mm * k, style.text_height_mm * k)
     } else {
         (DIM_ARROW_PX / zoom, DIM_TEXT_PX / zoom)
+    }
+}
+
+/// 寸法展開のパラメータ（[`dimension::DimRender`]）を組み立てる。
+///
+/// 表示モードの解決（[`dim_sizes`]）はここで済ませ、`dimension` モジュールへは
+/// **ワールド長になった値だけ**を渡す。文書尺度 `k` は矢の内外判定を紙 mm で行うために
+/// 別枠で渡す（[`dimension::DimRender`] の doc: 2 つの換算係数を混同しないこと）。
+fn dim_render(
+    style: &DimStyle,
+    paper_display: bool,
+    k: f64,
+    zoom: f64,
+) -> dimension::DimRender<'_> {
+    let (arrow_len_world, text_height_world) = dim_sizes(style, paper_display, k, zoom);
+    dimension::DimRender {
+        style,
+        scale_world_per_paper_mm: k,
+        arrow_len_world,
+        text_height_world,
     }
 }
 
@@ -4333,11 +4366,9 @@ fn draw_dim_linear(
     viewport: &Viewport,
     dim: &DimLinear,
     stroke: Stroke,
-    paper_display: bool,
-    k: f64,
+    render: dimension::DimRender<'_>,
 ) {
-    let (arrow_len, text_height) = dim_sizes(paper_display, k, viewport.zoom);
-    let ex = dimension::expand_linear(dim, arrow_len, text_height);
+    let ex = dimension::expand_linear(dim, render);
     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
 }
 
@@ -4348,22 +4379,36 @@ fn draw_dim_radial(
     viewport: &Viewport,
     dim: &DimRadial,
     stroke: Stroke,
-    paper_display: bool,
-    k: f64,
+    render: dimension::DimRender<'_>,
 ) {
-    let (arrow_len, text_height) = dim_sizes(paper_display, k, viewport.zoom);
-    let ex = dimension::expand_radial(dim, arrow_len, text_height);
+    let ex = dimension::expand_radial(dim, render);
     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
 }
 
-/// 寸法の展開結果（線分・矢先・文字）を Painter へ描く。プレビュー（`tool.rs` の
-/// `draw_preview`）と確定描画・選択ハイライトが共有する（`crate::draw_dim_expansion`）。
-/// 矢先は `stroke.color` で塗りつぶし、文字は既存の [`draw_text`] を再利用する。
+/// 直径寸法を描画する（純関数 helper [`dimension::expand_diameter`] の展開を Painter へ）。
+fn draw_dim_diameter(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    dim: &DimDiameter,
+    stroke: Stroke,
+    render: dimension::DimRender<'_>,
+) {
+    let ex = dimension::expand_diameter(dim, render);
+    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+}
+
+/// 寸法の展開結果（線分・矢先・記号ストローク・文字）を Painter へ描く。プレビュー
+/// （`tool.rs` の `draw_preview`）と確定描画・選択ハイライトが共有する
+/// （`crate::draw_dim_expansion`）。矢先は `stroke.color` で塗りつぶし、文字は既存の
+/// [`draw_text`] を再利用する。
 ///
-/// `ex.text.height` は [`dimension::expand_linear`]/[`dimension::expand_radial`] が
-/// `dim_sizes` の戻り値（既にワールド長）から組み立てた `TextGeom` の高さなので、
-/// ここでは**そのまま** `draw_text` のワールド高さ引数へ渡す（`k` を掛けると二重換算に
-/// なる。タスク37 判断(d)）。
+/// 各 `TextGeom::height` は `dimension` の展開関数が `dim_sizes` の戻り値（既にワールド長）
+/// から組み立てた高さなので、ここでは**そのまま** `draw_text` のワールド高さ引数へ渡す
+/// （`k` を掛けると二重換算になる。タスク37 判断(d)）。
+///
+/// [`dimension::DimExpansion::symbol_strokes`]（φ・□ のストローク）は寸法線とまったく
+/// 同じ `stroke` で、既存の [`draw_shape`] へ通して描く（M9 タスク49-3）。
 fn draw_dim_expansion(
     painter: &egui::Painter,
     rect: Rect,
@@ -4383,14 +4428,24 @@ fn draw_dim_expansion(
             .collect();
         painter.add(egui::Shape::convex_polygon(pts, stroke.color, Stroke::NONE));
     }
-    draw_text(
-        painter,
-        rect,
-        viewport,
-        &ex.text,
-        ex.text.height,
-        stroke.color,
-    );
+    // 記号（φ・□）は値と同じラベルの一部なので、文字の直前へ置いて描画順を揃える。
+    // 寸法は製図慣行として常に実線なので線種は `Continuous` 固定で、`draw_shape` の `k`
+    // （破線パターンの紙 mm → px 換算にしか使わない）は使われない。`tool.rs` の
+    // プレビュー描画が既に採っている流儀に合わせて 1.0 を渡す。
+    for shape in &ex.symbol_strokes {
+        draw_shape(
+            painter,
+            rect,
+            viewport,
+            shape,
+            stroke,
+            Linetype::Continuous,
+            1.0,
+        );
+    }
+    for text in &ex.texts {
+        draw_text(painter, rect, viewport, text, text.height, stroke.color);
+    }
 }
 
 /// 選択ハイライトと、進行中のプレビュー（矩形選択枠・複製/移動配置の仮表示）を描画する。
@@ -4408,6 +4463,7 @@ fn draw_selection(
     k: f64,
 ) {
     let highlight = Stroke::new(SELECTION_WIDTH, SELECTION_COLOR);
+    let render = dim_render(document.dim_style(), paper_display, k, viewport.zoom);
 
     // オフセットモード中は、元エンティティを強調表示したまま、確定結果のゴーストを
     // プレビュー色で重ねる（Document は変更しない）。退化して結果が作れないカーソル
@@ -4468,10 +4524,13 @@ fn draw_selection(
                         );
                     }
                     EntityGeom::DimLinear(dim) => {
-                        draw_dim_linear(painter, rect, viewport, &dim, highlight, paper_display, k);
+                        draw_dim_linear(painter, rect, viewport, &dim, highlight, render);
                     }
                     EntityGeom::DimRadial(dim) => {
-                        draw_dim_radial(painter, rect, viewport, &dim, highlight, paper_display, k);
+                        draw_dim_radial(painter, rect, viewport, &dim, highlight, render);
+                    }
+                    EntityGeom::DimDiameter(dim) => {
+                        draw_dim_diameter(painter, rect, viewport, &dim, highlight, render);
                     }
                     // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
                     _ => {}
@@ -4563,6 +4622,7 @@ fn draw_selected(
     paper_display: bool,
     k: f64,
 ) {
+    let render = dim_render(document.dim_style(), paper_display, k, viewport.zoom);
     for &id in select_tool.selection() {
         if let Some(entity) = document.entity(id) {
             match &entity.geom {
@@ -4586,10 +4646,13 @@ fn draw_selected(
                     draw_aabb_outline(painter, rect, viewport, &aabb, stroke);
                 }
                 EntityGeom::DimLinear(dim) => {
-                    draw_dim_linear(painter, rect, viewport, dim, stroke, paper_display, k)
+                    draw_dim_linear(painter, rect, viewport, dim, stroke, render)
                 }
                 EntityGeom::DimRadial(dim) => {
-                    draw_dim_radial(painter, rect, viewport, dim, stroke, paper_display, k)
+                    draw_dim_radial(painter, rect, viewport, dim, stroke, render)
+                }
+                EntityGeom::DimDiameter(dim) => {
+                    draw_dim_diameter(painter, rect, viewport, dim, stroke, render)
                 }
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
                 _ => {}
@@ -4765,8 +4828,9 @@ fn text_world_aabb(text: &TextGeom, k: f64) -> Aabb {
 /// `TextGeom::height` を直接使わず引数化しているのは二重換算防止のため:
 /// - Text エンティティ・プレビュー・ゴースト・選択ハイライトは `text.height * k` を渡す
 ///   （判断(c)、`k` = 紙 1mm あたりのワールド mm）。
-/// - `draw_dim_expansion` は `dimension::expand_linear`/`expand_radial` が既にワールド長で
-///   組み立てた `ex.text.height` を**そのまま**渡す（ここでさらに `k` を掛けると二重換算）。
+/// - `draw_dim_expansion` は `dimension` の展開関数（`expand_linear`/`expand_radial`/
+///   `expand_diameter`）が既にワールド長で組み立てた `ex.text.height` を**そのまま**渡す
+///   （ここでさらに `k` を掛けると二重換算）。
 ///
 /// # 位置と角度
 ///
@@ -6792,49 +6856,99 @@ mod tests {
         }
     }
 
-    // ---- M8 タスク37: dim_sizes（紙基準表示トグル拡張）----
+    // ---- M8 タスク37 / M9 タスク49-3: dim_sizes（紙基準表示トグル・スタイル追従）----
+
+    /// 既定とは別サイズのスタイル（文字 5.0mm・矢 6.0mm）。既定（3.5 / 3.0）と両方の
+    /// 値が違うので、「たまたま一致していて差が出ない」状態を検出できる。
+    fn large_dim_style() -> DimStyle {
+        DimStyle {
+            text_height_mm: 5.0,
+            arrow_len_mm: 6.0,
+            ..DimStyle::DEFAULT
+        }
+    }
 
     #[test]
-    fn dim_sizes_off_matches_legacy_screen_fixed_px_regardless_of_k() {
-        // OFF は k に依存しない（現行挙動の回帰固定）。
-        for k in [0.5_f64, 1.0, 2.0] {
-            for zoom in [0.1_f64, 1.0, 10.0] {
-                let (arrow_len, text_height) = dim_sizes(false, k, zoom);
-                assert!(
-                    (arrow_len - DIM_ARROW_PX / zoom).abs() < 1e-9,
-                    "k={k}, zoom={zoom}"
-                );
-                assert!(
-                    (text_height - DIM_TEXT_PX / zoom).abs() < 1e-9,
-                    "k={k}, zoom={zoom}"
-                );
+    fn dim_sizes_off_matches_legacy_screen_fixed_px_regardless_of_k_and_style() {
+        // OFF は k にもスタイルにも依存しない（画面固定 px モード。現行挙動の回帰固定）。
+        for style in [DimStyle::DEFAULT, large_dim_style()] {
+            for k in [0.5_f64, 1.0, 2.0] {
+                for zoom in [0.1_f64, 1.0, 10.0] {
+                    let (arrow_len, text_height) = dim_sizes(&style, false, k, zoom);
+                    assert!(
+                        (arrow_len - DIM_ARROW_PX / zoom).abs() < 1e-9,
+                        "k={k}, zoom={zoom}"
+                    );
+                    assert!(
+                        (text_height - DIM_TEXT_PX / zoom).abs() < 1e-9,
+                        "k={k}, zoom={zoom}"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn dim_sizes_on_scales_with_k_and_ignores_zoom() {
-        for k in [0.5_f64, 1.0, 2.0] {
-            for zoom in [0.1_f64, 1.0, 10.0] {
-                let (arrow_len, text_height) = dim_sizes(true, k, zoom);
-                assert!(
-                    (arrow_len - DIM_ARROW_MM * k).abs() < 1e-9,
-                    "k={k}, zoom={zoom}"
-                );
-                assert!(
-                    (text_height - DIM_TEXT_MM * k).abs() < 1e-9,
-                    "k={k}, zoom={zoom}"
-                );
+    fn dim_sizes_on_scales_the_style_paper_mm_with_k_and_ignores_zoom() {
+        for style in [DimStyle::DEFAULT, large_dim_style()] {
+            for k in [0.5_f64, 1.0, 2.0] {
+                for zoom in [0.1_f64, 1.0, 10.0] {
+                    let (arrow_len, text_height) = dim_sizes(&style, true, k, zoom);
+                    assert!(
+                        (arrow_len - style.arrow_len_mm * k).abs() < 1e-9,
+                        "k={k}, zoom={zoom}"
+                    );
+                    assert!(
+                        (text_height - style.text_height_mm * k).abs() < 1e-9,
+                        "k={k}, zoom={zoom}"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn dim_sizes_on_at_scale_one_to_one_matches_paper_mm_constants() {
+    fn dim_sizes_on_at_scale_one_to_one_matches_the_style_paper_mm() {
         for zoom in [0.1_f64, 1.0, 10.0] {
-            let (arrow_len, text_height) = dim_sizes(true, 1.0, zoom);
-            assert!((arrow_len - DIM_ARROW_MM).abs() < 1e-9);
-            assert!((text_height - DIM_TEXT_MM).abs() < 1e-9);
+            let (arrow_len, text_height) = dim_sizes(&DimStyle::DEFAULT, true, 1.0, zoom);
+            assert!((arrow_len - DimStyle::DEFAULT.arrow_len_mm).abs() < 1e-9);
+            assert!((text_height - DimStyle::DEFAULT.text_height_mm).abs() < 1e-9);
+        }
+    }
+
+    /// **M9 タスク49-3 の要点**: スタイルの文字高さ・矢先長を変えると、画面に実際に
+    /// 描かれる矢先の長さ・文字高さが変わる（判定や組版の比率だけが変わるのではない）。
+    ///
+    /// 画面描画そのもの（Painter）はテストできないので、描画関数が受け取る展開結果
+    /// （`draw_dim_expansion` の入力そのもの）で固定する。出力側の対は
+    /// `plot::dim_style_drives_the_plotted_annotation_sizes`。
+    #[test]
+    fn dim_style_drives_the_on_screen_annotation_sizes() {
+        let k = 2.0;
+        let dim = DimLinear {
+            p1: Point2::ORIGIN,
+            p2: Point2::new(200.0, 0.0),
+            offset: 20.0,
+            annotation: mcad_core::DimAnnotation::default(),
+        };
+
+        for style in [DimStyle::DEFAULT, large_dim_style()] {
+            let render = dim_render(&style, true, k, 1.0);
+            let ex = dimension::expand_linear(&dim, render);
+
+            // 矢先の実長（先端 → 後端）はスタイルの矢先長 × k。
+            let [tip, a, b] = ex.arrows[0];
+            let drawn_arrow = tip.distance(a.midpoint(b));
+            assert!(
+                (drawn_arrow - style.arrow_len_mm * k).abs() < 1e-9,
+                "arrow {drawn_arrow} for style {style:?}"
+            );
+            // 文字高さ（`draw_text` へワールド長として渡る値）はスタイルの文字高さ × k。
+            assert!(
+                (ex.texts[0].height - style.text_height_mm * k).abs() < 1e-9,
+                "text {} for style {style:?}",
+                ex.texts[0].height
+            );
         }
     }
 

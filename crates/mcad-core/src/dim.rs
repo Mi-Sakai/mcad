@@ -472,11 +472,15 @@ pub const MAX_DIM_STYLE_MM: f64 = 1_000.0;
 /// `k = Scale::world_mm_per_paper_mm` を掛ける app 層の責務。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DimStyle {
-    /// 寸法値の文字高さ [紙 mm]。既定 3.5（規定 6-2 b) の標準呼び 3.5。現行の
-    /// `mcad_app::plot::DIM_TEXT_MM` と同値で、既定のままなら見た目が変わらない）。
+    /// 寸法値の文字高さ [紙 mm]。既定 3.5（規定 6-2 b) の標準呼び 3.5）。
+    ///
+    /// M9 タスク49 以降、**画面と SVG/PDF の実際の描画サイズはこの値が唯一の出所**
+    /// （app 層にあった同値の定数 `plot::DIM_TEXT_MM` は削除した。描かれる大きさを定数、
+    /// 矢の内外判定と組版の比率をスタイル、と二重に持つとスタイル編集で破綻するため）。
     pub text_height_mm: f64,
-    /// 矢先の長さ [紙 mm]。既定 3.0（現行の `mcad_app::plot::DIM_ARROW_MM` と同値。
-    /// 矢羽の開き角度 15° は規定 5-4 4) 側で持つ）。
+    /// 矢先の長さ [紙 mm]。既定 3.0（[`DimStyle::text_height_mm`] と同じく、M9 タスク49 以降は
+    /// これが実際の描画サイズの唯一の出所）。矢羽の開き角度は規定 5-4 4) 側で持つ
+    /// （値は app 層の `ARROW_HALF_WIDTH_RATIO`。ここに数値を書くと二重管理になる）。
     pub arrow_len_mm: f64,
     /// 寸法値の小数点以下の桁数。既定 2（規定 5-2 2) a) の「±0.005mm 程度 → 2 桁」。
     /// 現行の `format!("{:.2}")` と同値）。上限は [`MAX_DIM_DECIMALS`]。
@@ -1033,7 +1037,8 @@ mod tests {
     fn dim_style_default_matches_the_drafting_standard() {
         let s = DimStyle::default();
         assert_eq!(s, DimStyle::DEFAULT);
-        // 規定 6-2 b)（文字高さ 3.5）・現行 plot::DIM_TEXT_MM / DIM_ARROW_MM。
+        // 規定 6-2 b)（文字高さ 3.5）。M8 までは app 層の紙 mm 定数が同じ値を持っていたが、
+        // M9 タスク49 で削除し、ここが実際の描画サイズの唯一の出所になった。
         assert_eq!(s.text_height_mm, 3.5);
         assert_eq!(s.arrow_len_mm, 3.0);
         // 規定 5-2 2) a)（±0.005mm → 2 桁）と DESIGN.md M9 判断5 (a)（ゼロトリム既定 ON）。

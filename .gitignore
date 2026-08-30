@@ -7,5 +7,9 @@
 # 策定中のため未公開(完成したらこの行を削除して追跡へ戻す)
 /製図規定.md
 
+# Claude Code のローカル設定・実行時ファイル(.claude/skills/ は追跡する)
+/.claude/settings.local.json
+/.claude/scheduled_tasks.lock
+
 # エディタの自動バックアップ
 *~

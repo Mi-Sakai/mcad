@@ -46,22 +46,13 @@ GUI に関わる変更(ダイアログ・ビューポート・パネル等)は�
 
 ## 外部クレートの既知の制約
 
-- **`dxf` クレート(0.6.1)**: 既知の制約は以下。詳細と実測根拠は `crates/mcad-io/src/dxf_file.rs` のモジュール doc を参照。
-  - Color は ACI インデックス(1〜255)のみで RGB 直接指定不可(9色パレットで近似)。
-  - `dxf::tables::Layer` にロック・重ね順フィールドがない → レイヤーロックは往復で消失し、`Layer.order` も DXF に保存できない。export はデフォルトレイヤーを LAYER テーブル先頭に固定し、残りを順序どおり書く。import はテーブル出現順を `order` として採用(best-effort)。
-  - **ヘッダは R2007 固定で、上下どちらにも動かさないこと**(R2004 以下は文字列 codec が往復でデータを壊す、R14 未満は LWPOLYLINE が黙って落ちる)。再発検知テストは `round_trip_preserves_pathological_text`。
-  - `Drawing::new()` が自動追加するレイヤー "0" は export 時に除去している。
-  - **位置基準が「水平 Left かつ垂直 Baseline」以外の `TEXT` は import せずスキップ**。alignment point (group code 11) を使う「改善」を入れないこと(理由は `is_text_justification_supported` の doc)。
-  - 単位は `$INSUNITS = 4`(mm)を export ヘッダへ書く。
-  - **TEXT 高さの尺度契約**: `TextGeom::height` は紙 mm。export は `SheetMeta::scale` で換算し、import は 1:1 とみなす。紙 mm の意味は尺度をまたいで往復しないが、モデル空間の幾何サイズは保存される。テストは `text_height_scales_by_sheet_scale_on_export`・`text_geometric_height_survives_round_trip_across_scale_reinterpretation`(`mcad-io`)。
-  - 線幅は best-effort: エンティティ線幅(group code 370)は読み書き可。**レイヤー線幅は export 不可**(`LineWeight` に任意 raw 値を作る公開コンストラクタがない)。import は読み取れる。mcad からの export は常に raw 0 で、re-import では「未指定」として既定 0.35mm に戻る(クランプとして計上しない)。
-  - 線種は mcad の4種を `CONTINUOUS`/`DASHED`/`DASHDOT`/`DIVIDE` で LTYPE 登録。**`DASHDOT2` を使わないこと**(同ライブラリでは半スケールの一点鎖線を指す既存名)。未知の線種名は `Continuous` へフォールバック。
+- **`dxf` クレート(0.6.1)**: R2007 ヘッダ固定、ACI 色のみ、レイヤーのロック・重ね順・線幅が保存できない等、**踏んではいけない制約が多数ある**。`crates/mcad-io/src/dxf_file.rs` を触る前に `dxf-constraints` skill を読むこと(実測根拠は同ファイルのモジュール doc)。
 - **`rfd`(ネイティブダイアログ)**: フレームコールバック内で同期(ブロッキング)呼び出し。MVP としては許容だがプラットフォーム依存の癖があるため、変更時は手動確認する。
 
 ## リポジトリ運用
 
 - `A-*.md`(外部レビュー等)は**ユーザー管理のメモで、コミット・変更・削除の対象外**(ルート・`資料/` 配下とも .gitignore 済み)。
 - 過去のマイルストーンの Codex レビュー記録は `資料/` に置く(追跡対象)。
-- タグは `v0.X.0` 形式でマイルストーン完了時に付ける。GitHub(`origin`)へ公開しており、タグも `git push --tags` でリモートへ反映する。
+- タグは `v0.X.0` 形式でマイルストーン完了時に付ける。GitHub(`origin`)へ公開しており、タグも `git push --tags` でリモートへ反映する。リリース時の手順(バージョン更新箇所・CHANGELOG・タグ)は `release` skill を参照。
 - コミットの author は GitHub の noreply アドレスを使う(リポジトリローカルの `user.email` に設定済み)。
 - ドキュメント(README / DESIGN / CHANGELOG)は実装と同じコミットで更新し、乖離させない。

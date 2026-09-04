@@ -22,11 +22,12 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimDiameter, DimLinear, DimRadial, DimStyle, Document, Entity, EntityGeom, EntityId,
-    Layer, LayerId, Linetype, Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta,
-    Style, TextGeom, TitleBlockFields, TitleBlockKind, WidthMm,
+    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimKind, DimLinear, DimRadial, DimStyle,
+    Document, Entity, EntityGeom, EntityId, FitClass, Layer, LayerId, Linetype, MAX_DIM_DECIMALS,
+    Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style,
+    TextGeom, TitleBlockFields, TitleBlockKind, WidthMm,
 };
-use mcad_geom::{Aabb, Arc, Point2, Polyline, Shape};
+use mcad_geom::{Aabb, Arc, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use frame::{frame_layout, paper_to_world, parse_scale_input};
@@ -38,9 +39,10 @@ use frame::{frame_layout, paper_to_world, parse_scale_input};
 use plot::dash_pattern_mm;
 
 use tool::{
-    ArcTool, CircleTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool, FilletTool,
-    InputEvent, LineTool, OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview,
-    PointTool, PolylineTool, SelectTool, SplitTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool,
+    ArcTool, CircleTool, DimDiameterTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool,
+    FilletTool, InputEvent, LineTool, OffsetOutcome, PlacementKind, PlacementOutcome,
+    PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TextTool, Tool, ToolCtx,
+    ToolResult, TrimTool,
 };
 use viewport::Viewport;
 
@@ -529,6 +531,7 @@ enum ToolKind {
     Text,
     DimLinear,
     DimRadial,
+    DimDiameter,
     Trim,
     Extend,
     Fillet,
@@ -550,6 +553,7 @@ impl ToolKind {
             ToolKind::Text => Some(Box::new(TextTool::default())),
             ToolKind::DimLinear => Some(Box::new(DimLinearTool::default())),
             ToolKind::DimRadial => Some(Box::new(DimRadialTool::default())),
+            ToolKind::DimDiameter => Some(Box::new(DimDiameterTool::default())),
             ToolKind::Trim => Some(Box::new(TrimTool::default())),
             ToolKind::Extend => Some(Box::new(ExtendTool::default())),
             ToolKind::Fillet => Some(Box::new(FilletTool::default())),
@@ -599,6 +603,7 @@ impl ToolKind {
             ToolKind::Text => "Text",
             ToolKind::DimLinear => "Linear Dim",
             ToolKind::DimRadial => "Radial Dim",
+            ToolKind::DimDiameter => "Diameter Dim",
             ToolKind::Trim => "Trim",
             ToolKind::Extend => "Extend",
             ToolKind::Fillet => "Fillet",
@@ -735,6 +740,45 @@ struct McadApp {
     /// `alt_zoom_anchor` と常に一体で扱い、[`McadApp::reset_transient_ui_state`] でも
     /// 一緒に破棄する。
     alt_view_gesture: Option<ViewGesture>,
+    /// 寸法パネル(M9タスク50-2)の入力欄が「どの選択集合を対象に開いているか」
+    /// （選択中の寸法 ID をソート済みで保持）。`dim_panel` は毎フレーム冒頭でこれと
+    /// 現在の選択を比較し、異なれば入力欄一式を新しい選択の共通値へ再同期する
+    /// （`sync_dim_edit_state`）。これが無いと、寸法Aの入力途中に選択をBへ変えて
+    /// 「確定」を押した際、A用の値がBへ誤って適用されてしまう
+    /// （Codex adversarial review 2026-09-04 指摘、M9タスク50 差し戻し対応）。
+    dim_edit_target: Vec<EntityId>,
+    /// 右パネル「寸法」セクション(M9タスク50)の公差編集状態。`None` は「選択中の
+    /// 公差種別をそのまま表示」(`sheet_panel` の `scale_custom_selected` と同じ流儀)。
+    /// 種別コンボで値の要る種別(対称/上下偏差/はめあい)を選ぶと、確定/選択解除まで
+    /// この状態を保つ。
+    dim_tol_editing: Option<DimTolKindUi>,
+    /// 対称公差(± v)の数値入力欄。
+    dim_tol_symmetric_input: String,
+    /// 上下偏差の上側入力欄。
+    dim_tol_upper_input: String,
+    /// 上下偏差の下側入力欄。
+    dim_tol_lower_input: String,
+    /// はめあい記号の入力欄。
+    dim_tol_fit_input: String,
+    /// 公差入力の直近の拒否理由(インライン赤字表示用)。
+    dim_tol_input_error: Option<String>,
+    /// 桁数の編集状態が「スタイルに従う」チェックを外して明示値へ入っているか。
+    /// `all_follow_style`(選択中の注記から算出する値)だけを見てチェック表示を決めると、
+    /// チェックを外した直後(まだ `decimals_override` を適用していない)フレームで
+    /// `all_follow_style` が再び `true` のままなので即座にチェックが戻ってしまう。
+    /// この永続フラグを併用することで「外した」という操作そのものを状態として保持する
+    /// (Codex adversarial review 2026-09-04 差し戻し対応A)。`sync_dim_edit_state` と
+    /// `reset_transient_ui_state` でリセットする。
+    dim_decimals_editing: bool,
+    /// 桁数上書きの入力欄(「スタイルに従う」チェックを外したときに使う)。
+    dim_decimals_input: String,
+    /// 桁数入力の直近の拒否理由。
+    dim_decimals_input_error: Option<String>,
+    /// 表示値上書き(非比例寸法)の入力欄。
+    dim_value_override_input: String,
+    /// 寸法スタイルダイアログの作業コピー。`Some` の間はモーダルが開いている
+    /// (表題欄編集ダイアログと同じ流儀。M9タスク50-3)。
+    dim_style_dialog: Option<DimStyleDialogState>,
 }
 
 /// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
@@ -753,6 +797,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "T=Text",
     "D=Linear Dim",
     "Shift+D=Radial Dim",
+    "G=Diameter Dim",
     "X=Trim",
     "E=Extend",
     "F=Fillet",
@@ -948,6 +993,18 @@ impl McadApp {
             scale_input_error: None,
             alt_zoom_anchor: None,
             alt_view_gesture: None,
+            dim_edit_target: Vec::new(),
+            dim_tol_editing: None,
+            dim_tol_symmetric_input: String::new(),
+            dim_tol_upper_input: String::new(),
+            dim_tol_lower_input: String::new(),
+            dim_tol_fit_input: String::new(),
+            dim_tol_input_error: None,
+            dim_decimals_editing: false,
+            dim_decimals_input: String::new(),
+            dim_decimals_input_error: None,
+            dim_value_override_input: String::new(),
+            dim_style_dialog: None,
         };
         if let Some(warning) = startup.warning {
             // 起動時はまだ egui の InputState が無いため now=0.0（[`STATUS_MESSAGE_SECS_IMPORTANT`]
@@ -963,7 +1020,9 @@ impl McadApp {
     /// キャンバス入力・ショートカット（F3/F8/F9/Home 含む）のゲートをこの1関数へ
     /// 集約する（M8タスク38。旧 `confirm_state != ConfirmState::Idle` 直書きの集約先）。
     fn modal_open(&self) -> bool {
-        self.confirm_state != ConfirmState::Idle || self.sheet_dialog.is_some()
+        self.confirm_state != ConfirmState::Idle
+            || self.sheet_dialog.is_some()
+            || self.dim_style_dialog.is_some()
     }
 
     /// 選択集合・進行中の作図ツール・スナップマーカーをリセットする。
@@ -992,6 +1051,19 @@ impl McadApp {
         self.scale_input_error = None;
         self.alt_zoom_anchor = None;
         self.alt_view_gesture = None;
+        // 寸法パネル・寸法スタイルダイアログの編集中状態も別図面へ持ち越さない。
+        self.dim_edit_target.clear();
+        self.dim_tol_editing = None;
+        self.dim_tol_symmetric_input.clear();
+        self.dim_tol_upper_input.clear();
+        self.dim_tol_lower_input.clear();
+        self.dim_tol_fit_input.clear();
+        self.dim_tol_input_error = None;
+        self.dim_decimals_editing = false;
+        self.dim_decimals_input.clear();
+        self.dim_decimals_input_error = None;
+        self.dim_value_override_input.clear();
+        self.dim_style_dialog = None;
     }
 
     /// undo/redo が成功した直後の UI 状態の後始末。
@@ -1009,6 +1081,11 @@ impl McadApp {
         // 宙ぶらりんのオフセットを残さない。設計判断2 と同じ思想）。
         self.select_tool.cancel_offset();
         self.snap_marker = None;
+        // 右パネル「寸法」の入力バッファは選択 ID 集合を鮮度キーにしているが、undo/redo は
+        // 選択を変えずに注記の中身だけを変える。そのままだと undo で戻した値がバッファに
+        // 残り、「確定」で undo を打ち消す新コマンドになる（M9 タスク50 Codex 指摘）。
+        // 対象集合を空にして、次フレームの `sync_dim_edit_state` に再同期させる。
+        self.dim_edit_target.clear();
     }
 
     /// ファイル操作（新規・開く・インポート・保存・名前を付けて保存・エクスポート）の
@@ -1657,6 +1734,20 @@ fn app_shortcuts_enabled(modal_open: bool, text_focused: bool) -> bool {
     !modal_open && !text_focused
 }
 
+/// キャンバス選択操作のうちキー入力で発火するもの（Delete/Backspace による削除、
+/// Esc による選択解除・ドラッグ中断）を処理してよいか。
+///
+/// `handle_select_input` は `!self.modal_open()` の内側でのみ呼ばれる（モーダル表示中は
+/// 呼び出し自体が起きない）ため、ここではテキスト入力欄フォーカスだけを見る。右パネルの
+/// 数値入力欄（寸法パネルの桁数/公差欄、オフセット距離欄など）にフォーカスがある間に
+/// Backspace で文字を消そうとしただけで選択中のエンティティが削除される、という事故を
+/// 防ぐ（Codex adversarial review 2026-09-04 差し戻し対応C）。
+#[inline]
+#[must_use]
+fn select_canvas_key_shortcuts_enabled(text_focused: bool) -> bool {
+    !text_focused
+}
+
 impl eframe::App for McadApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = ui.input(|i| i.time);
@@ -2036,6 +2127,24 @@ impl eframe::App for McadApp {
                 &mut self.status,
                 now,
             );
+            dim_panel(
+                ui,
+                &mut self.document,
+                self.select_tool.selection(),
+                &mut self.dim_edit_target,
+                &mut self.dim_tol_editing,
+                &mut self.dim_tol_symmetric_input,
+                &mut self.dim_tol_upper_input,
+                &mut self.dim_tol_lower_input,
+                &mut self.dim_tol_fit_input,
+                &mut self.dim_tol_input_error,
+                &mut self.dim_decimals_editing,
+                &mut self.dim_decimals_input,
+                &mut self.dim_decimals_input_error,
+                &mut self.dim_value_override_input,
+                &mut self.status,
+                now,
+            );
             let (sheet_changed, plot_color_mode_changed) = sheet_panel(
                 ui,
                 &mut self.document,
@@ -2047,6 +2156,7 @@ impl eframe::App for McadApp {
                 &mut self.status,
                 now,
             );
+            dim_style_panel(ui, &mut self.dim_style_dialog, &self.document);
             if sheet_changed
                 && self
                     .config
@@ -2105,6 +2215,7 @@ impl eframe::App for McadApp {
                         &mut self.status,
                         now,
                         offset_distance,
+                        text_focused,
                     );
                 } else {
                     handle_tool_input(
@@ -2355,13 +2466,106 @@ impl eframe::App for McadApp {
                 self.sheet_dialog = None;
             }
         }
+
+        // 寸法スタイルダイアログ(M9タスク50-3)。表題欄編集ダイアログと同じ流儀
+        // (右パネルの「寸法スタイルを編集…」ボタンから開き、OK で `Command::SetDimStyle`
+        // 1回、キャンセル/モーダル外クリックで破棄)。
+        if self.dim_style_dialog.is_some() {
+            let mut ok_clicked = false;
+            let mut cancel_clicked = false;
+            let mut reset_clicked = false;
+            let modal = egui::Modal::new(egui::Id::new("dim_style_dialog")).show(ui.ctx(), |ui| {
+                let dialog = self
+                    .dim_style_dialog
+                    .as_mut()
+                    .expect("guarded by is_some() above");
+                ui.set_width(320.0);
+                ui.heading("寸法スタイルを編集");
+                egui::Grid::new("dim_style_dialog_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("文字高さ[mm]:");
+                        ui.text_edit_singleline(&mut dialog.text_height_mm);
+                        ui.end_row();
+
+                        ui.label("矢の長さ[mm]:");
+                        ui.text_edit_singleline(&mut dialog.arrow_len_mm);
+                        ui.end_row();
+
+                        ui.label("小数桁数(0〜4):");
+                        ui.text_edit_singleline(&mut dialog.decimals);
+                        ui.end_row();
+
+                        ui.label("末尾ゼロを省く:");
+                        ui.checkbox(&mut dialog.trim_trailing_zeros, "");
+                        ui.end_row();
+
+                        ui.label("補助線のすきま[mm]:");
+                        ui.text_edit_singleline(&mut dialog.ext_gap_mm);
+                        ui.end_row();
+
+                        ui.label("補助線の突き出し[mm]:");
+                        ui.text_edit_singleline(&mut dialog.ext_overshoot_mm);
+                        ui.end_row();
+
+                        ui.label("文字とのすきま[mm]:");
+                        ui.text_edit_singleline(&mut dialog.text_gap_mm);
+                        ui.end_row();
+
+                        ui.label("公差文字の縮小率:");
+                        ui.text_edit_singleline(&mut dialog.tolerance_scale);
+                        ui.end_row();
+                    });
+                if let Some(err) = &dialog.error {
+                    ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        ok_clicked = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel_clicked = true;
+                    }
+                    if ui.button("既定に戻す").clicked() {
+                        reset_clicked = true;
+                    }
+                });
+            });
+            if reset_clicked {
+                let dialog = self
+                    .dim_style_dialog
+                    .as_mut()
+                    .expect("reset_clicked implies Some");
+                *dialog = DimStyleDialogState::from_style(&DimStyle::default());
+            } else if ok_clicked {
+                let dialog = self
+                    .dim_style_dialog
+                    .as_mut()
+                    .expect("ok_clicked implies Some");
+                match dialog.to_dim_style() {
+                    Ok(new_style) => match self.document.apply(Command::SetDimStyle(new_style)) {
+                        Ok(_) => self.dim_style_dialog = None,
+                        Err(err) => {
+                            dialog.error = Some(format!("寸法スタイルの変更に失敗しました: {err}"));
+                        }
+                    },
+                    Err(err) => {
+                        dialog.error = Some(err);
+                    }
+                }
+            } else if cancel_clicked || modal.should_close() {
+                self.dim_style_dialog = None;
+            }
+        }
     }
 }
 
 /// キーボードショートカットでアクティブツールを切り替える（DESIGN.md 3.4 のツール群）。
 ///
 /// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `P`=Polyline, `T`=Text,
-/// `D`/`Shift+D`=Linear/Radial Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
+/// `D`/`Shift+D`=Linear/Radial Dim, `G`=Diameter Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
 /// 作図ツールへ切り替えるときは、描画中に古い選択ハイライトが残らないよう選択をクリアする。
 fn handle_tool_shortcut_keys(
@@ -2401,6 +2605,10 @@ fn handle_tool_shortcut_keys(
             requested = Some(ToolKind::Polyline);
         } else if i.key_pressed(Key::T) {
             requested = Some(ToolKind::Text);
+        } else if i.key_pressed(Key::G) {
+            // 未使用キー（G/H/I/J/K/N/Q/U/V/W のうち G を採用。2026-09-04、
+            // main.rs/tool.rs をともに `grep -n "Key::G"` して未使用を確認済み）。
+            requested = Some(ToolKind::DimDiameter);
         } else if i.key_pressed(Key::X) {
             requested = Some(ToolKind::Trim);
         } else if i.key_pressed(Key::E) {
@@ -3153,6 +3361,790 @@ fn entity_style_panel(
     }
 }
 
+// ---------------------------------------------------------------------
+// 右パネル「寸法」セクション（M9タスク50-2）
+// ---------------------------------------------------------------------
+
+/// 右パネル「寸法」のコンボの展開メニューに許す最大高さ [px]。egui の既定
+/// （`Spacing::combo_height` = 200px）では、パネル下部で開いたときに項目が収まらず
+/// スクロールバーが出ることがあった（M9 タスク50 の手動スモークテスト、2026-09-05）。
+/// 記号コンボの最大項目数は「なし」+ 5 種で、これを余裕をもって収める値にする。
+///
+/// **これだけでは足りない**（下記 [`dim_combo_id_salt`] を参照）。
+const DIM_COMBO_MAX_HEIGHT: f32 = 400.0;
+
+/// 「寸法」パネルのコンボ（記号・公差種別・矢印配置）が**2回目以降の展開でメニューが
+/// 縮んでスクロールバー付きになる**不具合への対応（差し戻し対応、2026-09-05）。
+///
+/// # 原因（egui 0.35.0 のソースで確認した事実）
+///
+/// - `ComboBox` のポップアップは内部で必ず `ScrollArea::vertical().max_height(height)`
+///   を経由する（`egui-0.35.0/src/containers/combo_box.rs` の `combo_box_dyn` 関数、
+///   `Popup::menu(&button_response)...show(|ui| { ui.set_min_width(...);
+///   ScrollArea::vertical().max_height(height).show(ui, |ui| { ...; menu_contents(ui) })
+///   })` の箇所）。`height` は `ComboBox::height()`（未指定なら
+///   `Spacing::combo_height`）で、これは **上限**でしかない。
+/// - `ScrollArea::begin`（`egui-0.35.0/src/containers/scroll_area.rs`）は
+///   `let outer_size = available_outer.size().at_most(max_size);` で実際の高さ予算を
+///   決める。`available_outer = ui.available_rect_before_wrap()` は
+///   ポップアップの**外側の `Area`（`Popup::menu` が内部で作る）が今回どれだけの
+///   矩形を与えたか**で決まるので、`available_outer` が `max_size`（＝
+///   `ComboBox::height()`）より小さければ、`.height()` をいくら増やしても意味がない
+///   （ユーザーが 400px を指定しても症状が変わらなかったのはこのため）。
+/// - その `Area` 自身の高さは、**前回この `Area`（`Id` ごと）を表示したときに実測した
+///   サイズをセッション中ずっと記憶し続ける**
+///   （`egui-0.35.0/src/containers/area.rs` の `AreaState::size` の doc:
+///   「Area size is intentionally NOT persisted between sessions, so that a bad tooltip
+///   or menu size won't be remembered forever」＝アプリ再起動をまたいでは残さないが、
+///   **1セッション中は残る**ことが明記されている）。具体的には
+///   `Area::show()` の `let size = *state.size.get_or_insert_with(|| { ... })`
+///   （初回・`Id` 未使用時だけ計算し直す）と、`Area::end()` の
+///   `state.size = Some(content_ui.min_size());`（表示するたびに実測値で上書きする）
+///   の組により、一度でも実測が小さければ以後もその小さい値が使われ続け、
+///   `ScrollArea` の `auto_shrink`（既定 true。`scroll_area.rs` の
+///   `inner_size[d] = inner_size[d].min(content_size[d])`）でその小さい枠へ
+///   さらに縮められる ── 縮んだ状態が自己強化されて回復しない。
+/// - 初回だけ正しいサイズになるのは、`Id` が初めて使われる回だけ
+///   `sizing_pass = true`（`Area::show()` の `let mut sizing_pass = state.is_none();`）
+///   になり、`ui_builder.sizing_pass().invisible()`
+///   （制約の緩い非表示パスで実測してから即座に再描画する）で実測するため。
+///   このサイジングパスは通常の描画パスと計測条件が完全には一致しない
+///   （同バージョンの `sides.rs` にある `Ui::is_sizing_pass()` の利用例
+///   「When the parent is being auto-sized the gap will be as small as possible」が
+///   示すとおり、サイジングパスは通常パスより詰まった計測になりうる余地がある）。
+///   **この計測条件の差の詳細（何 px 分ずれるか）は未確認・推測**だが、
+///   「一度でも実測が小さいと自己修復しない」という上記の仕組み自体は
+///   ソースの該当行で確認済みの事実であり、`.height()` を上げても直らないという
+///   実際の再現症状とも整合する。
+///
+/// # 対応方針
+///
+/// egui はこの `Area` の記憶を個別に破棄する公開 API を持たない
+/// （`Memory::reset_areas()` は全 `Area` を一括で捨てる無差別な操作で、他の
+/// ウィンドウ/ポップアップにも影響するため使わない）。そこで、**このコンボの
+/// ポップアップが閉じた直後にだけ `Id` を回転させる**（`ComboBox::from_id_salt` へ
+/// 渡す salt に単調増加するエポック番号を混ぜる）。次に開いたときは必ず未使用の
+/// `Id` になるため、`AreaState::load` は毎回 `None` を返し、`sizing_pass` を
+/// 経た実測をやり直す。開いている間・閉じている間はエポックを変えないため、
+/// ボタン自身のクリック判定（`Sense::click()` は同一 `Id` が押下フレームと
+/// 離上フレームの両方に必要）やスクロール位置の連続性は壊れない。
+///
+/// `ComboBox::is_open` はボタンの `Id` から内部でポップアップ `Id` を導出して
+/// 判定する公開 API なので、ここで使うボタン `Id` は `ComboBox::show_ui` 内部の計算と
+/// 完全に一致させる必要がある。**注意: `ComboBox::from_id_salt(salt)` は salt を
+/// `IdSalt::new(salt)` で包んでから `ui.make_persistent_id(..)` へ渡す**
+/// （`combo_box.rs` の `id_salt: IdSalt::new(id_salt)` と
+/// `let button_id = ui.make_persistent_id(id_salt);`）。`IdSalt` を経由すると
+/// ハッシュが変わるため、`ui.make_persistent_id(salt)` と素の salt で計算した `Id` は
+/// **一致しない**（ヘッドレスの egui 0.35 で実測: 素の salt で `is_open` を問うと常に
+/// `false` になり、エポックが一度も進まなかった。2026-09-05）。同じ `ui` で
+/// `IdSalt::new(salt)` を包んで計算すること。
+///
+/// 実測（同じヘッドレス再現、6 項目のメニュー）: 3 項目で開いた後に 6 項目で開くと
+/// 回転なしでは高さ 78px（3 項目時 74px）のまま。回転ありでは 137px（最初から 6 項目で
+/// 開いたときと同値）。
+fn dim_combo_id_salt(ui: &egui::Ui, base: &'static str) -> (&'static str, u64) {
+    let epoch_key = egui::Id::new(base).with("dim_combo_reopen_epoch");
+    let was_open_key = egui::Id::new(base).with("dim_combo_was_open");
+    let epoch: u64 = ui.data(|d| d.get_temp(epoch_key)).unwrap_or(0);
+    let salt = (base, epoch);
+    let button_id = ui.make_persistent_id(egui::IdSalt::new(salt));
+    let is_open = egui::ComboBox::is_open(ui.ctx(), button_id);
+    let was_open: bool = ui.data(|d| d.get_temp(was_open_key)).unwrap_or(false);
+    if was_open && !is_open {
+        // 閉じた瞬間だけエポックを進める。次回開くときは未使用の Id になる。
+        ui.data_mut(|d| d.insert_temp(epoch_key, epoch.wrapping_add(1)));
+    }
+    ui.data_mut(|d| d.insert_temp(was_open_key, is_open));
+    salt
+}
+
+/// 寸法補助記号の UI 表示ラベル（規定 5-3）。フォント文字の "φ" 等をそのまま使う
+/// （G0-⑤ が縛るのは図面描画と出力のみ。DESIGN.md M9 設計判断1）。
+/// [`DimSymbol`] は `#[non_exhaustive]` なのでワイルドカード腕を持つ（未知の記号は
+/// 安全側の "?" 表示に倒す）。
+fn dim_symbol_ui_label(symbol: DimSymbol) -> &'static str {
+    match symbol {
+        DimSymbol::Diameter => "φ",
+        DimSymbol::SphereDiameter => "Sφ",
+        DimSymbol::Square => "□",
+        DimSymbol::Radius => "R",
+        DimSymbol::SphereRadius => "SR",
+        DimSymbol::ControlRadius => "CR",
+        DimSymbol::Chamfer => "C",
+        DimSymbol::Thickness => "t",
+        _ => "?",
+    }
+}
+
+/// 矢印配置コンボの日本語ラベル。
+fn dim_arrow_placement_label(placement: ArrowPlacement) -> &'static str {
+    match placement {
+        ArrowPlacement::Auto => "自動",
+        ArrowPlacement::Inside => "内向き",
+        ArrowPlacement::Outside => "外向き",
+    }
+}
+
+/// 寸法パネルの公差種別（UI 表示・編集の入口を選ぶタグ）。[`SizeTolerance`] は
+/// `#[non_exhaustive]` なので、まだ知らないバリアントを安全に表示だけする
+/// [`DimTolKindUi::Other`] を持つ（編集は提供しない。種別を明示的に変更するまで
+/// 既存値を保つ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DimTolKindUi {
+    None,
+    Symmetric,
+    Deviations,
+    Fit,
+    /// 未知の `SizeTolerance` バリアント（将来追加分の安全側の表示）。
+    Other,
+}
+
+fn dim_tol_kind_ui(tolerance: &Option<SizeTolerance>) -> DimTolKindUi {
+    match tolerance {
+        None => DimTolKindUi::None,
+        Some(SizeTolerance::Symmetric(_)) => DimTolKindUi::Symmetric,
+        Some(SizeTolerance::Deviations { .. }) => DimTolKindUi::Deviations,
+        Some(SizeTolerance::Fit(_)) => DimTolKindUi::Fit,
+        Some(_) => DimTolKindUi::Other,
+    }
+}
+
+fn dim_tol_kind_label(kind: DimTolKindUi) -> &'static str {
+    match kind {
+        DimTolKindUi::None => "なし",
+        DimTolKindUi::Symmetric => "± 対称",
+        DimTolKindUi::Deviations => "上下偏差",
+        DimTolKindUi::Fit => "はめあい記号",
+        DimTolKindUi::Other => "(その他)",
+    }
+}
+
+/// 寸法エンティティの幾何から種別と注記を取り出す（寸法以外は `None`）。
+fn dim_kind_and_annotation(geom: &EntityGeom) -> Option<(DimKind, &DimAnnotation)> {
+    match geom {
+        EntityGeom::DimLinear(d) => Some((DimKind::Linear, &d.annotation)),
+        EntityGeom::DimRadial(d) => Some((DimKind::Radial, &d.annotation)),
+        EntityGeom::DimDiameter(d) => Some((DimKind::Diameter, &d.annotation)),
+        _ => None,
+    }
+}
+
+/// `geom` の注記だけを `annotation` へ差し替えた新しい幾何を作る（寸法以外は `None`）。
+fn dim_geom_with_annotation(geom: &EntityGeom, annotation: DimAnnotation) -> Option<EntityGeom> {
+    match geom {
+        EntityGeom::DimLinear(d) => Some(EntityGeom::DimLinear(DimLinear {
+            annotation,
+            ..d.clone()
+        })),
+        EntityGeom::DimRadial(d) => Some(EntityGeom::DimRadial(DimRadial {
+            annotation,
+            ..d.clone()
+        })),
+        EntityGeom::DimDiameter(d) => Some(EntityGeom::DimDiameter(DimDiameter {
+            annotation,
+            ..d.clone()
+        })),
+        _ => None,
+    }
+}
+
+/// イテレータの全要素が等しければ `Some(値)`、1件でも異なれば `None`（空なら `None`）。
+/// 寸法パネルの「全件一致していれば表示、不一致なら空欄/混在表示」に使う。
+fn all_same<T: PartialEq + Clone>(mut it: impl Iterator<Item = T>) -> Option<T> {
+    let first = it.next()?;
+    if it.all(|v| v == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// `kinds` に含まれる全種別の [`DimKind::allowed_symbols`] の共通部分を返す
+/// （記号コンボの選択肢。core が拒否する組合せを最初から選ばせないための絞り込み。
+/// 表の出典は `DimKind::allowed_symbols` のみ — ここではその共通部分を計算するだけで、
+/// 記号の可否そのものは二重に持たない）。`kinds` が空なら空を返す。
+fn common_allowed_symbols(kinds: impl Iterator<Item = DimKind>) -> Vec<DimSymbol> {
+    let mut acc: Option<Vec<DimSymbol>> = None;
+    for kind in kinds {
+        let set = kind.allowed_symbols();
+        acc = Some(match acc {
+            None => set.to_vec(),
+            Some(prev) => prev.into_iter().filter(|s| set.contains(s)).collect(),
+        });
+    }
+    acc.unwrap_or_default()
+}
+
+/// 桁数「スタイルに従う」チェックボックスの表示状態（チェック済み＝スタイルに従う）を、
+/// 永続的な編集フラグ `decimals_editing` と現在の注記から算出した `all_follow_style`
+/// から導出する（Codex adversarial review 2026-09-04 差し戻し対応A）。
+///
+/// `all_follow_style` だけを見て判定すると、チェックを外した直後（まだ
+/// `decimals_override` を適用していない設計なので `all_follow_style` は依然 `true`）に
+/// 次のフレームで即座にチェックへ戻ってしまう「残像」バグが起きる。`decimals_editing`
+/// （ユーザーが明示的にチェックを外した、という操作そのものを表す永続フラグ）を
+/// 併用し、どちらかが「編集中」を示していれば未チェック（編集欄を出す）とする。
+#[inline]
+#[must_use]
+fn dim_decimals_follow_style_checked(decimals_editing: bool, all_follow_style: bool) -> bool {
+    !decimals_editing && all_follow_style
+}
+
+/// 「寸法」セクション見出し直下に出す選択集合の内訳（種別ごとの件数）。
+///
+/// Codex adversarial review 2026-09-04 差し戻し対応B。`SelectTool::on_click` は
+/// shift 無しクリックで選択へ**追加**する累積方式（既存・意図的な仕様。同メソッドの
+/// doc と `click_accumulates_selection_without_duplicates` テスト参照）であり、
+/// 寸法を選び直したつもりでも Shift クリックや Esc を挟まなければ前の選択が残る。
+/// その結果、記号コンボの選択肢が縮んだり「(混在)」表示になったりする ── これは
+/// `dim_panel` 側の不具合ではなく、累積選択の結果を正しく反映しているだけである。
+/// この表示はその状態を隠さず可視化する。
+fn dim_selection_summary(live: &[(EntityId, DimKind, DimAnnotation)]) -> String {
+    let mut linear = 0usize;
+    let mut radial = 0usize;
+    let mut diameter = 0usize;
+    for (_, kind, _) in live {
+        match kind {
+            DimKind::Linear => linear += 1,
+            DimKind::Radial => radial += 1,
+            DimKind::Diameter => diameter += 1,
+        }
+    }
+    format!(
+        "選択中: {} 件(長さ {linear}・半径 {radial}・直径 {diameter})",
+        live.len()
+    )
+}
+
+/// 対称公差（± v）の入力欄をパースする（[`SizeTolerance::validate`] の値検証はここでは
+/// 行わず core 側〔`build_annotation_edit_commands`〕へ委ねる。ここは文字列 → 数値の
+/// パース失敗だけを日本語メッセージへ変換する）。
+fn parse_symmetric_tolerance_input(input: &str) -> Result<SizeTolerance, String> {
+    input
+        .trim()
+        .parse::<f64>()
+        .map(SizeTolerance::Symmetric)
+        .map_err(|_| "公差値は数値で入力してください".to_string())
+}
+
+/// 上下偏差の入力欄をパースする（[`parse_symmetric_tolerance_input`] と同じ位置づけ）。
+fn parse_deviations_tolerance_input(upper: &str, lower: &str) -> Result<SizeTolerance, String> {
+    let parse = |s: &str| -> Result<f64, String> {
+        s.trim()
+            .parse::<f64>()
+            .map_err(|_| "上下偏差は数値で入力してください".to_string())
+    };
+    Ok(SizeTolerance::Deviations {
+        upper: parse(upper)?,
+        lower: parse(lower)?,
+    })
+}
+
+/// `live`（選択中の寸法。id・種別・現在の注記）へ `mutate` を適用し、変化があった分だけ
+/// `Command::ModifyEntity` を組み立てる。`DimAnnotation::validate(kind)` を通してから
+/// コマンド化するので、種別に許されない記号・不正な公差値・桁数上限超過・非有限座標・
+/// 空/制御文字混じりの表示値上書きはここで弾かれ、理由が `errors` へ積まれる
+/// （呼び出し側がまとめてステータスバーへ出す）。無変化のエンティティは何も積まない。
+fn build_annotation_edit_commands(
+    document: &Document,
+    live: &[(EntityId, DimKind, DimAnnotation)],
+    mut mutate: impl FnMut(&mut DimAnnotation),
+) -> (Vec<Command>, Vec<String>) {
+    let mut commands = Vec::new();
+    let mut errors = Vec::new();
+    for (id, kind, annotation) in live {
+        let mut new_annotation = annotation.clone();
+        mutate(&mut new_annotation);
+        if new_annotation == *annotation {
+            continue;
+        }
+        if let Err(err) = new_annotation.validate(*kind) {
+            errors.push(err.to_string());
+            continue;
+        }
+        let Some(entity) = document.entity(*id) else {
+            continue;
+        };
+        let Some(new_geom) = dim_geom_with_annotation(&entity.geom, new_annotation) else {
+            continue;
+        };
+        commands.push(Command::ModifyEntity { id: *id, new_geom });
+    }
+    (commands, errors)
+}
+
+/// 選択中の寸法 ID 集合が `edit_target` から変わっていたら、寸法パネルの入力欄一式
+/// （公差種別編集モード・各数値入力・エラー表示・桁数入力・表示値上書き入力）を
+/// 新しい選択の共通値へ再同期する。戻り値は「再同期した（＝選択が変わった）か」。
+///
+/// **これが無いと何が起きるか**（Codex adversarial review 2026-09-04 指摘）:
+/// 寸法Aを選んで公差や表示値の入力を書きかけのまま選択をBへ切り替えても、UI 状態
+/// （`String` バッファ）は寸法IDに紐付いていないためA用の入力がそのまま残り、
+/// 「確定」を押すとA用の値がBへ `ModifyEntity` されてしまう。逆に、既に
+/// `value_override` を持つ寸法へ選択を移しても入力欄は空のままなので、空欄のまま
+/// 「確定」を押すと既存値が消えてしまう。
+///
+/// 選択が変わっていないフレームでは何もしない（入力途中の文字列を消さないため）。
+#[allow(clippy::too_many_arguments)]
+fn sync_dim_edit_state(
+    edit_target: &mut Vec<EntityId>,
+    live: &[(EntityId, DimKind, DimAnnotation)],
+    tol_editing: &mut Option<DimTolKindUi>,
+    tol_symmetric_input: &mut String,
+    tol_upper_input: &mut String,
+    tol_lower_input: &mut String,
+    tol_fit_input: &mut String,
+    tol_input_error: &mut Option<String>,
+    decimals_editing: &mut bool,
+    decimals_input: &mut String,
+    decimals_input_error: &mut Option<String>,
+    value_override_input: &mut String,
+) -> bool {
+    let mut current_ids: Vec<EntityId> = live.iter().map(|(id, _, _)| *id).collect();
+    current_ids.sort();
+    if *edit_target == current_ids {
+        return false;
+    }
+    *edit_target = current_ids;
+
+    // まず全入力・エラー・編集中フラグをリセットする。
+    *tol_editing = None;
+    tol_symmetric_input.clear();
+    tol_upper_input.clear();
+    tol_lower_input.clear();
+    tol_fit_input.clear();
+    *tol_input_error = None;
+    *decimals_editing = false;
+    decimals_input.clear();
+    *decimals_input_error = None;
+    value_override_input.clear();
+
+    // 新しい選択の共通値（全件一致するものだけ）で入力欄を埋め直す。不一致（混在）は
+    // 空欄のままにし、パネル側が「(混在)」表示で示す。
+    if let Some(Some(tolerance)) = all_same(live.iter().map(|(_, _, a)| a.tolerance.clone())) {
+        match tolerance {
+            SizeTolerance::Symmetric(v) => *tol_symmetric_input = format!("{v}"),
+            SizeTolerance::Deviations { upper, lower } => {
+                *tol_upper_input = format!("{upper}");
+                *tol_lower_input = format!("{lower}");
+            }
+            SizeTolerance::Fit(fit) => *tol_fit_input = fit.as_str().to_string(),
+            // 将来の SizeTolerance バリアント（#[non_exhaustive]）は編集欄を持たない
+            // （DimTolKindUi::Other と同じ「安全側は表示のみ」の扱い）。
+            _ => {}
+        }
+    }
+    if let Some(Some(n)) = all_same(live.iter().map(|(_, _, a)| a.decimals_override)) {
+        *decimals_input = n.to_string();
+    }
+    if let Some(Some(value)) = all_same(live.iter().map(|(_, _, a)| a.value_override.clone())) {
+        *value_override_input = value;
+    }
+    true
+}
+
+/// 右パネルの「寸法」セクション（M9タスク50-2）。選択中に寸法エンティティ
+/// （`DimLinear`/`DimRadial`/`DimDiameter`）が1つ以上含まれるときだけ表示する。
+///
+/// 複数選択・複数種別混在に対応する: 値は「全件一致していれば表示、不一致なら
+/// 空欄/混在表示」、編集は選択中の全寸法へ適用し `Command::Batch` 1回（undo 1単位）で
+/// コミットする。記号コンボの選択肢は全件の [`DimKind::allowed_symbols`] の共通部分のみ
+/// （核が拒否する組合せを選ばせない）。
+#[allow(clippy::too_many_arguments)]
+fn dim_panel(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    selection: &[EntityId],
+    edit_target: &mut Vec<EntityId>,
+    tol_editing: &mut Option<DimTolKindUi>,
+    tol_symmetric_input: &mut String,
+    tol_upper_input: &mut String,
+    tol_lower_input: &mut String,
+    tol_fit_input: &mut String,
+    tol_input_error: &mut Option<String>,
+    decimals_editing: &mut bool,
+    decimals_input: &mut String,
+    decimals_input_error: &mut Option<String>,
+    value_override_input: &mut String,
+    status: &mut Option<StatusMessage>,
+    now: f64,
+) {
+    // 選択されていても墓標化・削除済みの ID、寸法以外のエンティティは除く
+    // （`entity_style_panel` と同じ防御。DESIGN.md M9 タスク50）。
+    let live: Vec<(EntityId, DimKind, DimAnnotation)> = selection
+        .iter()
+        .filter_map(|&id| {
+            let entity = document.entity(id)?;
+            let (kind, annotation) = dim_kind_and_annotation(&entity.geom)?;
+            Some((id, kind, annotation.clone()))
+        })
+        .collect();
+
+    // 選択が変わっていたら入力欄一式を新しい選択の共通値へ再同期する（`live` が空でも
+    // 呼ぶ — 選択解除後に別の寸法を選んだときも正しく再同期させるため）。
+    sync_dim_edit_state(
+        edit_target,
+        &live,
+        tol_editing,
+        tol_symmetric_input,
+        tol_upper_input,
+        tol_lower_input,
+        tol_fit_input,
+        tol_input_error,
+        decimals_editing,
+        decimals_input,
+        decimals_input_error,
+        value_override_input,
+    );
+
+    if live.is_empty() {
+        return;
+    }
+
+    ui.separator();
+    ui.heading("寸法");
+    // B の差し戻し対応: SelectTool::on_click は shift 無しクリックで選択へ**追加**する
+    // 累積方式（既存・意図的な仕様。`SelectTool::on_click` の doc と
+    // `click_accumulates_selection_without_duplicates` テスト参照）。寸法を選び直した
+    // つもりでも前の選択が残ったままだと記号コンボ等が意図せず混在扱いになるため、
+    // 選択の内訳をここに出して目視できるようにする。
+    ui.label(dim_selection_summary(&live));
+
+    let mut pending: Vec<Command> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut apply = |cmds: Vec<Command>, errs: Vec<String>| {
+        pending.extend(cmds);
+        errors.extend(errs);
+    };
+
+    // --- 記号: 全種別の allowed_symbols の共通部分だけを選択肢にする ---
+    let allowed_symbols = common_allowed_symbols(live.iter().map(|(_, kind, _)| *kind));
+    let symbol_common = all_same(live.iter().map(|(_, _, a)| a.symbol));
+    ui.horizontal(|ui| {
+        ui.label("記号:");
+        let selected_text = match symbol_common {
+            Some(Some(sym)) => dim_symbol_ui_label(sym),
+            Some(None) => "なし",
+            None => "(混在)",
+        };
+        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_symbol"))
+            .height(DIM_COMBO_MAX_HEIGHT)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(symbol_common == Some(None), "なし")
+                    .clicked()
+                {
+                    let (cmds, errs) =
+                        build_annotation_edit_commands(document, &live, |a| a.symbol = None);
+                    apply(cmds, errs);
+                }
+                for &sym in &allowed_symbols {
+                    if ui
+                        .selectable_label(
+                            symbol_common == Some(Some(sym)),
+                            dim_symbol_ui_label(sym),
+                        )
+                        .clicked()
+                    {
+                        let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                            a.symbol = Some(sym);
+                        });
+                        apply(cmds, errs);
+                    }
+                }
+            });
+    });
+
+    // --- 公差: 種別コンボ（なし/±対称/上下偏差/はめあい記号）+ 値入力 ---
+    let tol_kind_common = all_same(live.iter().map(|(_, _, a)| dim_tol_kind_ui(&a.tolerance)));
+    // 明示的に編集中の種別があればそれを、無ければ選択中の共通種別を表示に使う
+    // （`sheet_panel` の尺度カスタム入力と同じ「明示編集フラグが document 由来の値に
+    // 優先する」流儀）。
+    let display_kind = tol_editing.unwrap_or(tol_kind_common.unwrap_or(DimTolKindUi::None));
+    ui.horizontal(|ui| {
+        ui.label("公差:");
+        let selected_text = if tol_editing.is_none() && tol_kind_common.is_none() {
+            "(混在)"
+        } else {
+            dim_tol_kind_label(display_kind)
+        };
+        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_tol_kind"))
+            .height(DIM_COMBO_MAX_HEIGHT)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(display_kind == DimTolKindUi::None, "なし")
+                    .clicked()
+                {
+                    let (cmds, errs) =
+                        build_annotation_edit_commands(document, &live, |a| a.tolerance = None);
+                    apply(cmds, errs);
+                    *tol_editing = None;
+                    *tol_input_error = None;
+                }
+                for kind in [
+                    DimTolKindUi::Symmetric,
+                    DimTolKindUi::Deviations,
+                    DimTolKindUi::Fit,
+                ] {
+                    if ui
+                        .selectable_label(display_kind == kind, dim_tol_kind_label(kind))
+                        .clicked()
+                    {
+                        // 値の要る種別は選んだだけでは確定しない（数値入力が要るため）。
+                        // 編集欄を開き、現在の共通値があれば埋める。
+                        *tol_editing = Some(kind);
+                        *tol_input_error = None;
+                        let common_tol = all_same(live.iter().map(|(_, _, a)| a.tolerance.clone()));
+                        match (kind, common_tol) {
+                            (DimTolKindUi::Symmetric, Some(Some(SizeTolerance::Symmetric(v)))) => {
+                                *tol_symmetric_input = format!("{v}");
+                            }
+                            (
+                                DimTolKindUi::Deviations,
+                                Some(Some(SizeTolerance::Deviations { upper, lower })),
+                            ) => {
+                                *tol_upper_input = format!("{upper}");
+                                *tol_lower_input = format!("{lower}");
+                            }
+                            (DimTolKindUi::Fit, Some(Some(SizeTolerance::Fit(fit)))) => {
+                                *tol_fit_input = fit.as_str().to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+    });
+    match display_kind {
+        DimTolKindUi::Symmetric => {
+            ui.horizontal(|ui| {
+                ui.label("± :");
+                ui.add(egui::TextEdit::singleline(tol_symmetric_input).desired_width(64.0));
+                if ui.button("確定").clicked() {
+                    match parse_symmetric_tolerance_input(tol_symmetric_input) {
+                        Ok(tolerance) => {
+                            let (cmds, errs) =
+                                build_annotation_edit_commands(document, &live, |a| {
+                                    a.tolerance = Some(tolerance.clone());
+                                });
+                            if errs.is_empty() {
+                                apply(cmds, Vec::new());
+                                *tol_editing = None;
+                                *tol_input_error = None;
+                            } else {
+                                *tol_input_error = Some(errs.join("; "));
+                            }
+                        }
+                        Err(err) => {
+                            *tol_input_error = Some(err);
+                        }
+                    }
+                }
+            });
+        }
+        DimTolKindUi::Deviations => {
+            ui.horizontal(|ui| {
+                ui.label("上 :");
+                ui.add(egui::TextEdit::singleline(tol_upper_input).desired_width(56.0));
+                ui.label("下 :");
+                ui.add(egui::TextEdit::singleline(tol_lower_input).desired_width(56.0));
+                if ui.button("確定").clicked() {
+                    match parse_deviations_tolerance_input(tol_upper_input, tol_lower_input) {
+                        Ok(tolerance) => {
+                            let (cmds, errs) =
+                                build_annotation_edit_commands(document, &live, |a| {
+                                    a.tolerance = Some(tolerance.clone());
+                                });
+                            if errs.is_empty() {
+                                apply(cmds, Vec::new());
+                                *tol_editing = None;
+                                *tol_input_error = None;
+                            } else {
+                                *tol_input_error = Some(errs.join("; "));
+                            }
+                        }
+                        Err(err) => {
+                            *tol_input_error = Some(err);
+                        }
+                    }
+                }
+            });
+        }
+        DimTolKindUi::Fit => {
+            ui.horizontal(|ui| {
+                ui.label("記号:");
+                ui.add(egui::TextEdit::singleline(tol_fit_input).desired_width(56.0));
+                if ui.button("確定").clicked() {
+                    match FitClass::new(tol_fit_input.clone()) {
+                        Ok(fit) => {
+                            let (cmds, errs) =
+                                build_annotation_edit_commands(document, &live, |a| {
+                                    a.tolerance = Some(SizeTolerance::Fit(fit.clone()));
+                                });
+                            apply(cmds, errs);
+                            *tol_editing = None;
+                            *tol_input_error = None;
+                        }
+                        Err(err) => {
+                            *tol_input_error = Some(err.to_string());
+                        }
+                    }
+                }
+            });
+        }
+        DimTolKindUi::None | DimTolKindUi::Other => {}
+    }
+    if let Some(err) = tol_input_error {
+        ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+    }
+
+    // --- 桁数: 「スタイルに従う」チェック + 外したときの明示値入力 ---
+    // A の差し戻し対応: チェックを外した直後はまだ `decimals_override` を適用していない
+    // （コマンドはまだ発行しない設計）ため、`all_follow_style` だけでチェック表示を
+    // 決めると次のフレームで即座にチェックへ戻ってしまう。永続フラグ `decimals_editing`
+    // を併用する `dim_decimals_follow_style_checked` で判定する。
+    let style_decimals = document.dim_style().decimals;
+    let all_follow_style = live.iter().all(|(_, _, a)| a.decimals_override.is_none());
+    ui.horizontal(|ui| {
+        let mut follow_style =
+            dim_decimals_follow_style_checked(*decimals_editing, all_follow_style);
+        let label = format!("スタイルに従う(現在 {style_decimals} 桁)");
+        if ui.checkbox(&mut follow_style, label).changed() {
+            if follow_style {
+                // 再チェック: スタイルへ戻し、編集状態を終える。
+                let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                    a.decimals_override = None;
+                });
+                apply(cmds, errs);
+                *decimals_editing = false;
+                decimals_input.clear();
+                *decimals_input_error = None;
+            } else {
+                // 外した直後は編集状態に入るだけで、コマンドはまだ適用しない
+                // （数値入力→「確定」を待つ）。現在の解決済み桁数（スタイル or
+                // 既存の明示値）を編集欄の初期値にする。
+                *decimals_editing = true;
+                *decimals_input_error = None;
+                if decimals_input.is_empty() {
+                    let initial = live
+                        .first()
+                        .map(|(_, _, a)| document.dim_style().resolve_decimals(a.decimals_override))
+                        .unwrap_or(style_decimals);
+                    *decimals_input = initial.to_string();
+                }
+            }
+        }
+        if !follow_style {
+            // チェックボックスを外した直接操作を経ずに欄が表示される場合（選択直後から
+            // 既に一部/全部が明示上書き済み）にも、空欄のままにしない。
+            if decimals_input.is_empty() {
+                let initial = live
+                    .first()
+                    .map(|(_, _, a)| document.dim_style().resolve_decimals(a.decimals_override))
+                    .unwrap_or(style_decimals);
+                *decimals_input = initial.to_string();
+            }
+            ui.add(egui::TextEdit::singleline(decimals_input).desired_width(32.0));
+            if ui.button("確定").clicked() {
+                match decimals_input.trim().parse::<u8>() {
+                    Ok(n) if n <= MAX_DIM_DECIMALS => {
+                        let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                            a.decimals_override = Some(n);
+                        });
+                        apply(cmds, errs);
+                        *decimals_input_error = None;
+                        // 編集状態は維持する（再チェックまでは欄を出し続け、続けて
+                        // 別の値を試せるようにする）。
+                    }
+                    Ok(n) => {
+                        *decimals_input_error =
+                            Some(format!("{n} は上限 {MAX_DIM_DECIMALS} を超えています"));
+                    }
+                    Err(_) => {
+                        *decimals_input_error = Some("桁数は整数で入力してください".to_string());
+                    }
+                }
+            }
+        }
+    });
+    if let Some(err) = decimals_input_error {
+        ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+    }
+
+    // --- 矢印の配置 ---
+    let arrow_common = all_same(live.iter().map(|(_, _, a)| a.arrow_placement));
+    ui.horizontal(|ui| {
+        ui.label("矢印の配置:");
+        let selected_text = arrow_common.map_or("(混在)", dim_arrow_placement_label);
+        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_arrow_placement"))
+            .height(DIM_COMBO_MAX_HEIGHT)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for placement in [
+                    ArrowPlacement::Auto,
+                    ArrowPlacement::Inside,
+                    ArrowPlacement::Outside,
+                ] {
+                    if ui
+                        .selectable_label(
+                            arrow_common == Some(placement),
+                            dim_arrow_placement_label(placement),
+                        )
+                        .clicked()
+                    {
+                        let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                            a.arrow_placement = placement;
+                        });
+                        apply(cmds, errs);
+                    }
+                }
+            });
+    });
+
+    // --- 表示値の上書き（非比例寸法） ---
+    // 選択が変わったときは `sync_dim_edit_state` が既存の共通値（全件一致するもの）を
+    // この欄へ読み込み済み（混在時は空欄+「(混在)」相当の表示）。空欄のままの「確定」は
+    // 既存値を消してしまわないよう何もしない（値の消去は「解除」ボタンのみで行う）。
+    ui.horizontal(|ui| {
+        ui.label("表示値の上書き:");
+        ui.add(egui::TextEdit::singleline(value_override_input).desired_width(96.0));
+        if ui.button("確定").clicked() {
+            let trimmed = value_override_input.trim();
+            if !trimmed.is_empty() {
+                let new_value = Some(trimmed.to_string());
+                let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                    a.value_override = new_value.clone();
+                });
+                apply(cmds, errs);
+            }
+        }
+        let has_override = live.iter().any(|(_, _, a)| a.value_override.is_some());
+        if has_override && ui.button("解除").clicked() {
+            let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                a.value_override = None;
+            });
+            apply(cmds, errs);
+            value_override_input.clear();
+        }
+    });
+
+    if !pending.is_empty()
+        && let Err(err) = document.apply(Command::Batch(pending))
+    {
+        errors.push(err.to_string());
+    }
+    if !errors.is_empty() {
+        set_status(
+            status,
+            now,
+            format!("寸法の変更に失敗しました: {}", errors.join("; ")),
+        );
+    }
+}
+
 /// 用紙サイズの日本語ラベル（右パネルの用紙コンボ専用）。
 ///
 /// `frame::` 側の欄文字用ラベル（横は "A4"、縦は "A4 縦" と向きを合成する）とは
@@ -3485,6 +4477,93 @@ fn plot_color_mode_combo_label(mode: plot::PlotColorMode) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------
+// 寸法スタイルダイアログ（M9タスク50-3）
+// ---------------------------------------------------------------------
+
+/// 寸法スタイルダイアログの作業コピー。数値項目はすべて文字列で保持し（入力途中の
+/// 不正値でドキュメントを壊さないため）、OK 時にまとめてパースする。表題欄編集
+/// ダイアログ（[`TitleBlockDialogState`]）と同じ「ダイアログセッション全体が
+/// `Command::SetDimStyle` 1回 = undo 1単位」の流儀。
+struct DimStyleDialogState {
+    text_height_mm: String,
+    arrow_len_mm: String,
+    decimals: String,
+    trim_trailing_zeros: bool,
+    ext_gap_mm: String,
+    ext_overshoot_mm: String,
+    text_gap_mm: String,
+    tolerance_scale: String,
+    /// OK 時のパース/検証失敗をインライン表示するための直近エラー。
+    error: Option<String>,
+}
+
+impl DimStyleDialogState {
+    /// 現在の [`DimStyle`] から作業コピーを作る（ダイアログを開くとき・「既定に戻す」）。
+    fn from_style(style: &DimStyle) -> Self {
+        Self {
+            text_height_mm: format!("{}", style.text_height_mm),
+            arrow_len_mm: format!("{}", style.arrow_len_mm),
+            decimals: format!("{}", style.decimals),
+            trim_trailing_zeros: style.trim_trailing_zeros,
+            ext_gap_mm: format!("{}", style.ext_gap_mm),
+            ext_overshoot_mm: format!("{}", style.ext_overshoot_mm),
+            text_gap_mm: format!("{}", style.text_gap_mm),
+            tolerance_scale: format!("{}", style.tolerance_scale),
+            error: None,
+        }
+    }
+
+    /// 作業コピーの文字列をパースして [`DimStyle`] を組み立てる（純関数、単体テスト対象）。
+    /// パース失敗は日本語メッセージで返す。組み立てた値は最後に
+    /// [`DimStyle::validate`] を通すので、範囲外の値（非有限・0以下・上限超過など）も
+    /// ここで拒否される。
+    fn to_dim_style(&self) -> Result<DimStyle, String> {
+        let parse_mm = |s: &str, label: &str| -> Result<f64, String> {
+            s.trim()
+                .parse::<f64>()
+                .map_err(|_| format!("{label}は数値で入力してください"))
+        };
+        let text_height_mm = parse_mm(&self.text_height_mm, "文字高さ")?;
+        let arrow_len_mm = parse_mm(&self.arrow_len_mm, "矢の長さ")?;
+        let decimals: u8 = self
+            .decimals
+            .trim()
+            .parse()
+            .map_err(|_| "小数桁数は0〜4の整数で入力してください".to_string())?;
+        let ext_gap_mm = parse_mm(&self.ext_gap_mm, "補助線のすきま")?;
+        let ext_overshoot_mm = parse_mm(&self.ext_overshoot_mm, "補助線の突き出し")?;
+        let text_gap_mm = parse_mm(&self.text_gap_mm, "文字とのすきま")?;
+        let tolerance_scale = parse_mm(&self.tolerance_scale, "公差文字の縮小率")?;
+        let style = DimStyle {
+            text_height_mm,
+            arrow_len_mm,
+            decimals,
+            trim_trailing_zeros: self.trim_trailing_zeros,
+            ext_gap_mm,
+            ext_overshoot_mm,
+            text_gap_mm,
+            tolerance_scale,
+        };
+        style.validate()?;
+        Ok(style)
+    }
+}
+
+/// 右パネルの「寸法スタイル」行（M9タスク50-3）。ボタン1つの薄いセクションとして
+/// 図面セクションの下に置く（表題欄編集ダイアログの「表題欄を編集…」ボタンと対になる）。
+fn dim_style_panel(
+    ui: &mut egui::Ui,
+    dim_style_dialog: &mut Option<DimStyleDialogState>,
+    document: &Document,
+) {
+    ui.separator();
+    ui.heading("寸法スタイル");
+    if ui.button("寸法スタイルを編集…").clicked() {
+        *dim_style_dialog = Some(DimStyleDialogState::from_style(document.dim_style()));
+    }
+}
+
 /// 素のカーソル位置 `raw` にスナップを掛ける。有効かつ候補が見つかれば
 /// `(スナップ先, Some(結果))`、無効または候補なしなら `(raw, None)` を返す。
 ///
@@ -3579,8 +4658,13 @@ mod resolve_click_point_tests {
 /// コア側に従う）。
 ///
 /// - `Delete`/`Backspace`: 選択エンティティを 1 バッチで削除。適用成功時のみ選択を解除する。
+///   **右パネルのテキスト入力欄（寸法パネルの数値欄等）にフォーカスがある間は無効**
+///   （`text_focused`。Codex adversarial review 2026-09-04 差し戻し対応C。これが無いと
+///   数値欄で文字を消そうと Backspace を押しただけで選択中の寸法が削除されてしまう）。
 /// - `M`: 選択集合の移動配置モードへ入る（基準点→配置先の2クリック、スナップ対応）。
-/// - `Esc`: 進行中のドラッグ（または配置モード）を破棄（選択は変えない）。
+/// - `Esc`: 進行中のドラッグ（または配置モード）を破棄（選択は変えない）。こちらもテキスト
+///   入力欄フォーカス中は無効にし、欄側のフォーカス解除に譲る
+///   （[`handle_offset_input`] の `typing` ガードと同じ方針）。
 /// - `Space` 押下中の左ドラッグはパン用なので、選択操作としては扱わない。
 ///
 /// # 配置モード（Ctrl+D 複製・M 移動）の優先
@@ -3603,6 +4687,7 @@ fn handle_select_input(
     status: &mut Option<StatusMessage>,
     now: f64,
     offset_distance: Option<f64>,
+    text_focused: bool,
 ) {
     // オフセットモード中は専用経路が入力を占有する（配置モードと同じ入力ゲート思想）。
     if select_tool.is_offsetting() {
@@ -3711,7 +4796,11 @@ fn handle_select_input(
 
     // Delete / Backspace: 選択を 1 バッチで削除。ロックレイヤー混在時は Batch 原子性で
     // 全体失敗しうるので、apply が成功したときだけ選択を解除し、失敗は表示する。
-    if ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
+    // テキスト入力欄にフォーカスがある間は無効（差し戻し対応C。欄の編集キーがそのまま
+    // ドキュメント操作へ漏れないようにする）。
+    let canvas_key_shortcuts_enabled = select_canvas_key_shortcuts_enabled(text_focused);
+    if canvas_key_shortcuts_enabled
+        && ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
         && let Some(cmd) = select_tool.delete_command()
     {
         match document.apply(cmd) {
@@ -3721,8 +4810,9 @@ fn handle_select_input(
     }
 
     // Esc: 進行中のドラッグがあればそれだけ破棄（選択維持）、無ければ選択を全解除する
-    // （2段階挙動は SelectTool::on_cancel 側に集約）。
-    if ui.input(|i| i.key_pressed(Key::Escape)) {
+    // （2段階挙動は SelectTool::on_cancel 側に集約）。テキスト入力欄フォーカス中は
+    // 欄側のフォーカス解除に譲る（[`handle_offset_input`] と同じ方針）。
+    if canvas_key_shortcuts_enabled && ui.input(|i| i.key_pressed(Key::Escape)) {
         select_tool.on_cancel();
     }
 
@@ -5170,6 +6260,15 @@ mod tests {
     }
 
     #[test]
+    fn select_canvas_key_shortcuts_disabled_while_a_text_field_is_focused() {
+        // 差し戻し対応C: 寸法パネルの数値欄・オフセット距離欄などにフォーカスがある間は
+        // Delete/Backspace/Esc をキャンバス選択操作として処理しない
+        // （`handle_select_input` が `select_canvas_key_shortcuts_enabled` で判定する）。
+        assert!(select_canvas_key_shortcuts_enabled(false));
+        assert!(!select_canvas_key_shortcuts_enabled(true));
+    }
+
+    #[test]
     fn modal_open_covers_confirm_state_and_sheet_dialog() {
         let mut app = McadApp::new();
         assert!(!app.modal_open());
@@ -5753,6 +6852,31 @@ mod tests {
             )))
             .unwrap()
             .entities[0]
+    }
+
+    /// Codex 指摘（M9 タスク50）回帰: undo/redo は選択 ID を変えずに注記だけを変えるため、
+    /// 寸法パネルの入力バッファを ID 集合だけで鮮度判定していると、undo 前の値が残って
+    /// 「確定」で undo を打ち消してしまう。履歴変更後は対象集合を空にして再同期させる。
+    #[test]
+    fn after_history_change_invalidates_dimension_edit_buffers() {
+        let mut app = McadApp::new();
+        let dim = add_test_dim_linear(&mut app.document);
+        app.select_tool.set_selection(vec![dim]);
+        app.dim_edit_target = vec![dim];
+        app.dim_value_override_input = "A".to_string();
+
+        app.after_history_change();
+
+        assert!(app.dim_edit_target.is_empty());
+        // 次フレームの同期で、空の対象集合 ≠ 選択中の ID となりバッファが作り直される。
+        let live = vec![(dim, DimKind::Linear, DimAnnotation::default())];
+        let mut buffers = DimEditBuffers {
+            edit_target: app.dim_edit_target.clone(),
+            value_override_input: "A".to_string(),
+            ..DimEditBuffers::default()
+        };
+        assert!(buffers.sync(&live));
+        assert_eq!(buffers.value_override_input, "");
     }
 
     #[test]
@@ -7155,6 +8279,465 @@ mod tests {
         assert!(
             estimated_dashes < MAX_DASH_SEGMENTS as f32,
             "estimated_dashes={estimated_dashes}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 寸法パネル（M9タスク50-2）: 記号コンボの選択肢・公差入力パース・注記編集
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn common_allowed_symbols_intersects_the_grammar_matrix() {
+        // 単一種別は DimKind::allowed_symbols とそのまま一致する
+        // （唯一の出典を二重に持っていないことの確認）。
+        assert_eq!(
+            common_allowed_symbols(std::iter::once(DimKind::Linear)),
+            DimKind::Linear.allowed_symbols().to_vec()
+        );
+        // 長さ×半径は共通記号なし（φ/Sφ/□/C/t と R/SR/CR は素な集合）。
+        assert!(common_allowed_symbols([DimKind::Linear, DimKind::Radial].into_iter()).is_empty());
+        // 長さ×直径は φ/Sφ が共通。
+        assert_eq!(
+            common_allowed_symbols([DimKind::Linear, DimKind::Diameter].into_iter()),
+            vec![DimSymbol::Diameter, DimSymbol::SphereDiameter]
+        );
+        // 空イテレータは空を返す。
+        assert!(common_allowed_symbols(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn parse_symmetric_tolerance_input_parses_and_rejects() {
+        assert_eq!(
+            parse_symmetric_tolerance_input(" 0.05 "),
+            Ok(SizeTolerance::Symmetric(0.05))
+        );
+        assert!(parse_symmetric_tolerance_input("abc").is_err());
+        assert!(parse_symmetric_tolerance_input("").is_err());
+    }
+
+    #[test]
+    fn parse_deviations_tolerance_input_parses_and_rejects() {
+        assert_eq!(
+            parse_deviations_tolerance_input("0.2", "-0.1"),
+            Ok(SizeTolerance::Deviations {
+                upper: 0.2,
+                lower: -0.1,
+            })
+        );
+        assert!(parse_deviations_tolerance_input("x", "-0.1").is_err());
+        assert!(parse_deviations_tolerance_input("0.2", "y").is_err());
+    }
+
+    /// テスト用に長さ寸法エンティティを1件追加し、その ID を返す。
+    fn add_test_dim_linear(document: &mut Document) -> EntityId {
+        let layer = document.current_layer();
+        let ids = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(0.0, 0.0),
+                    p2: Point2::new(10.0, 0.0),
+                    offset: 5.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        ids.entities[0]
+    }
+
+    #[test]
+    fn build_annotation_edit_commands_skips_noop_changes() {
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document);
+        let live = vec![(id, DimKind::Linear, DimAnnotation::default())];
+
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |_| {});
+        assert!(cmds.is_empty());
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn build_annotation_edit_commands_rejects_symbol_not_allowed_for_kind() {
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document);
+        let live = vec![(id, DimKind::Linear, DimAnnotation::default())];
+
+        // R（半径記号）は長さ寸法に許されない（DimKind::allowed_symbols）。
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |a| {
+            a.symbol = Some(DimSymbol::Radius);
+        });
+        assert!(cmds.is_empty(), "invalid symbol must not produce a command");
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn build_annotation_edit_commands_builds_modify_entity_for_valid_change() {
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document);
+        let live = vec![(id, DimKind::Linear, DimAnnotation::default())];
+
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |a| {
+            a.symbol = Some(DimSymbol::Diameter);
+        });
+        assert!(errs.is_empty());
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Command::ModifyEntity { .. }));
+
+        // 実際に適用できる（core 側の検証も一致していることの確認）。
+        assert!(document.apply(Command::Batch(cmds)).is_ok());
+        let EntityGeom::DimLinear(dim) = &document.entity(id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim.annotation.symbol, Some(DimSymbol::Diameter));
+    }
+
+    // -----------------------------------------------------------------
+    // 寸法スタイルダイアログ（M9タスク50-3）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dim_style_dialog_round_trips_the_default_style() {
+        let dialog = DimStyleDialogState::from_style(&DimStyle::default());
+        assert_eq!(dialog.to_dim_style(), Ok(DimStyle::default()));
+    }
+
+    #[test]
+    fn dim_style_dialog_reflects_edited_fields() {
+        let mut dialog = DimStyleDialogState::from_style(&DimStyle::default());
+        dialog.decimals = "3".to_string();
+        dialog.trim_trailing_zeros = false;
+        let style = dialog.to_dim_style().expect("valid edit");
+        assert_eq!(style.decimals, 3);
+        assert!(!style.trim_trailing_zeros);
+        assert_ne!(style, DimStyle::default());
+    }
+
+    #[test]
+    fn dim_style_dialog_rejects_unparsable_numbers() {
+        let mut dialog = DimStyleDialogState::from_style(&DimStyle::default());
+        dialog.text_height_mm = "abc".to_string();
+        assert!(dialog.to_dim_style().is_err());
+    }
+
+    #[test]
+    fn dim_style_dialog_rejects_values_the_style_validator_rejects() {
+        // パースは成功するが DimStyle::validate() が拒否する値（矢の長さ 0 は非正）。
+        let mut dialog = DimStyleDialogState::from_style(&DimStyle::default());
+        dialog.arrow_len_mm = "0".to_string();
+        assert!(dialog.to_dim_style().is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // sync_dim_edit_state（差し戻し対応: 選択切替時の入力欄再同期）
+    // -----------------------------------------------------------------
+
+    /// `sync_dim_edit_state` のテスト用に、寸法パネルの入力欄一式をまとめた作業用構造体。
+    #[derive(Default)]
+    struct DimEditBuffers {
+        edit_target: Vec<EntityId>,
+        tol_editing: Option<DimTolKindUi>,
+        tol_symmetric_input: String,
+        tol_upper_input: String,
+        tol_lower_input: String,
+        tol_fit_input: String,
+        tol_input_error: Option<String>,
+        decimals_editing: bool,
+        decimals_input: String,
+        decimals_input_error: Option<String>,
+        value_override_input: String,
+    }
+
+    impl DimEditBuffers {
+        fn sync(&mut self, live: &[(EntityId, DimKind, DimAnnotation)]) -> bool {
+            sync_dim_edit_state(
+                &mut self.edit_target,
+                live,
+                &mut self.tol_editing,
+                &mut self.tol_symmetric_input,
+                &mut self.tol_upper_input,
+                &mut self.tol_lower_input,
+                &mut self.tol_fit_input,
+                &mut self.tol_input_error,
+                &mut self.decimals_editing,
+                &mut self.decimals_input,
+                &mut self.decimals_input_error,
+                &mut self.value_override_input,
+            )
+        }
+    }
+
+    #[test]
+    fn sync_dim_edit_state_resyncs_buffers_when_selection_changes() {
+        // (a) 寸法Aの入力途中に選択をBへ切り替えると、Aの入力がBへ持ち越されない
+        // （Codex adversarial review 2026-09-04 指摘。main.rs の元コードは入力欄が
+        // 選択集合に紐付いておらず、A用の値がBへ誤って ModifyEntity されうる欠陥があった）。
+        let mut document = Document::new();
+        let id_a = add_test_dim_linear(&mut document);
+        let id_b = add_test_dim_linear(&mut document);
+
+        let mut buffers = DimEditBuffers::default();
+        let live_a = vec![(id_a, DimKind::Linear, DimAnnotation::default())];
+        assert!(buffers.sync(&live_a), "初回同期は必ず変化扱い");
+
+        // Aの入力途中を模す（確定ボタンはまだ押していない）。
+        buffers.tol_editing = Some(DimTolKindUi::Symmetric);
+        buffers.tol_symmetric_input = "0.05".to_string();
+        buffers.decimals_editing = true;
+        buffers.decimals_input = "3".to_string();
+        buffers.value_override_input = "A用の入力".to_string();
+
+        // 選択をBへ切り替え。
+        let live_b = vec![(id_b, DimKind::Linear, DimAnnotation::default())];
+        let changed = buffers.sync(&live_b);
+
+        assert!(changed, "選択集合が変わったので再同期が起きる");
+        assert_eq!(
+            buffers.tol_editing, None,
+            "A の公差編集モードが残ってはいけない"
+        );
+        assert!(
+            !buffers.decimals_editing,
+            "A の桁数編集状態が B へ残ってはいけない"
+        );
+        assert!(
+            buffers.tol_symmetric_input.is_empty(),
+            "A の対称公差入力が残ってはいけない: {:?}",
+            buffers.tol_symmetric_input
+        );
+        assert!(
+            buffers.decimals_input.is_empty(),
+            "B は decimals_override が None（共通値なし扱い）なので空欄になる: {:?}",
+            buffers.decimals_input
+        );
+        assert!(
+            buffers.value_override_input.is_empty(),
+            "A の表示値上書き入力が B へ持ち越されてはいけない: {:?}",
+            buffers.value_override_input
+        );
+
+        // 選択が変わらないフレームでは何もしない（入力途中の文字列を消さない）。
+        buffers.tol_symmetric_input = "0.10".to_string();
+        let changed_again = buffers.sync(&live_b);
+        assert!(!changed_again);
+        assert_eq!(buffers.tol_symmetric_input, "0.10");
+    }
+
+    #[test]
+    fn sync_dim_edit_state_loads_existing_value_override_without_clearing_it() {
+        // (b) 既に value_override を持つ寸法を選ぶと、入力欄にその値が読み込まれる
+        // （読み込まれないと、空欄のまま「確定」を押して既存値を消してしまう事故につながる）。
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document);
+        let annotation = DimAnnotation {
+            value_override: Some("5-10".to_string()),
+            ..DimAnnotation::default()
+        };
+        let live = vec![(id, DimKind::Linear, annotation.clone())];
+
+        let mut buffers = DimEditBuffers::default();
+        buffers.sync(&live);
+
+        assert_eq!(
+            buffers.value_override_input, "5-10",
+            "既存の表示値上書きが入力欄へ読み込まれること"
+        );
+
+        // dim_panel 側のガード契約: 読み込まれた値のまま「確定」相当の処理（空でなければ
+        // 適用）をしても、既存値が意図せず None へ落ちない（消去は「解除」ボタンのみ）。
+        let trimmed = buffers.value_override_input.trim();
+        assert!(!trimmed.is_empty(), "既存値が空欄化されていないこと");
+        assert_eq!(Some(trimmed.to_string()), annotation.value_override);
+    }
+
+    // -----------------------------------------------------------------
+    // A: 桁数「スタイルに従う」チェックの状態遷移（差し戻し対応）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dim_decimals_follow_style_checked_does_not_snap_back_right_after_unchecking() {
+        // 外す前: 編集中でなく、全件が None（スタイルに従う）→ チェック済み。
+        assert!(dim_decimals_follow_style_checked(false, true));
+
+        // 外した直後: まだ decimals_override は適用していない（all_follow_style は
+        // 依然 true）が、editing フラグが立っているので未チェックのまま
+        // （＝これが無いと「残像」バグが起きる）。
+        assert!(!dim_decimals_follow_style_checked(true, true));
+
+        // 確定して Some(n) を適用した後: all_follow_style は false になり、
+        // editing フラグはそのまま true → 引き続き未チェック（編集欄を出し続ける）。
+        assert!(!dim_decimals_follow_style_checked(true, false));
+
+        // 再チェック（editing フラグを false へ戻す）: all_follow_style も
+        // None へ戻した結果 true になっていれば、チェック済み表示に戻る。
+        assert!(dim_decimals_follow_style_checked(false, true));
+
+        // 編集中でなくても、選択の一部/全部が既に明示上書き済みなら未チェック
+        // （選択直後、ユーザー操作を経ずに欄が表示されるケース）。
+        assert!(!dim_decimals_follow_style_checked(false, false));
+    }
+
+    #[test]
+    fn dim_decimals_editing_flag_drives_the_full_toggle_confirm_recheck_sequence() {
+        // A の状態遷移を実際の `DimEditBuffers`（sync_dim_edit_state と同じ経路）で
+        // 一通り確認する: 外す→編集状態、確定→Some、再チェック→None。
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document);
+        let mut buffers = DimEditBuffers::default();
+        let mut live = vec![(id, DimKind::Linear, DimAnnotation::default())];
+        buffers.sync(&live);
+
+        // 初期状態: 選択中の寸法は decimals_override = None なのでチェック済み。
+        let all_follow_style = live.iter().all(|(_, _, a)| a.decimals_override.is_none());
+        assert!(dim_decimals_follow_style_checked(
+            buffers.decimals_editing,
+            all_follow_style
+        ));
+
+        // 「外す」操作（dim_panel のチェックボックス changed 分岐、follow_style=false 側）。
+        buffers.decimals_editing = true;
+        buffers.decimals_input = "3".to_string();
+        // コマンドはまだ適用しない → 注記は不変。
+        assert_eq!(live[0].2.decimals_override, None);
+        assert!(!dim_decimals_follow_style_checked(
+            buffers.decimals_editing,
+            all_follow_style
+        ));
+
+        // 「確定」操作: decimals_override = Some(3) を適用する
+        // （build_annotation_edit_commands 経由、実際の dim_panel と同じ経路）。
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |a| {
+            a.decimals_override = Some(3);
+        });
+        assert!(errs.is_empty());
+        document.apply(Command::Batch(cmds)).unwrap();
+        let EntityGeom::DimLinear(dim) = &document.entity(id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim.annotation.decimals_override, Some(3));
+        live[0].2 = dim.annotation.clone();
+        let all_follow_style = live.iter().all(|(_, _, a)| a.decimals_override.is_none());
+        // 確定後も editing フラグは維持され、欄は表示され続ける。
+        assert!(buffers.decimals_editing);
+        assert!(!dim_decimals_follow_style_checked(
+            buffers.decimals_editing,
+            all_follow_style
+        ));
+
+        // 「再チェック」操作: decimals_override = None を適用し、editing を終える。
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |a| {
+            a.decimals_override = None;
+        });
+        assert!(errs.is_empty());
+        document.apply(Command::Batch(cmds)).unwrap();
+        buffers.decimals_editing = false;
+        let EntityGeom::DimLinear(dim) = &document.entity(id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim.annotation.decimals_override, None);
+        live[0].2 = dim.annotation.clone();
+        let all_follow_style = live.iter().all(|(_, _, a)| a.decimals_override.is_none());
+        assert!(dim_decimals_follow_style_checked(
+            buffers.decimals_editing,
+            all_follow_style
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // B: 選択集合の内訳表示（差し戻し対応）
+    // -----------------------------------------------------------------
+
+    /// `dim_combo_id_salt` が `ComboBox` の実際のポップアップ `Id` を見ていることの
+    /// 回帰テスト（ヘッドレスの `egui::Context` でフレームを回す）。ボタン `Id` の
+    /// 計算を `IdSalt::new` で包み忘れると `ComboBox::is_open` が常に `false` になり、
+    /// 閉じてもエポックが進まない（2026-09-05 に実機で再現した不具合）。
+    #[test]
+    fn dim_combo_id_salt_advances_the_epoch_after_the_popup_closes() {
+        let ctx = egui::Context::default();
+        let observed = std::cell::Cell::new(("", 0u64));
+        let popup_id = std::cell::Cell::new(egui::Id::NULL);
+        let frame = |ctx: &egui::Context| {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let salt = dim_combo_id_salt(ui, "test_combo");
+                observed.set(salt);
+                let button_id = ui.make_persistent_id(egui::IdSalt::new(salt));
+                popup_id.set(button_id.with("popup"));
+                egui::ComboBox::from_id_salt(salt)
+                    .selected_text("x")
+                    .show_ui(ui, |ui| {
+                        let _ = ui.selectable_label(false, "a");
+                    });
+            });
+        };
+        frame(&ctx);
+        frame(&ctx);
+        assert_eq!(observed.get().1, 0, "開閉前はエポック 0");
+
+        egui::Popup::open_id(&ctx, popup_id.get());
+        frame(&ctx);
+        frame(&ctx);
+        assert_eq!(observed.get().1, 0, "開いている間はエポックを変えない");
+
+        egui::Popup::close_id(&ctx, popup_id.get());
+        frame(&ctx);
+        frame(&ctx);
+        assert_eq!(observed.get().1, 1, "閉じた直後にエポックが 1 進む");
+
+        frame(&ctx);
+        assert_eq!(observed.get().1, 1, "閉じたままでは進まない");
+    }
+
+    #[test]
+    fn dim_selection_summary_counts_each_kind() {
+        let mut document = Document::new();
+        let linear = add_test_dim_linear(&mut document);
+        let layer = document.current_layer();
+        let radial = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimRadial(DimRadial {
+                    center: Point2::ORIGIN,
+                    radius: 5.0,
+                    leader_angle: 0.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let diameter = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimDiameter(DimDiameter {
+                    center: Point2::ORIGIN,
+                    radius: 5.0,
+                    angle: 0.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
+        let live = vec![
+            (linear, DimKind::Linear, DimAnnotation::default()),
+            (radial, DimKind::Radial, DimAnnotation::default()),
+            (diameter, DimKind::Diameter, DimAnnotation::default()),
+        ];
+        assert_eq!(
+            dim_selection_summary(&live),
+            "選択中: 3 件(長さ 1・半径 1・直径 1)"
+        );
+
+        // 単一種別のみ（長さ寸法だけを選び直したはずが、累積選択で直径寸法が
+        // 残っている状況を模す: B の再現）。
+        let mixed = vec![
+            (linear, DimKind::Linear, DimAnnotation::default()),
+            (diameter, DimKind::Diameter, DimAnnotation::default()),
+        ];
+        assert_eq!(
+            dim_selection_summary(&mixed),
+            "選択中: 2 件(長さ 1・半径 0・直径 1)"
         );
     }
 }

@@ -41,8 +41,8 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimAnnotation, DimLinear, DimRadial, Document, Entity, EntityGeom, EntityId, LayerId,
-    Linetype, NewIds, Style,
+    Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, Document, Entity, EntityGeom,
+    EntityId, LayerId, Linetype, NewIds, Style,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -1142,6 +1142,116 @@ impl Tool for DimRadialTool {
     fn on_circle_pick(&mut self, hit: CirclePick) {
         if matches!(self.state, DimRadialState::WaitingCircle) {
             self.state = DimRadialState::WaitingLeader {
+                center: hit.center,
+                radius: hit.radius,
+            };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 直径寸法（DimDiameter、M9 設計判断3）
+// ---------------------------------------------------------------------
+
+/// 直径寸法ツール（`G`）の状態。[`DimRadialTool`] と同じ 2 段（円/円弧のヒットテスト →
+/// 寸法線方向のクリック）を踏襲する。半径寸法との違いは、2 クリック目が引出線ではなく
+/// 中心を通る寸法線（直径線）の向きを決める点のみ。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum DimDiameterState {
+    /// 円／円弧のヒットテスト待ち（1 クリック目）。app 層が当てて [`Tool::on_circle_pick`]
+    /// で結果を渡す。
+    #[default]
+    WaitingCircle,
+    /// 寸法線方向のクリック待ち（2 クリック目）。中心・半径は採取済み。
+    WaitingLine { center: Point2, radius: f64 },
+}
+
+/// 直径寸法ツール（`G`）。円／円弧をヒットテストで拾い（それ以外は app 層が拒否）、
+/// 寸法線方向のクリックで [`EntityGeom::DimDiameter`] を確定する（[`DimRadialTool`] と
+/// 同じ操作系を踏襲。DESIGN.md M9 タスク50 「既存 DimRadial の操作系をそのまま踏襲」）。
+/// 半径寸法へ φ を上書きする運用（R12 と φ24 の取り違え）を避けるための独立ツール
+/// （DESIGN.md M9 設計判断3）。
+#[derive(Debug, Default)]
+pub struct DimDiameterTool {
+    state: DimDiameterState,
+    cursor: Option<Point2>,
+}
+
+impl Tool for DimDiameterTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                // 1 クリック目は円ヒットテスト（app 層が on_circle_pick 経由で処理する）。
+                DimDiameterState::WaitingCircle => ToolResult::Continue,
+                DimDiameterState::WaitingLine { center, radius } => {
+                    // クリックが中心とほぼ一致すると寸法線の向きが定まらない
+                    // （DimRadialTool の引出方向と同じ退化条件）。
+                    if p.distance(center) <= DIM_DEGENERATE_EPSILON {
+                        ToolResult::Rejected(
+                            "Diameter dim: dimension line direction undefined at center",
+                        )
+                    } else {
+                        let angle = (p - center).angle();
+                        let cmd = Command::AddEntity(Entity::new(
+                            EntityGeom::DimDiameter(DimDiameter {
+                                center,
+                                radius,
+                                angle,
+                                // 作図直後は無注記(φ 記号は展開側が既定で付ける)。
+                                annotation: DimAnnotation::default(),
+                            }),
+                            ctx.layer,
+                            ctx.style,
+                        ));
+                        self.state = DimDiameterState::WaitingCircle;
+                        ToolResult::Commit(cmd)
+                    }
+                }
+            },
+            InputEvent::Cancel => {
+                self.state = DimDiameterState::WaitingCircle;
+                ToolResult::Cancel
+            }
+            InputEvent::Confirm => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        render: crate::dimension::DimRender<'_>,
+    ) {
+        if let (DimDiameterState::WaitingLine { center, radius }, Some(cursor)) =
+            (self.state, self.cursor)
+        {
+            if cursor.distance(center) <= DIM_DEGENERATE_EPSILON {
+                return;
+            }
+            let angle = (cursor - center).angle();
+            let dim = DimDiameter {
+                center,
+                radius,
+                angle,
+                annotation: DimAnnotation::default(),
+            };
+            let ex = crate::dimension::expand_diameter(&dim, render);
+            crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
+        }
+    }
+
+    fn wants_circle_pick(&self) -> bool {
+        matches!(self.state, DimDiameterState::WaitingCircle)
+    }
+
+    fn on_circle_pick(&mut self, hit: CirclePick) {
+        if matches!(self.state, DimDiameterState::WaitingCircle) {
+            self.state = DimDiameterState::WaitingLine {
                 center: hit.center,
                 radius: hit.radius,
             };
@@ -4870,6 +4980,63 @@ mod tests {
         assert!(tool.wants_circle_pick());
     }
 
+    // --- 直径寸法ツール（DimDiameter）---
+
+    #[test]
+    fn dim_diameter_tool_wants_circle_pick_then_line() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimDiameterTool::default();
+
+        // 1 クリック目は円ヒットテスト段階。
+        assert!(tool.wants_circle_pick());
+        tool.on_circle_pick(CirclePick {
+            center: Point2::new(1.0, 2.0),
+            radius: 5.0,
+        });
+        assert!(!tool.wants_circle_pick());
+
+        // 寸法線方向のクリックで確定。angle は中心→クリックの角度（+x 方向 → 0）。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 2.0))));
+        let EntityGeom::DimDiameter(dim) = geom else {
+            panic!("expected DimDiameter, got {geom:?}");
+        };
+        assert!(dim.center.distance(Point2::new(1.0, 2.0)) < 1e-9);
+        assert!((dim.radius - 5.0).abs() < 1e-9);
+        assert!(dim.angle.abs() < 1e-9);
+        // 確定後は円ヒットテスト段階へ戻る。
+        assert!(tool.wants_circle_pick());
+    }
+
+    #[test]
+    fn dim_diameter_tool_rejects_line_at_center() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimDiameterTool::default();
+        let center = Point2::new(1.0, 2.0);
+        tool.on_circle_pick(CirclePick {
+            center,
+            radius: 5.0,
+        });
+
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(center)),
+            ToolResult::Rejected("Diameter dim: dimension line direction undefined at center")
+        );
+        assert!(!tool.wants_circle_pick());
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 2.0))));
+        assert!(matches!(geom, EntityGeom::DimDiameter(_)));
+    }
+
+    #[test]
+    fn dim_diameter_tool_click_in_circle_stage_is_noop() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimDiameterTool::default();
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(3.0, 3.0))),
+            ToolResult::Continue
+        );
+        assert!(tool.wants_circle_pick());
+    }
+
     // --- pick_circle_or_arc（app 層ヒットテスト）---
 
     #[test]
@@ -6035,6 +6202,70 @@ mod tests {
         let mut tool = SelectTool::default();
         tool.on_click(&doc, Point2::new(0.0, 3.0), 0.1, false);
         assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn selecting_a_different_dimension_without_shift_accumulates_rather_than_replaces() {
+        // main.rs の寸法パネルで報告された不具合B（「直径寸法を一度選んで以降、長さ寸法
+        // 単体を選んでも記号コンボが φ/Sφ のまま」「別の寸法を選び直しても(混在)表示に
+        // なる」）の原因を再現・固定する回帰テスト。
+        //
+        // 原因（事実）: `SelectTool::on_click` は shift 無しクリックを**常に既存の選択へ
+        // 追加する**累積方式であり（本メソッドの doc 参照）、
+        // `click_accumulates_selection_without_duplicates` で既にテスト・保証されている
+        // M9以前からの意図的な仕様である。ピックの距離計算（`linear_distance`/
+        // `diameter_distance` 等）の誤ヒットではない ── 別の寸法をクリックしても
+        // 前回の選択（直径寸法）は解除されず、選択集合に残り続ける。
+        //
+        // dim_panel はこの選択集合をそのまま `live` として使うため、直径寸法が
+        // 生き残っていれば記号コンボの共通部分が φ/Sφ に絞られ、種別が混在すれば
+        // 「(混在)」表示になる。dim_panel 自体のバグではなく、選択を明示的に解除
+        // （Shift クリックまたは Esc）しない限りクリックが積み上がる、という既存の
+        // 選択モデルの結果である。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let diameter = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimDiameter(DimDiameter {
+                    center: Point2::ORIGIN,
+                    radius: 5.0,
+                    angle: 0.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let linear = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(20.0, 0.0),
+                    p2: Point2::new(24.0, 0.0),
+                    offset: 2.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
+        let mut tool = SelectTool::default();
+        // 直径寸法をクリックして選択。
+        tool.on_click(&doc, Point2::new(-3.0, 0.02), 0.1, false);
+        assert_eq!(tool.selection(), &[diameter]);
+
+        // 「選び直した」つもりで、shift を押さずに別の寸法（長さ寸法）をクリック。
+        tool.on_click(&doc, Point2::new(22.0, 2.02), 0.1, false);
+        // 置き換わらず、直径寸法が選択に残ったまま長さ寸法が追加される
+        // （これが dim_panel を混在表示にする実体）。
+        assert_eq!(tool.selection(), &[diameter, linear]);
+
+        // Shift クリックで直径寸法だけを明示的に外せば、長さ寸法単体になる
+        // （記号コンボが φ/Sφ に狭まる問題の正しい回避策）。
+        tool.on_click(&doc, Point2::new(-3.0, 0.02), 0.1, true);
+        assert_eq!(tool.selection(), &[linear]);
     }
 
     // --- snaps_shape_pick（分割ツールのスナップ対応） ---

@@ -22,6 +22,15 @@
 //! 一切反映しない。反映すると「同じクリックがズームによって当たったり外れたりする」
 //! 不具合（M6 タスク24 の前例）を招くためである。
 //!
+//! # 文字ブロックの当たり判定は例外（M9 タスク51、設計判断7）
+//!
+//! [`DimExpansion::label_box`] は**表示サイズ依存**（`DimRender` を通した展開結果）で、
+//! 上記のズーム非依存 pick 契約とは別の当たり判定に使う。対象は**選択済み**の寸法の
+//! 文字ブロックドラッグ（`text_anchor` の後編集）に限られ、`linear_pick_segments` 等の
+//! 通常選択の pick 形状には一切混ぜない。表示サイズに依存してよい理由は、これが
+//! 「掴める場所を見た目どおりに掴む」操作であり、ズームで当たり外れが変わっても
+//! 実害がない（選択そのものを左右しない）ため。
+//!
 //! # 展開パラメータ（M9 タスク49-2）
 //!
 //! 展開関数は [`DimRender`] を受け取る。**このモジュールは紙基準表示トグル（F9）も
@@ -87,6 +96,13 @@ pub struct DimExpansion {
     /// 画面（`draw_dim_expansion`）と出力（`plot::push_dim`）のどちらも寸法線と同じ
     /// ストロークで描く。
     pub symbol_strokes: Vec<Shape>,
+    /// 文字ブロックの外形（[`label::DimLabel::bounds`] をワールドへ写した凸四角形）。
+    ///
+    /// 頂点順は `[左下, 右下, 右上, 左上]`（ラベルのローカル軸に沿う。回転しても平行四辺形
+    /// のまま歪まない）。**M9 タスク51**（文字位置の後編集）の当たり判定・ドラッグ対象の
+    /// 可視化に使う。`place_label` を呼ばない経路は素通しで `None` のまま
+    /// （現状すべての展開関数が `place_label` を通るため実質常に `Some`）。
+    pub label_box: Option<[Point2; 4]>,
 }
 
 impl DimExpansion {
@@ -97,8 +113,41 @@ impl DimExpansion {
             arrows,
             texts: Vec::new(),
             symbol_strokes: Vec::new(),
+            label_box: None,
         }
     }
+}
+
+/// 凸四角形 `quad`（[`DimExpansion::label_box`] と同じ頂点順）が点 `p` を含むか。
+///
+/// 頂点順（時計回り・反時計回りいずれか一定方向）を前提に、各辺について `p` が
+/// 同じ側にあるかを符号付き外積で判定する（すべて同符号 = 内側）。`label_box` は
+/// 常に矩形を回転しただけの凸四角形なので、この単純な判定で十分。
+#[must_use]
+pub fn label_box_contains(quad: &[Point2; 4], p: Point2) -> bool {
+    let mut sign = 0.0_f64;
+    for i in 0..4 {
+        let a = quad[i];
+        let b = quad[(i + 1) % 4];
+        let edge = b - a;
+        let to_p = p - a;
+        let cross = edge.x * to_p.y - edge.y * to_p.x;
+        if cross == 0.0 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+/// 凸四角形 `quad`（[`DimExpansion::label_box`] と同じ頂点順）の中心（対角線の交点）。
+#[must_use]
+pub fn label_box_center(quad: &[Point2; 4]) -> Point2 {
+    quad[0].midpoint(quad[2])
 }
 
 // ---------------------------------------------------------------------
@@ -317,6 +366,13 @@ fn place_label(label: &DimLabel, center: Point2, along: Vec2, out: &mut DimExpan
     if let Some([a, b]) = label.underline {
         out.segments.push([to_world(a), to_world(b)]);
     }
+    let bounds = label.bounds;
+    out.label_box = Some([
+        to_world(Point2::new(bounds.min.x, bounds.min.y)),
+        to_world(Point2::new(bounds.max.x, bounds.min.y)),
+        to_world(Point2::new(bounds.max.x, bounds.max.y)),
+        to_world(Point2::new(bounds.min.x, bounds.max.y)),
+    ]);
 }
 
 /// 直線的な寸法線を持つ寸法（長さ寸法・直径寸法）の共通展開。
@@ -2000,5 +2056,55 @@ mod tests {
         let [ua, _] = unit.underline.expect("下線");
         let [sa, _] = scaled.underline.expect("下線");
         assert!((sa.y - ua.y * 10.0).abs() < T);
+    }
+
+    // --- 文字ブロック外形（M9 タスク51） ---
+
+    #[test]
+    fn expand_linear_label_box_encloses_the_label_centre() {
+        // 自動配置時、`label_box` の中心はラベルの表示中心（＝ `place_label` が置いた点）
+        // と一致し、四隅は必ずその中心を囲む（凸四角形として退化していない限り）。
+        let dim = plain_linear(Point2::new(0.0, 0.0), Point2::new(4.0, 0.0), 2.0);
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        let quad = ex.label_box.expect("label_box が展開されている");
+        let center = label_box_center(&quad);
+        assert!(label_box_contains(&quad, center));
+        // 四隅は退化しない（幅・高さがゼロでない）。
+        assert!(quad[0].distance(quad[1]) > T);
+        assert!(quad[1].distance(quad[2]) > T);
+    }
+
+    #[test]
+    fn expand_linear_label_box_is_centred_on_the_text_anchor() {
+        // `text_anchor` を指定すると、`label_box` の中心はその点になる
+        // （`place_label` が外形の中心を `center` へ置く、という既存の配置規則どおり）。
+        let anchor = Point2::new(-10.0, 7.0);
+        let dim = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 2.0,
+            annotation: DimAnnotation {
+                text_anchor: Some(anchor),
+                ..DimAnnotation::default()
+            },
+        };
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        let quad = ex.label_box.expect("label_box が展開されている");
+        assert!(approx(label_box_center(&quad), anchor));
+    }
+
+    #[test]
+    fn label_box_contains_checks_convex_quad_membership() {
+        // 軸並行の正方形 [0,0]-[2,0]-[2,2]-[0,2] で内外を確かめる。
+        let quad = [
+            Point2::new(0.0, 0.0),
+            Point2::new(2.0, 0.0),
+            Point2::new(2.0, 2.0),
+            Point2::new(0.0, 2.0),
+        ];
+        assert!(label_box_contains(&quad, Point2::new(1.0, 1.0)));
+        assert!(label_box_contains(&quad, Point2::new(0.0, 0.0))); // 境界も含む
+        assert!(!label_box_contains(&quad, Point2::new(3.0, 1.0)));
+        assert!(!label_box_contains(&quad, Point2::new(1.0, -0.1)));
     }
 }

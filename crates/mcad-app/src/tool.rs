@@ -1927,11 +1927,37 @@ struct DragState {
 }
 
 /// ドラッグ中のプレビュー描画に必要な情報（`McadApp` の描画層向けの公開ビュー）。
-/// ドラッグは矩形選択専用なので矩形プレビューのみを表す。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DragPreview {
     /// 矩形選択のプレビュー（2 隅のワールド座標）。
     Rect { start: Point2, current: Point2 },
+    /// 寸法の文字ブロックドラッグのプレビュー（M9 タスク51）。`id` の寸法を
+    /// `text_anchor = Some(anchor)` に差し替えた一時コピーで描く（`main.rs` 側の責務）。
+    DimText { id: EntityId, anchor: Point2 },
+}
+
+/// 進行中の寸法文字ブロックドラッグ（M9 タスク51、設計判断7）。
+///
+/// # なぜ [`DragState`]（矩形選択）と別立てにするのか
+///
+/// 矩形選択は「選択集合を書き換えるだけ」で `Document` を変えないが、文字ドラッグは
+/// 確定時に `text_anchor` の `ModifyEntity` を生む。対象も単一エンティティ（ドラッグ
+/// 開始点でヒットした寸法）で、矩形選択の「複数を内包判定」とは意味論が異なる。
+/// ヒット判定自体（表示サイズ依存の `label_box`）は `main.rs` の `dim_label_hit` が
+/// 展開結果から解決してからここへ渡す（`pick`/`linear_pick_segments` 等のズーム
+/// 非依存 pick 契約は変更しない、という設計判断7の要請どおり）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TextDragState {
+    /// ドラッグ対象の寸法エンティティ。
+    id: EntityId,
+    /// ドラッグ開始時点のラベル外形中心（現在の `text_anchor` 相当。自動配置中の
+    /// 寸法なら自動配置結果の中心）。
+    label_center: Point2,
+    /// ドラッグ開始点（ワールド）。移動量 `current - grab` を `label_center` へ足して
+    /// 新しい中心にする。
+    grab: Point2,
+    /// カーソル追従用の現在位置。
+    current: Point2,
 }
 
 // ---------------------------------------------------------------------
@@ -2159,10 +2185,13 @@ pub struct SelectTool {
     /// 進行中のオフセットモード（`O`、単一エンティティ対象の1クリック操作）。無ければ `None`。
     /// 配置モードと同様、アクティブな間は通常の選択入力より優先される（入力ゲート）。
     offset: Option<OffsetState>,
+    /// 進行中の寸法文字ブロックドラッグ（M9 タスク51）。無ければ `None`。矩形選択ドラッグ
+    /// とは排他（[`SelectTool::start_text_drag`] が `drag` を破棄する）。
+    text_drag: Option<TextDragState>,
 }
 
 /// エンティティの所属レイヤーが可視か（非表示レイヤーは描画・ヒットテスト対象外）。
-fn layer_visible(document: &Document, entity: &Entity) -> bool {
+pub(crate) fn layer_visible(document: &Document, entity: &Entity) -> bool {
     document.layer(entity.layer).is_some_and(|l| l.visible)
 }
 
@@ -2188,9 +2217,22 @@ impl SelectTool {
         self.selection.retain(|&id| document.entity(id).is_some());
     }
 
-    /// ドラッグ中のプレビュー情報（矩形選択枠）。ドラッグしていなければ `None`。
+    /// ドラッグ中のプレビュー情報（矩形選択枠、または文字ブロックドラッグ）。
+    /// どちらもドラッグしていなければ `None`。
     #[must_use]
     pub fn drag_preview(&self) -> Option<DragPreview> {
+        if let Some(TextDragState {
+            id,
+            label_center,
+            grab,
+            current,
+        }) = self.text_drag
+        {
+            return Some(DragPreview::DimText {
+                id,
+                anchor: label_center + (current - grab),
+            });
+        }
         self.drag
             .map(|DragState { start, current }| DragPreview::Rect { start, current })
     }
@@ -2255,11 +2297,68 @@ impl SelectTool {
         });
     }
 
-    /// ドラッグ中の現在位置を更新する（プレビュー用）。ドラッグしていなければ無視。
+    /// ドラッグ中の現在位置を更新する（プレビュー用）。矩形選択・文字ブロックドラッグの
+    /// どちらが進行中でもこの1つで済む（同時には進行しない排他関係のため優先順位は
+    /// 問わない）。どちらもしていなければ無視。
     pub fn on_drag(&mut self, world: Point2) {
-        if let Some(DragState { current, .. }) = &mut self.drag {
+        if let Some(TextDragState { current, .. }) = &mut self.text_drag {
+            *current = world;
+        } else if let Some(DragState { current, .. }) = &mut self.drag {
             *current = world;
         }
+    }
+
+    /// 寸法の文字ブロックドラッグを開始する（M9 タスク51）。`label_center` はドラッグ
+    /// 開始時点のラベル外形中心（`main.rs` の `dim_label_hit` が展開結果から求める）、
+    /// `world` はドラッグ開始点。矩形選択ドラッグとは排他なので、進行中の `drag` は破棄する。
+    pub fn start_text_drag(&mut self, id: EntityId, label_center: Point2, world: Point2) {
+        self.drag = None;
+        self.text_drag = Some(TextDragState {
+            id,
+            label_center,
+            grab: world,
+            current: world,
+        });
+    }
+
+    /// 進行中の文字ブロックドラッグか。
+    #[must_use]
+    pub fn is_text_dragging(&self) -> bool {
+        self.text_drag.is_some()
+    }
+
+    /// 文字ブロックドラッグを確定する。移動量（`world - grab`）が `tol`（ワールド単位、
+    /// ピック許容量）未満なら誤操作とみなし履歴を汚さず `None` を返す。それ以外は
+    /// `label_center + (world - grab)` を新しい `text_anchor` として書いた
+    /// `Command::ModifyEntity` を返す（呼び出し側が `Document::apply` する）。
+    /// ドラッグ中でなければ `None`。対象エンティティが消えている（undo/redo 等）場合も
+    /// `None`（ドラッグ状態は破棄する）。
+    #[must_use]
+    pub fn end_text_drag(
+        &mut self,
+        document: &Document,
+        world: Point2,
+        tol: f64,
+    ) -> Option<Command> {
+        let TextDragState {
+            id,
+            label_center,
+            grab,
+            ..
+        } = self.text_drag.take()?;
+        let delta = world - grab;
+        if delta.length() < tol {
+            return None;
+        }
+        let entity = document.entity(id)?;
+        let (kind, annotation) = crate::dim_kind_and_annotation(&entity.geom)?;
+        let mut new_annotation = annotation.clone();
+        new_annotation.text_anchor = Some(label_center + delta);
+        if new_annotation.validate(kind).is_err() {
+            return None;
+        }
+        let new_geom = crate::dim_geom_with_annotation(&entity.geom, new_annotation)?;
+        Some(Command::ModifyEntity { id, new_geom })
     }
 
     /// 矩形選択ドラッグの確定。ドラッグ矩形に **完全内包** される可視エンティティを
@@ -2294,7 +2393,10 @@ impl SelectTool {
     /// 配置モード（複製・移動）中の Esc は呼び出し側で別経路として先に処理され、
     /// ここには来ない。
     pub fn on_cancel(&mut self) {
-        if self.drag.is_some() {
+        if self.text_drag.is_some() {
+            // 文字ドラッグ中の Esc はそれだけを破棄する（矩形選択の中断と同じ扱い）。
+            self.text_drag = None;
+        } else if self.drag.is_some() {
             self.drag = None;
         } else {
             self.selection.clear();
@@ -2560,6 +2662,16 @@ impl SelectTool {
     /// Document は一切変更しない。選択集合も変えない。
     pub fn cancel_offset(&mut self) {
         self.offset = None;
+    }
+
+    /// 進行中の寸法文字ブロックドラッグを破棄する（Esc・ツール切替・ファイル操作・
+    /// モーダル表示・undo/redo から呼ぶ）。確定（[`SelectTool::end_text_drag`]）を
+    /// 経ない限り Document は変更しないが、確定すれば Document を変更しうるドラッグ
+    /// なので、配置・オフセットと同じリセット経路で必ず破棄する
+    /// （`cancel_placement` / `cancel_offset` を呼ぶ箇所は必ずこれも呼ぶ）。選択集合は
+    /// 変えない。
+    pub fn cancel_text_drag(&mut self) {
+        self.text_drag = None;
     }
 
     /// オフセットのプレビュー形状（いま確定した場合の結果ゴースト）。退化して結果を
@@ -6281,5 +6393,92 @@ mod tests {
     #[test]
     fn snaps_shape_pick_true_only_for_split() {
         assert!(SplitTool::default().snaps_shape_pick());
+    }
+
+    // --- 文字ブロックドラッグ（M9 タスク51） ---
+
+    fn doc_with_linear_dim() -> (Document, EntityId) {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(0.0, 0.0),
+                    p2: Point2::new(4.0, 0.0),
+                    offset: 2.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        (doc, id)
+    }
+
+    #[test]
+    fn start_then_end_text_drag_yields_modify_entity_with_the_expected_anchor() {
+        let (doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        let label_center = Point2::new(2.0, 3.5);
+        let grab = Point2::new(2.0, 3.5);
+        tool.start_text_drag(id, label_center, grab);
+        assert!(tool.is_text_dragging());
+        tool.on_drag(Point2::new(5.0, 6.5)); // 移動量 (3,3)
+
+        let cmd = tool
+            .end_text_drag(&doc, Point2::new(5.0, 6.5), 0.1)
+            .expect("移動量が tol を超えるので Some");
+        match cmd {
+            Command::ModifyEntity {
+                id: modified_id,
+                new_geom: EntityGeom::DimLinear(dim),
+            } => {
+                assert_eq!(modified_id, id);
+                assert_eq!(dim.annotation.text_anchor, Some(Point2::new(5.0, 6.5)));
+            }
+            other => panic!("expected ModifyEntity(DimLinear), got {other:?}"),
+        }
+        // ドラッグ状態は確定後に破棄されている。
+        assert!(!tool.is_text_dragging());
+    }
+
+    #[test]
+    fn end_text_drag_below_tolerance_returns_none_and_does_not_touch_history() {
+        let (doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        let grab = Point2::new(2.0, 3.5);
+        tool.start_text_drag(id, grab, grab);
+        // 移動量 0.01 < tol 0.1 なので誤操作扱い。
+        let result = tool.end_text_drag(&doc, Point2::new(2.01, 3.5), 0.1);
+        assert_eq!(result, None);
+        assert!(!tool.is_text_dragging());
+    }
+
+    #[test]
+    fn on_cancel_during_text_drag_discards_only_the_drag() {
+        let (_doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![id]);
+        tool.start_text_drag(id, Point2::new(2.0, 3.5), Point2::new(2.0, 3.5));
+        assert!(tool.is_text_dragging());
+        tool.on_cancel();
+        assert!(!tool.is_text_dragging());
+        // 選択集合は Esc の1段階目（ドラッグ中断）では消えない。
+        assert_eq!(tool.selection(), &[id]);
+    }
+
+    #[test]
+    fn cancel_text_drag_discards_drag_but_keeps_selection() {
+        // ファイル操作・モーダル・undo/redo・ツール切替のリセット経路
+        // （`cancel_placement` / `cancel_offset` と同じ経路）で使う破棄口。
+        let (_doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![id]);
+        tool.start_text_drag(id, Point2::new(2.0, 3.5), Point2::new(2.0, 3.5));
+        assert!(tool.is_text_dragging());
+        tool.cancel_text_drag();
+        assert!(!tool.is_text_dragging());
+        assert_eq!(tool.selection(), &[id]);
     }
 }

@@ -42,7 +42,7 @@ use tool::{
     ArcTool, CircleTool, DimDiameterTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool,
     FilletTool, InputEvent, LineTool, OffsetOutcome, PlacementKind, PlacementOutcome,
     PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TextTool, Tool, ToolCtx,
-    ToolResult, TrimTool,
+    ToolResult, TrimTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -1036,6 +1036,7 @@ impl McadApp {
         self.select_tool.clear_selection();
         self.select_tool.cancel_placement();
         self.select_tool.cancel_offset();
+        self.select_tool.cancel_text_drag();
         // 読込前の距離・半径入力は持ち越さない（別図面では意味が変わるため）。
         self.offset_distance_input.clear();
         self.fillet_radius_input.clear();
@@ -1080,6 +1081,7 @@ impl McadApp {
         // オフセットモードも解除する（対象が undo/redo で消えたり、選択の意図が崩れたら
         // 宙ぶらりんのオフセットを残さない。設計判断2 と同じ思想）。
         self.select_tool.cancel_offset();
+        self.select_tool.cancel_text_drag();
         self.snap_marker = None;
         // 右パネル「寸法」の入力バッファは選択 ID 集合を鮮度キーにしているが、undo/redo は
         // 選択を変えずに注記の中身だけを変える。そのままだと undo で戻した値がバッファに
@@ -1100,6 +1102,7 @@ impl McadApp {
     fn cancel_placement_for_file_op(&mut self) {
         self.select_tool.cancel_placement();
         self.select_tool.cancel_offset();
+        self.select_tool.cancel_text_drag();
         self.reset_picked_shape_tool();
         self.snap_marker = None;
     }
@@ -1854,6 +1857,7 @@ impl eframe::App for McadApp {
             if self.select_tool.is_placing() || self.select_tool.is_offsetting() {
                 self.select_tool.cancel_placement();
                 self.select_tool.cancel_offset();
+                self.select_tool.cancel_text_drag();
                 self.snap_marker = None;
             }
             // トリム・延長の途中状態（採取済みの境界）もモーダル表示で畳む
@@ -2203,6 +2207,7 @@ impl eframe::App for McadApp {
             let offset_distance = parse_offset_distance(&self.offset_distance_input);
             if !self.modal_open() {
                 if self.tool_kind == ToolKind::Select {
+                    let dim_scale_k = self.document.sheet().scale.world_mm_per_paper_mm();
                     handle_select_input(
                         ui,
                         &response,
@@ -2216,6 +2221,8 @@ impl eframe::App for McadApp {
                         now,
                         offset_distance,
                         text_focused,
+                        self.config.paper_display_enabled,
+                        dim_scale_k,
                     );
                 } else {
                     handle_tool_input(
@@ -2628,6 +2635,7 @@ fn handle_tool_shortcut_keys(
         // Select のままの再選択（S）でも確定させずに畳む（DESIGN.md 設計判断2・5）。
         select_tool.cancel_placement();
         select_tool.cancel_offset();
+        select_tool.cancel_text_drag();
         // 作図ツールへ移るときは選択を解除する（Select のままなら選択は保持）。
         if kind != ToolKind::Select {
             select_tool.clear_selection();
@@ -4131,6 +4139,32 @@ fn dim_panel(
         }
     });
 
+    // --- 文字位置（M9 タスク51）---
+    // `text_anchor` はドラッグ（`SelectTool` の文字ブロックドラッグ、main.rs の
+    // `handle_select_input`）でしか `Some` にならない。ここは状態表示と「自動配置に
+    // 戻す」操作のみを持つ（設計判断7）。
+    ui.horizontal(|ui| {
+        ui.label("文字位置:");
+        let some_count = live
+            .iter()
+            .filter(|(_, _, a)| a.text_anchor.is_some())
+            .count();
+        let label = if some_count == 0 {
+            "自動"
+        } else if some_count == live.len() {
+            "手動"
+        } else {
+            "混在"
+        };
+        ui.label(label);
+        if some_count > 0 && ui.button("自動配置に戻す").clicked() {
+            let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                a.text_anchor = None;
+            });
+            apply(cmds, errs);
+        }
+    });
+
     if !pending.is_empty()
         && let Err(err) = document.apply(Command::Batch(pending))
     {
@@ -4688,6 +4722,8 @@ fn handle_select_input(
     now: f64,
     offset_distance: Option<f64>,
     text_focused: bool,
+    paper_display: bool,
+    dim_scale_k: f64,
 ) {
     // オフセットモード中は専用経路が入力を占有する（配置モードと同じ入力ゲート思想）。
     if select_tool.is_offsetting() {
@@ -4826,12 +4862,35 @@ fn handle_select_input(
     if let Some(pos) = pointer {
         let world = world_at(pos);
         if response.drag_started_by(egui::PointerButton::Primary) {
-            select_tool.on_drag_start(world);
+            // ドラッグ開始点が、選択済み寸法の文字ブロックに入っていれば文字ドラッグへ
+            // 分岐する（M9 タスク51、設計判断7）。それ以外は従来どおり矩形選択。
+            let render = dim_render(
+                document.dim_style(),
+                paper_display,
+                dim_scale_k,
+                viewport.zoom,
+            );
+            match dim_label_hit(document, select_tool.selection(), world, render) {
+                Some((id, label_center)) => {
+                    select_tool.start_text_drag(id, label_center, world);
+                }
+                None => select_tool.on_drag_start(world),
+            }
         } else if response.dragged_by(egui::PointerButton::Primary) {
             select_tool.on_drag(world);
         } else if response.drag_stopped_by(egui::PointerButton::Primary) {
-            // ドラッグは矩形選択専用。選択集合を書き換えるだけで Document は変更しない。
-            select_tool.on_drag_end(document, world);
+            if select_tool.is_text_dragging() {
+                // 文字ドラッグの確定（M9 タスク51）。移動量が tol 未満なら
+                // `end_text_drag` が `None` を返し、履歴を汚さない。
+                if let Some(cmd) = select_tool.end_text_drag(document, world, tol)
+                    && let Err(err) = document.apply(cmd)
+                {
+                    set_status(status, now, format!("文字位置の変更に失敗しました: {err}"));
+                }
+            } else {
+                // ドラッグは矩形選択専用。選択集合を書き換えるだけで Document は変更しない。
+                select_tool.on_drag_end(document, world);
+            }
         } else if response.clicked_by(egui::PointerButton::Primary) {
             let shift = ui.input(|i| i.modifiers.shift);
             select_tool.on_click(document, world, tol, shift);
@@ -5012,6 +5071,7 @@ fn handle_offset_input(
     // Esc: オフセットモードを解除する（Document は変更しない）。
     if !typing && ui.input(|i| i.key_pressed(Key::Escape)) {
         select_tool.cancel_offset();
+        select_tool.cancel_text_drag();
         *snap_marker = None;
         return;
     }
@@ -5449,6 +5509,42 @@ fn dim_render(
     }
 }
 
+/// `world` が、**選択集合に含まれる**寸法いずれかの文字ブロック（表示サイズ依存の
+/// `label_box`）に入っていれば、その `(EntityId, 現在のラベル中心)` を返す（M9 タスク51）。
+///
+/// 選択集合だけを対象にするのは設計判断7どおり: 「選択済み寸法の文字ブロックドラッグ」
+/// という別経路であり、未選択の寸法をクリックしただけで文字ドラッグへ入ってはいけない
+/// （通常のクリック選択・矩形選択の意味を壊さないため）。複数の寸法の label_box が
+/// 重なって該当する場合は選択順の先頭を返す（決定的だが優先順位に強い意味はない）。
+fn dim_label_hit(
+    document: &Document,
+    selection: &[EntityId],
+    world: Point2,
+    render: dimension::DimRender<'_>,
+) -> Option<(EntityId, Point2)> {
+    for &id in selection {
+        let Some(entity) = document.entity(id) else {
+            continue;
+        };
+        if !layer_visible(document, entity) {
+            // 非表示レイヤーの寸法は当たり判定の対象外（描画・通常ピックと同じ扱い）。
+            continue;
+        }
+        let ex = match &entity.geom {
+            EntityGeom::DimLinear(dim) => dimension::expand_linear(dim, render),
+            EntityGeom::DimRadial(dim) => dimension::expand_radial(dim, render),
+            EntityGeom::DimDiameter(dim) => dimension::expand_diameter(dim, render),
+            _ => continue,
+        };
+        if let Some(quad) = ex.label_box
+            && dimension::label_box_contains(&quad, world)
+        {
+            return Some((id, dimension::label_box_center(&quad)));
+        }
+    }
+    None
+}
+
 /// 長さ寸法を描画する（純関数 helper [`dimension::expand_linear`] の展開を Painter へ）。
 fn draw_dim_linear(
     painter: &egui::Painter,
@@ -5687,6 +5783,44 @@ fn draw_selection(
             painter.line_segment([r.right_bottom(), r.left_bottom()], outline);
             painter.line_segment([r.left_bottom(), r.left_top()], outline);
         }
+        Some(DragPreview::DimText { id, anchor }) => {
+            // 文字ブロックドラッグ中（M9 タスク51）: 現在の選択・位置はそのまま強調表示し、
+            // ドラッグ対象の寸法だけ `text_anchor = Some(anchor)` に差し替えた一時コピーを
+            // 重ねて仮表示する（複製・移動プレビューと同じ「ゴースト」流儀。Document は
+            // 変更しない）。
+            draw_selected(
+                painter,
+                rect,
+                document,
+                viewport,
+                select_tool,
+                highlight,
+                paper_display,
+                k,
+            );
+            if let Some(entity) = document.entity(id)
+                && let Some((kind, annotation)) = dim_kind_and_annotation(&entity.geom)
+            {
+                let mut new_annotation = annotation.clone();
+                new_annotation.text_anchor = Some(anchor);
+                if new_annotation.validate(kind).is_ok()
+                    && let Some(new_geom) = dim_geom_with_annotation(&entity.geom, new_annotation)
+                {
+                    match new_geom {
+                        EntityGeom::DimLinear(dim) => {
+                            draw_dim_linear(painter, rect, viewport, &dim, highlight, render)
+                        }
+                        EntityGeom::DimRadial(dim) => {
+                            draw_dim_radial(painter, rect, viewport, &dim, highlight, render)
+                        }
+                        EntityGeom::DimDiameter(dim) => {
+                            draw_dim_diameter(painter, rect, viewport, &dim, highlight, render)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         None => draw_selected(
             painter,
             rect,
@@ -5736,18 +5870,46 @@ fn draw_selected(
                     draw_aabb_outline(painter, rect, viewport, &aabb, stroke);
                 }
                 EntityGeom::DimLinear(dim) => {
-                    draw_dim_linear(painter, rect, viewport, dim, stroke, render)
+                    let ex = dimension::expand_linear(dim, render);
+                    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+                    draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
                 }
                 EntityGeom::DimRadial(dim) => {
-                    draw_dim_radial(painter, rect, viewport, dim, stroke, render)
+                    let ex = dimension::expand_radial(dim, render);
+                    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+                    draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
                 }
                 EntityGeom::DimDiameter(dim) => {
-                    draw_dim_diameter(painter, rect, viewport, dim, stroke, render)
+                    let ex = dimension::expand_diameter(dim, render);
+                    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+                    draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
                 }
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
                 _ => {}
             }
         }
+    }
+}
+
+/// 選択中の寸法の文字ブロック外形（[`dimension::DimExpansion::label_box`]）を
+/// 細線で描く（M9 タスク51）。ドラッグで掴める場所をユーザーへ示すためだけの
+/// 表示で、ヒットテスト自体（`dim_label_hit`）は保存データではなく同じ展開を
+/// 再計算して使う（表示と判定を食い違わせないため、同じ `label_box` を共有する）。
+fn draw_dim_label_box(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    ex: &dimension::DimExpansion,
+    color: Color32,
+) {
+    let Some(quad) = ex.label_box else {
+        return;
+    };
+    let thin = Stroke::new(1.0, color);
+    for i in 0..4 {
+        let a = viewport.world_to_screen(rect, quad[i]);
+        let b = viewport.world_to_screen(rect, quad[(i + 1) % 4]);
+        painter.line_segment([a, b], thin);
     }
 }
 

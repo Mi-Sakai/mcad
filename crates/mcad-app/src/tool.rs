@@ -2241,7 +2241,7 @@ impl SelectTool {
     /// エンティティを返す。該当なしなら `None`。
     fn pick(&self, document: &Document, world: Point2, tol: f64) -> Option<EntityId> {
         // ヒット距離: Shape は実形状への最近距離、Text は近似 aabb への符号なし距離
-        // （DESIGN.md M6 L429 の割り切り。内部なら 0、外部なら境界までのユークリッド距離。
+        // （DESIGN.md M6 設計判断6 の割り切り。内部なら 0、外部なら境界までのユークリッド距離。
         // これにより tol 内なら枠のすぐ外側も拾えるし、枠内の空白よりも実形状が近ければ
         // そちらを優先できる）。寸法は展開線分（寸法線・補助線・引出線）への最近距離
         // （`dimension` の純関数）。いずれも「tol 以内で最も近いものを拾う」統一比較に
@@ -4916,7 +4916,7 @@ mod tests {
 
     #[test]
     fn offset_rejects_text_entity() {
-        // Text は選択できるようになったが、オフセット対象外（DESIGN.md M6 L385）。
+        // Text は選択できるようになったが、オフセット対象外（DESIGN.md M6 設計判断1）。
         // start_offset は選択数 1 で起動するが、確定クリックで明示的に拒否される。
         let mut doc = Document::new();
         let t = add_text(&mut doc, Point2::ORIGIN, "Ab", 2.0);

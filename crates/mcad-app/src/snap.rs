@@ -113,9 +113,9 @@ pub fn snap(
         }
         match &entity.geom {
             EntityGeom::Shape(shape) => enumerate_features(shape, cursor, r2, &mut best),
-            // Text はアンカー点のみをスナップ源にする（端点扱い。DESIGN.md M6 L386）。
+            // Text はアンカー点のみをスナップ源にする（端点扱い。DESIGN.md M6 設計判断1）。
             EntityGeom::Text(text) => best.consider(SnapKind::Endpoint, text.anchor, cursor, r2),
-            // 寸法はスナップ源にしない（DESIGN.md M6 L386）。`EntityGeom` は
+            // 寸法はスナップ源にしない（DESIGN.md M6 設計判断1）。`EntityGeom` は
             // `#[non_exhaustive]` なので、未知の幾何も同じくスナップ源にしない。
             _ => {}
         }
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn text_anchor_snaps_as_endpoint() {
         use mcad_core::TextGeom;
-        // Text エンティティのアンカーだけが端点候補になる（DESIGN.md M6 L386）。
+        // Text エンティティのアンカーだけが端点候補になる（DESIGN.md M6 設計判断1）。
         let mut doc = Document::new();
         let layer = doc.current_layer();
         doc.apply(Command::AddEntity(Entity::new(

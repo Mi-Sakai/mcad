@@ -4,6 +4,77 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-05 — 寸法のGPS化
+
+寸法補助記号・サイズ公差・直径寸法・文書単位の寸法スタイル・文字位置の後編集・レイヤー変更
+コマンド・標準レイヤー構成を実装(M9 タスク45〜54)。`.mcad` スキーマを v4 → v5 へ更新。
+GUI 変更はタスク49〜53 の各完了時点で手動スモークテストを実施し `docs/design/M9.md` に記録。
+
+### 追加
+
+- 寸法補助記号 `DimSymbol`(φ/Sφ/□/R/SR/CR/C/t)を `crates/mcad-geom/src/symbol.rs` に新設。
+  φ・□ は `dim_symbol_glyph` がストロークを生成し(フォント非依存)、R/SR/CR/C/t は
+  フォント文字として組版する(`crates/mcad-app/src/dimension.rs` の `label::layout_dim_label`)
+- 寸法の注記モデル `DimAnnotation`(`symbol` / `tolerance` / `decimals_override` /
+  `value_override` / `text_anchor` / `arrow_placement`)と `SizeTolerance`
+  (`Symmetric` / `Deviations` / `Fit(FitClass)`)・`ArrowPlacement`(`Auto` / `Inside` /
+  `Outside`)を `crates/mcad-core/src/dim.rs` に新設し、`DimLinear` / `DimRadial` へ埋め込み。
+  種別ごとの許容記号・`upper < lower`・非有限・不正なはめあい文字列は
+  `DimAnnotation::validate(kind)` が core コマンド境界・`.mcad` v5 読込・UI 入力の3境界で拒否
+- 直径寸法 `EntityGeom::DimDiameter { center, radius, angle, annotation }` と
+  直径寸法ツール(`G`。円/円弧をクリック → 寸法線の向きをクリック。`DimRadialTool` と同じ2段操作)
+- 文書単位の寸法スタイル `DimStyle`(`text_height_mm` / `arrow_len_mm` / `decimals` /
+  `trim_trailing_zeros` / `ext_gap_mm` / `ext_overshoot_mm` / `text_gap_mm` /
+  `tolerance_scale`)と `Command::SetDimStyle`(no-op 判定・undo 1単位)。寸法スタイル
+  ダイアログ(右パネル「寸法スタイル」セクションの「寸法スタイルを編集…」から。8項目、「既定に戻す」、不正値の拒否)。
+  `decimals_override` が `None` の寸法はスタイルの桁数に生きた参照で従い、`Some` は
+  そのエンティティ限定の上書き
+- 右パネル「寸法」セクション: 記号コンボ(選択中の全寸法で許される記号の共通部分のみ)・
+  公差(± / 上下偏差 / はめあい)・桁数(「スタイルに従う」/ 明示値)・矢印配置・表示値の
+  上書き(非比例寸法。値の下に下線)。編集は `ModifyEntity` を `Batch` にまとめて undo 1単位。
+  見出し直下に「選択中: N 件(長さ a・半径 b・直径 c)」を表示
+- 寸法文字位置の後編集: 選択中の寸法の文字ブロック(枠を表示)をドラッグして
+  `DimAnnotation::text_anchor` を設定(`ModifyEntity` 1発で undo 1単位、微小ドラッグは無視)。
+  右パネル「寸法」に「文字位置: 自動/手動/混在」と「自動配置に戻す」
+  (`crates/mcad-app/src/tool.rs` の `SelectTool::start_text_drag` / `end_text_drag`、
+  `dimension::DimExpansion::label_box`)
+- `Command::SetEntityLayer { id, layer }`(`SetEntityStyle` と同型。移動元・移動先の両方で
+  ロック検査、同一レイヤーは no-op、undo/redo)。右パネル「選択中のスタイル」に
+  「レイヤー:」コンボ(複数選択は `Batch` で undo 1単位、混在時は「混在」表示)
+- 標準レイヤー構成: 新規図面の既定レイヤーを製図規定 4-1 に対応する5枚(中心線 一点鎖線
+  0.13 / 破線 破線 0.35 / 外形線 実線 0.35 / 寸法線 実線 0.18 / 文字 実線 0.18)へ拡張し、
+  カレントを「外形線」にする(`crates/mcad-app/src/main.rs` の `DEFAULT_EXTRA_LAYERS` /
+  `fresh_document`)。寸法ツールは「寸法線」、文字は「文字」という名前のレイヤーがあれば
+  そこへ自動割当(`resolve_tool_layer`。無ければカレントレイヤー。読込図面でレイヤーは増やさない)
+- `.mcad` v5(`crates/mcad-io/src/mcad_file.rs`): `DimAnnotation`・`DimDiameter`・`dim_style`
+  を永続化。v4 DTO は凍結。v1〜v4 は既定値補完(`decimals_override` は全件 `None`)で無損失読込。
+  v5 の不正値(不正組合せ・`upper < lower`・非有限・不正 Fit 文字列)は読込拒否
+- SVG/PDF 出力(`crates/mcad-app/src/plot/`)が記号ストローク・公差文字・下線・直径寸法に追従
+
+### 変更
+
+- **寸法数値の末尾ゼロトリムが既定 ON**(`120.00` → `120`、`12.50` → `12.5`)。
+  `DimStyle::trim_trailing_zeros` で切替(文書に保存)
+- **寸法文字を常に寸法線の上側へ配置**(JIS Z 8317 の読み取り方向規則。旧「計測対象から
+  遠い側」)。保存データは不変で描画のみ変わる。旧挙動の互換表示は設けない
+- **寸法補助線にすきま 1.0mm・突き出し 2.0mm**(`DimStyle::ext_gap_mm` / `ext_overshoot_mm`、
+  `dimension::extension_line`)。オフセットがすきま以下なら補助線を描かない
+- 矢先の開き角度を 20° へ(`dimension::ARROW_HALF_WIDTH_RATIO = 0.1763`。製図規定 5-4 4))。
+  矢先の長さ 3.0mm は据え置き
+- 外向き矢印: 文字幅+矢2つが寸法線長に収まらないときは自動で外向き(`DimAnnotation::
+  arrow_placement = Auto`)。`Inside` / `Outside` で手動上書き
+- **新規図面の既定レイヤー名「Text」→「文字」**(既定レイヤーセットの変更に伴う。
+  保存データに書かれる既定名の変更であり、既存ファイルのレイヤー名は変わらない。
+  旧「Text」レイヤーの図面を開いてもレイヤーは増えない)
+- `plot::DIM_TEXT_MM` / `DIM_ARROW_MM` 定数を削除し、`DimStyle::DEFAULT` を描画サイズの唯一の出所にした
+- DESIGN.md を分割: 完了済みマイルストーンの設計章(M5〜M9)を `docs/design/M5.md`〜`M9.md`
+  へ移設し、本体には総論・現役マイルストーン・移設先の索引表を残す。コード内の行番号
+  アンカー6件を節名アンカーへ是正
+
+### テスト
+
+- 709本 → 845本
+
 ## [0.8.1] - 2026-08-12 — v0.8.x 番号外対応
 
 出力(SVG/PDF)のモノクロ化、分割ツールのスナップ対応、ズーム・パンの追加操作手段の3件を実装。

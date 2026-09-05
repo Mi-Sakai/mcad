@@ -4919,7 +4919,7 @@ fn handle_select_input(
     // 消費するので、ここへ来る `O` は素の押下のみ。以降のクリックは次フレームから
     // オフセット経路が受け取る。
     if ui.input(|i| !i.modifiers.command && i.key_pressed(Key::O)) {
-        // Text・寸法はオフセット対象外（DESIGN.md M6 L385）。pick() の汎用化で Text も
+        // Text・寸法はオフセット対象外（DESIGN.md M6 設計判断1）。pick() の汎用化で Text も
         // 選択できるようになったため、単一 Text 選択で O を押してもモードに入らないよう
         // ここで明示的に拒否する（`offset_click` 側の拒否と二重の防御）。
         let sel = select_tool.selection();

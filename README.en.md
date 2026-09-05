@@ -2,7 +2,7 @@
 
 *[日本語版 README](./README.md)*
 
-A 2D CAD application built with Rust and egui. Current version: **v0.8.1**.
+A 2D CAD application built with Rust and egui. Current version: **v0.9.0**.
 
 > **Note on language.** The project's design documents (`DESIGN.md`, `AGENTS.md`,
 > `CHANGELOG.md`) are written in Japanese, and the application UI is being migrated
@@ -23,7 +23,7 @@ for the design and [`AGENTS.md`](./AGENTS.md) for the development conventions
 
 ## Features
 
-- **Drawing**: points, line segments, circles, arcs (three-point: start / through / end), polylines, text (CJK supported), dimensions (linear and radial)
+- **Drawing**: points, line segments, circles, arcs (three-point: start / through / end), polylines, text (CJK supported), **dimensions** (linear, radial and diameter; auxiliary symbols φ/Sφ/□/R/SR/CR/C/t; tolerance support; style editing; drag text position)
 - **Editing**: selection (click, rubber band, additive), move, duplicate, rotate, mirror, offset, **trim, extend, fillet, split**, delete
 - **Snapping**: endpoint, intersection, midpoint, center and grid candidates chosen by priority, with a distinct marker per kind
 - **Layers**: color, visibility, lock, stacking order (front / back buttons), managed in a dedicated panel
@@ -69,6 +69,7 @@ For everyday use, a release build is recommended: `cargo run --release -p mcad-a
 | `T` | Text (click the anchor, type the string and height in the top panel, `Enter` to commit, `Esc` to cancel) |
 | `D` | Linear dimension (three clicks: two measured points, then the dimension line position; preview follows the cursor) |
 | `Shift+D` | Radial dimension (two clicks: a circle or arc, then the leader direction) |
+| `G` | Diameter dimension (two clicks: a circle or arc, then the direction of the dimension line) |
 | `Enter` | Commit a polyline (two or more points, left open; clicking the start point closes and commits it) |
 | `Del` / `Backspace` | Delete the selected entities |
 | `Esc` | Cancel drawing or placement / discard a rubber-band drag / clear the selection |
@@ -88,8 +89,8 @@ a settings file and restored on the next launch (see "Settings" below).
 
 ## File formats
 
-- **`.mcad`**: the native JSON format. As of v0.8.0 the schema is v4; v1 through v3 files still load (backward compatible)
-- **New drawings** start with `"0"` plus five layers matching the drafting standard's line table (centre line, hidden line, outline, dimension line, text, with their linetypes and widths), and the current layer is the outline layer. Dimensions and text are placed automatically on layers named `寸法線` and `文字` when those exist (in a loaded drawing without them, the current layer is used). The standard layers can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
+- **`.mcad`**: the native JSON format. As of v0.9.0 the schema is v5; v1 through v4 files still load (backward compatible, with dimension settings filled in by defaults)
+- **New drawings** start with `"0"` plus five layers matching the drafting standard's line table (centre line, hidden line, outline, dimension line, text, with their linetypes and widths), and the current layer is the outline layer. Dimensions and text are placed automatically on layers named `寸法線` (dimension line) and `文字` (text) when those exist (in a loaded drawing without them, the current layer is used). The standard layers can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
 
 ## Settings
 
@@ -100,6 +101,7 @@ on Linux). No drawing content is ever stored there.
 - Snap (`F3`) / orthogonal mode (`F8`) / paper-based display (`F9`) on/off state
 - Default paper size, orientation, scale and title-block style for new documents
 - Recently used files (the "Recent" menu in the top panel, up to 5 entries; updated on every open/save, missing files are excluded)
+- Dimension trailing-zero trimming (default ON; toggled in the dimension style dialog and saved with the document. `120.00` displays as `120`)
 
 If the settings file is missing or corrupted, mcad falls back to defaults and
 still starts normally.
@@ -184,7 +186,9 @@ Font License 1.1 (see below).
 
 To render CJK glyphs in document text (Text entities), [Noto Sans JP](https://fonts.google.com/noto/specimen/Noto+Sans+JP)
 Regular is embedded in the binary. It is registered as a fallback behind egui's
-default fonts, so egui falls back per glyph and both Latin and CJK render correctly.
+default fonts, so egui falls back per glyph and both Latin and CJK render correctly. The application UI is being
+migrated to Japanese region by region; currently the right panel (layers, selected style, sheet info, dimensions) and
+the title-block editor and the dimension style dialog are in Japanese, while the rest (top panel, dialogs) remain in English.
 
 Noto Sans JP is provided under the SIL Open Font License 1.1. The full license text
 is bundled at [`crates/mcad-app/assets/fonts/LICENSE-OFL.txt`](./crates/mcad-app/assets/fonts/LICENSE-OFL.txt).

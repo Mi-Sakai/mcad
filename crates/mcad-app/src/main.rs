@@ -3297,6 +3297,48 @@ fn entity_style_panel(
 
     let mut pending: Vec<Command> = Vec::new();
 
+    // 選択中の全エンティティの所属レイヤーID（表示用に一括取得）。
+    let entity_layer_ids: Vec<LayerId> = live
+        .iter()
+        .map(|(id, ..)| document.entity(*id).unwrap().layer)
+        .collect();
+    let first_layer_id = entity_layer_ids[0];
+    let layer_selection_uniform = entity_layer_ids
+        .iter()
+        .all(|&layer| layer == first_layer_id);
+    let layers_in_order = document.layers_in_order();
+    let current_layer_label = if layer_selection_uniform {
+        document
+            .layer(first_layer_id)
+            .map(|layer| layer.name.clone())
+            .unwrap_or_default()
+    } else {
+        "混在".to_string()
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("レイヤー:");
+        egui::ComboBox::from_id_salt("entity_layer")
+            .selected_text(current_layer_label)
+            .show_ui(ui, |ui| {
+                for (layer_id, layer) in &layers_in_order {
+                    let selected = layer_selection_uniform && *layer_id == first_layer_id;
+                    if ui.selectable_label(selected, &layer.name).clicked() {
+                        for (id, current_layer) in
+                            live.iter().map(|(id, ..)| id).zip(&entity_layer_ids)
+                        {
+                            if current_layer != layer_id {
+                                pending.push(Command::SetEntityLayer {
+                                    id: *id,
+                                    layer: *layer_id,
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+    });
+
     ui.horizontal(|ui| {
         ui.label("線幅:");
         width_mm_combo(ui, "entity_style_width", effective_width, |width| {

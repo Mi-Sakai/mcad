@@ -48,6 +48,11 @@ enum Applied {
         before: Style,
         after: Style,
     },
+    SetEntityLayer {
+        id: EntityId,
+        before: LayerId,
+        after: LayerId,
+    },
     AddLayer {
         id: LayerId,
         layer: Layer,
@@ -481,6 +486,22 @@ impl Document {
                     changed,
                 ))
             }
+            Command::SetEntityLayer { id, layer } => {
+                self.require_editable_entity(id)?;
+                self.require_editable_layer(layer)?;
+                let slot = self.live_entity_mut(id);
+                let before = std::mem::replace(&mut slot.layer, layer);
+                // 同一レイヤーへの差し替えは意味的 no-op（履歴を汚さない）。
+                let changed = before != layer;
+                Ok(ExecuteOutcome::conditional(
+                    Applied::SetEntityLayer {
+                        id,
+                        before,
+                        after: layer,
+                    },
+                    changed,
+                ))
+            }
             Command::AddLayer(layer) => {
                 let id = self.layers.insert(Some(layer.clone()));
                 // 追加は常に状態を変えるので changed = true。
@@ -609,6 +630,7 @@ impl Document {
             Applied::RemoveEntity { id, entity } => self.set_entity(*id, Some(entity.clone())),
             Applied::ModifyEntity { id, before, .. } => self.set_entity_geom(*id, before.clone()),
             Applied::SetEntityStyle { id, before, .. } => self.set_entity_style(*id, *before),
+            Applied::SetEntityLayer { id, before, .. } => self.set_entity_layer(*id, *before),
             Applied::AddLayer { id, .. } => self.set_layer(*id, None),
             Applied::RemoveLayer { id, layer } => self.set_layer(*id, Some(layer.clone())),
             Applied::SetLayerProps { id, before, .. } => self.set_layer(*id, Some(before.clone())),
@@ -631,6 +653,7 @@ impl Document {
             Applied::RemoveEntity { id, .. } => self.set_entity(*id, None),
             Applied::ModifyEntity { id, after, .. } => self.set_entity_geom(*id, after.clone()),
             Applied::SetEntityStyle { id, after, .. } => self.set_entity_style(*id, *after),
+            Applied::SetEntityLayer { id, after, .. } => self.set_entity_layer(*id, *after),
             Applied::AddLayer { id, layer } => self.set_layer(*id, Some(layer.clone())),
             Applied::RemoveLayer { id, .. } => self.set_layer(*id, None),
             Applied::SetLayerProps { id, after, .. } => self.set_layer(*id, Some(after.clone())),
@@ -763,6 +786,11 @@ impl Document {
     /// 生存エンティティのスタイルのみ差し替える。生存を前提とする。
     fn set_entity_style(&mut self, id: EntityId, style: Style) {
         self.live_entity_mut(id).style = style;
+    }
+
+    /// 生存エンティティの所属レイヤーのみ差し替える。生存を前提とする。
+    fn set_entity_layer(&mut self, id: EntityId, layer: LayerId) {
+        self.live_entity_mut(id).layer = layer;
     }
 }
 
@@ -967,6 +995,135 @@ mod tests {
             Err(CoreError::LayerLocked(layer))
         );
         assert_eq!(doc.entity(id).unwrap().style, Style::inherited());
+    }
+
+    #[test]
+    fn set_entity_layer_undo_redo_swaps_layer() {
+        // M9 タスク52: 右パネルのレイヤーコンボが経由するコマンド。
+        // SetEntityStyle と同じ「まとめて差し替え・undo/redo で前後を入れ替える」流儀。
+        let mut doc = Document::new();
+        let original_layer = doc.current_layer();
+        let target_layer = add_layer_get_id(&mut doc, "Target");
+        let id = add_entity_get_id(
+            &mut doc,
+            Entity::new(line(0.0), original_layer, Style::inherited()),
+        );
+
+        doc.apply(Command::SetEntityLayer {
+            id,
+            layer: target_layer,
+        })
+        .unwrap();
+        assert_eq!(doc.entity(id).unwrap().layer, target_layer);
+        // geom は巻き込まれていない。
+        assert_eq!(doc.entity(id).unwrap().geom, line(0.0));
+
+        assert!(doc.undo());
+        assert_eq!(doc.entity(id).unwrap().layer, original_layer);
+
+        assert!(doc.redo());
+        assert_eq!(doc.entity(id).unwrap().layer, target_layer);
+    }
+
+    #[test]
+    fn set_entity_layer_to_same_layer_is_noop() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+
+        let undo_len_before = doc.undo_stack.len();
+        let generation_before = doc.generation();
+
+        assert_eq!(
+            doc.apply(Command::SetEntityLayer { id, layer }),
+            Ok(NewIds::default())
+        );
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(doc.generation(), generation_before);
+    }
+
+    #[test]
+    fn set_entity_layer_from_locked_layer_is_rejected() {
+        // 移動元エンティティのロックは require_editable_entity で拒否される
+        // （ModifyEntity/RemoveEntity/SetEntityStyle と対称）。
+        let mut doc = Document::new();
+        let original_layer = doc.current_layer();
+        let target_layer = add_layer_get_id(&mut doc, "Target");
+        let id = add_entity_get_id(
+            &mut doc,
+            Entity::new(line(0.0), original_layer, Style::inherited()),
+        );
+        lock_layer(&mut doc, original_layer);
+
+        assert_eq!(
+            doc.apply(Command::SetEntityLayer {
+                id,
+                layer: target_layer,
+            }),
+            Err(CoreError::LayerLocked(original_layer))
+        );
+        assert_eq!(doc.entity(id).unwrap().layer, original_layer);
+    }
+
+    #[test]
+    fn set_entity_layer_to_locked_layer_is_rejected() {
+        // 移動先レイヤーのロックは require_editable_layer で拒否される
+        // （AddEntity と対称）。
+        let mut doc = Document::new();
+        let original_layer = doc.current_layer();
+        let target_layer = add_layer_get_id(&mut doc, "Target");
+        let id = add_entity_get_id(
+            &mut doc,
+            Entity::new(line(0.0), original_layer, Style::inherited()),
+        );
+        lock_layer(&mut doc, target_layer);
+
+        assert_eq!(
+            doc.apply(Command::SetEntityLayer {
+                id,
+                layer: target_layer,
+            }),
+            Err(CoreError::LayerLocked(target_layer))
+        );
+        assert_eq!(doc.entity(id).unwrap().layer, original_layer);
+    }
+
+    #[test]
+    fn set_entity_layer_to_unknown_layer_errors() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = add_entity_get_id(&mut doc, Entity::new(line(0.0), layer, Style::inherited()));
+        let ghost = LayerId::default();
+        let undo_len_before = doc.undo_stack.len();
+
+        assert_eq!(
+            doc.apply(Command::SetEntityLayer { id, layer: ghost }),
+            Err(CoreError::LayerNotFound(ghost))
+        );
+        assert_eq!(doc.entity(id).unwrap().layer, layer);
+        // 失敗しても履歴は積まれない。
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+    }
+
+    #[test]
+    fn set_entity_layer_then_remove_old_empty_layer_succeeds() {
+        // レイヤー変更後、旧レイヤーが空になれば RemoveLayer が通ることを確認する
+        // （SetEntityLayer が layer フィールドを正しく差し替えている証拠）。
+        let mut doc = Document::new();
+        let original_layer = add_layer_get_id(&mut doc, "Old");
+        let target_layer = add_layer_get_id(&mut doc, "Target");
+        let id = add_entity_get_id(
+            &mut doc,
+            Entity::new(line(0.0), original_layer, Style::inherited()),
+        );
+
+        doc.apply(Command::SetEntityLayer {
+            id,
+            layer: target_layer,
+        })
+        .unwrap();
+
+        assert!(doc.apply(Command::RemoveLayer(original_layer)).is_ok());
     }
 
     #[test]

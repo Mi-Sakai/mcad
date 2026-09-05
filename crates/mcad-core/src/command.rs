@@ -41,6 +41,20 @@ pub enum Command {
         style: Style,
     },
 
+    /// エンティティの所属レイヤーを差し替える（M9 タスク52。[`Command::SetEntityStyle`]
+    /// と同じ「まとめて差し替え」流儀）。
+    ///
+    /// 移動元エンティティは [`crate::Document::require_editable_entity`]（存在・ロック）、
+    /// 移動先レイヤーは [`crate::Document::require_editable_layer`]（存在・ロック。
+    /// [`Command::AddEntity`] と対称）の両方を満たす必要がある。同一レイヤーへの
+    /// 差し替えは意味的 no-op（履歴を汚さない）。
+    SetEntityLayer {
+        /// 対象エンティティ。
+        id: EntityId,
+        /// 差し替え後の所属レイヤー。
+        layer: LayerId,
+    },
+
     /// レイヤーを追加する。
     AddLayer(Layer),
 

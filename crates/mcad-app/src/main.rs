@@ -144,15 +144,56 @@ const LAYER_COLOR_PALETTE: [Rgb; 6] = [
 
 /// 新規文書（起動時・Ctrl+N）に用意する、デフォルトレイヤー `"0"` 以外の既定レイヤー。
 ///
-/// `(レイヤー名, 色)` を **奥から手前の順** に並べる。重ね順（[`Layer::order`]）は
-/// この配列の添字 + 1 を割り当てる（`"0"` が `order = 0` なので、既定レイヤーは
-/// 常に `"0"` より手前に載る）。将来ハッチング等を実装したときは**この配列へ1行
-/// 足すだけ**で既定セットを拡張できる。
+/// `(レイヤー名, 色, 線種, 線幅mm)` を **奥から手前の順** に並べる。重ね順
+/// （[`Layer::order`]）はこの配列の添字 + 1 を割り当てる（`"0"` が `order = 0` なので、
+/// 既定レイヤーは常に `"0"` より手前に載る）。将来ハッチング等を実装したときは
+/// **この配列へ1行足すだけ**で既定セットを拡張できる。
 ///
-/// 現状 `"Text"` のみ。文字が図形に隠れないよう最上位に置くのが一般的な運用で、
-/// 初期状態からその並びを提供する。ハッチ用レイヤーは機能自体が未実装のうちは
-/// 用途の分からない空レイヤーになるため入れない。
-const DEFAULT_EXTRA_LAYERS: [(&str, Rgb); 1] = [("Text", LAYER_COLOR_PALETTE[3])];
+/// 製図規定 4-1 準拠（M9 タスク53）: 中心線（一点鎖線 0.13mm）→ 破線（破線 0.35mm）
+/// → 外形線（実線 0.35mm）→ 寸法線（実線 0.18mm）→ 文字（実線 0.18mm、規定に明記の
+/// 行は無いため寸法線と同じ細線幅を流用）の順で奥から手前へ積む。文字を最前面に
+/// 置くのは図形に隠れないようにする一般的な運用。色は [`LAYER_COLOR_PALETTE`] から
+/// 重複しないよう割り当てる（`文字` は改名前の `"Text"` 時代から `palette[3]` を
+/// 維持し、他の4層は残りの添字を使う）。[`fresh_document`] がこの配列を基に
+/// カレントレイヤーを `外形線` へ設定する。
+const DEFAULT_EXTRA_LAYERS: [(&str, Rgb, Linetype, f32); 5] = [
+    ("中心線", LAYER_COLOR_PALETTE[0], Linetype::DashDot, 0.13),
+    ("破線", LAYER_COLOR_PALETTE[1], Linetype::Dashed, 0.35),
+    ("外形線", LAYER_COLOR_PALETTE[2], Linetype::Continuous, 0.35),
+    ("寸法線", LAYER_COLOR_PALETTE[4], Linetype::Continuous, 0.18),
+    ("文字", LAYER_COLOR_PALETTE[3], Linetype::Continuous, 0.18),
+];
+
+/// [`DEFAULT_EXTRA_LAYERS`] のうち、新規文書のカレントレイヤーにする名前。
+///
+/// 作図の既定は輪郭線であるべきなので `外形線` を選ぶ（[`fresh_document`]）。
+const DEFAULT_CURRENT_LAYER_NAME: &str = "外形線";
+
+/// 寸法ツール（[`ToolKind::DimLinear`]/`DimRadial`/`DimDiameter`）が新規エンティティを
+/// 割り当てる先のレイヤー名。[`layer_named`] で存在確認したうえで使う
+/// （M9 タスク53: 該当名のレイヤーが無ければカレントレイヤーへフォールバックし、
+/// 読込図面で勝手にレイヤーを増やさない）。
+const DIM_LAYER_NAME: &str = "寸法線";
+
+/// 文字ツール（`commit_text`）が新規エンティティを割り当てる先のレイヤー名。
+/// [`DIM_LAYER_NAME`] と同様、存在すれば使い、無ければカレントレイヤーへ
+/// フォールバックする。
+const TEXT_LAYER_NAME: &str = "文字";
+
+/// 文書中から名前が完全一致するレイヤーを探す（表示・ロック状態は問わない）。
+///
+/// 作図ツールの自動割当（[`DIM_LAYER_NAME`]/[`TEXT_LAYER_NAME`]）が使う。**新規に
+/// レイヤーを作らない** — 該当名が無ければ呼び出し側がカレントレイヤーへ
+/// フォールバックする（読込図面でレイヤーが勝手に増えないための設計。
+/// [`fresh_document`] の doc 参照）。同名レイヤーが複数存在する場合は
+/// [`Document::layers`] の反復順で最初に見つかったものを返す（重複禁止は
+/// 不変条件ではないため、決定的な仕様として明記する）。
+fn layer_named(document: &Document, name: &str) -> Option<LayerId> {
+    document
+        .layers()
+        .find(|(_, layer)| layer.name == name)
+        .map(|(id, _)| id)
+}
 
 /// ステータスメッセージの文字色（エラー通知が主用途なので警告寄りの赤）。
 const STATUS_MESSAGE_COLOR: Color32 = Color32::from_rgb(255, 120, 120);
@@ -890,7 +931,7 @@ fn open_status(clamped_widths: usize) -> String {
 /// `Document::new()` は `.mcad` / DXF の読込時にも「再構築の出発点」として使われる
 /// （読込はデフォルトレイヤーを [`Command::SetLayerProps`] で上書きし、残りを
 /// ファイル内容から [`Command::AddLayer`] する）。既定レイヤーを core へ入れると
-/// **既存ファイルを読むたびにファイルに存在しない `"Text"` レイヤーが生えてしまう**。
+/// **既存ファイルを読むたびにファイルに存在しない `文字` 等のレイヤーが生えてしまう**。
 /// そのため「新規文書のテンプレート」という UI 上の判断は app 側だけに置き、
 /// 読込経路（[`McadApp::open_document`] / [`McadApp::apply_imported_dxf`]）からは
 /// 一切呼ばない。
@@ -905,20 +946,31 @@ fn open_status(clamped_widths: usize) -> String {
 /// （[`SheetMeta::validate`]）、この経路で `SetSheet` が失敗することはない。
 fn fresh_document(sheet: SheetMeta) -> Document {
     let mut document = Document::new();
-    for (index, (name, color)) in DEFAULT_EXTRA_LAYERS.iter().enumerate() {
+    let mut default_current_layer = None;
+    for (index, (name, color, linetype, width_mm)) in DEFAULT_EXTRA_LAYERS.iter().enumerate() {
         let mut layer = Layer::new(*name, *color);
+        layer.linetype = *linetype;
+        layer.width_mm = WidthMm::new(*width_mm).expect("DEFAULT_EXTRA_LAYERS widths are valid");
         // "0" が order = 0。既定レイヤーはその手前に配列順で積み上げる。
         layer.order = i32::try_from(index).expect("DEFAULT_EXTRA_LAYERS is tiny") + 1;
-        document
+        let new_ids = document
             .apply(Command::AddLayer(layer))
             .expect("AddLayer on a fresh document cannot fail");
+        if *name == DEFAULT_CURRENT_LAYER_NAME {
+            default_current_layer = new_ids.layers.first().copied();
+        }
+    }
+    if let Some(layer_id) = default_current_layer {
+        document
+            .apply(Command::SetCurrentLayer(layer_id))
+            .expect("DEFAULT_CURRENT_LAYER_NAME is always added above");
     }
     document
         .apply(Command::SetSheet(sheet))
         .expect("standard title block templates are always valid");
-    // 既定レイヤー・図面メタデータの適用自体を Ctrl+Z で巻き戻せてはいけない（読込と
-    // 同じ扱い）。呼び出し側は clear_history 後の世代（0）を saved_generation の
-    // 基準点にする。
+    // 既定レイヤー・カレントレイヤー・図面メタデータの適用自体を Ctrl+Z で巻き戻せて
+    // はいけない（読込と同じ扱い）。呼び出し側は clear_history 後の世代（0）を
+    // saved_generation の基準点にする。
     document.clear_history();
     document
 }
@@ -948,7 +1000,8 @@ impl McadApp {
     /// 上記の「Ctrl+N も起動時も `Document::new()` のみ」という判断のうち、
     /// **エンティティは一切追加しない**という部分は変わらないが、**レイヤーについては
     /// 覆した**: 起動時・Ctrl+N ともに [`fresh_document`] を使い、`"0"` に加えて
-    /// [`DEFAULT_EXTRA_LAYERS`]（現状 `"Text"`）を持つ文書を作る。文字を最前面に置く
+    /// [`DEFAULT_EXTRA_LAYERS`]（M9 タスク53以降は規定4-1準拠の `中心線`/`破線`/
+    /// `外形線`/`寸法線`/`文字` の5層）を持つ文書を作る。文字を最前面に置く
     /// といった典型的な運用を初期状態で満たすためで、既定セットを core ではなく app 側に
     /// 置いた理由（ファイル読込時にレイヤーが増えるのを避ける）は [`fresh_document`] の
     /// doc を参照。**読込経路は従来どおり `Document::new()` ベースで再構築する。**
@@ -1270,7 +1323,7 @@ impl McadApp {
         }
         let cmd = Command::AddEntity(Entity::new(
             geom,
-            self.document.current_layer(),
+            resolve_tool_layer(&self.document, ToolKind::Text),
             Style::inherited(),
         ));
         match self.document.apply(cmd) {
@@ -2643,6 +2696,29 @@ fn handle_tool_shortcut_keys(
     }
 }
 
+/// 新規エンティティを追加する先のレイヤーを、作図ツールの種類から解決する
+/// （M9 タスク53: 標準レイヤー構成と自動割当）。
+///
+/// 寸法ツール（`DimLinear`/`DimRadial`/`DimDiameter`）は [`DIM_LAYER_NAME`]
+/// （`寸法線`）、文字ツール（[`ToolKind::Text`]）は [`TEXT_LAYER_NAME`]（`文字`）が
+/// 文書に存在すればそこへ、無ければ [`Document::current_layer`] へフォールバックする。
+/// それ以外のツールは常にカレントレイヤーを使う。**該当名のレイヤーが無い文書へ
+/// 新しくレイヤーを作ることはしない**（読込図面でレイヤーが勝手に増えないための
+/// 設計。[`fresh_document`] の doc 参照）。ロック中のレイヤーへ自動割当した結果
+/// `AddEntity` が失敗した場合は、既存の `LayerLocked` エラー経路でステータスバーへ
+/// 表示される（ここではフォールバックしない — ユーザーがロックした意図を尊重する）。
+fn resolve_tool_layer(document: &Document, tool_kind: ToolKind) -> LayerId {
+    match tool_kind {
+        ToolKind::DimLinear | ToolKind::DimRadial | ToolKind::DimDiameter => {
+            layer_named(document, DIM_LAYER_NAME).unwrap_or_else(|| document.current_layer())
+        }
+        ToolKind::Text => {
+            layer_named(document, TEXT_LAYER_NAME).unwrap_or_else(|| document.current_layer())
+        }
+        _ => document.current_layer(),
+    }
+}
+
 /// アクティブなツールへ、キャンバス上の入力（クリック/Enter/Esc/マウス移動）を渡す。
 ///
 /// パン操作（中ボタンドラッグ、または Space+左ドラッグ）と作図クリックが衝突しない
@@ -2690,7 +2766,7 @@ fn handle_tool_input(
     let pick_tol = PICK_TOLERANCE_PX / viewport.zoom;
 
     let ctx = ToolCtx {
-        layer: document.current_layer(),
+        layer: resolve_tool_layer(document, *tool_kind),
         style: Style::inherited(),
     };
 
@@ -6911,6 +6987,26 @@ mod tests {
     }
 
     #[test]
+    fn commit_text_assigns_new_entity_to_text_layer_when_present() {
+        // fresh_document（起動時・Ctrl+N）は "文字" レイヤーを持つので、commit_text は
+        // カレントレイヤー（"外形線"）ではなくそちらへ割り当てる（M9 タスク53）。
+        let mut app = McadApp::new();
+        app.text_content_input = "abc".to_owned();
+
+        let committed = app.commit_text(Point2::new(1.0, 2.0), 0.0);
+        assert!(committed);
+
+        let text_layer = layer_named(&app.document, TEXT_LAYER_NAME).unwrap();
+        let (_, entity) = app
+            .document
+            .entities()
+            .find(|(_, e)| matches!(e.geom, EntityGeom::Text(_)))
+            .expect("text entity must exist");
+        assert_eq!(entity.layer, text_layer);
+        assert_ne!(entity.layer, app.document.current_layer());
+    }
+
+    #[test]
     fn hiding_text_field_clears_pending_content() {
         // Esc でアンカーをキャンセルした等で入力欄が非表示に転じたら、入力中の文字列を
         // 捨てる（次にアンカーを置いたとき前回入力が残らない。coordinator 指摘の回帰）。
@@ -7606,7 +7702,7 @@ mod tests {
         expected.extend(
             DEFAULT_EXTRA_LAYERS
                 .iter()
-                .map(|(name, _)| (*name).to_owned()),
+                .map(|(name, ..)| (*name).to_owned()),
         );
         assert_eq!(ordered_layer_names(&document), expected);
         assert_eq!(
@@ -7618,15 +7714,96 @@ mod tests {
             (0..=DEFAULT_EXTRA_LAYERS.len() as i32).collect::<Vec<_>>()
         );
 
-        // カレントレイヤーは "0" のまま（AddLayer はカレントを動かさない）。
-        assert_eq!(document.current_layer(), document.default_layer());
+        // 規定4-1準拠の線種・線幅がそのまま反映されている（M9 タスク53）。
+        for (name, color, linetype, width_mm) in DEFAULT_EXTRA_LAYERS {
+            let layer_id = layer_named(&document, name).expect("layer must exist");
+            let layer = document.layer(layer_id).unwrap();
+            assert_eq!(layer.color, color);
+            assert_eq!(layer.linetype, linetype);
+            assert_eq!(layer.width_mm.mm(), width_mm);
+        }
+
+        // カレントレイヤーは既定の作図対象である「外形線」（"0" のままではない）。
+        let outline_layer = layer_named(&document, DEFAULT_CURRENT_LAYER_NAME).unwrap();
+        assert_eq!(document.current_layer(), outline_layer);
+        assert_ne!(document.current_layer(), document.default_layer());
         assert_eq!(document.layer(document.default_layer()).unwrap().name, "0");
 
-        // 既定レイヤーの追加は履歴に残らず、世代は基準点（0）に戻っている。
+        // 既定レイヤー・カレントレイヤーの適用は履歴に残らず、世代は基準点（0）に戻っている。
         assert!(!document.can_undo());
         assert!(!document.can_redo());
         assert_eq!(document.generation(), 0);
         assert_eq!(document.entity_count(), 0);
+    }
+
+    #[test]
+    fn layer_named_finds_exact_match_and_returns_none_otherwise() {
+        let document = fresh_document(config::Config::default().default_sheet_meta());
+
+        let dim_layer = layer_named(&document, DIM_LAYER_NAME).expect("寸法線 must exist");
+        assert_eq!(document.layer(dim_layer).unwrap().name, DIM_LAYER_NAME);
+
+        let text_layer = layer_named(&document, TEXT_LAYER_NAME).expect("文字 must exist");
+        assert_eq!(document.layer(text_layer).unwrap().name, TEXT_LAYER_NAME);
+
+        assert_eq!(layer_named(&document, "存在しないレイヤー"), None);
+        // 部分一致は不可（完全一致のみ）。
+        assert_eq!(layer_named(&document, "寸法"), None);
+    }
+
+    #[test]
+    fn resolve_tool_layer_falls_back_to_current_layer_when_named_layer_is_absent() {
+        // Document::new() ベース（読込相当）は "0" のみなので、寸法・文字とも
+        // current_layer へフォールバックする（読込図面でレイヤーを増やさない）。
+        let document = Document::new();
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimLinear),
+            document.current_layer()
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimRadial),
+            document.current_layer()
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimDiameter),
+            document.current_layer()
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::Text),
+            document.current_layer()
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::Line),
+            document.current_layer()
+        );
+    }
+
+    #[test]
+    fn resolve_tool_layer_uses_named_layer_when_present_in_fresh_document() {
+        let document = fresh_document(config::Config::default().default_sheet_meta());
+
+        let dim_layer = layer_named(&document, DIM_LAYER_NAME).unwrap();
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimLinear),
+            dim_layer
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimRadial),
+            dim_layer
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimDiameter),
+            dim_layer
+        );
+
+        let text_layer = layer_named(&document, TEXT_LAYER_NAME).unwrap();
+        assert_eq!(resolve_tool_layer(&document, ToolKind::Text), text_layer);
+
+        // それ以外のツールは常にカレントレイヤー（"外形線"）。
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::Line),
+            document.current_layer()
+        );
     }
 
     // ---- 設定永続化（M8 タスク41-1） ----

@@ -89,7 +89,7 @@ a settings file and restored on the next launch (see "Settings" below).
 ## File formats
 
 - **`.mcad`**: the native JSON format. As of v0.8.0 the schema is v4; v1 through v3 files still load (backward compatible)
-- **New drawings** start with two layers, `"0"` and `"Text"`. `"Text"` can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
+- **New drawings** start with `"0"` plus five layers matching the drafting standard's line table (centre line, hidden line, outline, dimension line, text, with their linetypes and widths), and the current layer is the outline layer. Dimensions and text are placed automatically on layers named `寸法線` and `文字` when those exist (in a loaded drawing without them, the current layer is used). The standard layers can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
 
 ## Settings
 

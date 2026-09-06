@@ -47,7 +47,7 @@
 use mcad_core::{
     ArrowPlacement, DimAnnotation, DimDiameter, DimKind, DimLinear, DimRadial, DimStyle, TextGeom,
 };
-use mcad_geom::{LineSeg, Point2, Shape, Vec2};
+use mcad_geom::{ArrowGlyph, ArrowKind, LineSeg, Point2, Shape, Vec2, arrow_glyph};
 
 use self::label::{DimLabel, layout_dim_label};
 
@@ -61,14 +61,6 @@ use self::label::{DimLabel, layout_dim_label};
 /// 値を食い違わせないことのほうが重要である。
 const ASCII_CHAR_WIDTH_RATIO: f64 = 0.55;
 
-/// 矢先の半幅と長さの比。全開き角度20°（tan(10°) ≈ 0.1763）。規定 5-4 4) と同値を保つこと。
-///
-/// M9 タスク49 の手動スモークテスト（2026-08-23、ユーザー実施）で、規定の草案値だった 15°
-/// は塗りつぶし矢としては細すぎると判断され、規定 5-4 4) 側の数値ごと 20° へ改めた。
-/// 塗りつぶし矢の一般的な慣行に沿う値で、AutoCAD の既定 "Closed filled" も約 19°。
-/// 矢先の長さ（[`mcad_core::DimStyle::arrow_len_mm`]、既定 3.0mm）は据え置き。
-const ARROW_HALF_WIDTH_RATIO: f64 = 0.1763;
-
 /// 寸法を描画・プレビュー可能な要素へ展開した結果（すべてワールド座標）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DimExpansion {
@@ -81,8 +73,16 @@ pub struct DimExpansion {
     /// 並び順は **寸法線（または引出線）→ 非比例寸法の下線（あれば）→ 補助線**。
     /// `segments[0]` が寸法線であることだけは全種別で共通。
     pub segments: Vec<[Point2; 2]>,
-    /// 矢先（各要素は塗りつぶす三角形の 3 頂点）。
-    pub arrows: Vec<[Point2; 3]>,
+    /// 矢先（各要素は 1 個ぶんの形状を**ワールド座標へ写した** [`ArrowGlyph`]）。
+    ///
+    /// 形そのものは geom の純関数 [`mcad_geom::arrow_glyph`] が種別
+    /// （[`DimStyle::arrow_kind`]）ごとに決め、ここではローカル座標を
+    /// [`place_arrow`] でワールドへ移しただけのものを持つ。消費側（`main.rs` の
+    /// `draw_dim_expansion`・`plot::push_dim`）は [`ArrowGlyph::fills`] を塗り、
+    /// [`ArrowGlyph::strokes`] を寸法線と同じストロークで描く。
+    /// **種別ごとの分岐は消費側に一切置かない**（画面と SVG/PDF が同一の形を描くのは
+    /// 「形を決めるのは geom の純関数ひとつだけ」という M9 判断1・9 の帰結）。
+    pub arrows: Vec<ArrowGlyph>,
     /// フォント文字として描く要素（値・英字記号・公差）。既存の `draw_text` を
     /// そのまま再利用できる形で返す。
     ///
@@ -107,7 +107,7 @@ pub struct DimExpansion {
 
 impl DimExpansion {
     /// 線分・矢先だけを持つ空のラベル列で作る（ラベルは [`place_label`] が後から積む）。
-    fn new(segments: Vec<[Point2; 2]>, arrows: Vec<[Point2; 3]>) -> Self {
+    fn new(segments: Vec<[Point2; 2]>, arrows: Vec<ArrowGlyph>) -> Self {
         Self {
             segments,
             arrows,
@@ -216,11 +216,39 @@ impl DimRender<'_> {
     }
 }
 
-/// 先端 `tip`・方向 `dir`（単位ベクトル）・長さ `len` の矢先三角形を作る。
-fn arrow_triangle(tip: Point2, dir: Vec2, len: f64) -> [Point2; 3] {
-    let back = tip - dir * len;
-    let half = dir.perp() * (len * ARROW_HALF_WIDTH_RATIO);
-    [tip, back + half, back - half]
+/// 矢先グリフ（ローカル座標）を、先端 `tip`・向き `dir`（単位ベクトル。**先端が指す
+/// 方向**）でワールドへ配置する。
+///
+/// [`ArrowGlyph`] のローカル座標 `(x, y)` は `tip + dir * x + dir.perp() * y` へ移る
+/// （M9 までの `arrow_triangle` が `[tip, back + half, back - half]` を作っていたのと
+/// 同じ姿勢: `dir` が +x、その左手側が +y）。
+fn place_arrow(tip: Point2, dir: Vec2, glyph: &ArrowGlyph) -> ArrowGlyph {
+    let up = dir.perp();
+    let to_world = |p: Point2| tip + dir * p.x + up * p.y;
+    ArrowGlyph {
+        fills: glyph
+            .fills
+            .iter()
+            .map(|poly| poly.iter().map(|p| to_world(*p)).collect())
+            .collect(),
+        strokes: glyph
+            .strokes
+            .iter()
+            .map(|[a, b]| [to_world(*a), to_world(*b)])
+            .collect(),
+        along_len: glyph.along_len,
+    }
+}
+
+/// 矢先種別 `kind` が寸法線に沿って場所を取るか（＝内外配置の指定が描画に現れるか）。
+///
+/// `false` になるのは `Oblique` / `Dot` / `None`。UI（右パネルの矢印配置コンボ）が
+/// この判定で無効化するために公開している（DESIGN.md 7章「随時対応」の「寸法矢印の
+/// ブロック化」設計確定4・6）。[`mcad_geom::ArrowGlyph::along_len`] は `len` に比例
+/// するので、長さ 1 の代表値で問うても種別ごとの答えは変わらない。
+#[must_use]
+pub fn arrow_kind_occupies_line(kind: ArrowKind) -> bool {
+    arrow_glyph(kind, 1.0).along_len > 0.0
 }
 
 /// 点 `p` から線分群への最短距離。空なら [`f64::INFINITY`]。
@@ -287,10 +315,19 @@ fn extension_line(
 /// [`ArrowPlacement::Inside`] / [`ArrowPlacement::Outside`] は手動指定なのでそのまま従う。
 /// [`ArrowPlacement::Auto`] は「ラベル幅 + 矢 2 つ分が寸法線長に収まるか」で決める。
 ///
+/// # 寸法線に沿って場所を取らない矢先は常に内向き（M10 タスク63）
+///
+/// 「矢 2 つ分」は矢先長ではなく [`ArrowGlyph::along_len`]（矢先が寸法線に沿って占める
+/// 長さ）で測る。`Oblique` / `Dot` / `None` はこれが 0 なので、自動判定は外向きにならず、
+/// 手動 [`ArrowPlacement::Outside`] も無視して内向き扱いにする（描画がまったく変わらない
+/// のに寸法線だけが伸びるのを防ぐ。7章「随時対応」の「寸法矢印のブロック化」設計確定4）。
+/// UI 側はこの種別のとき矢印配置コンボを無効化する（[`arrow_kind_occupies_line`]）。
+///
 /// # 判定はビュー非依存（必須）
 ///
 /// 3 つの量を**すべて紙 mm**で取る。ラベル幅は [`DimStyle::text_height_mm`] で組んだ
-/// [`DimLabel::width`]、矢先長は [`DimStyle::arrow_len_mm`]、寸法線長は
+/// [`DimLabel::width`]、矢先の占有長は [`DimStyle::arrow_len_mm`] で作ったグリフの
+/// `along_len`、寸法線長は
 /// ワールド長を [`DimRender::scale_world_per_paper_mm`] で割った値である。
 /// **描画用のワールド長（紙基準表示 OFF ではズーム依存）を混ぜてはならない。**
 /// M9 の検収基準は「画面と SVG/PDF で同一に描画される」ことを要求しており、判定が
@@ -304,6 +341,12 @@ fn arrows_point_outward(
     kind: DimKind,
     render: DimRender<'_>,
 ) -> bool {
+    // 紙 mm で作ったグリフの占有長。種別が `Oblique` / `Dot` / `None` のとき、および
+    // スタイルの矢先長が使えない値のときは 0 になる。
+    let along_len_mm = arrow_glyph(render.style.arrow_kind, render.style.arrow_len_mm).along_len;
+    if along_len_mm <= 0.0 {
+        return false;
+    }
     match annotation.arrow_placement {
         ArrowPlacement::Inside => false,
         ArrowPlacement::Outside => true,
@@ -322,7 +365,7 @@ fn arrows_point_outward(
                 render.style.text_height_mm,
             )
             .width();
-            line_len_mm < label_width_mm + 2.0 * render.style.arrow_len_mm
+            line_len_mm < label_width_mm + 2.0 * along_len_mm
         }
     }
 }
@@ -384,7 +427,8 @@ fn place_label(label: &DimLabel, center: Point2, along: Vec2, out: &mut DimExpan
 /// 1. 文字は寸法線の**上側**（[`reading_direction`] の `perp()` 正側）へ、
 ///    [`DimStyle::text_gap_mm`] のすきまを空けて置く（規定 5-2 3)）。
 /// 2. 矢は [`arrows_point_outward`] の判定で内外を切り替える（規定 5-4 4)）。
-///    外向きのときは矢が乗る線がなくなるので、寸法線を両端へ矢先長ぶん延長する。
+///    外向きのときは矢が乗る線がなくなるので、寸法線を両端へ矢先の占有長
+///    （[`ArrowGlyph::along_len`]）ぶん延長する。
 /// 3. [`DimAnnotation::text_anchor`] が `Some` ならラベル外形の中心をその点へ置き、
 ///    1. の自動配置を上書きする。
 fn expand_straight(
@@ -396,22 +440,24 @@ fn expand_straight(
     kind: DimKind,
     render: DimRender<'_>,
 ) -> DimExpansion {
-    let arrow_len = render.arrow_len_world;
+    let glyph = arrow_glyph(render.style.arrow_kind, render.arrow_len_world);
     let outward = arrows_point_outward((d2 - d1).length(), value, annotation, kind, render);
 
-    // 矢先の先端は常に寸法線の両端（`d1` / `d2`）。三角形の胴を内・外どちらへ出すかだけが
-    // 変わる（`arrow_triangle` は先端から `-dir * len` の側へ胴を作る）。
+    // 矢先の先端は常に寸法線の両端（`d1` / `d2`）。胴を内・外どちらへ出すかだけが変わる
+    // （`place_arrow` は先端から `-dir` の側へ胴を作る）。
     let (tail1, tail2) = if outward { (dir, -dir) } else { (-dir, dir) };
+    // 外向きのときだけ寸法線を伸ばす。伸ばす量は矢先が線に沿って占める長さそのもの
+    // （`outward` が真になる種別では `render.arrow_len_world` と一致する）。
     let (line1, line2) = if outward {
-        (d1 - dir * arrow_len, d2 + dir * arrow_len)
+        (d1 - dir * glyph.along_len, d2 + dir * glyph.along_len)
     } else {
         (d1, d2)
     };
     let mut ex = DimExpansion::new(
         vec![[line1, line2]],
         vec![
-            arrow_triangle(d1, tail1, arrow_len),
-            arrow_triangle(d2, tail2, arrow_len),
+            place_arrow(d1, tail1, &glyph),
+            place_arrow(d2, tail2, &glyph),
         ],
     );
 
@@ -526,10 +572,8 @@ pub fn radial_distance(dim: &DimRadial, p: Point2) -> f64 {
 pub fn expand_radial(dim: &DimRadial, render: DimRender<'_>) -> DimExpansion {
     let (dir, pc) = radial_frame(dim);
     let arrow_len = render.arrow_len_world;
-    let mut ex = DimExpansion::new(
-        vec![[dim.center, pc]],
-        vec![arrow_triangle(pc, dir, arrow_len)],
-    );
+    let glyph = arrow_glyph(render.style.arrow_kind, arrow_len);
+    let mut ex = DimExpansion::new(vec![[dim.center, pc]], vec![place_arrow(pc, dir, &glyph)]);
 
     let label = layout_dim_label(
         dim.radius,
@@ -1067,10 +1111,21 @@ mod tests {
         mm / DimStyle::DEFAULT.text_height_mm
     }
 
+    /// 配置済み矢先グリフの先端（＝ローカル原点を写した点）。
+    ///
+    /// 既定の [`ArrowKind::ClosedFilled`] は `[先端, 後端+半幅, 後端−半幅]` の三角形
+    /// 1 枚なので、最初の塗り多角形の頂点 0 が先端になる（`arrow_glyph` の
+    /// `closed_filled_is_a_triangle_with_a_30_degree_included_angle` が頂点順を固定
+    /// している）。既定以外の種別を使うテストではこの helper を使わないこと。
+    fn arrow_tip(glyph: &ArrowGlyph) -> Point2 {
+        glyph.fills[0][0]
+    }
+
     /// 矢が外向きか（先端から胴への向きが寸法線 `dir` の外側か）を展開結果から読む。
+    /// [`arrow_tip`] と同じく既定の塗りつぶし三角形を前提にする。
     fn arrows_are_outward(ex: &DimExpansion, dir: Vec2) -> bool {
-        let [tip, a, b] = ex.arrows[0];
-        (a.midpoint(b) - tip).dot(dir) < 0.0
+        let tri = &ex.arrows[0].fills[0];
+        (tri[1].midpoint(tri[2]) - tri[0]).dot(dir) < 0.0
     }
 
     /// 展開結果のフォント文字ラン（φ・□ のストロークは含まない）。
@@ -1150,8 +1205,8 @@ mod tests {
         let dim = plain_linear(Point2::new(0.0, 0.0), Point2::new(4.0, 0.0), 2.0);
         let ex = expand_linear(&dim, render(0.5, 1.0));
         // 矢先の先端（各三角形の第 1 頂点）は、内外配置に関わらず寸法線の両端。
-        assert!(approx(ex.arrows[0][0], Point2::new(0.0, 2.0)));
-        assert!(approx(ex.arrows[1][0], Point2::new(4.0, 2.0)));
+        assert!(approx(arrow_tip(&ex.arrows[0]), Point2::new(0.0, 2.0)));
+        assert!(approx(arrow_tip(&ex.arrows[1]), Point2::new(4.0, 2.0)));
     }
 
     #[test]
@@ -1350,20 +1405,21 @@ mod tests {
         let dir = Vec2::new(1.0, 0.0);
         let arrow_len = 0.5;
 
-        // 100mm の寸法線には「100」+ 矢 2 つ（各 3mm）が余裕で収まる → 内向き。
+        // 100mm の寸法線には「100」+ 矢 2 つ（各 5mm＝既定 `arrow_len_mm`）が余裕で
+        // 収まる → 内向き。
         let long = plain_linear(Point2::new(0.0, 0.0), Point2::new(100.0, 0.0), 2.0);
         let ex = expand_linear(&long, render(arrow_len, 1.0));
         assert!(!arrows_are_outward(&ex, dir));
         assert!(approx(ex.segments[0][0], Point2::new(0.0, 2.0)));
         assert!(approx(ex.segments[0][1], Point2::new(100.0, 2.0)));
 
-        // 5mm では「5」+ 矢 2 つ（6mm）が収まらない → 外向き。矢先の先端は寸法線の端の
+        // 5mm では「5」+ 矢 2 つ（10mm）が収まらない → 外向き。矢先の先端は寸法線の端の
         // ままで、胴が外へ出る。矢が乗る線がなくなるので寸法線を両端へ矢先長ぶん延長する。
         let short = plain_linear(Point2::new(0.0, 0.0), Point2::new(5.0, 0.0), 2.0);
         let ex = expand_linear(&short, render(arrow_len, 1.0));
         assert!(arrows_are_outward(&ex, dir));
-        assert!(approx(ex.arrows[0][0], Point2::new(0.0, 2.0)));
-        assert!(approx(ex.arrows[1][0], Point2::new(5.0, 2.0)));
+        assert!(approx(arrow_tip(&ex.arrows[0]), Point2::new(0.0, 2.0)));
+        assert!(approx(arrow_tip(&ex.arrows[1]), Point2::new(5.0, 2.0)));
         assert!(approx(ex.segments[0][0], Point2::new(-arrow_len, 2.0)));
         assert!(approx(ex.segments[0][1], Point2::new(5.0 + arrow_len, 2.0)));
     }
@@ -1468,7 +1524,7 @@ mod tests {
         assert_eq!(contents_of(&ex), ["R", "12.5"]);
         assert!(ex.symbol_strokes.is_empty(), "R はフォント文字");
         // 矢先の先端は円周点 (12.5,0)。
-        assert!(approx(ex.arrows[0][0], Point2::new(12.5, 0.0)));
+        assert!(approx(arrow_tip(&ex.arrows[0]), Point2::new(12.5, 0.0)));
         // 文字は水平（角 0）で円周点より外側（x>12.5）。
         assert!(ex.texts.iter().all(|t| t.angle.abs() < T));
         assert!(ex.texts[0].anchor.x > 12.5);
@@ -1550,8 +1606,8 @@ mod tests {
         assert!(approx(ex.segments[0][0], Point2::new(-30.0, 0.0)));
         assert!(approx(ex.segments[0][1], Point2::new(30.0, 0.0)));
         assert_eq!(ex.arrows.len(), 2);
-        assert!(approx(ex.arrows[0][0], Point2::new(-30.0, 0.0)));
-        assert!(approx(ex.arrows[1][0], Point2::new(30.0, 0.0)));
+        assert!(approx(arrow_tip(&ex.arrows[0]), Point2::new(-30.0, 0.0)));
+        assert!(approx(arrow_tip(&ex.arrows[1]), Point2::new(30.0, 0.0)));
         assert!(!arrows_are_outward(&ex, Vec2::new(1.0, 0.0)));
     }
 
@@ -1612,6 +1668,158 @@ mod tests {
             &expand_diameter(&forced_outside, render(0.5, 1.0)),
             dir
         ));
+    }
+
+    // --- 矢先のブロック化（M10 タスク63） ---
+
+    /// [`ArrowKind`] の全既知バリアント（geom 側は `#[non_exhaustive]` なのでここに列挙
+    /// する。[`ALL_SYMBOLS`] と同じ流儀で、**種別が増えたらここへ足すこと**）。
+    const ALL_ARROW_KINDS: [ArrowKind; 7] = [
+        ArrowKind::ClosedFilled,
+        ArrowKind::ClosedBlank,
+        ArrowKind::Open30,
+        ArrowKind::Open90,
+        ArrowKind::Oblique,
+        ArrowKind::Dot,
+        ArrowKind::None,
+    ];
+
+    /// 矢先種別だけを差し替えた展開パラメータ（尺度 1:1）。
+    fn render_with_arrow_kind(
+        style: &DimStyle,
+        arrow_len_world: f64,
+        text_height_world: f64,
+    ) -> DimRender<'_> {
+        DimRender {
+            style,
+            scale_world_per_paper_mm: 1.0,
+            arrow_len_world,
+            text_height_world,
+        }
+    }
+
+    /// 展開結果の矢先は「geom の純関数が作った形を先端・向きへ写しただけ」である。
+    ///
+    /// 種別ごとの形の責務は geom にしかない（app 側にも消費側にも分岐が無い）ことを
+    /// 全種別で固定する。画面（`draw_dim_expansion`）と SVG/PDF（`plot::push_dim`）は
+    /// この同じ [`DimExpansion`] を描くので、これが「7 種が画面と出力で同一に描かれる」
+    /// ことの app 層側の担保になる。
+    #[test]
+    fn expansion_arrows_are_the_geom_glyph_placed_at_the_line_ends() {
+        let dim = plain_linear(Point2::new(0.0, 0.0), Point2::new(100.0, 0.0), 2.0);
+        for kind in ALL_ARROW_KINDS {
+            let style = DimStyle {
+                arrow_kind: kind,
+                ..DimStyle::DEFAULT
+            };
+            let ex = expand_linear(&dim, render_with_arrow_kind(&style, 4.0, 1.0));
+            assert_eq!(ex.arrows.len(), 2, "{kind:?}");
+            // 100mm の寸法線にはどの種別でも収まる → 内向き（先端は寸法線の両端で、
+            // 胴は内側へ出るので向きは d1 が −x、d2 が +x）。
+            let glyph = arrow_glyph(kind, 4.0);
+            assert_eq!(
+                ex.arrows[0],
+                place_arrow(Point2::new(0.0, 2.0), Vec2::new(-1.0, 0.0), &glyph),
+                "{kind:?}"
+            );
+            assert_eq!(
+                ex.arrows[1],
+                place_arrow(Point2::new(100.0, 2.0), Vec2::new(1.0, 0.0), &glyph),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// 設計確定4: 寸法線に沿って場所を取らない種別（斜線・点・なし）は、自動判定でも
+    /// 手動 [`ArrowPlacement::Outside`] でも外向きにならず、寸法線も延長されない。
+    #[test]
+    fn arrow_kinds_without_line_occupancy_never_extend_the_dimension_line() {
+        let arrow_len = 0.5;
+        let with = |kind, placement| {
+            (
+                DimStyle {
+                    arrow_kind: kind,
+                    ..DimStyle::DEFAULT
+                },
+                DimLinear {
+                    p1: Point2::ORIGIN,
+                    // 5mm は「5」+ 矢 2 つが収まらない長さ（自動なら確実に外向き）。
+                    p2: Point2::new(5.0, 0.0),
+                    offset: 2.0,
+                    annotation: DimAnnotation {
+                        arrow_placement: placement,
+                        ..DimAnnotation::default()
+                    },
+                },
+            )
+        };
+        let placements = [
+            ArrowPlacement::Auto,
+            ArrowPlacement::Inside,
+            ArrowPlacement::Outside,
+        ];
+
+        for kind in [ArrowKind::Oblique, ArrowKind::Dot, ArrowKind::None] {
+            assert!(!arrow_kind_occupies_line(kind), "{kind:?}");
+            for placement in placements {
+                let (style, dim) = with(kind, placement);
+                let ex = expand_linear(&dim, render_with_arrow_kind(&style, arrow_len, 1.0));
+                assert!(
+                    approx(ex.segments[0][0], Point2::new(0.0, 2.0))
+                        && approx(ex.segments[0][1], Point2::new(5.0, 2.0)),
+                    "{kind:?} / {placement:?} で寸法線が延長された: {:?}",
+                    ex.segments[0]
+                );
+            }
+        }
+
+        // 対照: 場所を取る 4 種は同じ寸法で外向きになり、両端が矢先長ぶん伸びる。
+        for kind in [
+            ArrowKind::ClosedFilled,
+            ArrowKind::ClosedBlank,
+            ArrowKind::Open30,
+            ArrowKind::Open90,
+        ] {
+            assert!(arrow_kind_occupies_line(kind), "{kind:?}");
+            let (style, dim) = with(kind, ArrowPlacement::Auto);
+            let ex = expand_linear(&dim, render_with_arrow_kind(&style, arrow_len, 1.0));
+            // 延長量は矢先長ではなく glyph の along_len（Open90 は len/2）。
+            let reach = mcad_geom::arrow_glyph(kind, arrow_len).along_len;
+            assert!(
+                approx(ex.segments[0][0], Point2::new(-reach, 2.0))
+                    && approx(ex.segments[0][1], Point2::new(5.0 + reach, 2.0)),
+                "{kind:?} で寸法線が延長されていない: {:?}",
+                ex.segments[0]
+            );
+        }
+    }
+
+    /// 半径寸法の矢先も文書スタイルの種別に従う（長さ寸法と同じ経路であることの固定）。
+    #[test]
+    fn radial_arrow_follows_the_document_arrow_kind() {
+        let dim = DimRadial {
+            center: Point2::ORIGIN,
+            radius: 12.5,
+            leader_angle: 0.0,
+            annotation: DimAnnotation::default(),
+        };
+        for kind in ALL_ARROW_KINDS {
+            let style = DimStyle {
+                arrow_kind: kind,
+                ..DimStyle::DEFAULT
+            };
+            let ex = expand_radial(&dim, render_with_arrow_kind(&style, 0.5, 1.0));
+            assert_eq!(ex.arrows.len(), 1, "{kind:?}");
+            assert_eq!(
+                ex.arrows[0],
+                place_arrow(
+                    Point2::new(12.5, 0.0),
+                    Vec2::new(1.0, 0.0),
+                    &arrow_glyph(kind, 0.5)
+                ),
+                "{kind:?}"
+            );
+        }
     }
 
     // --- ラベルの組版（タスク49-1） ---

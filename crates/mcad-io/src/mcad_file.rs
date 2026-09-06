@@ -164,6 +164,18 @@ use crate::IoError;
 /// [`FileDocumentV5`] 参照）。
 pub const FORMAT_VERSION: u32 = 6;
 
+/// v1〜v4(`dim_style` を持たない版)の読込で補完する寸法スタイル。
+///
+/// `DimStyle::DEFAULT` を使ってはいけない: 既定値は新規文書のためのもので、M10 タスク63 で
+/// 矢の長さの既定を 3.0 → 5.0mm に変えた。旧ファイルは「保存当時の描画 = 3.0mm・塗りつぶし矢」
+/// で読めるべきで、既定値に追従させると読込のたびに矢が伸び、外向き判定も変わり、保存で
+/// 固定化される(Codex adversarial review 2026-09-06、high)。v5 以降は `dim_style` を
+/// ファイルが持つので補完は起きない。**この値は凍結**(既定値が変わっても動かさない)。
+const LEGACY_DIM_STYLE: DimStyle = DimStyle {
+    arrow_len_mm: 3.0,
+    ..DimStyle::DEFAULT
+};
+
 /// `.mcad` ファイル全体を表すポータブルな DTO（現行 v6）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDocument {
@@ -627,7 +639,7 @@ impl FileDocumentV4 {
             layers: self.layers,
             current_layer: self.current_layer,
             entities: self.entities,
-            dim_style: DimStyle::default(),
+            dim_style: LEGACY_DIM_STYLE,
         }
     }
 
@@ -1925,7 +1937,23 @@ mod tests {
         };
         assert_eq!(dim.annotation, DimAnnotation::default());
         assert_eq!(dim.annotation.decimals_override, None);
-        assert_eq!(*doc.dim_style(), DimStyle::default());
+        // 旧ファイルは凍結された旧既定(矢 3.0mm)で補完される。新規文書の既定(5.0mm)ではない。
+        assert_eq!(*doc.dim_style(), LEGACY_DIM_STYLE);
+        assert_eq!(doc.dim_style().arrow_len_mm, 3.0);
+        assert_ne!(*doc.dim_style(), DimStyle::default());
+    }
+
+    #[test]
+    fn v4_file_keeps_legacy_arrow_length_across_resave() {
+        // 読込 → 保存 → 再読込で 3.0mm のまま(既定値の変更が旧図面へ滲まない)。
+        let linear_json = v4_json_with_dimension(
+            r#"{"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 4.0, "y": 0.0}, "offset": 1.5}}"#,
+        );
+        let doc = load(&linear_json).unwrap();
+        let saved = to_json(&doc).unwrap();
+        let reloaded = load(&saved).unwrap();
+        assert_eq!(reloaded.dim_style().arrow_len_mm, 3.0);
+        assert_eq!(*reloaded.dim_style(), LEGACY_DIM_STYLE);
     }
 
     /// v5 の最小 JSON。`dim_style` は既定値の JSON を渡す（呼び出し側で差し替え可能）。

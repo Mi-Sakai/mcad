@@ -2646,6 +2646,23 @@ impl eframe::App for McadApp {
                         ui.text_edit_singleline(&mut dialog.arrow_len_mm);
                         ui.end_row();
 
+                        ui.label("矢先:");
+                        // 右パネルのコンボと同じ流儀（ポップアップ高さの記憶対策として
+                        // `dim_combo_id_salt` で Id を回す。同関数の doc 参照）。
+                        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_style_arrow_kind"))
+                            .height(DIM_COMBO_MAX_HEIGHT)
+                            .selected_text(dim_arrow_kind_label(dialog.arrow_kind))
+                            .show_ui(ui, |ui| {
+                                for kind in ARROW_KIND_CHOICES {
+                                    ui.selectable_value(
+                                        &mut dialog.arrow_kind,
+                                        kind,
+                                        dim_arrow_kind_label(kind),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
                         ui.label("小数桁数(0〜4):");
                         ui.text_edit_singleline(&mut dialog.decimals);
                         ui.end_row();
@@ -3866,6 +3883,35 @@ fn dim_arrow_placement_label(placement: ArrowPlacement) -> &'static str {
     }
 }
 
+/// 寸法スタイルダイアログの「矢先」コンボに並べる種別（M10 タスク63）。
+/// [`ArrowKind`] は `#[non_exhaustive]` なので網羅はこの配列が担保する
+/// （`dimension::tests::ALL_SYMBOLS` と同じ流儀。**種別を増やしたらここへ足す**）。
+const ARROW_KIND_CHOICES: [ArrowKind; 7] = [
+    ArrowKind::ClosedFilled,
+    ArrowKind::ClosedBlank,
+    ArrowKind::Open30,
+    ArrowKind::Open90,
+    ArrowKind::Oblique,
+    ArrowKind::Dot,
+    ArrowKind::None,
+];
+
+/// 矢先コンボの日本語ラベル（DESIGN.md 7章「随時対応」の「寸法矢印のブロック化」
+/// 設計確定3・6）。[`ArrowKind`] は `#[non_exhaustive]` なので、未知バリアントは
+/// [`dim_symbol_ui_label`] と同じく安全側の "?" 表示へ倒す。
+fn dim_arrow_kind_label(kind: ArrowKind) -> &'static str {
+    match kind {
+        ArrowKind::ClosedFilled => "塗りつぶし矢",
+        ArrowKind::ClosedBlank => "白抜き矢",
+        ArrowKind::Open30 => "開いた矢 30°",
+        ArrowKind::Open90 => "開いた矢 90°",
+        ArrowKind::Oblique => "斜線",
+        ArrowKind::Dot => "点",
+        ArrowKind::None => "なし",
+        _ => "?",
+    }
+}
+
 /// 寸法パネルの公差種別（UI 表示・編集の入口を選ぶタグ）。[`SizeTolerance`] は
 /// `#[non_exhaustive]` なので、まだ知らないバリアントを安全に表示だけする
 /// [`DimTolKindUi::Other`] を持つ（編集は提供しない。種別を明示的に変更するまで
@@ -4455,33 +4501,47 @@ fn dim_panel(
     }
 
     // --- 矢印の配置 ---
+    // 文書の矢先が寸法線に沿って場所を取らない種別（斜線・点・なし）のときは、内向き・
+    // 外向きのどちらを選んでも描画が変わらない（`dimension::arrows_point_outward` が
+    // 手動指定ごと内向きへ倒す）。選べてしまうと「効かない設定」になるのでコンボを
+    // 無効化し、理由をホバーで示す（DESIGN.md 7章「寸法矢印のブロック化」設計確定4・6）。
+    let arrow_kind = document.dim_style().arrow_kind;
+    let placement_matters = dimension::arrow_kind_occupies_line(arrow_kind);
     let arrow_common = all_same(live.iter().map(|(_, _, a)| a.arrow_placement));
     ui.horizontal(|ui| {
         ui.label("矢印の配置:");
         let selected_text = arrow_common.map_or("(混在)", dim_arrow_placement_label);
-        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_arrow_placement"))
-            .height(DIM_COMBO_MAX_HEIGHT)
-            .selected_text(selected_text)
-            .show_ui(ui, |ui| {
-                for placement in [
-                    ArrowPlacement::Auto,
-                    ArrowPlacement::Inside,
-                    ArrowPlacement::Outside,
-                ] {
-                    if ui
-                        .selectable_label(
-                            arrow_common == Some(placement),
-                            dim_arrow_placement_label(placement),
-                        )
-                        .clicked()
-                    {
-                        let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
-                            a.arrow_placement = placement;
-                        });
-                        apply(cmds, errs);
+        ui.add_enabled_ui(placement_matters, |ui| {
+            egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_arrow_placement"))
+                .height(DIM_COMBO_MAX_HEIGHT)
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    for placement in [
+                        ArrowPlacement::Auto,
+                        ArrowPlacement::Inside,
+                        ArrowPlacement::Outside,
+                    ] {
+                        if ui
+                            .selectable_label(
+                                arrow_common == Some(placement),
+                                dim_arrow_placement_label(placement),
+                            )
+                            .clicked()
+                        {
+                            let (cmds, errs) =
+                                build_annotation_edit_commands(document, &live, |a| {
+                                    a.arrow_placement = placement;
+                                });
+                            apply(cmds, errs);
+                        }
                     }
-                }
-            });
+                });
+        })
+        .response
+        .on_disabled_hover_text(format!(
+            "矢先が「{}」のときは内向き・外向きで描画が変わりません",
+            dim_arrow_kind_label(arrow_kind)
+        ));
     });
 
     // --- 表示値の上書き（非比例寸法） ---
@@ -4900,10 +4960,8 @@ struct DimStyleDialogState {
     ext_overshoot_mm: String,
     text_gap_mm: String,
     tolerance_scale: String,
-    /// 矢先の種類。ダイアログにコンボはまだ無い（M10 タスク63で追加）ので、開いた
-    /// ときの値をそのまま持ち回るだけ。ここで持たずに `DimStyle::DEFAULT` を常用
-    /// すると、v6 ファイルで既定以外の矢先を選んだ図面がこのダイアログの OK で
-    /// 黙って `ClosedFilled` へ戻ってしまう。
+    /// 矢先の種類（M10 タスク63 で「矢先」コンボを追加）。数値項目と違い文字列を
+    /// 経由しないので、コンボの選択がそのまま作業コピーへ入る。
     arrow_kind: ArrowKind,
     /// OK 時のパース/検証失敗をインライン表示するための直近エラー。
     error: Option<String>,
@@ -6378,8 +6436,8 @@ fn draw_dim_diameter(
 
 /// 寸法の展開結果（線分・矢先・記号ストローク・文字）を Painter へ描く。プレビュー
 /// （`tool.rs` の `draw_preview`）と確定描画・選択ハイライトが共有する
-/// （`crate::draw_dim_expansion`）。矢先は `stroke.color` で塗りつぶし、文字は既存の
-/// [`draw_text`] を再利用する。
+/// （`crate::draw_dim_expansion`）。矢先は塗り（`stroke.color`）と線（寸法線と同じ
+/// `stroke`）の 2 系統で描き、文字は既存の [`draw_text`] を再利用する。
 ///
 /// 各 `TextGeom::height` は `dimension` の展開関数が `dim_sizes` の戻り値（既にワールド長）
 /// から組み立てた高さなので、ここでは**そのまま** `draw_text` のワールド高さ引数へ渡す
@@ -6399,12 +6457,22 @@ fn draw_dim_expansion(
         let b = viewport.world_to_screen(rect, seg[1]);
         painter.line_segment([a, b], stroke);
     }
-    for tri in &ex.arrows {
-        let pts: Vec<Pos2> = tri
-            .iter()
-            .map(|p| viewport.world_to_screen(rect, *p))
-            .collect();
-        painter.add(egui::Shape::convex_polygon(pts, stroke.color, Stroke::NONE));
+    // 矢先は種別ごとに「塗る多角形」と「描く線分」の組で来る（`mcad_geom::arrow_glyph`）。
+    // ここに種別の分岐は無い ── 形を決めるのは geom の純関数ひとつだけで、`plot::push_dim`
+    // も同じ組を同じ規則で描くから画面と SVG/PDF が一致する。
+    for glyph in &ex.arrows {
+        for poly in &glyph.fills {
+            let pts: Vec<Pos2> = poly
+                .iter()
+                .map(|p| viewport.world_to_screen(rect, *p))
+                .collect();
+            painter.add(egui::Shape::convex_polygon(pts, stroke.color, Stroke::NONE));
+        }
+        for [a, b] in &glyph.strokes {
+            let a = viewport.world_to_screen(rect, *a);
+            let b = viewport.world_to_screen(rect, *b);
+            painter.line_segment([a, b], stroke);
+        }
     }
     // 記号（φ・□）は値と同じラベルの一部なので、文字の直前へ置いて描画順を揃える。
     // 寸法は製図慣行として常に実線なので線種は `Continuous` 固定で、`draw_shape` の `k`
@@ -9257,9 +9325,10 @@ mod tests {
             let render = dim_render(&style, true, k, 1.0);
             let ex = dimension::expand_linear(&dim, render);
 
-            // 矢先の実長（先端 → 後端）はスタイルの矢先長 × k。
-            let [tip, a, b] = ex.arrows[0];
-            let drawn_arrow = tip.distance(a.midpoint(b));
+            // 矢先の実長（先端 → 後端）はスタイルの矢先長 × k（既定の塗りつぶし矢は
+            // `[先端, 後端+半幅, 後端−半幅]` の三角形 1 枚）。
+            let tri = &ex.arrows[0].fills[0];
+            let drawn_arrow = tri[0].distance(tri[1].midpoint(tri[2]));
             assert!(
                 (drawn_arrow - style.arrow_len_mm * k).abs() < 1e-9,
                 "arrow {drawn_arrow} for style {style:?}"
@@ -9652,6 +9721,50 @@ mod tests {
     fn dim_style_dialog_round_trips_the_default_style() {
         let dialog = DimStyleDialogState::from_style(&DimStyle::default());
         assert_eq!(dialog.to_dim_style(), Ok(DimStyle::default()));
+    }
+
+    /// 矢先コンボ（M10 タスク63）: 選んだ種別が `SetDimStyle` の値へ届き、既定以外の
+    /// 矢先を持つ図面をダイアログで開いて OK しても種別が黙って戻らない。
+    #[test]
+    fn dim_style_dialog_round_trips_the_arrow_kind() {
+        for kind in ARROW_KIND_CHOICES {
+            let style = DimStyle {
+                arrow_kind: kind,
+                ..DimStyle::default()
+            };
+            let dialog = DimStyleDialogState::from_style(&style);
+            assert_eq!(dialog.to_dim_style(), Ok(style), "{kind:?}");
+        }
+
+        // コンボで選び直した分だけが変わる。
+        let mut dialog = DimStyleDialogState::from_style(&DimStyle::default());
+        dialog.arrow_kind = ArrowKind::Oblique;
+        let edited = dialog.to_dim_style().expect("valid edit");
+        assert_eq!(edited.arrow_kind, ArrowKind::Oblique);
+        assert_eq!(
+            edited,
+            DimStyle {
+                arrow_kind: ArrowKind::Oblique,
+                ..DimStyle::default()
+            }
+        );
+    }
+
+    /// 矢先コンボの選択肢が全種別を漏れなく持ち、どれも "?"（未知バリアントの安全側
+    /// 表示）にならない。`ArrowKind` は `#[non_exhaustive]` なので網羅はこのテストと
+    /// [`ARROW_KIND_CHOICES`] が担保する。
+    #[test]
+    fn arrow_kind_choices_cover_every_known_kind_with_a_japanese_label() {
+        assert!(ARROW_KIND_CHOICES.contains(&ArrowKind::default()));
+        for kind in ARROW_KIND_CHOICES {
+            assert_ne!(dim_arrow_kind_label(kind), "?", "{kind:?}");
+        }
+        // 配置コンボを無効化する種別（`along_len == 0`）は 3 つ。
+        let no_room = ARROW_KIND_CHOICES
+            .iter()
+            .filter(|&&k| !dimension::arrow_kind_occupies_line(k))
+            .count();
+        assert_eq!(no_room, 3, "斜線・点・なしの 3 種のはず");
     }
 
     #[test]

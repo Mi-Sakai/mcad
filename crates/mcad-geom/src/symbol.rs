@@ -149,9 +149,7 @@ fn square_glyph(h: f64) -> SymbolGlyph {
 /// この型を保持する。
 ///
 /// JIS Z 8317-1:2008 附属書A の図示記号を優先し、AutoCAD の `DIMBLK` 系互換名は
-/// 参考に留める（設計確定3）。**形状生成（`arrow_glyph` 純関数）は M10 タスク63で
-/// 実装する** — このバリアント自体は `.mcad` v6 のスキーマ確定のため先に導入する
-/// （タスク57・63 の分割。設計確定1〜2）。
+/// 参考に留める（設計確定3）。形状の生成は純関数 [`arrow_glyph`]（M10 タスク63）。
 ///
 /// `#[non_exhaustive]`: 種別は今後も増えうる。未知バリアントは呼び出し側が
 /// [`ArrowKind::ClosedFilled`] として扱う（設計確定3。M9 判断1 と同じ「黙って
@@ -174,6 +172,185 @@ pub enum ArrowKind {
     Dot,
     /// 矢先なし。
     None,
+}
+
+/// 閉じた矢（[`ArrowKind::ClosedFilled`] / [`ArrowKind::ClosedBlank`]）の全開き角（度）。
+///
+/// JIS Z 8317-1:2008 附属書A の開いた矢（30°）と揃えた値（DESIGN.md 7章「随時対応」の
+/// 「寸法矢印のブロック化」設計確定5）。M9 まで app 層の定数 `ARROW_HALF_WIDTH_RATIO` が
+/// 持っていた 20° より太い（意図した可視差。タスク63）。
+const CLOSED_ARROW_INCLUDED_ANGLE_DEG: f64 = 30.0;
+
+/// [`ArrowKind::Open30`] の全開き角（度）。JIS Z 8317-1:2008 附属書A。
+const OPEN_ARROW_NARROW_INCLUDED_ANGLE_DEG: f64 = 30.0;
+
+/// [`ArrowKind::Open90`] の寸法線に沿った到達距離の `len` に対する比。全幅 = 2·len·この比 = len。
+const OPEN90_REACH_RATIO: f64 = 0.5;
+
+/// [`ArrowKind::Open90`] の全開き角（度）。JIS Z 8317-1:2008 附属書A。
+const OPEN_ARROW_WIDE_INCLUDED_ANGLE_DEG: f64 = 90.0;
+
+/// [`ArrowKind::Oblique`]（建築用チック）が寸法線となす角（度）。
+const OBLIQUE_ANGLE_DEG: f64 = 45.0;
+
+/// [`ArrowKind::Dot`] の円の直径 ÷ 矢先の長さ `len`（設計確定5）。
+const DOT_DIAMETER_RATIO: f64 = 0.5;
+
+/// [`ArrowKind::Dot`] の円を近似する正多角形の頂点数。
+///
+/// 点は塗りつぶし専用（画面は `convex_polygon`、SVG/PDF は fill パス）なので、
+/// [`Shape::Circle`] のベジエ近似ではなく多角形で持つ（[`ArrowGlyph`] が
+/// 「塗る多角形＋描く線分」の 2 つだけで閉じるため）。矢先長さ 5mm なら直径 2.5mm で、
+/// 16 角形の最大偏差は `r(1 - cos(π/16))` ≒ 半径の 1.9%（≒ 0.024mm）＝ 線幅
+/// （0.25mm 級）より十分小さい。
+const DOT_POLYGON_SEGMENTS: u32 = 16;
+
+/// [`arrow_glyph`] が生成する矢先 1 個分の形状。
+///
+/// 座標は**矢先のローカル座標**: 原点＝矢の先端、+x ＝先端が指す向き。したがって矢の胴は
+/// `x <= 0` 側（＝寸法線の内側方向が −x）にある。ワールドへの回転・平行移動は呼び出し側
+/// （app 層の `dimension::place_arrow`）が行う。
+///
+/// [`dim_symbol_glyph`] と同じ「geom の純関数が形を決め、画面と SVG/PDF が同じ形を描く」
+/// 流儀（DESIGN.md M9 設計判断1・9、7章「随時対応」の「寸法矢印のブロック化」設計確定2）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ArrowGlyph {
+    /// 塗りつぶす多角形。各要素は頂点列で、**閉じているものとして扱う**
+    /// （始点を末尾に繰り返さない）。
+    pub fills: Vec<Vec<Point2>>,
+    /// ストロークで描く線分。線幅・色は寸法線と同じものを呼び出し側が与える。
+    pub strokes: Vec<[Point2; 2]>,
+    /// 矢先が**寸法線に沿って**占める長さ。閉じた矢・開いた矢は `len`、
+    /// [`ArrowKind::Oblique`] / [`ArrowKind::Dot`] / [`ArrowKind::None`] は `0`。
+    ///
+    /// app 層の外向き矢印の自動判定（「ラベル幅 + `along_len` × 2 が寸法線長に収まるか」）と、
+    /// 外向き時に寸法線を延長する量がこの値を使う。`0` の種別は内外の区別が描画に現れない
+    /// ので、自動判定も手動指定（`ArrowPlacement::Outside`）も内向き扱いになる（設計確定4）。
+    pub along_len: f64,
+}
+
+/// 矢先種別 `kind` のジオメトリを、長さ `len`（ローカル座標）で生成する。
+///
+/// 戻り値の座標系は [`ArrowGlyph`] の doc のとおり（先端＝原点、+x ＝先端の向き）。
+/// `len` の単位は呼び出し側の単位そのまま（ワールド長を渡せばワールド長、紙 mm を渡せば
+/// 紙 mm が返る。[`dim_symbol_glyph`] の `h` と同じ「単位は抽象」の契約）。
+///
+/// # 種別ごとの形（設計確定3・5）
+///
+/// | 種別 | 形 | `along_len` |
+/// |---|---|---|
+/// | [`ArrowKind::ClosedFilled`] | 全開き 30° の三角形を塗る | `len` |
+/// | [`ArrowKind::ClosedBlank`] | 同じ三角形の輪郭 3 辺を描く | `len` |
+/// | [`ArrowKind::Open30`] | 先端から 2 本の線（全開き 30°） | `len` |
+/// | [`ArrowKind::Open90`] | 同 90°（到達距離は `len/2`、全幅 = `len`） | `len/2` |
+/// | [`ArrowKind::Oblique`] | 45° の斜線 1 本（先端が中点、長さ `len`） | `0` |
+/// | [`ArrowKind::Dot`] | 直径 `len × 0.5` の円（塗り、多角形近似） | `0` |
+/// | [`ArrowKind::None`] | 空 | `0` |
+///
+/// 開いた矢の 2 本の線は、同じ全開き角の閉じた矢の**斜辺そのもの**（＝ 閉じた矢から
+/// 底辺を除いたもの）である。これにより `along_len` は「寸法線に沿って占める長さ」＝
+/// `len` という定義どおりの値になり、閉じた矢と開いた矢の到達距離も揃う。
+///
+/// # 未知バリアントは `ClosedFilled` として描く
+///
+/// [`ArrowKind`] は `#[non_exhaustive]` なので、`match` は
+/// [`ArrowKind::ClosedFilled`] と未知バリアントを**同じ腕**（ワイルドカード）で扱う
+/// （設計確定3。M9 設計判断1 の「黙って壊れるより保守的な既定」と同じ）。
+///
+/// # 退化
+///
+/// `len` が非有限または非正のときは空の [`ArrowGlyph`]（`along_len = 0`）を返す。
+/// 描くものが無いだけで、呼び出し側は分岐を増やさずに済む。
+#[must_use]
+pub fn arrow_glyph(kind: ArrowKind, len: f64) -> ArrowGlyph {
+    if !(len.is_finite() && len > 0.0) {
+        return ArrowGlyph::default();
+    }
+    match kind {
+        ArrowKind::ClosedBlank => closed_arrow_glyph(len, false),
+        ArrowKind::Open30 => open_arrow_glyph(len, OPEN_ARROW_NARROW_INCLUDED_ANGLE_DEG),
+        // 90° は 30° と同じ到達距離だと全幅 2·len(既定 5.0 で 10mm)になり広すぎる(ユーザー実機、
+        // 2026-09-06)。到達距離を半分にして全幅 = len に抑える。
+        ArrowKind::Open90 => {
+            open_arrow_glyph(len * OPEN90_REACH_RATIO, OPEN_ARROW_WIDE_INCLUDED_ANGLE_DEG)
+        }
+        ArrowKind::Oblique => oblique_arrow_glyph(len),
+        ArrowKind::Dot => dot_arrow_glyph(len),
+        ArrowKind::None => ArrowGlyph::default(),
+        // `ArrowKind::ClosedFilled` と、将来追加される未知バリアント（`#[non_exhaustive]`）。
+        // 明示の腕を作らず 1 つにまとめてあるので、`ClosedFilled` のテストが同時に
+        // 未知バリアントの経路を固定する。
+        _ => closed_arrow_glyph(len, true),
+    }
+}
+
+/// 全開き角 `included_deg` の矢羽の 2 端点（順に +y 側・−y 側）。
+///
+/// 先端は原点、底辺は `x = -len` の上にあるので、半幅は `len * tan(included_deg / 2)`。
+fn barb_ends(len: f64, included_deg: f64) -> [Point2; 2] {
+    let half_width = len * (included_deg * 0.5).to_radians().tan();
+    [
+        Point2::new(-len, half_width),
+        Point2::new(-len, -half_width),
+    ]
+}
+
+/// 閉じた矢（`filled` なら塗りつぶし、そうでなければ輪郭 3 辺のストローク）。
+fn closed_arrow_glyph(len: f64, filled: bool) -> ArrowGlyph {
+    let [left, right] = barb_ends(len, CLOSED_ARROW_INCLUDED_ANGLE_DEG);
+    let tip = Point2::ORIGIN;
+    if filled {
+        ArrowGlyph {
+            fills: vec![vec![tip, left, right]],
+            strokes: Vec::new(),
+            along_len: len,
+        }
+    } else {
+        ArrowGlyph {
+            fills: Vec::new(),
+            strokes: vec![[tip, left], [left, right], [right, tip]],
+            along_len: len,
+        }
+    }
+}
+
+/// 開いた矢（先端から出る 2 本の線＝閉じた矢の斜辺のみ）。
+fn open_arrow_glyph(len: f64, included_deg: f64) -> ArrowGlyph {
+    let [left, right] = barb_ends(len, included_deg);
+    let tip = Point2::ORIGIN;
+    ArrowGlyph {
+        fills: Vec::new(),
+        strokes: vec![[tip, left], [tip, right]],
+        along_len: len,
+    }
+}
+
+/// 斜線（建築用チック）。先端を中点とする長さ `len` の 45° 線で、寸法線を横切る。
+fn oblique_arrow_glyph(len: f64) -> ArrowGlyph {
+    let angle = OBLIQUE_ANGLE_DEG.to_radians();
+    let half = Vec2::new(angle.cos(), angle.sin()) * (len * 0.5);
+    ArrowGlyph {
+        fills: Vec::new(),
+        strokes: vec![[Point2::ORIGIN - half, Point2::ORIGIN + half]],
+        // 寸法線に沿って「場所を取らない」ので 0（設計確定4）。
+        along_len: 0.0,
+    }
+}
+
+/// 点（先端を中心とする塗りつぶし円の多角形近似）。
+fn dot_arrow_glyph(len: f64) -> ArrowGlyph {
+    let radius = len * DOT_DIAMETER_RATIO * 0.5;
+    let vertices = (0..DOT_POLYGON_SEGMENTS)
+        .map(|i| {
+            let t = std::f64::consts::TAU * f64::from(i) / f64::from(DOT_POLYGON_SEGMENTS);
+            Point2::new(radius * t.cos(), radius * t.sin())
+        })
+        .collect();
+    ArrowGlyph {
+        fills: vec![vertices],
+        strokes: Vec::new(),
+        along_len: 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +502,216 @@ mod tests {
         // （`mcad-geom` は `serde_json` に依存していないため、ここでは
         // `Default` の値だけを固定する）。
         assert_eq!(ArrowKind::default(), ArrowKind::ClosedFilled);
+    }
+
+    // -----------------------------------------------------------------
+    // 矢先（M10 タスク63）
+    // -----------------------------------------------------------------
+
+    /// [`ArrowKind`] の全既知バリアント。`#[non_exhaustive]` なので網羅は
+    /// コンパイラではなくこの配列が担保する（`ALL_VARIANTS` と同じ流儀）。
+    /// **種別を増やしたらここへ足すこと。**
+    const ALL_ARROW_KINDS: [ArrowKind; 7] = [
+        ArrowKind::ClosedFilled,
+        ArrowKind::ClosedBlank,
+        ArrowKind::Open30,
+        ArrowKind::Open90,
+        ArrowKind::Oblique,
+        ArrowKind::Dot,
+        ArrowKind::None,
+    ];
+
+    /// 矢先が寸法線に沿って場所を取る（＝ `along_len == len`）種別。
+    const ARROWS_ALONG_THE_LINE: [ArrowKind; 4] = [
+        ArrowKind::ClosedFilled,
+        ArrowKind::ClosedBlank,
+        ArrowKind::Open30,
+        ArrowKind::Open90,
+    ];
+
+    /// グリフの全頂点（塗り多角形の頂点＋線分の両端）。
+    fn arrow_points(glyph: &ArrowGlyph) -> Vec<Point2> {
+        let mut out: Vec<Point2> = glyph.fills.iter().flatten().copied().collect();
+        for [a, b] in &glyph.strokes {
+            out.push(*a);
+            out.push(*b);
+        }
+        out
+    }
+
+    #[test]
+    fn every_known_arrow_kind_but_none_has_geometry() {
+        for kind in ALL_ARROW_KINDS {
+            let glyph = arrow_glyph(kind, 5.0);
+            let has_geometry = !glyph.fills.is_empty() || !glyph.strokes.is_empty();
+            if kind == ArrowKind::None {
+                assert!(!has_geometry, "None は空のはず");
+                assert!(glyph.fills.is_empty() && glyph.strokes.is_empty());
+            } else {
+                assert!(has_geometry, "{kind:?} の形状が空になっている");
+            }
+        }
+    }
+
+    #[test]
+    fn along_len_is_len_for_line_occupying_kinds_and_zero_otherwise() {
+        let len = 5.0;
+        for kind in ALL_ARROW_KINDS {
+            let glyph = arrow_glyph(kind, len);
+            let expected = if kind == ArrowKind::Open90 {
+                // 90° だけ到達距離を半分にしている（全幅 = len）。
+                len * OPEN90_REACH_RATIO
+            } else if ARROWS_ALONG_THE_LINE.contains(&kind) {
+                len
+            } else {
+                0.0
+            };
+            assert!(
+                (glyph.along_len - expected).abs() < 1e-12,
+                "{kind:?}: along_len {} != {expected}",
+                glyph.along_len
+            );
+        }
+    }
+
+    /// 先端は常にローカル原点、胴は `x <= 0` 側（[`ArrowGlyph`] の座標契約）。
+    ///
+    /// 対象は `along_len > 0` の種別（閉じた矢・開いた矢）。[`ArrowKind::Oblique`] と
+    /// [`ArrowKind::Dot`] は**先端を中心に置く**設計なので +x 側へもはみ出す
+    /// （それぞれ専用テストで形を固定している）。
+    #[test]
+    fn arrow_bodies_stay_on_the_non_positive_x_side() {
+        for kind in ARROWS_ALONG_THE_LINE {
+            for p in arrow_points(&arrow_glyph(kind, 5.0)) {
+                assert!(p.x <= 1e-12, "{kind:?}: 胴が +x 側へ出た（{p:?}）");
+            }
+        }
+    }
+
+    /// `ClosedFilled` は明示の腕を持たず、未知バリアントと同じワイルドカード腕で
+    /// 処理される（設計確定3）。したがってこのテストは「未知バリアントを
+    /// `ClosedFilled` として描く」経路も同時に固定している。
+    #[test]
+    fn closed_filled_is_a_triangle_with_a_30_degree_included_angle() {
+        let len = 5.0;
+        let glyph = arrow_glyph(ArrowKind::ClosedFilled, len);
+        assert_eq!(glyph.fills.len(), 1);
+        assert!(glyph.strokes.is_empty(), "塗りだけで輪郭は描かない");
+        let tri = &glyph.fills[0];
+        assert_eq!(tri.len(), 3);
+        // 頂点順は [先端, 後端+半幅, 後端−半幅]（M9 までの `arrow_triangle` と同じ）。
+        assert_eq!(tri[0], Point2::ORIGIN);
+        let half_width = len * (CLOSED_ARROW_INCLUDED_ANGLE_DEG * 0.5).to_radians().tan();
+        assert!((tri[1].x + len).abs() < 1e-12);
+        assert!((tri[1].y - half_width).abs() < 1e-12);
+        assert!((tri[2].x + len).abs() < 1e-12);
+        assert!((tri[2].y + half_width).abs() < 1e-12);
+        // 全開き 30°（tan15° ≒ 0.2679）は M9 までの 20°（tan10° ≒ 0.1763）より太い。
+        assert!(half_width > len * 0.1763, "20° より太いこと");
+    }
+
+    #[test]
+    fn closed_blank_is_the_same_triangle_drawn_as_three_edges() {
+        let len = 5.0;
+        let filled = arrow_glyph(ArrowKind::ClosedFilled, len);
+        let blank = arrow_glyph(ArrowKind::ClosedBlank, len);
+        assert!(blank.fills.is_empty(), "白抜きは fill を持たない");
+        assert_eq!(blank.strokes.len(), 3);
+        let tri = &filled.fills[0];
+        assert_eq!(blank.strokes[0], [tri[0], tri[1]]);
+        assert_eq!(blank.strokes[1], [tri[1], tri[2]]);
+        assert_eq!(blank.strokes[2], [tri[2], tri[0]]);
+    }
+
+    /// 開いた矢の 2 本は同じ全開き角の閉じた矢の斜辺そのもの（`along_len` の定義が
+    /// 「寸法線に沿って占める長さ」であることの担保）。
+    #[test]
+    fn open_arrows_are_the_slanted_edges_of_the_closed_triangle() {
+        let len = 5.0;
+        let open30 = arrow_glyph(ArrowKind::Open30, len);
+        assert!(open30.fills.is_empty());
+        assert_eq!(open30.strokes.len(), 2);
+        let closed = arrow_glyph(ArrowKind::ClosedFilled, len);
+        let tri = &closed.fills[0];
+        // `ClosedFilled` も 30° なので斜辺が一致する。
+        assert_eq!(open30.strokes[0], [tri[0], tri[1]]);
+        assert_eq!(open30.strokes[1], [tri[0], tri[2]]);
+
+        // 90° は到達距離 len/2 で半幅 = len/2·tan45° = len/2（全幅 = len）。30° より幅広。
+        let open90 = arrow_glyph(ArrowKind::Open90, len);
+        assert_eq!(open90.strokes.len(), 2);
+        assert!((open90.strokes[0][1].y - len * OPEN90_REACH_RATIO).abs() < 1e-12);
+        assert!(open90.strokes[0][1].y > open30.strokes[0][1].y);
+        // 底辺は x = -along_len（＝寸法線に沿って占める長さ）。
+        for glyph in [&open30, &open90] {
+            for [_, end] in &glyph.strokes {
+                assert!((end.x + glyph.along_len).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn oblique_crosses_the_dimension_line_through_the_tip() {
+        let len = 5.0;
+        let glyph = arrow_glyph(ArrowKind::Oblique, len);
+        assert!(glyph.fills.is_empty());
+        assert_eq!(glyph.strokes.len(), 1);
+        let [a, b] = glyph.strokes[0];
+        // 先端（原点）が中点で、長さは len。
+        assert!(a.midpoint(b).distance(Point2::ORIGIN) < 1e-12);
+        assert!((a.distance(b) - len).abs() < 1e-12);
+        // 寸法線（局所 x 軸）を横切る: 両端が x 軸の反対側にあり、
+        // かつ寸法線の内側（−x）と外側（+x）の両方へ出る。
+        assert!(a.y * b.y < 0.0, "x 軸を横切っていない");
+        assert!(a.x * b.x < 0.0, "y 軸を横切っていない");
+        // 45°（|dy/dx| = 1）。
+        assert!(((b.y - a.y).abs() - (b.x - a.x).abs()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dot_is_a_filled_polygon_of_half_the_arrow_length_in_diameter() {
+        let len = 5.0;
+        let glyph = arrow_glyph(ArrowKind::Dot, len);
+        assert!(glyph.strokes.is_empty());
+        assert_eq!(glyph.fills.len(), 1);
+        let poly = &glyph.fills[0];
+        assert_eq!(poly.len(), DOT_POLYGON_SEGMENTS as usize);
+        let radius = len * DOT_DIAMETER_RATIO * 0.5;
+        for p in poly {
+            assert!(
+                (p.distance(Point2::ORIGIN) - radius).abs() < 1e-12,
+                "頂点が半径 {radius} の円上にない: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_glyphs_scale_linearly_with_len() {
+        for kind in ALL_ARROW_KINDS {
+            let one = arrow_glyph(kind, 1.0);
+            let two = arrow_glyph(kind, 2.0);
+            assert!(
+                (two.along_len - one.along_len * 2.0).abs() < 1e-12,
+                "{kind:?}"
+            );
+            let (p1, p2) = (arrow_points(&one), arrow_points(&two));
+            assert_eq!(p1.len(), p2.len(), "{kind:?}");
+            for (a, b) in p1.iter().zip(p2.iter()) {
+                assert!((b.x - a.x * 2.0).abs() < 1e-12, "{kind:?}");
+                assert!((b.y - a.y * 2.0).abs() < 1e-12, "{kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_or_non_positive_len_yields_an_empty_glyph() {
+        for len in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for kind in ALL_ARROW_KINDS {
+                let glyph = arrow_glyph(kind, len);
+                assert!(glyph.fills.is_empty(), "{kind:?} / len {len}");
+                assert!(glyph.strokes.is_empty(), "{kind:?} / len {len}");
+                assert_eq!(glyph.along_len, 0.0, "{kind:?} / len {len}");
+            }
+        }
     }
 }

@@ -529,14 +529,29 @@ fn push_dim(
         ];
         paths.push(PlotPath::stroked(cmds, stroke));
     }
-    for tri in &ex.arrows {
-        let cmds = vec![
-            PathCmd::MoveTo(world_to_paper(tri[0], k)),
-            PathCmd::LineTo(world_to_paper(tri[1], k)),
-            PathCmd::LineTo(world_to_paper(tri[2], k)),
-            PathCmd::Close,
-        ];
-        paths.push(PlotPath::filled(cmds, color));
+    // 矢先は種別ごとに「塗る多角形」と「描く線分」の組で来る（`mcad_geom::arrow_glyph`）。
+    // 画面側（`crate::draw_dim_expansion`）とまったく同じ組を、同じ順で描く。
+    for glyph in &ex.arrows {
+        for poly in &glyph.fills {
+            let mut cmds = Vec::with_capacity(poly.len() + 1);
+            for (i, p) in poly.iter().enumerate() {
+                let paper = world_to_paper(*p, k);
+                cmds.push(if i == 0 {
+                    PathCmd::MoveTo(paper)
+                } else {
+                    PathCmd::LineTo(paper)
+                });
+            }
+            cmds.push(PathCmd::Close);
+            paths.push(PlotPath::filled(cmds, color));
+        }
+        for [a, b] in &glyph.strokes {
+            let cmds = vec![
+                PathCmd::MoveTo(world_to_paper(*a, k)),
+                PathCmd::LineTo(world_to_paper(*b, k)),
+            ];
+            paths.push(PlotPath::stroked(cmds, stroke));
+        }
     }
     // 記号（φ・□）は値と同じラベルの一部なので、文字の直前へ置いて描画順を揃える。
     for shape in &ex.symbol_strokes {
@@ -753,7 +768,7 @@ mod tests {
         Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, DimStyle, Layer, Scale,
         SheetMeta, SizeTolerance, Style, WidthMm,
     };
-    use mcad_geom::{Circle, LineSeg, dim_symbol_glyph};
+    use mcad_geom::{ArrowKind, Circle, LineSeg, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
     const T: f64 = 1e-9;
@@ -999,6 +1014,126 @@ mod tests {
         let (center, rim) = endpoints(stroked(&page)[0]);
         point_close_to(center, 0.0, 0.0);
         point_close_to(rim, 10.0, 0.0);
+    }
+
+    // ---- 3c: 矢先のブロック化（M10 タスク63）----
+
+    /// [`ArrowKind`] の全既知バリアント（geom 側は `#[non_exhaustive]`。
+    /// **種別が増えたらここへ足すこと**。`crate::ARROW_KIND_CHOICES` と同じ流儀）。
+    const ALL_ARROW_KINDS: [ArrowKind; 7] = [
+        ArrowKind::ClosedFilled,
+        ArrowKind::ClosedBlank,
+        ArrowKind::Open30,
+        ArrowKind::Open90,
+        ArrowKind::Oblique,
+        ArrowKind::Dot,
+        ArrowKind::None,
+    ];
+
+    /// パスの点列が `expected` と（許容誤差つきで）一致するか。
+    fn path_points_match(path: &PlotPath, expected: &[Point2]) -> bool {
+        let points = cmd_points(&path.cmds);
+        points.len() == expected.len()
+            && points.iter().zip(expected).all(|(a, b)| a.distance(*b) < T)
+    }
+
+    /// **タスク63 の検収基準**: 7 種の矢先が、geom の純関数
+    /// （[`mcad_geom::arrow_glyph`]）が作った形そのままで出力へ出る。
+    ///
+    /// 期待値は画面描画の入力とまったく同じ [`DimExpansion`] から取る
+    /// （画面は `crate::draw_dim_expansion` が同じ `arrows` を描く）。つまりこのテストが
+    /// 「画面と SVG/PDF で同一に描かれる」の出力側の担保になる。尺度 1:1 なので
+    /// ワールド長 = 紙 mm で、`push_dim` の `÷ k` は恒等。
+    #[test]
+    fn every_arrow_kind_is_plotted_with_the_geometry_from_geom() {
+        for kind in ALL_ARROW_KINDS {
+            let mut document = document_with_scale(1, 1);
+            let style = DimStyle {
+                arrow_kind: kind,
+                ..DimStyle::DEFAULT
+            };
+            document.apply(Command::SetDimStyle(style)).unwrap();
+            let dim = DimLinear {
+                p1: Point2::ORIGIN,
+                p2: Point2::new(100.0, 0.0),
+                offset: 10.0,
+                annotation: DimAnnotation::default(),
+            };
+            add(&mut document, EntityGeom::DimLinear(dim.clone()));
+            let page = plot_page(&document, PlotColorMode::Color);
+
+            let render = dimension::DimRender {
+                style: &style,
+                scale_world_per_paper_mm: 1.0,
+                arrow_len_world: style.arrow_len_mm,
+                text_height_world: style.text_height_mm,
+            };
+            let ex = dimension::expand_linear(&dim, render);
+            assert_eq!(ex.arrows.len(), 2, "{kind:?}");
+
+            // 本数: 寸法線 1 + 補助線 2 + 矢先の線分、塗り: 値ラベル 1 + 矢先の塗り。
+            let glyph = &ex.arrows[0];
+            assert_eq!(
+                stroked(&page).len(),
+                3 + 2 * glyph.strokes.len(),
+                "{kind:?} のストローク本数"
+            );
+            assert_eq!(
+                filled(&page).len(),
+                1 + 2 * glyph.fills.len(),
+                "{kind:?} の塗りパス数"
+            );
+
+            // 形: 展開結果の各矢先が、そのままの点列でページに出ている。
+            for arrow in &ex.arrows {
+                for poly in &arrow.fills {
+                    assert!(
+                        filled(&page).iter().any(|p| path_points_match(p, poly)),
+                        "{kind:?}: 塗り多角形 {poly:?} が出力に無い"
+                    );
+                }
+                for [a, b] in &arrow.strokes {
+                    assert!(
+                        stroked(&page)
+                            .iter()
+                            .any(|p| path_points_match(p, &[*a, *b])),
+                        "{kind:?}: 線分 {a:?}-{b:?} が出力に無い"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 矢先の線分は寸法線とまったく同じ [`PlotStroke`]（実線・同じ線幅）で出る
+    /// （白抜き矢・開いた矢が寸法線と違う太さで描かれないこと）。
+    #[test]
+    fn arrow_strokes_share_the_dimension_line_stroke() {
+        let mut document = document_with_scale(1, 1);
+        document
+            .apply(Command::SetDimStyle(DimStyle {
+                arrow_kind: ArrowKind::ClosedBlank,
+                ..DimStyle::DEFAULT
+            }))
+            .unwrap();
+        add(
+            &mut document,
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::ORIGIN,
+                p2: Point2::new(100.0, 0.0),
+                offset: 10.0,
+                annotation: DimAnnotation::default(),
+            }),
+        );
+        let page = plot_page(&document, PlotColorMode::Color);
+        // 寸法線 1 + 補助線 2 + 白抜き矢の輪郭 3 辺 × 2。
+        let lines = stroked(&page);
+        assert_eq!(lines.len(), 9);
+        let dim_line_stroke = lines[0].stroke.unwrap();
+        for path in &lines {
+            assert_eq!(path.stroke.unwrap(), dim_line_stroke);
+        }
+        // 白抜き矢は塗らない（値ラベルだけが塗りパス）。
+        assert_eq!(filled(&page).len(), 1);
     }
 
     // ---- 3b: 直径寸法・記号ストローク・公差文字・非比例寸法の下線（M9 タスク49-3）----

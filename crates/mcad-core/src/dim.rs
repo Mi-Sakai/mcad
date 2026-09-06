@@ -478,9 +478,14 @@ pub struct DimStyle {
     /// （app 層にあった同値の定数 `plot::DIM_TEXT_MM` は削除した。描かれる大きさを定数、
     /// 矢の内外判定と組版の比率をスタイル、と二重に持つとスタイル編集で破綻するため）。
     pub text_height_mm: f64,
-    /// 矢先の長さ [紙 mm]。既定 3.0（[`DimStyle::text_height_mm`] と同じく、M9 タスク49 以降は
-    /// これが実際の描画サイズの唯一の出所）。矢羽の開き角度は規定 5-4 4) 側で持つ
-    /// （値は app 層の `ARROW_HALF_WIDTH_RATIO`。ここに数値を書くと二重管理になる）。
+    /// 矢先の長さ [紙 mm]。既定 5.0（[`DimStyle::text_height_mm`] と同じく、M9 タスク49 以降は
+    /// これが実際の描画サイズの唯一の出所）。矢先の形（開き角度・半幅比）は
+    /// [`ArrowKind`] ごとに `mcad_geom::arrow_glyph` が持つ（ここに数値を書くと二重管理になる）。
+    ///
+    /// M10 タスク63 で既定を 3.0 → 5.0 へ変えた（文字高さ 3.5mm に対して「細くて短い」と
+    /// いうユーザー評価への対応。DESIGN.md 7章「随時対応」の「寸法矢印のブロック化」
+    /// 設計確定5）。**保存データは変わらず、既定スタイルの描画だけが変わる**（既存
+    /// ファイルは保存された値のまま読まれる）。
     pub arrow_len_mm: f64,
     /// 寸法値の小数点以下の桁数。既定 2（規定 5-2 2) a) の「±0.005mm 程度 → 2 桁」。
     /// 現行の `format!("{:.2}")` と同値）。上限は [`MAX_DIM_DECIMALS`]。
@@ -505,11 +510,12 @@ pub struct DimStyle {
     /// 公差文字を寸法値に対して何倍の高さで書くか。既定 0.7
     /// （規定 5-12-2 2)「公差数値の文字サイズは、寸法数値の 70% 程度に縮小する」）。
     pub tolerance_scale: f64,
-    /// 矢先の種類。既定 [`ArrowKind::ClosedFilled`]（現行の形。DESIGN.md 7章「随時
-    /// 対応」の「寸法矢印のブロック化」設計確定1）。
+    /// 矢先の種類。既定 [`ArrowKind::ClosedFilled`]（M9 までと同じ塗りつぶし矢。
+    /// DESIGN.md 7章「随時対応」の「寸法矢印のブロック化」設計確定1）。
     ///
-    /// 形状生成（`arrow_glyph`）と画面/plot への反映は M10 タスク63。ここではまだ
-    /// スキーマ（`.mcad` v6）とスタイル保持のみを持つ。`#[serde(default)]` を付け、
+    /// 形状生成は `mcad_geom::arrow_glyph`、画面/plot への反映は app 層
+    /// （M10 タスク63）。端ごとの個別指定（AutoCAD `DIMBLK1`/`DIMBLK2` 相当）は
+    /// non-goal で、文書単位に 1 つだけ持つ。`#[serde(default)]` を付け、
     /// v1〜v5 の `.mcad`（このキーを持たない）を [`ArrowKind::ClosedFilled`] へ
     /// 既定値補完する（`decimals` 等、他フィールドと同じ流儀）。
     #[serde(default)]
@@ -522,7 +528,7 @@ impl DimStyle {
     /// [`Default`] は `const` 文脈で使えないので、定数として使える形も置く。
     pub const DEFAULT: DimStyle = DimStyle {
         text_height_mm: 3.5,
-        arrow_len_mm: 3.0,
+        arrow_len_mm: 5.0,
         decimals: 2,
         trim_trailing_zeros: true,
         ext_gap_mm: 1.0,
@@ -1050,7 +1056,10 @@ mod tests {
         // 規定 6-2 b)（文字高さ 3.5）。M8 までは app 層の紙 mm 定数が同じ値を持っていたが、
         // M9 タスク49 で削除し、ここが実際の描画サイズの唯一の出所になった。
         assert_eq!(s.text_height_mm, 3.5);
-        assert_eq!(s.arrow_len_mm, 3.0);
+        // M10 タスク63 で 3.0 → 5.0（文字高さ 3.5mm との釣り合い。7章「寸法矢印の
+        // ブロック化」設計確定5）。既定スタイルの描画だけが変わる可視差で、保存された
+        // ファイルの値には影響しない。
+        assert_eq!(s.arrow_len_mm, 5.0);
         // 規定 5-2 2) a)（±0.005mm → 2 桁）と DESIGN.md M9 判断5 (a)（ゼロトリム既定 ON）。
         assert_eq!(s.decimals, 2);
         assert!(s.trim_trailing_zeros);

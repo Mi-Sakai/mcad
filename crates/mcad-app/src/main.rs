@@ -11,6 +11,7 @@ mod config;
 mod dimension;
 mod fonts;
 mod frame;
+mod iso;
 mod ortho;
 mod plot;
 mod snap;
@@ -40,9 +41,9 @@ use plot::dash_pattern_mm;
 
 use tool::{
     ArcTool, CircleTool, DimDiameterTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool,
-    FilletTool, InputEvent, LineTool, OffsetOutcome, PlacementKind, PlacementOutcome,
-    PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TextTool, Tool, ToolCtx,
-    ToolResult, TrimTool, layer_visible,
+    FilletTool, InputEvent, IsoCircleTool, LineTool, OffsetOutcome, PlacementKind,
+    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TextTool,
+    Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -568,6 +569,7 @@ enum ToolKind {
     Line,
     Circle,
     Arc,
+    IsoCircle,
     Polyline,
     Text,
     DimLinear,
@@ -590,6 +592,7 @@ impl ToolKind {
             ToolKind::Line => Some(Box::new(LineTool::default())),
             ToolKind::Circle => Some(Box::new(CircleTool::default())),
             ToolKind::Arc => Some(Box::new(ArcTool::default())),
+            ToolKind::IsoCircle => Some(Box::new(IsoCircleTool::default())),
             ToolKind::Polyline => Some(Box::new(PolylineTool::default())),
             ToolKind::Text => Some(Box::new(TextTool::default())),
             ToolKind::DimLinear => Some(Box::new(DimLinearTool::default())),
@@ -640,6 +643,7 @@ impl ToolKind {
             ToolKind::Line => "Line",
             ToolKind::Circle => "Circle",
             ToolKind::Arc => "Arc",
+            ToolKind::IsoCircle => "Iso Circle",
             ToolKind::Polyline => "Polyline",
             ToolKind::Text => "Text",
             ToolKind::DimLinear => "Linear Dim",
@@ -834,6 +838,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "L=Line",
     "C=Circle",
     "A=Arc",
+    "I=Iso Circle",
     "P=Polyline",
     "T=Text",
     "D=Linear Dim",
@@ -851,6 +856,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "Del=Delete",
     "Esc=Cancel",
     "F3=Snap",
+    "F5=Iso Grid",
     "F8=Ortho",
     "F9=Paper View",
     "Ctrl+Z=Undo",
@@ -2016,6 +2022,49 @@ impl eframe::App for McadApp {
             self.persist_config(now);
         }
 
+        // F5 でグリッドモード（矩形/等測）をトグルする。F3/F8/F9 と同じガード条件
+        // （モーダル非表示中は常に効く）。DESIGN.md 7章「随時対応」アイソメ図・アクソメ図の
+        // 作図補助 設計確定1。
+        if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F5)) {
+            self.config.grid_mode = match self.config.grid_mode {
+                config::GridMode::Rectangular => config::GridMode::Isometric,
+                config::GridMode::Isometric => config::GridMode::Rectangular,
+            };
+            self.persist_config(now);
+        }
+
+        // Tab で作図ツール固有の選択肢を循環する（現在はアイソメ円ツールの面
+        // Top/Left/Right。DESIGN.md 7章「アイソメ図・アクソメ図の作図補助」設計確定1・5）。
+        // 循環する選択肢を持つツール（[`Tool::variant_label`] が `Some`）がアクティブな
+        // ときだけ Tab を横取りし、それ以外では egui 本来のフォーカス移動キーのまま残す。
+        // テキスト欄フォーカス中・モーダル表示中の抑止は他のショートカットと同じゲート。
+        //
+        // フォーカス移動を打ち消す理由: egui は Tab をフレーム開始時
+        // （`Memory::begin_pass`）に読んでフォーカス移動を予約するため、そのままだと面を
+        // 切り替えたつもりの Tab が上部パネルの最初のウィジェットへフォーカスを移す。
+        // `text_focused`（何かにフォーカスがある）は全ショートカットの抑止条件なので、
+        // 次のフレーム以降ツール切替も Tab 自身も効かなくなってしまう。パネルを1つも
+        // 描いていないこの時点なら `move_focus(None)` で予約を取り消せる
+        // （`consume_key` はイベント自体も取り上げ、下流のウィジェットに渡さない）。
+        if app_shortcuts_enabled(self.modal_open(), text_focused)
+            && self
+                .tool
+                .as_ref()
+                .is_some_and(|t| t.variant_label().is_some())
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab))
+        {
+            ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+            // `InputEvent::Cycle` はレイヤー・スタイルを見ないが、`Tool::on_input` の
+            // 共通シグネチャに合わせて `handle_tool_input` と同じ ctx を組む。
+            let ctx = ToolCtx {
+                layer: resolve_tool_layer(&self.document, self.tool_kind),
+                style: Style::inherited(),
+            };
+            if let Some(active) = self.tool.as_mut() {
+                let _ = active.on_input(&ctx, InputEvent::Cycle);
+            }
+        }
+
         // 表示時間を過ぎたステータスメッセージは消す。
         if self
             .status
@@ -2115,6 +2164,14 @@ impl eframe::App for McadApp {
                                 .desired_width(56.0)
                                 .hint_text("radius"),
                         );
+                        ui.separator();
+                    }
+                    // アイソメ円ツールの現在の面（Top/Left/Right）。ツール本体が持つ状態
+                    // なので `Tool::variant_label()` で取り出す（ツール選択中のみ表示）。
+                    // Tab キーで循環できることを併記する（凡例はツールキーのみ載せる方針で、
+                    // ツール固有のキーはこの文脈表示側で案内する）。
+                    if let Some(face) = self.tool.as_ref().and_then(|t| t.variant_label()) {
+                        ui.label(format!("Iso face: {face} (Tab)"));
                         ui.separator();
                     }
                     // Text ツールの文字列・高さ入力欄（M6 タスク23）。アンカー確定後のみ表示し、
@@ -2270,6 +2327,7 @@ impl eframe::App for McadApp {
                         &mut self.select_tool,
                         self.config.snap_enabled,
                         &mut self.snap_marker,
+                        self.config.grid_mode,
                         &mut self.status,
                         now,
                         offset_distance,
@@ -2290,6 +2348,7 @@ impl eframe::App for McadApp {
                         self.config.snap_enabled,
                         &mut self.snap_marker,
                         self.config.ortho_enabled,
+                        self.config.grid_mode,
                         &mut self.status,
                         now,
                         parse_fillet_radius(&self.fillet_radius_input),
@@ -2305,7 +2364,7 @@ impl eframe::App for McadApp {
             // （タスク37）。
             let k = self.document.sheet().scale.world_mm_per_paper_mm();
 
-            draw_grid(&painter, rect, &self.viewport);
+            draw_grid(&painter, rect, &self.viewport, self.config.grid_mode);
             // 図面枠は「グリッドと同格」の派生描画（判断3）。用紙縁は印刷対象ではない
             // 画面専用ヒントなので `FrameLayout` を経由せず、枠と同じ表示条件で
             // まとめて出す（分岐を1つに保つ）。
@@ -2624,7 +2683,7 @@ impl eframe::App for McadApp {
 
 /// キーボードショートカットでアクティブツールを切り替える（DESIGN.md 3.4 のツール群）。
 ///
-/// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `P`=Polyline, `T`=Text,
+/// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `I`=Iso Circle, `P`=Polyline, `T`=Text,
 /// `D`/`Shift+D`=Linear/Radial Dim, `G`=Diameter Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
 /// 作図ツールへ切り替えるときは、描画中に古い選択ハイライトが残らないよう選択をクリアする。
@@ -2661,6 +2720,10 @@ fn handle_tool_shortcut_keys(
             requested = Some(ToolKind::Circle);
         } else if i.key_pressed(Key::A) {
             requested = Some(ToolKind::Arc);
+        } else if i.key_pressed(Key::I) {
+            // 未使用キー（2026-09-06、main.rs/tool.rs をともに `grep -n "Key::I"` して
+            // 確認済み）。DESIGN.md 7章「アイソメ図・アクソメ図の作図補助」設計確定1。
+            requested = Some(ToolKind::IsoCircle);
         } else if i.key_pressed(Key::P) {
             requested = Some(ToolKind::Polyline);
         } else if i.key_pressed(Key::T) {
@@ -2747,6 +2810,7 @@ fn handle_tool_input(
     snap_enabled: bool,
     snap_marker: &mut Option<snap::SnapResult>,
     ortho_enabled: bool,
+    grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
     now: f64,
     fillet_radius: Option<f64>,
@@ -2775,6 +2839,7 @@ fn handle_tool_input(
     // 事前絞り込みはカーソル近傍 AABB を snap 側が内部で構成する（`snap.rs` 参照）。
     let radius = SNAP_RADIUS_PX / viewport.zoom;
     let grid_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
+    let grid = snap::GridSpec::new(grid_step, grid_mode);
 
     // マウス移動は毎フレーム流し、プレビュー追従に使ってもらう。スナップ先はマーカー
     // 描画のために記録する（ホバーしていなければマーカーを消す）。
@@ -2801,16 +2866,10 @@ fn handle_tool_input(
             let _ = active.on_input(&ctx, InputEvent::Move(raw));
         } else {
             let extra_points = active.snap_points();
-            let (_, marker) = apply_snap(
-                document,
-                snap_enabled,
-                raw,
-                radius,
-                grid_step,
-                &extra_points,
-            );
+            let (_, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &extra_points);
             *snap_marker = marker;
-            let world = resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin());
+            let world =
+                resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin(), grid_mode);
             let _ = active.on_input(&ctx, InputEvent::Move(world));
         }
     } else {
@@ -2865,15 +2924,9 @@ fn handle_tool_input(
             }
         } else {
             let extra_points = active.snap_points();
-            let (_, marker) = apply_snap(
-                document,
-                snap_enabled,
-                raw,
-                radius,
-                grid_step,
-                &extra_points,
-            );
-            let world = resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin());
+            let (_, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &extra_points);
+            let world =
+                resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin(), grid_mode);
             result = active.on_input(&ctx, InputEvent::Click(world));
         }
     }
@@ -4726,23 +4779,26 @@ fn apply_snap(
     enabled: bool,
     raw: Point2,
     radius: f64,
-    grid_step: f64,
+    grid: snap::GridSpec,
     extra_points: &[Point2],
 ) -> (Point2, Option<snap::SnapResult>) {
     if !enabled {
         return (raw, None);
     }
-    match snap::snap(document, raw, radius, grid_step, extra_points) {
+    match snap::snap(document, raw, radius, grid, extra_points) {
         Some(result) => (result.point, Some(result)),
         None => (raw, None),
     }
 }
 
-/// スナップと直交モード（ortho、v0.7.1）を「スナップ優先」で合成する（`ortho.rs` §2）。
+/// スナップと直交モード（ortho、v0.7.1。アイソメ-2でグリッドモードに応じた軸切替に
+/// 対応）を「スナップ優先」で合成する（`ortho.rs` §2）。
 ///
 /// `snap_result` が `Some`（スナップ候補が見つかった）ならその座標をそのまま使い、
 /// ortho は適用しない。`None`（候補なし）のときだけ、`ortho_enabled` かつ
 /// `origin`（[`tool::Tool::ortho_origin`]）が `Some` であれば `raw` を軸拘束する。
+/// 軸集合は `grid_mode` で切り替える: `Isometric` なら [`ortho::ISO_AXES`]
+/// （30°/90°/150°）、`Rectangular` なら水平・垂直（[`ortho::constrain`]）。
 /// `Move`/`Click` の両経路が同じこの関数を通ることで、プレビューと確定がずれない。
 #[must_use]
 fn resolve_click_point(
@@ -4750,10 +4806,14 @@ fn resolve_click_point(
     raw: Point2,
     ortho_enabled: bool,
     origin: Option<Point2>,
+    grid_mode: config::GridMode,
 ) -> Point2 {
     match snap_result {
         Some(result) => result.point,
-        None if ortho_enabled => origin.map_or(raw, |o| ortho::constrain(o, raw)),
+        None if ortho_enabled => origin.map_or(raw, |o| match grid_mode {
+            config::GridMode::Rectangular => ortho::constrain(o, raw),
+            config::GridMode::Isometric => ortho::constrain_to_axes(o, raw, &ortho::ISO_AXES),
+        }),
         None => raw,
     }
 }
@@ -4771,7 +4831,13 @@ mod resolve_click_point_tests {
         let raw = Point2::new(10.0, 0.5);
         let origin = Some(Point2::new(0.0, 0.0));
         assert_eq!(
-            resolve_click_point(snap_result, raw, true, origin),
+            resolve_click_point(
+                snap_result,
+                raw,
+                true,
+                origin,
+                config::GridMode::Rectangular
+            ),
             Point2::new(9.0, 9.0)
         );
     }
@@ -4781,7 +4847,7 @@ mod resolve_click_point_tests {
         let raw = Point2::new(10.0, 0.5);
         let origin = Some(Point2::new(0.0, 0.0));
         assert_eq!(
-            resolve_click_point(None, raw, true, origin),
+            resolve_click_point(None, raw, true, origin, config::GridMode::Rectangular),
             Point2::new(10.0, 0.0)
         );
     }
@@ -4790,14 +4856,32 @@ mod resolve_click_point_tests {
     fn ortho_off_returns_raw() {
         let raw = Point2::new(10.0, 0.5);
         let origin = Some(Point2::new(0.0, 0.0));
-        assert_eq!(resolve_click_point(None, raw, false, origin), raw);
+        assert_eq!(
+            resolve_click_point(None, raw, false, origin, config::GridMode::Rectangular),
+            raw
+        );
     }
 
     #[test]
     fn no_origin_returns_raw_even_if_ortho_on() {
         // 1点目のクリック待ちなど、基準点がまだ無い局面。
         let raw = Point2::new(10.0, 0.5);
-        assert_eq!(resolve_click_point(None, raw, true, None), raw);
+        assert_eq!(
+            resolve_click_point(None, raw, true, None, config::GridMode::Rectangular),
+            raw
+        );
+    }
+
+    #[test]
+    fn isometric_mode_constrains_to_nearest_iso_axis() {
+        // グリッドモードが Isometric のときは水平/垂直ではなく30°/90°/150°軸を使う。
+        let raw = Point2::new(10.0, 0.5);
+        let origin = Some(Point2::new(0.0, 0.0));
+        let expected = ortho::constrain_to_axes(Point2::new(0.0, 0.0), raw, &ortho::ISO_AXES);
+        assert_eq!(
+            resolve_click_point(None, raw, true, origin, config::GridMode::Isometric),
+            expected
+        );
     }
 }
 
@@ -4836,6 +4920,7 @@ fn handle_select_input(
     select_tool: &mut SelectTool,
     snap_enabled: bool,
     snap_marker: &mut Option<snap::SnapResult>,
+    grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
     now: f64,
     offset_distance: Option<f64>,
@@ -4854,6 +4939,7 @@ fn handle_select_input(
             select_tool,
             snap_enabled,
             snap_marker,
+            grid_mode,
             status,
             now,
             offset_distance,
@@ -4872,6 +4958,7 @@ fn handle_select_input(
             select_tool,
             snap_enabled,
             snap_marker,
+            grid_mode,
             status,
             now,
         );
@@ -5038,6 +5125,7 @@ fn handle_placement_input(
     select_tool: &mut SelectTool,
     snap_enabled: bool,
     snap_marker: &mut Option<snap::SnapResult>,
+    grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
     now: f64,
 ) {
@@ -5051,13 +5139,14 @@ fn handle_placement_input(
     // スナップ用パラメータ（作図ツールと同じ換算）。
     let radius = SNAP_RADIUS_PX / viewport.zoom;
     let grid_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
+    let grid = snap::GridSpec::new(grid_step, grid_mode);
     // 確定判定のゼロ変位しきい値はピック許容量基準。
     let tol = PICK_TOLERANCE_PX / viewport.zoom;
 
     // カーソル追従（プレビュー用）とスナップマーカー更新。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid_step, &[]);
+        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
         *snap_marker = marker;
         select_tool.placement_move(world);
     } else {
@@ -5074,7 +5163,7 @@ fn handle_placement_input(
         && let Some(pos) = response.interact_pointer_pos()
     {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid_step, &[]);
+        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
         match select_tool.placement_click(document, world, tol) {
             PlacementOutcome::Continue => {}
             PlacementOutcome::Cancelled(msg) => {
@@ -5177,6 +5266,7 @@ fn handle_offset_input(
     select_tool: &mut SelectTool,
     snap_enabled: bool,
     snap_marker: &mut Option<snap::SnapResult>,
+    grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
     now: f64,
     offset_distance: Option<f64>,
@@ -5197,13 +5287,14 @@ fn handle_offset_input(
     // スナップ用パラメータ（作図・配置ツールと同じ換算）。
     let radius = SNAP_RADIUS_PX / viewport.zoom;
     let grid_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
+    let grid = snap::GridSpec::new(grid_step, grid_mode);
     // 通過点方式で「通過点が対象上」を判定するゼロ距離しきい値はピック許容量基準。
     let tol = PICK_TOLERANCE_PX / viewport.zoom;
 
     // カーソル追従（プレビュー用ゴースト）とスナップマーカー更新。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid_step, &[]);
+        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
         *snap_marker = marker;
         select_tool.offset_move(world);
     } else {
@@ -5220,7 +5311,7 @@ fn handle_offset_input(
         && let Some(pos) = response.interact_pointer_pos()
     {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid_step, &[]);
+        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
         match select_tool.offset_click(document, world, tol, offset_distance) {
             OffsetOutcome::Cancelled(msg) => {
                 *snap_marker = None;
@@ -5364,11 +5455,18 @@ fn handle_modifier_view_input(
     *active_gesture = gesture;
 }
 
-/// ズームレベルに応じて間引いたグリッド線を描画する。
+/// ズームレベルに応じて間引いたグリッド線を描画する。矩形/等測モードで分岐する
+/// （DESIGN.md 7章「随時対応」アイソメ図・アクソメ図の作図補助 設計確定3）。
 ///
 /// 副グリッド（`nice_grid_step` が返す基本間隔）と、その5倍の主グリッドの2段。
-/// 副グリッドの画面間隔が狭すぎる（読み取れない）場合は副グリッドを省略する。
-fn draw_grid(painter: &egui::Painter, rect: Rect, viewport: &Viewport) {
+/// 副グリッドの画面間隔が狭すぎる（読み取れない）場合は副グリッドを省略する
+/// （この間引き規則は両モード共通）。
+fn draw_grid(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    grid_mode: config::GridMode,
+) {
     let minor_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
     let minor_px = minor_step * viewport.zoom;
     let major_step = minor_step * 5.0;
@@ -5378,11 +5476,21 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, viewport: &Viewport) {
 
     let visible = viewport.visible_aabb(rect);
 
-    // 副グリッドは画面間隔が十分（>= 6px）ある時だけ描く。
-    if minor_px >= 6.0 {
-        draw_grid_lines(painter, rect, viewport, &visible, minor_step, minor_stroke);
+    match grid_mode {
+        config::GridMode::Rectangular => {
+            // 副グリッドは画面間隔が十分（>= 6px）ある時だけ描く。
+            if minor_px >= 6.0 {
+                draw_grid_lines(painter, rect, viewport, &visible, minor_step, minor_stroke);
+            }
+            draw_grid_lines(painter, rect, viewport, &visible, major_step, major_stroke);
+        }
+        config::GridMode::Isometric => {
+            if minor_px >= 6.0 {
+                draw_iso_grid_lines(painter, rect, viewport, &visible, minor_step, minor_stroke);
+            }
+            draw_iso_grid_lines(painter, rect, viewport, &visible, major_step, major_stroke);
+        }
     }
-    draw_grid_lines(painter, rect, viewport, &visible, major_step, major_stroke);
 }
 
 /// 間隔 `step`（ワールド単位）でグリッド線を1系統描画する。
@@ -5411,6 +5519,131 @@ fn draw_grid_lines(
         let sy = viewport.world_to_screen(rect, Point2::new(0.0, y)).y;
         painter.hline(rect.x_range(), sy, stroke);
         y += step;
+    }
+}
+
+/// 間隔 `step`（ワールド単位）で等測グリッド線を1系統（副/主のいずれか）描画する
+/// （DESIGN.md 7章「随時対応」アイソメ図・アクソメ図の作図補助 設計確定3）。
+///
+/// 30°・150°・90° の3線群を描く。格子ベクトル `u = step·(cos30°, sin30°)`、
+/// `v = step·(cos150°, sin150°)` に対し、30° 線群は `y = x·tan30° + n·step`、
+/// 150° 線群は `y = x·tan150° + n·step`（いずれも `n` は整数）、90° 線群は
+/// `x = n·(√3/2)·step`。各線は可視矩形 `visible` との交差範囲だけを
+/// `painter.line_segment` で描く（無限に長い線を投げない）。
+fn draw_iso_grid_lines(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    visible: &Aabb,
+    step: f64,
+    stroke: Stroke,
+) {
+    if step <= 0.0 || !step.is_finite() {
+        return;
+    }
+    let sqrt3 = 3f64.sqrt();
+    let tan30 = 1.0 / sqrt3;
+    let corners = [
+        Point2::new(visible.min.x, visible.min.y),
+        Point2::new(visible.min.x, visible.max.y),
+        Point2::new(visible.max.x, visible.min.y),
+        Point2::new(visible.max.x, visible.max.y),
+    ];
+
+    // 30° 線群: y = x·tan30° + n·step ⟺ c = y - x·tan30° = n·step。
+    let c30: Vec<f64> = corners.iter().map(|p| p.y - p.x * tan30).collect();
+    let (c30_min, c30_max) = min_max(&c30);
+    let n30_start = (c30_min / step).floor() as i64;
+    let n30_end = (c30_max / step).ceil() as i64;
+    for n in n30_start..=n30_end {
+        let c = n as f64 * step;
+        let p0 = Point2::new(0.0, c);
+        let dir = Point2::new(sqrt3 / 2.0, 0.5);
+        draw_clipped_line(painter, rect, viewport, visible, p0, dir, stroke);
+    }
+
+    // 150° 線群: y = x·tan150° + n·step ⟺ c = y + x·tan30° = n·step（tan150° = -tan30°）。
+    let c150: Vec<f64> = corners.iter().map(|p| p.y + p.x * tan30).collect();
+    let (c150_min, c150_max) = min_max(&c150);
+    let n150_start = (c150_min / step).floor() as i64;
+    let n150_end = (c150_max / step).ceil() as i64;
+    for n in n150_start..=n150_end {
+        let c = n as f64 * step;
+        let p0 = Point2::new(0.0, c);
+        let dir = Point2::new(-sqrt3 / 2.0, 0.5);
+        draw_clipped_line(painter, rect, viewport, visible, p0, dir, stroke);
+    }
+
+    // 90° 線群: x = n·(√3/2)·step（格子点の x 間隔。設計確定3）。
+    let vertical_step = sqrt3 / 2.0 * step;
+    let n90_start = (visible.min.x / vertical_step).floor() as i64;
+    let n90_end = (visible.max.x / vertical_step).ceil() as i64;
+    for n in n90_start..=n90_end {
+        let x = n as f64 * vertical_step;
+        let p0 = Point2::new(x, 0.0);
+        let dir = Point2::new(0.0, 1.0);
+        draw_clipped_line(painter, rect, viewport, visible, p0, dir, stroke);
+    }
+}
+
+/// `[f64]` の最小値・最大値を返す（空スライスは呼び出し側で発生しない前提）。
+fn min_max(values: &[f64]) -> (f64, f64) {
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (min, max)
+}
+
+/// 点 `p0` を通り方向 `dir` の直線を可視矩形 `visible` で切り取り、交差区間があれば
+/// 画面座標へ変換して1本の線分として描く（無限に長い線は投げない）。
+fn draw_clipped_line(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    visible: &Aabb,
+    p0: Point2,
+    dir: Point2,
+    stroke: Stroke,
+) {
+    let Some((t0, t1)) = clip_line_param_range(p0, dir, visible) else {
+        return;
+    };
+    let a = Point2::new(p0.x + t0 * dir.x, p0.y + t0 * dir.y);
+    let b = Point2::new(p0.x + t1 * dir.x, p0.y + t1 * dir.y);
+    let sa = viewport.world_to_screen(rect, a);
+    let sb = viewport.world_to_screen(rect, b);
+    painter.line_segment([sa, sb], stroke);
+}
+
+/// 直線 `p(t) = p0 + t·dir`（`t` は実数全域）を軸並行矩形 `aabb` で切り取り、
+/// 交差するパラメータ区間 `(t_min, t_max)` を返す（交差しなければ `None`）。
+/// `dir` の成分が 0 の軸は、`p0` がその軸の範囲内にあるかどうかだけを見る
+/// （Liang–Barsky 型のパラメトリック直線クリッピング）。
+fn clip_line_param_range(p0: Point2, dir: Point2, aabb: &Aabb) -> Option<(f64, f64)> {
+    let mut t_min = f64::NEG_INFINITY;
+    let mut t_max = f64::INFINITY;
+
+    for (p0_c, dir_c, lo, hi) in [
+        (p0.x, dir.x, aabb.min.x, aabb.max.x),
+        (p0.y, dir.y, aabb.min.y, aabb.max.y),
+    ] {
+        if dir_c == 0.0 {
+            if p0_c < lo || p0_c > hi {
+                return None;
+            }
+        } else {
+            let (mut t_lo, mut t_hi) = ((lo - p0_c) / dir_c, (hi - p0_c) / dir_c);
+            if t_lo > t_hi {
+                std::mem::swap(&mut t_lo, &mut t_hi);
+            }
+            t_min = t_min.max(t_lo);
+            t_max = t_max.min(t_hi);
+        }
+    }
+
+    if t_min > t_max {
+        None
+    } else {
+        Some((t_min, t_max))
     }
 }
 
@@ -6320,6 +6553,65 @@ mod tests {
         assert_eq!(format_grid_step(50.0), "50");
         assert_eq!(format_grid_step(0.05), "0.05");
         assert_eq!(format_grid_step(0.00005), "0.00005");
+    }
+
+    // --- clip_line_param_range（等測グリッド線の可視矩形クリッピング） ---
+
+    #[test]
+    fn clip_line_param_range_diagonal_line_through_box() {
+        // 原点通過・45°方向の直線が [-10,10]×[-10,10] を貫く区間。
+        let aabb = Aabb {
+            min: Point2::new(-10.0, -10.0),
+            max: Point2::new(10.0, 10.0),
+        };
+        let (t0, t1) = clip_line_param_range(Point2::new(0.0, 0.0), Point2::new(1.0, 1.0), &aabb)
+            .expect("line crosses the box");
+        assert!((t0 - -10.0).abs() < 1e-9);
+        assert!((t1 - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clip_line_param_range_vertical_line_within_x_bounds() {
+        // 垂直線（dir.x == 0）は x が範囲内なら y 方向の全区間を返す。
+        let aabb = Aabb {
+            min: Point2::new(-5.0, -5.0),
+            max: Point2::new(5.0, 5.0),
+        };
+        let (t0, t1) = clip_line_param_range(Point2::new(2.0, 0.0), Point2::new(0.0, 1.0), &aabb)
+            .expect("vertical line within x bounds crosses the box");
+        assert!((t0 - -5.0).abs() < 1e-9);
+        assert!((t1 - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clip_line_param_range_vertical_line_outside_x_bounds_is_none() {
+        // x = 100 の垂直線は箱の外なので交差しない。
+        let aabb = Aabb {
+            min: Point2::new(-5.0, -5.0),
+            max: Point2::new(5.0, 5.0),
+        };
+        assert_eq!(
+            clip_line_param_range(Point2::new(100.0, 0.0), Point2::new(0.0, 1.0), &aabb),
+            None
+        );
+    }
+
+    #[test]
+    fn clip_line_param_range_line_missing_the_box_is_none() {
+        // 箱から離れた位置を通る水平線は交差しない。
+        let aabb = Aabb {
+            min: Point2::new(-5.0, -5.0),
+            max: Point2::new(5.0, 5.0),
+        };
+        assert_eq!(
+            clip_line_param_range(Point2::new(0.0, 100.0), Point2::new(1.0, 0.0), &aabb),
+            None
+        );
+    }
+
+    #[test]
+    fn min_max_returns_extremes() {
+        assert_eq!(min_max(&[3.0, -1.0, 2.5, 0.0]), (-1.0, 3.0));
     }
 
     #[test]
@@ -7841,6 +8133,7 @@ mod tests {
                 default_title_block: config::TitleBlockChoice::A,
                 recent_files: Vec::new(),
                 plot_color_mode: plot::PlotColorMode::default(),
+                grid_mode: config::GridMode::default(),
             },
             path: Some(PathBuf::from("/tmp/mcad-app-test/config.json")),
             warning: Some("something went wrong".to_owned()),

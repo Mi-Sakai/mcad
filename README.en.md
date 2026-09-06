@@ -2,7 +2,7 @@
 
 *[日本語版 README](./README.md)*
 
-A 2D CAD application built with Rust and egui. Current version: **v0.9.0**.
+A 2D CAD application built with Rust and egui. Current version: **v0.9.1**.
 
 > **Note on language.** The project's design documents (`DESIGN.md`, `AGENTS.md`,
 > `CHANGELOG.md`) are written in Japanese, and the application UI is being migrated
@@ -25,6 +25,7 @@ for the design and [`AGENTS.md`](./AGENTS.md) for the development conventions
 
 - **Drawing**: points, line segments, circles, arcs (three-point: start / through / end), polylines, text (CJK supported), **dimensions** (linear, radial and diameter; auxiliary symbols φ/Sφ/□/R/SR/CR/C/t; tolerance support; style editing; drag text position)
 - **Editing**: selection (click, rubber band, additive), move, duplicate, rotate, mirror, offset, **trim, extend, fillet, split**, delete
+- **Isometric drawing aids**: isometric grid (`F5`), isometric axes for orthogonal mode, and an isometric circle tool (`I`, four-centre method). No Z axis or true ellipse; everything stays 2D arcs
 - **Snapping**: endpoint, intersection, midpoint, center and grid candidates chosen by priority, with a distinct marker per kind
 - **Layers**: color, visibility, lock, stacking order (front / back buttons), managed in a dedicated panel
 - **Undo/redo**: built on the command pattern
@@ -70,11 +71,13 @@ For everyday use, a release build is recommended: `cargo run --release -p mcad-a
 | `D` | Linear dimension (three clicks: two measured points, then the dimension line position; preview follows the cursor) |
 | `Shift+D` | Radial dimension (two clicks: a circle or arc, then the leader direction) |
 | `G` | Diameter dimension (two clicks: a circle or arc, then the direction of the dimension line) |
+| `I` | Isometric circle (click the centre, then a point at the radius; drawn as four arcs by the four-centre method. `Tab` during the preview cycles the face Top/Left/Right) |
 | `Enter` | Commit a polyline (two or more points, left open; clicking the start point closes and commits it) |
 | `Del` / `Backspace` | Delete the selected entities |
 | `Esc` | Cancel drawing or placement / discard a rubber-band drag / clear the selection |
 | `F3` | Toggle snapping |
-| `F8` | Toggle orthogonal mode (constrains to horizontal/vertical from the previous point; an available snap candidate takes precedence) |
+| `F5` | Toggle grid mode (rectangular / isometric; the isometric grid is the 30°, 90° and 150° line families, and snapping and orthogonal mode follow its lattice and axes) |
+| `F8` | Toggle orthogonal mode (constrains to horizontal/vertical from the previous point, or to the nearest of 30°/90°/150° on the isometric grid; an available snap candidate takes precedence) |
 | `F9` | Toggle paper-based display (line width and annotation size shown at paper mm scale vs. fixed screen px) |
 | `Home` | Manual zoom-to-fit (fits the whole drawing in view) |
 | Wheel | Cursor-centered zoom |

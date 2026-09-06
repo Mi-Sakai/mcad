@@ -51,6 +51,7 @@ use mcad_geom::{
 };
 
 use crate::draw_shape;
+use crate::iso::{IsoFace, iso_circle_arcs};
 use crate::viewport::Viewport;
 
 /// プレビュー線の色（確定済みエンティティと区別しやすい暖色）。
@@ -71,13 +72,14 @@ pub struct ToolCtx {
     pub style: Style,
 }
 
-/// 寸法の方向が定まるかを判定するスケール非依存の幾何許容値（ワールド単位）。
+/// 形状・方向が数学的に成立するかを判定する、スケール非依存の幾何許容値（ワールド単位）。
 ///
 /// ピック許容量（`PICK_TOLERANCE_PX / zoom`、スクリーン基準でズーム依存）とは別物で、
 /// 「線分・引出方向が数学的に成立するか」だけを見る絶対値。ズームアウト時に有効な短い
 /// 寸法を誤って拒否しないよう、退化判定にはこちらを使う（[`PolylineTool`] の
-/// `AUTO_CLOSE_EPSILON` と同じ考え方）。長さ寸法の p1≈p2、半径寸法の引出クリック＝中心の
-/// 両方で共有する。
+/// `AUTO_CLOSE_EPSILON` と同じ考え方）。長さ寸法の p1≈p2、半径寸法・直径寸法の
+/// 引出クリック＝中心、[`IsoCircleTool`] の半径 0 の 3 者で共有する（値も判定の意味も
+/// 同じなので、別名の定数を増やさない）。
 const DIM_DEGENERATE_EPSILON: f64 = 1e-9;
 
 /// 半径寸法ツールの 1 クリック目で拾った円／円弧の採取値（中心・半径）。
@@ -159,6 +161,13 @@ pub enum InputEvent {
     Confirm,
     /// Escキー（未確定の状態を破棄する）。
     Cancel,
+    /// Tabキー（ツール固有の選択肢を1つ進める）。現在の利用者は [`IsoCircleTool`] の
+    /// 面切替（Top → Left → Right）のみで、他のツールは無視する。
+    ///
+    /// キー操作なので [`Tool::variant_label`] のような拡張点ではなく [`InputEvent`] に
+    /// 置く（Enter = [`InputEvent::Confirm`]・Esc = [`InputEvent::Cancel`] と同じ扱い）。
+    /// 循環はツールの状態遷移そのものであり、GUI なしで単体テストできる経路に載せたい。
+    Cycle,
 }
 
 /// [`Tool::on_input`] の結果。
@@ -356,6 +365,16 @@ pub trait Tool {
     /// 見せる」向きの拡張点なのに対し、こちらは「app 層の入力欄をツールへ流し込む」逆向きの
     /// 拡張点。app 層は毎フレーム呼ぶので、ツール側は最後に渡された値だけを保持すればよい。
     fn set_radius_input(&mut self, _radius: Option<f64>) {}
+
+    /// `Tab`（[`InputEvent::Cycle`]）で循環するツール固有の選択肢の現在値を、上部パネルへ
+    /// 表示するための ASCII ラベル。既定は `None`（循環する選択肢を持たない）。
+    ///
+    /// [`Tool::pending_text_anchor`] と同じ「ツールの状態を app 層へ 1 点だけ見せる」
+    /// 向きの拡張点。現在の利用者は [`IsoCircleTool`] の面（`Top`/`Left`/`Right`）のみで、
+    /// app 層は `Box<dyn Tool>` からツール型を知らずに現在の面を表示できる。
+    fn variant_label(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -381,7 +400,7 @@ impl Tool for PointTool {
                 ctx.style,
             ))),
             InputEvent::Cancel => ToolResult::Cancel,
-            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
         }
     }
 
@@ -457,7 +476,7 @@ impl Tool for LineTool {
                 self.state = LineState::WaitingFirst;
                 ToolResult::Cancel
             }
-            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
         }
     }
 
@@ -542,7 +561,7 @@ impl Tool for CircleTool {
                 self.state = CircleState::WaitingCenter;
                 ToolResult::Cancel
             }
-            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
         }
     }
 
@@ -658,7 +677,7 @@ impl Tool for ArcTool {
                 self.state = ArcState::WaitingP1;
                 ToolResult::Cancel
             }
-            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
         }
     }
 
@@ -713,6 +732,141 @@ impl Tool for ArcTool {
             // 3点目の基準は直近の p2（設計書 §3）。
             ArcState::WaitingP3(_p1, p2) => Some(p2),
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// アイソメ円（四心法。DESIGN.md 7章「アイソメ図・アクソメ図の作図補助」アイソメ-3）
+// ---------------------------------------------------------------------
+
+/// アイソメ円ツールの状態。[`CircleTool`] と同じ 2 クリック（中心 → 半径）。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum IsoCircleState {
+    /// 中心のクリック待ち（1 クリック目）。
+    #[default]
+    WaitingCenter,
+    /// 半径のクリック待ち（2 クリック目）。中心は確定済み。
+    WaitingRadius(Point2),
+}
+
+/// アイソメ円ツール（`I`）。等測投影された円を四心法の 4 円弧で近似して作図する
+/// （幾何は [`crate::iso`]）。中心クリック → カーソルまでの距離を実半径とし、
+/// 2 クリック目で `AddEntity` × 4 を [`Command::Batch`] 1 発として確定する
+/// （原子的＝ undo 1 回で 4 円弧とも消える。DESIGN.md 設計確定5）。
+/// `Tab`（[`InputEvent::Cycle`]）で面を Top → Left → Right → Top と循環する。
+///
+/// # 面をツールが持つ理由
+///
+/// DESIGN.md 設計確定1 は「既定 Top・ツール起動ごとに Top へ戻す」と定める。面を
+/// ツール本体に持たせれば、ツールを作り直す全経路（キー切替・確定失敗・undo/redo・
+/// ファイル操作）で `spawn()` が走るぶん、この規約が構造的に満たされる。app 層の
+/// 状態にすると経路ごとにリセットを書き足す必要があり、抜けやすい。
+///
+/// # 縮み率を掛けない
+///
+/// 等測図は縮み率（0.816）を掛けない実寸の等角図とする（DESIGN.md 設計確定2）ので、
+/// クリック距離がそのまま呼び径の半分（実半径）になる。
+#[derive(Debug, Default)]
+pub struct IsoCircleTool {
+    state: IsoCircleState,
+    face: IsoFace,
+    cursor: Option<Point2>,
+}
+
+impl IsoCircleTool {
+    /// 中心と 2 点目（クリックまたはカーソル）から確定・プレビュー用の 4 円弧を作る。
+    ///
+    /// 半径が退化（[`DIM_DEGENERATE_EPSILON`] 以下）なら `None`。ズームに依存しない
+    /// 絶対値で判定するのは、ズームアウト時の有効な小さい円を誤って拒否しないため
+    /// （寸法ツールの退化判定と同じ考え方。同定数の doc 参照）。
+    fn arcs(&self, center: Point2, point: Point2) -> Option<[Arc; 4]> {
+        let radius = center.distance(point);
+        if radius <= DIM_DEGENERATE_EPSILON {
+            return None;
+        }
+        iso_circle_arcs(self.face, center, radius)
+    }
+}
+
+impl Tool for IsoCircleTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                IsoCircleState::WaitingCenter => {
+                    self.state = IsoCircleState::WaitingRadius(p);
+                    ToolResult::Continue
+                }
+                IsoCircleState::WaitingRadius(center) => match self.arcs(center, p) {
+                    Some(arcs) => {
+                        let cmd = Command::Batch(
+                            arcs.iter()
+                                .map(|arc| {
+                                    Command::AddEntity(Entity::new(
+                                        Shape::Arc(*arc),
+                                        ctx.layer,
+                                        ctx.style,
+                                    ))
+                                })
+                                .collect(),
+                        );
+                        self.state = IsoCircleState::WaitingCenter;
+                        ToolResult::Commit(cmd)
+                    }
+                    // 半径 0（中心と同じ点をクリック）。状態は据え置いて理由だけ返し、
+                    // 2 クリック目を待ち続ける（半径寸法の退化クリックと同じ流儀）。
+                    None => ToolResult::Rejected("Iso circle: radius must be greater than zero"),
+                },
+            },
+            // 面切替は中心クリック前でも受け付ける（作図を始める前に面を選べる）。
+            InputEvent::Cycle => {
+                self.face = self.face.next();
+                ToolResult::Continue
+            }
+            InputEvent::Cancel => {
+                self.state = IsoCircleState::WaitingCenter;
+                ToolResult::Cancel
+            }
+            InputEvent::Confirm => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _render: crate::dimension::DimRender<'_>,
+    ) {
+        if let (IsoCircleState::WaitingRadius(center), Some(cursor)) = (self.state, self.cursor)
+            && let Some(arcs) = self.arcs(center, cursor)
+        {
+            for arc in &arcs {
+                draw_shape(
+                    painter,
+                    rect,
+                    viewport,
+                    &Shape::Arc(*arc),
+                    preview_stroke(),
+                    Linetype::Continuous,
+                    1.0,
+                );
+            }
+        }
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            IsoCircleState::WaitingCenter => Vec::new(),
+            IsoCircleState::WaitingRadius(center) => vec![center],
+        }
+    }
+
+    fn variant_label(&self) -> Option<&'static str> {
+        Some(self.face.label())
     }
 }
 
@@ -775,6 +929,7 @@ impl Tool for PolylineTool {
                     ToolResult::Continue
                 }
             }
+            InputEvent::Cycle => ToolResult::Continue,
             InputEvent::Cancel => {
                 self.vertices.clear();
                 ToolResult::Cancel
@@ -868,7 +1023,7 @@ impl Tool for TextTool {
                 ToolResult::Continue
             }
             // 確定（Enter による `AddEntity`）は app 層が担う。ここでは何もしない。
-            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
             InputEvent::Cancel => match self.state {
                 // 入力待ち中の Esc はアンカーを捨てて未確定へ戻る（ツールは維持）。
                 TextState::Editing(_) => {
@@ -992,7 +1147,7 @@ impl Tool for DimLinearTool {
                 self.state = DimLinearState::WaitingP1;
                 ToolResult::Cancel
             }
-            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
         }
     }
 
@@ -1104,7 +1259,7 @@ impl Tool for DimRadialTool {
                 self.state = DimRadialState::WaitingCircle;
                 ToolResult::Cancel
             }
-            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
         }
     }
 
@@ -1216,7 +1371,7 @@ impl Tool for DimDiameterTool {
                 self.state = DimDiameterState::WaitingCircle;
                 ToolResult::Cancel
             }
-            InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
         }
     }
 
@@ -1437,7 +1592,7 @@ impl BoundaryTargetTool {
             // Move はプレビューに使わない（ヒットテスト結果が無いと対象形状が分からず、
             // `Move` は Document を持たないため。DESIGN.md M7 設計判断6 の
             // 「ホバー中のライブプレビューは行わない」）。
-            InputEvent::Move(_) | InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Move(_) | InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
             InputEvent::Cancel => {
                 self.state = BoundaryTargetState::WaitingBoundary;
                 ToolResult::Cancel
@@ -1684,7 +1839,7 @@ impl Tool for FilletTool {
         match ev {
             // トリム・延長と同じ理由でホバー中のライブプレビューは行わない
             // （`Move` は Document を持たず、ヒットするまで対象形状が分からない）。
-            InputEvent::Move(_) | InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Move(_) | InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
             InputEvent::Cancel => {
                 self.state = FilletState::WaitingFirstLine;
                 ToolResult::Cancel
@@ -1800,7 +1955,7 @@ impl Tool for SplitTool {
         match ev {
             // トリム・延長・フィレットと同じ理由でホバー中のライブプレビューは行わない
             // （`Move` は Document を持たず、ヒットするまで対象形状が分からない）。
-            InputEvent::Move(_) | InputEvent::Confirm => ToolResult::Continue,
+            InputEvent::Move(_) | InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
             InputEvent::Cancel => ToolResult::Cancel,
             // クリックは常にヒットテスト経路（`wants_shape_pick`）を通るのでここへは
             // 来ない想定。来ても状態は変えない。
@@ -3040,6 +3195,155 @@ mod tests {
             tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 9.0))),
             ToolResult::Continue
         );
+    }
+
+    // --- アイソメ円ツール（IsoCircle、v0.9.x 番号外 アイソメ-3）---
+
+    /// `Commit` から 4 円弧を取り出す（`Batch(AddEntity × 4)` を前提に検証する）。
+    fn iso_arcs_of(result: ToolResult, ctx: &ToolCtx) -> Vec<Arc> {
+        match result {
+            ToolResult::Commit(Command::Batch(subs)) => {
+                assert_eq!(subs.len(), 4, "アイソメ円は 4 円弧の Batch");
+                subs.into_iter()
+                    .map(|sub| match sub {
+                        Command::AddEntity(entity) => {
+                            assert_eq!(entity.layer, ctx.layer);
+                            assert_eq!(entity.style, ctx.style);
+                            match entity.geom {
+                                EntityGeom::Shape(Shape::Arc(arc)) => arc,
+                                other => panic!("expected Arc, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected AddEntity, got {other:?}"),
+                    })
+                    .collect()
+            }
+            other => panic!("expected Commit(Batch(..)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn iso_circle_tool_commits_four_arcs_as_one_batch() {
+        let (_doc, ctx) = ctx();
+        let mut tool = IsoCircleTool::default();
+        let center = Point2::new(2.0, -3.0);
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(center)),
+            ToolResult::Continue
+        );
+        // 2 クリック目までの距離が実半径（縮み率を掛けない。DESIGN.md 設計確定2）。
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0)));
+        let arcs = iso_arcs_of(result, &ctx);
+        let expected = iso_circle_arcs(IsoFace::Top, center, 5.0).expect("valid");
+        assert_eq!(arcs, expected.to_vec());
+        // 確定後は次のアイソメ円の中心待ちへ戻る（1 クリック目として扱われる）。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(center)),
+            ToolResult::Continue
+        );
+    }
+
+    #[test]
+    fn iso_circle_tool_batch_applies_and_undoes_as_one_unit() {
+        // 検収基準「undo 1回で4円弧とも消える」。
+        let (mut doc, ctx) = ctx();
+        let mut tool = IsoCircleTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::ORIGIN));
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(10.0, 0.0)));
+        let ToolResult::Commit(cmd) = result else {
+            panic!("expected commit");
+        };
+        doc.apply(cmd).unwrap();
+        assert_eq!(doc.entity_count(), 4);
+        assert!(doc.undo());
+        assert_eq!(doc.entity_count(), 0);
+    }
+
+    #[test]
+    fn iso_circle_tool_rejects_zero_radius_and_keeps_waiting() {
+        let (_doc, ctx) = ctx();
+        let mut tool = IsoCircleTool::default();
+        let center = Point2::new(1.0, 1.0);
+        tool.on_input(&ctx, InputEvent::Click(center));
+        // 中心と同じ点のクリックは退化。状態は据え置き（2 クリック目を待ち続ける）。
+        assert!(matches!(
+            tool.on_input(&ctx, InputEvent::Click(center)),
+            ToolResult::Rejected(_)
+        ));
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 4.0)));
+        let arcs = iso_arcs_of(result, &ctx);
+        assert_eq!(arcs, iso_circle_arcs(IsoFace::Top, center, 3.0).unwrap());
+    }
+
+    #[test]
+    fn iso_circle_tool_cycle_switches_face_and_geometry() {
+        let (_doc, ctx) = ctx();
+        let mut tool = IsoCircleTool::default();
+        // 既定は Top。Tab で Top → Left → Right → Top。
+        assert_eq!(tool.variant_label(), Some("Top"));
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+        assert_eq!(tool.variant_label(), Some("Left"));
+        tool.on_input(&ctx, InputEvent::Cycle);
+        assert_eq!(tool.variant_label(), Some("Right"));
+        tool.on_input(&ctx, InputEvent::Cycle);
+        assert_eq!(tool.variant_label(), Some("Top"));
+
+        // 中心確定後（プレビュー中）の切替が確定形状に反映される。
+        let center = Point2::new(-4.0, 0.5);
+        tool.on_input(&ctx, InputEvent::Click(center));
+        tool.on_input(&ctx, InputEvent::Cycle);
+        assert_eq!(tool.variant_label(), Some("Left"));
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(-4.0, 2.5)));
+        let arcs = iso_arcs_of(result, &ctx);
+        assert_eq!(arcs, iso_circle_arcs(IsoFace::Left, center, 2.0).unwrap());
+    }
+
+    #[test]
+    fn iso_circle_tool_cancel_discards_center() {
+        let (_doc, ctx) = ctx();
+        let mut tool = IsoCircleTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 5.0)));
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+        // 中心は破棄済み。次のクリックは 1 クリック目（中心）として扱われる。
+        assert!(tool.snap_points().is_empty());
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0))),
+            ToolResult::Continue
+        );
+    }
+
+    #[test]
+    fn iso_circle_tool_snap_points_reflects_center() {
+        let (_doc, ctx) = ctx();
+        let mut tool = IsoCircleTool::default();
+        assert!(tool.snap_points().is_empty());
+        let center = Point2::new(7.0, -1.0);
+        tool.on_input(&ctx, InputEvent::Click(center));
+        assert_eq!(tool.snap_points(), vec![center]);
+    }
+
+    /// 他のツールは `Tab`（`InputEvent::Cycle`）を無視する（循環する選択肢を持たない）。
+    #[test]
+    fn other_tools_ignore_cycle() {
+        let (_doc, ctx) = ctx();
+        let mut line = LineTool::default();
+        line.on_input(&ctx, InputEvent::Click(Point2::ORIGIN));
+        assert_eq!(line.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+        assert_eq!(line.snap_points(), vec![Point2::ORIGIN]);
+        assert_eq!(line.variant_label(), None);
+
+        let mut polyline = PolylineTool::default();
+        polyline.on_input(&ctx, InputEvent::Click(Point2::ORIGIN));
+        polyline.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0)));
+        assert_eq!(
+            polyline.on_input(&ctx, InputEvent::Cycle),
+            ToolResult::Continue
+        );
+        // Cycle で頂点列が壊れない（Enter で従来どおり確定できる）。
+        assert!(matches!(
+            polyline.on_input(&ctx, InputEvent::Confirm),
+            ToolResult::Commit(_)
+        ));
     }
 
     // --- Polyline ---

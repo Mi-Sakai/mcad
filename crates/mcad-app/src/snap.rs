@@ -37,6 +37,8 @@
 use mcad_core::{Document, Entity, EntityGeom, EntityId};
 use mcad_geom::{Aabb, Point2, Shape, intersect, point_tol};
 
+use crate::config::GridMode;
+
 /// スナップ候補の種別。優先度は Endpoint > Intersection > Midpoint > Center > Grid
 /// （DESIGN.md 3.4）。数値優先度は [`SnapKind::priority`] が返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,13 +78,80 @@ pub struct SnapResult {
     pub point: Point2,
 }
 
+/// グリッドスナップのパラメータ（刻み幅＋モード）。DESIGN.md 7章「随時対応」
+/// アイソメ図・アクソメ図の作図補助 設計確定3。
+///
+/// 従来の `grid_step: f64` 引数を「刻み＋モード」へ一般化したもの。`step` が
+/// `0` 以下・非有限ならモードによらずグリッド候補なし（[`snap`] 参照）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridSpec {
+    /// グリッド間隔（ワールド単位）。
+    pub step: f64,
+    /// グリッド種別（矩形/等測）。
+    pub mode: GridMode,
+}
+
+impl GridSpec {
+    /// `GridSpec` を作る。
+    #[must_use]
+    pub fn new(step: f64, mode: GridMode) -> Self {
+        Self { step, mode }
+    }
+}
+
+/// 等測グリッドの格子点スナップ（純関数）。
+///
+/// 格子ベクトル `u = step·(cos30°, sin30°)`、`v = step·(cos150°, sin150°)` に対し、
+/// 斜交座標 `cursor = a·u + b·v` を解き、`a`・`b` それぞれの floor/ceil の組合せ
+/// 4 点のうち**ユークリッド距離が最小**の格子点を返す（DESIGN.md 7章「随時対応」
+/// アイソメ図・アクソメ図の作図補助 設計確定3）。`step` が非有限または `0` 以下なら `None`。
+///
+/// `a`・`b` を独立に `round` してはいけない: 基底が 120° で交わる斜交座標では成分ごとの
+/// 丸めが最近点にならず（例: `(a, b) = (0.49, −0.49)` は原点〔距離 0.849·step〕より
+/// 格子点 `u`〔距離 0.500·step〕が近い）、描画された線群の交点とスナップ先が食い違う
+/// （Codex adversarial review 2026-09-06 指摘）。三角格子の Voronoi 胞は隣接 4 候補の
+/// いずれかに必ず含まれる。
+#[must_use]
+pub fn iso_grid_snap(cursor: Point2, step: f64) -> Option<Point2> {
+    if !step.is_finite() || step <= 0.0 {
+        return None;
+    }
+    // u = step·(cos30°, sin30°) = step·(√3/2, 1/2)
+    // v = step·(cos150°, sin150°) = step·(-√3/2, 1/2)
+    let ux = step * 3f64.sqrt() / 2.0;
+    let uy = step * 0.5;
+    let vx = -ux;
+    let vy = uy;
+
+    // [ux vx][a]   [cursor.x]
+    // [uy vy][b] = [cursor.y]
+    let det = ux * vy - vx * uy;
+    if !det.is_finite() || det.abs() < f64::EPSILON {
+        return None;
+    }
+    let a = (cursor.x * vy - vx * cursor.y) / det;
+    let b = (ux * cursor.y - cursor.x * uy) / det;
+    let lattice = |a: f64, b: f64| Point2::new(a * ux + b * vx, a * uy + b * vy);
+    let (a0, b0) = (a.floor(), b.floor());
+    let mut best: Option<(f64, Point2)> = None;
+    for (da, db) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+        let p = lattice(a0 + da, b0 + db);
+        let d2 = (p.x - cursor.x).powi(2) + (p.y - cursor.y).powi(2);
+        if best.is_none_or(|(bd, _)| d2 < bd) {
+            best = Some((d2, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// カーソル位置 `cursor` から半径 `radius`（ワールド単位）内のスナップ候補を
 /// 列挙し、優先度・距離規則で 1 点を選んで返す。候補が無ければ `None`。
 ///
 /// - `document`: 候補の元となるエンティティ（可視レイヤーのみ対象）。
 /// - `cursor`: カーソルのワールド座標。
 /// - `radius`: 探索半径（ワールド単位。呼び出し側で `半径px / zoom` に換算済み）。
-/// - `grid_step`: グリッド間隔（ワールド単位）。`0` 以下・非有限ならグリッド候補なし。
+/// - `grid`: グリッド間隔＋モード（[`GridSpec`]）。`step` が `0` 以下・非有限なら
+///   モードによらずグリッド候補なし。
 /// - `extra_points`: 作図中（未確定）ツールの頂点列（[`crate::tool::Tool::snap_points`]）。
 ///   `Document` にまだ存在しない点だが、[`SnapKind::Endpoint`]（最優先）候補として
 ///   他の端点と同じ優先度・最近傍規則で扱う。ポリライン作図中に自分自身の始点へ
@@ -92,7 +161,7 @@ pub fn snap(
     document: &Document,
     cursor: Point2,
     radius: f64,
-    grid_step: f64,
+    grid: GridSpec,
     extra_points: &[Point2],
 ) -> Option<SnapResult> {
     if !radius.is_finite() || radius <= 0.0 {
@@ -141,11 +210,19 @@ pub fn snap(
     }
 
     // グリッド: カーソルに最も近いグリッド交点。最低優先度なので他候補が無いときの
-    // フォールバックになる。
-    if grid_step.is_finite() && grid_step > 0.0 {
-        let gx = (cursor.x / grid_step).round() * grid_step;
-        let gy = (cursor.y / grid_step).round() * grid_step;
-        best.consider(SnapKind::Grid, Point2::new(gx, gy), cursor, r2);
+    // フォールバックになる。矩形は直交丸め、等測は斜交座標の丸め（[`iso_grid_snap`]）。
+    if grid.step.is_finite() && grid.step > 0.0 {
+        let candidate = match grid.mode {
+            GridMode::Rectangular => {
+                let gx = (cursor.x / grid.step).round() * grid.step;
+                let gy = (cursor.y / grid.step).round() * grid.step;
+                Some(Point2::new(gx, gy))
+            }
+            GridMode::Isometric => iso_grid_snap(cursor, grid.step),
+        };
+        if let Some(p) = candidate {
+            best.consider(SnapKind::Grid, p, cursor, r2);
+        }
     }
 
     best.finish()
@@ -376,7 +453,13 @@ mod tests {
 
     /// グリッド無効（`grid_step = 0`）・`extra_points` 無しでスナップする短縮版。
     fn snap_no_grid(doc: &Document, cursor: Point2, radius: f64) -> Option<SnapResult> {
-        snap(doc, cursor, radius, 0.0, &[])
+        snap(
+            doc,
+            cursor,
+            radius,
+            GridSpec::new(0.0, GridMode::Rectangular),
+            &[],
+        )
     }
 
     #[test]
@@ -449,7 +532,14 @@ mod tests {
 
         // カーソル (0.1,0.1): 最寄りグリッド交点(0,0)まで ≈0.14、中心(0.3,0.3)まで ≈0.28。
         // グリッドの方が近いが、優先度で中心が勝つ。
-        let r = snap(&doc, Point2::new(0.1, 0.1), 0.5, 1.0, &[]).unwrap();
+        let r = snap(
+            &doc,
+            Point2::new(0.1, 0.1),
+            0.5,
+            GridSpec::new(1.0, GridMode::Rectangular),
+            &[],
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Center);
         assert_eq!(r.point, Point2::new(0.3, 0.3));
     }
@@ -458,7 +548,14 @@ mod tests {
     fn grid_is_fallback_when_nothing_else_in_range() {
         // エンティティのない空ドキュメントでもグリッドにはスナップする。
         let doc = Document::new();
-        let r = snap(&doc, Point2::new(0.2, -0.1), 0.5, 1.0, &[]).unwrap();
+        let r = snap(
+            &doc,
+            Point2::new(0.2, -0.1),
+            0.5,
+            GridSpec::new(1.0, GridMode::Rectangular),
+            &[],
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
         assert_eq!(r.point, Point2::new(0.0, 0.0));
     }
@@ -517,7 +614,14 @@ mod tests {
 
         // カーソルを交点から半径ちょうど（距離 3.0、半径 3.0）離しても交点にスナップする。
         let cursor = Point2::new(103.0, 100.0);
-        let r = snap(&doc, cursor, 3.0, 0.0, &[]).unwrap();
+        let r = snap(
+            &doc,
+            cursor,
+            3.0,
+            GridSpec::new(0.0, GridMode::Rectangular),
+            &[],
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Intersection);
         assert_eq!(r.point, Point2::new(100.0, 100.0));
     }
@@ -531,7 +635,16 @@ mod tests {
         add(&mut doc, line(100.0, 70.0, 100.0, 110.0));
 
         // カーソル (0,0): 交点まで距離 ≈141。半径 3 では何にもスナップしない。
-        assert_eq!(snap(&doc, Point2::new(0.0, 0.0), 3.0, 0.0, &[]), None);
+        assert_eq!(
+            snap(
+                &doc,
+                Point2::new(0.0, 0.0),
+                3.0,
+                GridSpec::new(0.0, GridMode::Rectangular),
+                &[]
+            ),
+            None
+        );
     }
 
     #[test]
@@ -540,7 +653,14 @@ mod tests {
         // 未確定頂点）を渡すと、より優先度の高い端点として選ばれる。
         let doc = Document::new();
         let extra = [Point2::new(0.05, 0.0)];
-        let r = snap(&doc, Point2::new(0.0, 0.0), 0.5, 1.0, &extra).unwrap();
+        let r = snap(
+            &doc,
+            Point2::new(0.0, 0.0),
+            0.5,
+            GridSpec::new(1.0, GridMode::Rectangular),
+            &extra,
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Endpoint);
         assert_eq!(r.point, Point2::new(0.05, 0.0));
     }
@@ -573,7 +693,14 @@ mod tests {
         let doc = Document::new();
         let extra = [Point2::new(10.0, 10.0)];
         // 半径外なので extra_points は候補にならず、グリッドにフォールバックする。
-        let r = snap(&doc, Point2::new(0.1, -0.1), 0.5, 1.0, &extra).unwrap();
+        let r = snap(
+            &doc,
+            Point2::new(0.1, -0.1),
+            0.5,
+            GridSpec::new(1.0, GridMode::Rectangular),
+            &extra,
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
         assert_eq!(r.point, Point2::new(0.0, 0.0));
     }
@@ -855,5 +982,98 @@ mod tests {
             snap_split_position(&doc, id, &closed_polyline, Point2::new(0.5, 0.0), 1.0),
             None
         );
+    }
+
+    // --- iso_grid_snap（等測グリッドの格子点スナップ） ---
+
+    #[test]
+    fn iso_grid_snap_exact_lattice_point_is_unchanged() {
+        // a=1, b=0 の格子点 u = (√3/2, 1/2)。
+        let step = 1.0;
+        let u = Point2::new(3f64.sqrt() / 2.0, 0.5);
+        let snapped = iso_grid_snap(u, step).unwrap();
+        assert!((snapped.x - u.x).abs() < 1e-9);
+        assert!((snapped.y - u.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn iso_grid_snap_rounds_midpoint_to_nearest_lattice_point() {
+        // u と v のちょうど中間 ((u+v)/2 = (0, 0.5)) は a=0.5, b=0.5 で、
+        // 四捨五入丸めにより a=1, b=0（あるいは a=0, b=1 のような近傍格子点）へ寄る。
+        let step = 1.0;
+        let u = Point2::new(3f64.sqrt() / 2.0, 0.5);
+        let v = Point2::new(-3f64.sqrt() / 2.0, 0.5);
+        let midpoint = Point2::new((u.x + v.x) / 2.0, (u.y + v.y) / 2.0);
+        let snapped = iso_grid_snap(midpoint, step).unwrap();
+        // 丸め先はいずれかの格子点（原点・u・v 等）であり、中間点そのものにはならない。
+        let dist_to_midpoint =
+            ((snapped.x - midpoint.x).powi(2) + (snapped.y - midpoint.y).powi(2)).sqrt();
+        assert!(dist_to_midpoint > 1e-6);
+    }
+
+    #[test]
+    fn iso_grid_snap_handles_negative_coordinates() {
+        let step = 2.0;
+        // a=-2, b=3 の格子点。
+        let ux = step * 3f64.sqrt() / 2.0;
+        let uy = step * 0.5;
+        let vx = -ux;
+        let vy = uy;
+        let a = -2.0;
+        let b = 3.0;
+        let target = Point2::new(a * ux + b * vx, a * uy + b * vy);
+        let snapped = iso_grid_snap(target, step).unwrap();
+        assert!((snapped.x - target.x).abs() < 1e-9);
+        assert!((snapped.y - target.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn iso_grid_snap_picks_euclidean_nearest_not_componentwise_rounding() {
+        // (a, b) = (0.49, -0.49) → ワールド (0.49·√3, 0) ≈ (0.849, 0)。成分ごとの丸めは
+        // 原点（距離 0.849）を返すが、格子点 u = (√3/2, 1/2) は距離 0.500 で近い。
+        let step = 1.0;
+        let ux = 3f64.sqrt() / 2.0;
+        let cursor = Point2::new(0.49 * ux - (-0.49) * ux, 0.49 * 0.5 + (-0.49) * 0.5);
+        // u と −v = (√3/2, −1/2) はどちらも距離 0.500 で同値。どちらが返っても
+        // 「最近点」であることだけを固定する（原点〔0.849〕を返してはいけない）。
+        let p = iso_grid_snap(cursor, step).unwrap();
+        let dist = ((p.x - cursor.x).powi(2) + (p.y - cursor.y).powi(2)).sqrt();
+        let origin_dist = (cursor.x.powi(2) + cursor.y.powi(2)).sqrt();
+        assert!(
+            dist < 0.51 && dist < origin_dist,
+            "got {p:?} at distance {dist}"
+        );
+        assert!((p.x - ux).abs() < 1e-9 && p.y.abs() > 0.4, "got {p:?}");
+    }
+
+    #[test]
+    fn iso_grid_snap_non_finite_or_non_positive_step_returns_none() {
+        let cursor = Point2::new(1.0, 1.0);
+        assert_eq!(iso_grid_snap(cursor, f64::NAN), None);
+        assert_eq!(iso_grid_snap(cursor, f64::INFINITY), None);
+        assert_eq!(iso_grid_snap(cursor, 0.0), None);
+        assert_eq!(iso_grid_snap(cursor, -1.0), None);
+    }
+
+    #[test]
+    fn snap_uses_isometric_grid_when_mode_is_isometric() {
+        // 空ドキュメント: グリッドのみが候補になる。等測格子点 (u = (√3/2, 0.5)) の
+        // すぐ近くにカーソルを置くと、矩形丸め ((1,1) など) ではなく等測格子点へ
+        // スナップすることを確認する。
+        let doc = Document::new();
+        let step = 1.0;
+        let u = Point2::new(3f64.sqrt() / 2.0, 0.5);
+        let cursor = Point2::new(u.x + 0.02, u.y - 0.01);
+        let r = snap(
+            &doc,
+            cursor,
+            0.5,
+            GridSpec::new(step, GridMode::Isometric),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::Grid);
+        assert!((r.point.x - u.x).abs() < 1e-9);
+        assert!((r.point.y - u.y).abs() < 1e-9);
     }
 }

@@ -4,6 +4,35 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-06 — アイソメ図・アクソメ図の作図補助
+
+等測グリッド・直交モードの等測軸・アイソメ円ツール(四心法)の3件を実装。M9 完了後の番号外
+対応をまとめて v0.9.1 リリース。変更は app 層に閉じ、geom・core・io・`.mcad`・DXF は無変更。
+
+### 追加
+
+- グリッドモード `GridMode`(`Rectangular` / `Isometric`、`crates/mcad-app/src/config.rs`)を
+  `F5` で切り替え、`config.json` の `grid_mode` に永続化(旧 config は矩形へ補完)。上部パネルの
+  トグル表示に `F5=Iso Grid` を追加。等測グリッドは格子ベクトル `u = s·(cos30°, sin30°)`・
+  `v = s·(cos150°, sin150°)` の格子に 30°・150°・90° の3線群を描く(`main.rs` の
+  `draw_iso_grid_lines`。副/主の間引きと 6px 閾値は矩形と同じ)
+- 等測グリッドの格子点スナップ `snap::iso_grid_snap`(斜交座標の floor/ceil 4候補から
+  ユークリッド最近点を選ぶ)。`snap()` の引数を `grid_step: f64` から `GridSpec { step, mode }` へ
+- 直交モードの拘束軸を集合で一般化(`ortho::constrain_to_axes`、軸は単位ベクトル)。矩形は
+  `RECT_AXES`(0°/90°、従来と同値)、等測は `ISO_AXES`(30°/90°/150°)の最近軸へ射影し、境界は
+  配列先頭側へ倒す
+- アイソメ円ツール `I`(`tool.rs` の `IsoCircleTool`、幾何は `crates/mcad-app/src/iso.rs` の
+  `iso_circle_arcs`): 中心クリック → 半径点クリックで、面(Top/Left/Right、プレビュー中の `Tab` で
+  循環、既定 Top)に応じた四心法の4円弧を `Command::Batch` 1発で作図(undo 1回)。大円弧の半径
+  `(√3/2)d`・小円弧 `(√3/6)d`、端点は菱形辺の中点。縮み率は掛けない実寸の等角図。半径 0 は拒否。
+  上部パネルにツール選択中のみ `Iso face: Top (Tab)` を表示
+- `InputEvent::Cycle`(`Tab`)を `Tool` の入力に追加。アイソメ円ツールがアクティブな間だけ
+  egui のフォーカス移動を打ち消して横取りし、他のショートカットが死なないようにする
+
+### テスト
+
+- 845本 → 880本
+
 ## [0.9.0] - 2026-09-05 — 寸法のGPS化
 
 寸法補助記号・サイズ公差・直径寸法・文書単位の寸法スタイル・文字位置の後編集・レイヤー変更

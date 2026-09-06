@@ -89,6 +89,9 @@ pub struct Config {
     /// 存在しない）はコンテナの `#[serde(default)]` により
     /// [`PlotColorMode::default`]（`Monochrome`）へ補完される。
     pub plot_color_mode: PlotColorMode,
+    /// 作図グリッドの種別（矩形/等測。F5）。旧バージョンの config.json（このフィールドが
+    /// 存在しない）は [`GridMode::default`]（`Rectangular`）へ補完される。
+    pub grid_mode: GridMode,
 }
 
 impl Default for Config {
@@ -103,8 +106,25 @@ impl Default for Config {
             default_title_block: TitleBlockChoice::default(),
             recent_files: Vec::new(),
             plot_color_mode: PlotColorMode::default(),
+            grid_mode: GridMode::default(),
         }
     }
+}
+
+/// 作図グリッドの種別（F5）。DESIGN.md 7章「随時対応」アイソメ図・アクソメ図の
+/// 作図補助（等測投影サポート）設計確定3。
+///
+/// `grid_mode` は `config.json` に永続化される（画面表示・スナップの挙動のみに
+/// 影響し、図面データ（`.mcad`/DXF）には無関係）。旧バージョンの config.json
+/// （このフィールドが存在しない）はコンテナの `#[serde(default)]` により
+/// [`GridMode::default`]（`Rectangular`）へ補完される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GridMode {
+    /// 矩形グリッド（既定。現行の X/Y 軸グリッド）。
+    #[default]
+    Rectangular,
+    /// 等測グリッド（30°/90°/150° の3線群、格子点は斜交座標）。
+    Isometric,
 }
 
 impl Config {
@@ -294,6 +314,7 @@ mod tests {
         assert_eq!(config.default_title_block, TitleBlockChoice::B);
         assert!(config.recent_files.is_empty());
         assert_eq!(config.plot_color_mode, PlotColorMode::Monochrome);
+        assert_eq!(config.grid_mode, GridMode::Rectangular);
     }
 
     #[test]
@@ -308,6 +329,7 @@ mod tests {
             default_title_block: TitleBlockChoice::C,
             recent_files: vec![PathBuf::from("/tmp/a.mcad"), PathBuf::from("/tmp/b.mcad")],
             plot_color_mode: PlotColorMode::Blueprint,
+            grid_mode: GridMode::Isometric,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let parsed: Config = serde_json::from_str(&json).unwrap();
@@ -361,6 +383,26 @@ mod tests {
     fn invalid_plot_color_mode_value_fails_to_load() {
         let path = unique_temp_path("invalid-plot-color-mode");
         fs::write(&path, r#"{"plot_color_mode": "Rainbow"}"#).unwrap();
+        let result = load(&path);
+        assert!(result.is_err());
+    }
+
+    /// 旧バージョンの config.json（`grid_mode` フィールドが存在しない）を読み込んだとき、
+    /// [`GridMode::default`]（`Rectangular`）へ補完される（アイソメ-1、DESIGN.md 7章
+    /// 「随時対応」アイソメ図・アクソメ図の作図補助 設計確定1・検収基準）。
+    #[test]
+    fn missing_grid_mode_field_defaults_to_rectangular() {
+        let config: Config =
+            serde_json::from_str(r#"{"snap_enabled": false, "default_paper": "A1"}"#).unwrap();
+        assert_eq!(config.grid_mode, GridMode::Rectangular);
+    }
+
+    /// `grid_mode` に存在しない値（不正値）が入っている config.json は、既存の
+    /// 「不正値で `load` が `Err` になる」規約に従う。
+    #[test]
+    fn invalid_grid_mode_value_fails_to_load() {
+        let path = unique_temp_path("invalid-grid-mode");
+        fs::write(&path, r#"{"grid_mode": "Perspective"}"#).unwrap();
         let result = load(&path);
         assert!(result.is_err());
     }

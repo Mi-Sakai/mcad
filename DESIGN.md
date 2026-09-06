@@ -644,6 +644,53 @@ SVG/PDF で同一形状が保証され、`DimExpansion.arrows` の `[Point2; 3]`
 筋。矢先形状の一般化は上記 (b) のとおり `DimExpansion` の形に影響するので、M9 完了後・M10 着手前に
 設計を確定させること。
 
+**設計確定(2026-09-06、采配役、M10 着手前)**: 上記 (a)〜(f) を次のとおり決める。実装は M10 の
+タスク63(下記 M10 タスク表)で、`DimStyle` のフィールド追加は v6(タスク57)に相乗りさせる。
+1. **(a) 種別の置き場所**: `DimStyle.arrow_kind: ArrowKind`(文書単位、既定 `ClosedFilled` =
+   現行の形)。`DimStyle` は `Copy` + serde 直列化なので v6 で必ずフィールドを足し、v5 以前は
+   既定値補完(M9 判断6 と同じ流儀)。**端ごとの個別指定(AutoCAD `DIMBLK1`/`DIMBLK2` 相当)は
+   設けない**(non-goal。M11 の DXF DIMENSION 取込で第1・第2端が異なる寸法は文書スタイルへ
+   丸めて警告に計上する。必要が実使用で出たら `DimAnnotation` 側の上書きとして再検討)。
+2. **(b) 形状生成の置き場所**: `mcad_geom::symbol` に `#[non_exhaustive]` enum `ArrowKind` と
+   純関数 `arrow_glyph(kind, len) -> ArrowGlyph { fills: Vec<Vec<Point2>>, strokes: Vec<[Point2; 2]>,
+   along_len: f64 }`(ローカル座標: 先端 = 原点、寸法線方向 = −x。`dim_symbol_glyph` と同じ
+   「geom の純関数で画面と出力の同一形状を保証する」流儀、M9 判断1・9)。`DimExpansion.arrows`
+   は `[Point2; 3]` 固定から `Vec<ArrowGlyph>`(ワールド座標へ写したもの)へ一般化し、消費側
+   (`main.rs` の `draw_dim_expansion` は塗りを `convex_polygon`・線を `line_segment`、
+   `plot::push_dim` は `PlotPath::filled` / stroke)を追従させる。plot の IR(`PlotPath` の
+   stroke/fill)は変更不要。
+3. **種別の初期セット**(JIS Z 8317-1:2008 附属書A の図示記号を優先し、AutoCAD 互換名は
+   参考に留める): `ClosedFilled`(閉じた塗りつぶし矢。現行)/ `ClosedBlank`(閉じた白抜き:
+   fill 白ではなく**輪郭 stroke のみ**。モノクロ出力・青図で背景色に依存しないため)/
+   `Open30`(開いた矢 30°。附属書A)/ `Open90`(開いた矢 90°。附属書A)/ `Oblique`(斜線 45°、
+   建築用チック)/ `Dot`(小円、塗りつぶし)/ `None`。**未知バリアントは `ClosedFilled` として
+   描く**(M9 判断1 の「黙って壊れるより保守的な既定」と同じ。テストで既知種別の取りこぼしを検出)。
+4. **(d) 外向き判定との関係**: `ArrowGlyph.along_len`(矢先が寸法線に沿って占める長さ)で
+   統一する。閉じた矢・開いた矢は `len`、`Oblique` / `Dot` / `None` は `0`。
+   `arrows_point_outward` は「ラベル幅 + `along_len`×2 が寸法線長に収まるか」で判定するので、
+   `along_len = 0` の種別は自動的に外向きにならず、寸法線の延長も起きない(判定の有無を種別で
+   分岐しない)。手動 `ArrowPlacement::Outside` は `along_len = 0` の種別では無視する(描画が
+   変わらないため。UI で当該種別のときは矢印配置コンボを無効化する)。
+5. **(e)(f) 寸法比**: 種別ごとの半幅比・線幅は `arrow_glyph` の定数として持つ(暫定: 閉じた矢の
+   全開き角は**30°**〔附属書A の開いた矢と揃え、現行 20° より太い〕、`Oblique` の長さは `len`、
+   `Dot` の直径は `len × 0.5`)。長さ `arrow_len_mm` の既定 3.0 は**文字高さ 3.5 との釣り合いで
+   タスク63 の手動スモークテスト時に確定する**(候補: 3.0 据え置き / 3.5 = 文字高さと同値 /
+   **5.0**〔ユーザーの現時点の印象、2026-09-06。v0.9.0 のスタイルダイアログで値を動かした感触〕。
+   「矢の長さは文字高さと同程度」が一般的な慣行かは**確認できず**。research-scout で JIS Z 8317-1
+   附属書A の寸法比を照合してから決める)。既定値を変えた場合は保存データ不変・描画のみの
+   可視差として CHANGELOG に明記する(M9 判断5 の前例)。
+6. **UI**: 寸法スタイルダイアログ(タスク50-3)に「矢先」コンボを1行追加(日本語ラベル。
+   `SetDimStyle` 経由で undo 1単位)。右パネル「寸法」の矢印配置コンボは上記4の無効化のみ。
+7. **DXF**: 寸法は DXF 非対応(M11 で設計)のため本項では無関係。
+8. **tcad**: geom への enum 追加は additive、`EntityGeom` 不変。`DimStyle` のフィールド追加は
+   `..DimStyle::DEFAULT` で構築している限り破壊しないが、tcad 側で `DimStyle { .. }` を全フィールド
+   列挙していないか着手時に `grep` する。
+- **検収基準(タスク63)**: 7種の矢先が画面と SVG/PDF で同一に描かれる/`ClosedFilled` の
+  既定描画が(角度・長さの既定を変えない限り)現行とビット一致する/`along_len = 0` の種別で
+  外向き自動判定と寸法線延長が起きない/v5 ファイルの読込で `arrow_kind` が `ClosedFilled` に
+  補完され v6 往復が無損失/ダイアログの変更が undo 1単位/文字高さ 3.5mm との釣り合いを
+  JIS 系の作図例と並べてユーザーが確認し、既定の長さ・角度を確定して記録する。
+
 **v0.8.1 リリース確定(2026-08-12)**: 番号外3件(出力モノクロ化、分割ツールのスナップ対応、ズーム・パンの追加操作手段)すべてが完了。CHANGELOG・README・Cargo.toml・AGENTS.md を更新し、テスト709本で通過。
 
 **アイソメ図・アクソメ図の作図補助(等測投影サポート)— 配置決定(2026-08-18、design-fable 案・ユーザー承認)**:
@@ -867,11 +914,12 @@ M11 では扱わない**。関連付け情報(DIMASSOC)は公開フィールド�
 |---|---|---|---|---|
 | 55 | 規定整備: 部品欄様式 | `製図規定.md` へ部品欄(部品表)の節を新設: 列構成(照合番号・名称・個数・材質・備考等)、配置(表題欄直上・行は下から上へ追記)、行高さ・列幅・文字高さの推奨値。JIS 要確認マーク付き草案とし**コミット前にユーザー承認**(タスク45と同じ承認ゲート) | haiku-assistant | — |
 | 56 | core: 汎用テーブルモデル | `TableGeom` 新設(設計方針1・3・4)+ `EntityGeom::Table` バリアント追加(translated/mirrored は anchor のみ、aabb は 1:1 解釈、validate: 行列数0・非有限・非正寸法・セル数不整合の拒否)、core コマンド境界の拒否テスト、`../tcad` の `cargo test --workspace` 実測 | implement-opus | — |
-| 57 | io: `.mcad` v6 | v6 スキーマ(Table)、v5 凍結 DTO、v1〜v5 読込の既定値補完、v6 不正値の読込拒否、往復無損失テスト | implement-sonnet | 56 |
+| 57 | io: `.mcad` v6 | v6 スキーマ(Table **+ `DimStyle.arrow_kind`〔タスク63 の前提。core 側のフィールド追加もここで行う〕**)、v5 凍結 DTO、v1〜v5 読込の既定値補完(`arrow_kind` は `ClosedFilled`)、v6 不正値の読込拒否、往復無損失テスト | implement-sonnet | 56 |
 | 58 | app: 表の展開・描画・出力 | 表展開の純関数(罫線セグメント+セル文字 anchor を紙 mm × k で算出)、画面描画、選択 pick(尺度反映 AABB は app 層)、plot builder 追従(SVG/PDF へ罫線・セル文字が出る)。座標変換・尺度 1:2 のテスト固定 | implement-opus | 56 |
 | 59 | app: 表ツールと編集UI | 表作成ツール(未使用キーはタスク内で確認。配置クリック→初期行列数)、表編集ダイアログ(セル文字・行/列の追加削除・列幅編集。`ModifyEntity` 経由 undo 1単位、表題欄ダイアログ流儀)、UI 境界の不正入力拒否 | implement-sonnet | 58 |
 | 60 | app: 部品表プリセット | 規定様式の列構成・寸法プリセット(タスク55確定値)、表題欄直上への配置ヘルパー(枠有効時に吸着、枠無効時は任意配置)、行追加を上方向へ積む配置規則。**自動集計は非対応の決定を doc に明記**(設計方針2) | implement-sonnet | 55, 59 |
 | 61 | io: DXF best-effort | export は表を分解(罫線→LINE、セル→TEXT。非対称往復として AGENTS.md へ記録)、import は ACAD_TABLE 系をスキップ+件数計上(dxf 0.6.1 が該当エンティティをどう返すかの実測を含む) | implement-sonnet | 56, 58 |
 | 62 | ドキュメント整合 | README・AGENTS.md(v6・Table・DXF 非対称)・DESIGN.md 本章反映・CHANGELOG・v0.10.0 リリース | haiku-assistant | 55-61 |
+| 63 | geom+app: 寸法矢先のブロック化 | `mcad_geom::symbol::ArrowKind`(7種)と `arrow_glyph` 純関数、`DimExpansion.arrows` の一般化と画面/plot の追従、外向き判定を `along_len` へ統一、寸法スタイルダイアログの「矢先」コンボ、既定プロポーションの確定(7章「随時対応」の「寸法矢印のブロック化」設計確定 1〜8・検収基準)。**`DimStyle.arrow_kind` のフィールド追加と v5 補完はタスク57 の v6 に含める** | implement-opus | 57 |
 
 M11 以降の詳細設計は、各マイルストーン着手時に本章へ追記する(M4 までと同じ運用)。

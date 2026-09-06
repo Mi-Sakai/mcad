@@ -12,6 +12,25 @@
 //! （DXF の DIMENSION はブロック参照を伴い、対応するプリミティブがない設計判断。
 //! DESIGN.md M6 設計判断5、import 対応は M9 のまま）。
 //!
+//! 表（[`mcad_core::EntityGeom::Table`]、M10）は**非対称往復**の best-effort で
+//! 対応する（DESIGN.md M10 設計方針6・詳細設計8、タスク61）:
+//!
+//! - **export**: [`table_to_dxf_entities`] が罫線を `LINE`、非空セル文字を `TEXT`
+//!   へ分解して書く（`mcad-app` の `table::expand_table` と同じ組版規則を、依存
+//!   方向の制約から `mcad-io` 側に独立実装したもの）。分解できるため
+//!   `skipped_entities` には計上しない（Text と同じ「対応済み」扱い）。
+//! - **import**: DXF に「表」に相当するプリミティブは無いので、分解後の
+//!   `LINE`/`TEXT` を import しても [`mcad_core::EntityGeom::Table`] へは戻らず、
+//!   ただの直線・文字の集合として復元される。**表として export したファイルを
+//!   import しても表エンティティには戻らない**（往復非対称。AGENTS.md にも記録）。
+//! - 他 CAD が書いた `ACAD_TABLE` 系のテーブルオブジェクトは、`dxf` 0.6.1 の
+//!   `EntityType` にテーブル系のバリアントが無いため、そもそも `drawing.entities()`
+//!   に現れず読み飛ばされる（実測、詳細は
+//!   `tests::import_ignores_acad_table_and_still_reads_other_entities` の doc）。
+//!   したがってこの経路は `ImportSummary::skipped_entities` を増やさない
+//!   （DIMENSION・SPLINE 等、`EntityType` にバリアントはあるが `dxf_entity_to_geom`
+//!   が変換しないものは通常どおり計上される、という既存の区別と異なる）。
+//!
 //! # 文字列は UTF-8 で書く（ヘッダバージョン R2007）
 //!
 //! export のヘッダバージョンは **R2007**（[`export_dxf`] で `$ACADVER` を設定）。
@@ -251,7 +270,8 @@ use dxf::tables::{Layer as DxfLayer, LineType as DxfLineType};
 use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
 use mcad_core::{
-    Command, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Rgb, Style, TextGeom, WidthMm,
+    Command, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Rgb, Style, TableGeom,
+    TextGeom, WidthMm,
 };
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
@@ -698,6 +718,115 @@ fn text_to_dxf_entity(text: &TextGeom, world_mm_per_paper_mm: f64) -> DxfEntity 
     DxfEntity::new(specific)
 }
 
+/// 表（[`TableGeom`]、M10）の DXF 分解 export で使うセル文字の左パディング（紙 mm）。
+///
+/// `mcad-app` の `frame::CELL_TEXT_PAD_MM` と同じ値。`mcad-io` は `mcad-app` へ依存
+/// できない（アーキテクチャ不変条件、依存方向は app → io → core → geom）ため、
+/// ここに独立した定数として複製する（DESIGN.md M10 詳細設計8 が認めた割り切り。
+/// 定数の一致は `mcad-app` 側の統合テストに委ねる将来課題として DESIGN.md へ残債
+/// 記録済み）。
+const TABLE_CELL_TEXT_PAD_MM: f64 = 1.5;
+
+/// [`TableGeom`]（表・M10）を DXF の `LINE`（罫線）・`TEXT`（セル文字）へ**分解**する
+/// （タスク61、DESIGN.md M10 設計方針6・詳細設計8）。
+///
+/// DXF に「表」に相当するプリミティブが無いため、[`crate::mcad_file`] のような
+/// ポータブル DTO 経由ではなく `mcad-app` の `table::expand_table` と**同じ組版規則を
+/// 独立に**実装する（`mcad-io` は `mcad-app` に依存できないため関数を再利用できない。
+/// 依存方向はモジュール doc・AGENTS.md 参照）。罫線の順序は
+/// 外枠4辺 →（上から）行境界 →（左から）列境界、セル文字は行優先（行0=最上段）で
+/// `expand_table` と揃えてあるが、**一致は本モジュールのテストでのみ固定**しており
+/// `expand_table` との突き合わせテストは無い（残債、DESIGN.md 参照）。
+///
+/// - 罫線の太さ（外枠 0.5mm・内部 0.13mm の区別）は**書かない**
+///   （[`export_dxf`] が呼び出し側でエンティティの [`Style::width_mm`] を全罫線へ
+///   一律に適用するため、表題欄と同じ「太い枠・細い仕切り」の描き分けは DXF には
+///   残らない。dxf 0.6.1 のレイヤー線幅と同じ「クレート側 API ではなく mcad の
+///   設計上の割り切りとして保存されない」制約としてモジュール doc に記録する）。
+/// - セル文字の高さは [`text_to_dxf_entity`] と同じ尺度契約（`text_height_mm * k`）。
+/// - **空セルは出さない**（`expand_table` と同じ。描くものが無い）。
+/// - **退化した表（行数・列数が 0）は空を返す**（`EntityGeom::validate` を通していない
+///   値が渡っても panic しない全域関数。`expand_table` と同じ配慮）。
+///
+/// この分解は **非対称往復**（import しても表エンティティへは戻らない。モジュール doc
+/// 「未対応エンティティ・不正ジオメトリの扱い（import）」および AGENTS.md 参照）。
+fn table_to_dxf_entities(table: &TableGeom, world_mm_per_paper_mm: f64) -> Vec<DxfEntity> {
+    let (rows, cols) = (table.rows(), table.cols());
+    if rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+
+    let k = world_mm_per_paper_mm;
+    let total_w = table.width_mm();
+    let total_h = table.height_mm();
+    // 局所（紙 mm、アンカー=原点、y-up）→ ワールド。`table::expand_table` と同じ
+    // 「anchor 基準で k 倍」の写像。
+    let to_world =
+        |x_mm: f64, y_mm: f64| Point2::new(table.anchor.x + x_mm * k, table.anchor.y + y_mm * k);
+
+    let mut entities = Vec::new();
+    let mut push_line = |ax: f64, ay: f64, bx: f64, by: f64| {
+        entities.push(DxfEntity::new(EntityType::Line(DxfLine {
+            p1: to_dxf_point(to_world(ax, ay)),
+            p2: to_dxf_point(to_world(bx, by)),
+            ..Default::default()
+        })));
+    };
+
+    // 外枠4辺。
+    push_line(0.0, 0.0, total_w, 0.0);
+    push_line(total_w, 0.0, total_w, total_h);
+    push_line(total_w, total_h, 0.0, total_h);
+    push_line(0.0, total_h, 0.0, 0.0);
+
+    // 行境界（最下段の下端は外枠と重なるので描かない）。
+    let mut row_top = total_h;
+    for (r, row_height) in table.row_heights_mm.iter().enumerate() {
+        let row_bottom = row_top - row_height;
+        if r + 1 < rows {
+            push_line(0.0, row_bottom, total_w, row_bottom);
+        }
+        row_top = row_bottom;
+    }
+
+    // 列境界（右端は外枠と重なるので描かない）。
+    let mut cell_right = 0.0;
+    for (c, col_width) in table.col_widths_mm.iter().enumerate() {
+        cell_right += col_width;
+        if c + 1 < cols {
+            push_line(cell_right, 0.0, cell_right, total_h);
+        }
+    }
+
+    // セル文字（非空のみ、行優先で行0=最上段から）。
+    let mut row_top = total_h;
+    for (r, row_height) in table.row_heights_mm.iter().enumerate() {
+        let row_bottom = row_top - row_height;
+        let mut cell_left = 0.0;
+        for (c, col_width) in table.col_widths_mm.iter().enumerate() {
+            if let Some(content) = table.cell(r, c)
+                && !content.is_empty()
+            {
+                let anchor = to_world(
+                    cell_left + TABLE_CELL_TEXT_PAD_MM,
+                    row_bottom + (row_height - table.text_height_mm) / 2.0,
+                );
+                entities.push(DxfEntity::new(EntityType::Text(DxfText {
+                    location: to_dxf_point(anchor),
+                    text_height: table.text_height_mm * k,
+                    value: content.to_owned(),
+                    rotation: 0.0,
+                    ..Default::default()
+                })));
+            }
+            cell_left += col_width;
+        }
+        row_top = row_bottom;
+    }
+
+    entities
+}
+
 /// `Document` を `dxf::Drawing` へ変換する。
 ///
 /// 生存中のレイヤー・エンティティのみを列挙する（undo/redo 履歴は含めない）。
@@ -818,11 +947,13 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
             .expect("Document invariant: entity's layer must be alive")
             .clone();
         // M6: Shape・Text は DXF エンティティへ変換する（タスク25で Text も対応）。
+        // 表（M10 タスク61）は複数の LINE/TEXT へ分解する（[`table_to_dxf_entities`]）。
         // 寸法（DimLinear/DimRadial）は DXF に対応するプリミティブがないためスキップし
         // 件数を数える。件数は呼び出し側がステータス表示し、無警告のデータロスを防ぐ。
-        let mut dxf_entity = match &entity.geom {
-            EntityGeom::Shape(shape) => shape_to_dxf_entity(shape),
-            EntityGeom::Text(text) => text_to_dxf_entity(text, world_mm_per_paper_mm),
+        let dxf_entities: Vec<DxfEntity> = match &entity.geom {
+            EntityGeom::Shape(shape) => vec![shape_to_dxf_entity(shape)],
+            EntityGeom::Text(text) => vec![text_to_dxf_entity(text, world_mm_per_paper_mm)],
+            EntityGeom::Table(table) => table_to_dxf_entities(table, world_mm_per_paper_mm),
             // 寸法（DimLinear/DimRadial）と、将来 core へ追加される未知の幾何
             // （`EntityGeom` は `#[non_exhaustive]`）はまとめてスキップ側に回す。
             _ => {
@@ -830,20 +961,22 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
                 continue;
             }
         };
-        dxf_entity.common.layer = layer_name;
-        dxf_entity.common.color = style_color_to_dxf(entity.style.color);
-        // 線種・線幅は ByLayer（`Style` の該当フィールドが `None`）なら DXF の
-        // 既定（`line_type_name = "BYLAYER"`）のままにする。線幅の既定
-        // （`lineweight_enum_value = 0`）は「明示的に 0」を意味してしまうため、
-        // ByLayer を表す `-1`（group code 370 の慣例）を明示的に書く必要がある。
-        if let Some(linetype) = entity.style.linetype {
-            dxf_entity.common.line_type_name = linetype_to_dxf_name(linetype).to_string();
+        for mut dxf_entity in dxf_entities {
+            dxf_entity.common.layer = layer_name.clone();
+            dxf_entity.common.color = style_color_to_dxf(entity.style.color);
+            // 線種・線幅は ByLayer（`Style` の該当フィールドが `None`）なら DXF の
+            // 既定（`line_type_name = "BYLAYER"`）のままにする。線幅の既定
+            // （`lineweight_enum_value = 0`）は「明示的に 0」を意味してしまうため、
+            // ByLayer を表す `-1`（group code 370 の慣例）を明示的に書く必要がある。
+            if let Some(linetype) = entity.style.linetype {
+                dxf_entity.common.line_type_name = linetype_to_dxf_name(linetype).to_string();
+            }
+            dxf_entity.common.lineweight_enum_value = entity
+                .style
+                .width_mm
+                .map_or(-1, width_mm_to_dxf_lineweight_raw);
+            drawing.add_entity(dxf_entity);
         }
-        dxf_entity.common.lineweight_enum_value = entity
-            .style
-            .width_mm
-            .map_or(-1, width_mm_to_dxf_lineweight_raw);
-        drawing.add_entity(dxf_entity);
     }
 
     ExportSummary {
@@ -1415,14 +1548,71 @@ mod tests {
         assert_eq!(text_entity.value, "hi");
     }
 
+    /// タスク61: 表（`EntityGeom::Table`、M10）の DXF 分解 export。
+    /// 2×2 の表は罫線 `4（外枠）+ 1（行境界）+ 1（列境界）= 6` 本の LINE と、
+    /// 非空セルぶんの TEXT へ分解される（DESIGN.md M10 詳細設計8）。表自体は
+    /// `skipped_entities` に計上しない（分解して書けているため、Text と同じ
+    /// 「対応済み」扱い）。
     #[test]
-    fn export_skips_table_entities_without_panicking() {
-        // 表（`EntityGeom::Table`、M10）の DXF 分解 export はタスク61の範囲。
-        // タスク57 時点では最小限の確認として、`export_dxf` の match のワイルドカード
-        // 腕（`_ => { skipped_entities += 1; }`）が表もパニックせずスキップし、
-        // 既存の DimLinear 等と同じ流儀で件数に計上することだけを固定する。
-        use mcad_core::TableGeom;
+    fn export_decomposes_table_into_lines_and_texts() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Table(TableGeom {
+                anchor: Point2::new(10.0, 20.0),
+                col_widths_mm: vec![30.0, 20.0],
+                row_heights_mm: vec![8.0, 8.0],
+                text_height_mm: 3.5,
+                cells: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
 
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 0);
+
+        for entity in export.drawing.entities() {
+            assert!(
+                matches!(entity.specific, EntityType::Line(_) | EntityType::Text(_)),
+                "table export must only produce LINE/TEXT, got {:?}",
+                entity.specific
+            );
+        }
+        let line_count = export
+            .drawing
+            .entities()
+            .filter(|e| matches!(e.specific, EntityType::Line(_)))
+            .count();
+        let text_count = export
+            .drawing
+            .entities()
+            .filter(|e| matches!(e.specific, EntityType::Text(_)))
+            .count();
+        assert_eq!(line_count, 6, "4 outer + 1 row divider + 1 col divider");
+        assert_eq!(text_count, 4, "all 4 cells are non-empty");
+
+        let text_values: Vec<&str> = export
+            .drawing
+            .entities()
+            .filter_map(|e| match &e.specific {
+                EntityType::Text(t) => Some(t.value.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["a", "b", "c", "d"] {
+            assert!(
+                text_values.contains(&expected),
+                "missing cell text {expected:?} in {text_values:?}"
+            );
+        }
+    }
+
+    /// タスク61: 空セルの表は TEXT を1つも出さない（`expand_table` と同じ
+    /// 「空セルは描かない」規則）。罫線だけは出る。
+    #[test]
+    fn export_table_with_empty_cells_produces_no_text() {
         let mut doc = Document::new();
         let layer = doc.current_layer();
         doc.apply(Command::AddEntity(Entity::new(
@@ -1439,8 +1629,113 @@ mod tests {
         .unwrap();
 
         let export = export_dxf(&doc);
-        assert_eq!(export.skipped_entities, 1);
-        assert_eq!(export.drawing.entities().count(), 0);
+        assert_eq!(export.skipped_entities, 0);
+        let text_count = export
+            .drawing
+            .entities()
+            .filter(|e| matches!(e.specific, EntityType::Text(_)))
+            .count();
+        assert_eq!(text_count, 0);
+        // 1行1列でも外枠4本は出る。
+        let line_count = export
+            .drawing
+            .entities()
+            .filter(|e| matches!(e.specific, EntityType::Line(_)))
+            .count();
+        assert_eq!(line_count, 4);
+    }
+
+    /// タスク61: 表の DXF 分解は紙 mm × k（ワールド）で座標を書く。尺度 1:2
+    /// （`k = 2.0`）で 1行1列・列幅30mm・行高さ8mm・anchor (0,0) の表の外枠は
+    /// ワールドで幅60mm・高さ16mmになる（`text_height_scales_by_sheet_scale_on_export`
+    /// と同じ契約）。
+    #[test]
+    fn export_table_lines_scale_by_sheet_scale() {
+        use mcad_core::Scale;
+
+        let mut doc = Document::new();
+        let mut sheet = doc.sheet().clone();
+        sheet.scale = Scale::new(1, 2).unwrap(); // 1:2、k = 2.0
+        doc.apply(Command::SetSheet(sheet)).unwrap();
+
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Table(TableGeom {
+                anchor: Point2::new(0.0, 0.0),
+                col_widths_mm: vec![30.0],
+                row_heights_mm: vec![8.0],
+                text_height_mm: 3.5,
+                cells: vec!["x".into()],
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+
+        // 外枠の対角（右上隅）はワールドで (60.0, 16.0) になっているはず。
+        let max_x = export
+            .drawing
+            .entities()
+            .filter_map(|e| match &e.specific {
+                EntityType::Line(l) => Some(l.p1.x.max(l.p2.x)),
+                _ => None,
+            })
+            .fold(f64::MIN, f64::max);
+        let max_y = export
+            .drawing
+            .entities()
+            .filter_map(|e| match &e.specific {
+                EntityType::Line(l) => Some(l.p1.y.max(l.p2.y)),
+                _ => None,
+            })
+            .fold(f64::MIN, f64::max);
+        assert!((max_x - 60.0).abs() < EPS, "got {max_x}");
+        assert!((max_y - 16.0).abs() < EPS, "got {max_y}");
+
+        // セル文字の高さは `3.5 * 2.0 = 7.0`（Text export と同じ尺度契約）。
+        let text_entity = export
+            .drawing
+            .entities()
+            .find_map(|e| match &e.specific {
+                EntityType::Text(t) => Some(t),
+                _ => None,
+            })
+            .expect("TEXT entity must be present");
+        assert!((text_entity.text_height - 7.0).abs() < EPS);
+    }
+
+    /// タスク61 import: `ACAD_TABLE`(dxf 0.6.1 に対応する `EntityType` バリアントは
+    /// 存在しない。実測: `dxf::entities::EntityType` の生成ソースにも spec にも
+    /// テーブル系のバリアントは無い)を含む最小 DXF 文字列を import しても、
+    /// 他のエンティティ（LINE）は正しく読める。
+    ///
+    /// **実測で判明した制約**: `dxf` 0.6.1 は型名を認識できないエンティティ
+    /// （`EntityType::from_type_string` が `None` を返す名前）を、パーサ内部で
+    /// **`drawing.entities()` に一切現れない形で読み飛ばす**
+    /// （`dxf-0.6.1/src/entity.rs` の `read_entity` 内 `None => { // swallow
+    /// unsupported entity }`）。そのため `import_dxf` の `skipped_entities` は
+    /// **`drawing.entities()` を走査して初めて数えられる**ので、ACAD_TABLE の
+    /// ようにクレートが型として知らないエンティティは `import_dxf` に渡る前に
+    /// 消えており、`skipped_entities` へは計上され**ない**（0 のまま）。
+    /// これは DIMENSION・SPLINE 等（`EntityType` にバリアントがあり
+    /// `dxf_entity_to_geom` の `_ => None` 腕でスキップする）とは異なる、
+    /// クレートのパーサ自体による無警告の読み飛ばしである。
+    #[test]
+    fn import_ignores_acad_table_and_still_reads_other_entities() {
+        let dxf_text = "0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0.0\n20\n0.0\n30\n0.0\n11\n1.0\n21\n0.0\n31\n0.0\n0\nACAD_TABLE\n8\n0\n0\nENDSEC\n0\nEOF\n";
+        let mut cursor = std::io::Cursor::new(dxf_text.as_bytes());
+        let drawing = Drawing::load(&mut cursor).unwrap();
+
+        // クレート自体が ACAD_TABLE をパーサ内部で読み飛ばすため、
+        // `drawing.entities()` の時点で既に LINE 1件しか現れない。
+        assert_eq!(drawing.entities().count(), 1);
+
+        let summary = import_dxf(&drawing).unwrap();
+        assert_eq!(summary.document.entity_count(), 1);
+        // 実測どおり、この経路では skipped_entities は増えない（doc 参照）。
+        assert_eq!(summary.skipped_entities, 0);
     }
 
     #[test]

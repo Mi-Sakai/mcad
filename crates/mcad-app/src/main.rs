@@ -7,6 +7,7 @@
 //! クリック/Enter/Escで確定・キャンセルできるようにする。後続タスクで
 //! 選択・編集ツールとスナップエンジンを追加する。
 
+mod bom;
 mod config;
 mod dimension;
 mod fonts;
@@ -32,6 +33,7 @@ use mcad_core::{
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
+use bom::{apply_bom_preset, bom_anchor_above_title_block};
 use frame::{frame_layout, paper_to_world, parse_scale_input};
 use table::table_world_aabb;
 
@@ -163,8 +165,10 @@ const DEFAULT_EXTRA_LAYERS: [(&str, Rgb, Linetype, f32); 5] = [
     ("中心線", LAYER_COLOR_PALETTE[0], Linetype::DashDot, 0.13),
     ("破線", LAYER_COLOR_PALETTE[1], Linetype::Dashed, 0.35),
     ("外形線", LAYER_COLOR_PALETTE[2], Linetype::Continuous, 0.35),
-    ("寸法線", LAYER_COLOR_PALETTE[4], Linetype::Continuous, 0.18),
-    ("文字", LAYER_COLOR_PALETTE[3], Linetype::Continuous, 0.18),
+    // 寸法線・文字は白(ユーザー指示 2026-09-06。線と区別する色分けは外形線・中心線・破線で足り、
+    // 注記は白の方が読みやすい)。
+    ("寸法線", Rgb::WHITE, Linetype::Continuous, 0.18),
+    ("文字", Rgb::WHITE, Linetype::Continuous, 0.18),
 ];
 
 /// [`DEFAULT_EXTRA_LAYERS`] のうち、新規文書のカレントレイヤーにする名前。
@@ -2283,9 +2287,11 @@ impl eframe::App for McadApp {
             );
             table_panel(
                 ui,
-                &self.document,
+                &mut self.document,
                 self.select_tool.selection(),
                 &mut self.table_dialog,
+                &mut self.status,
+                now,
             );
             let (sheet_changed, plot_color_mode_changed) = sheet_panel(
                 ui,
@@ -2968,7 +2974,9 @@ fn resolve_tool_layer(document: &Document, tool_kind: ToolKind) -> LayerId {
         ToolKind::DimLinear | ToolKind::DimRadial | ToolKind::DimDiameter => {
             layer_named(document, DIM_LAYER_NAME).unwrap_or_else(|| document.current_layer())
         }
-        ToolKind::Text => {
+        // 表・部品表も文字レイヤーへ(ユーザー指示 2026-09-06。表は罫線と文字の複合だが、
+        // 図面上の位置づけは注記に近い)。
+        ToolKind::Text | ToolKind::Table => {
             layer_named(document, TEXT_LAYER_NAME).unwrap_or_else(|| document.current_layer())
         }
         _ => document.current_layer(),
@@ -5117,18 +5125,20 @@ fn build_table_from_dialog(state: &TableDialogState) -> Result<TableGeom, String
 /// ボタンは出さない（DESIGN.md M10 詳細設計6）。
 fn table_panel(
     ui: &mut egui::Ui,
-    document: &Document,
+    document: &mut Document,
     selection: &[EntityId],
     table_dialog: &mut Option<TableDialogState>,
+    status: &mut Option<StatusMessage>,
+    now: f64,
 ) {
     // 選択されていても墓標化・削除済みの ID、表以外のエンティティは除く
     // （`dim_panel`/`entity_style_panel` と同じ防御）。
-    let tables: Vec<(EntityId, &TableGeom)> = selection
+    let tables: Vec<(EntityId, TableGeom)> = selection
         .iter()
         .filter_map(|&id| {
             let entity = document.entity(id)?;
             match &entity.geom {
-                EntityGeom::Table(table) => Some((id, table)),
+                EntityGeom::Table(table) => Some((id, table.clone())),
                 _ => None,
             }
         })
@@ -5144,11 +5154,51 @@ fn table_panel(
         ui.label("表を1つだけ選択してください");
         return;
     }
-    let (id, table) = tables[0];
+    let (id, table) = &tables[0];
+    let id = *id;
     ui.label(format!("表: {} 行 × {} 列", table.rows(), table.cols()));
     if ui.button("表を編集…").clicked() {
         *table_dialog = Some(TableDialogState::from_table(id, table));
     }
+
+    // 部品表プリセット（M10 詳細設計7、タスク60）。自動集計は非対応（規定 2-5-4 の 5)、
+    // M10 設計方針2）— ここは列構成の置換と配置だけを行う。
+    if ui.button("部品表にする").clicked() {
+        let template_width_mm = document.sheet().title_block.template().width_mm;
+        let new_table = apply_bom_preset(table, template_width_mm);
+        if let Err(err) = document.apply(Command::ModifyEntity {
+            id,
+            new_geom: EntityGeom::Table(new_table),
+        }) {
+            set_status(status, now, format!("部品表への変換に失敗しました: {err}"));
+        }
+    }
+
+    let frame_visible = document.sheet().frame_visible;
+    let place_button = ui.add_enabled(frame_visible, egui::Button::new("表題欄の上に配置"));
+    let place_button = if frame_visible {
+        place_button
+    } else {
+        place_button.on_disabled_hover_text("図面枠が無効です")
+    };
+    if place_button.clicked() {
+        let k = document.sheet().scale.world_mm_per_paper_mm();
+        let anchor = bom_anchor_above_title_block(document.sheet(), k);
+        let mut new_table = table.clone();
+        new_table.anchor = anchor;
+        if let Err(err) = document.apply(Command::ModifyEntity {
+            id,
+            new_geom: EntityGeom::Table(new_table),
+        }) {
+            set_status(
+                status,
+                now,
+                format!("表題欄上への配置に失敗しました: {err}"),
+            );
+        }
+    }
+
+    ui.label("部品欄への記入は手動です（自動集計は行いません）。");
 }
 
 /// 素のカーソル位置 `raw` にスナップを掛ける。有効かつ候補が見つかれば

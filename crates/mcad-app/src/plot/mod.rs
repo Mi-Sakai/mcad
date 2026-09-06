@@ -88,12 +88,13 @@ pub use svg::to_svg;
 
 use std::f64::consts::FRAC_PI_2;
 
-use mcad_core::{Document, Entity, EntityGeom, Layer, Linetype, Rgb, TextGeom};
+use mcad_core::{Document, Entity, EntityGeom, Layer, Linetype, Rgb, TableGeom, TextGeom};
 use mcad_geom::{Arc, Point2, Polyline, Shape, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::dimension::{self, DimExpansion};
 use crate::frame::{FrameLayout, frame_layout};
+use crate::table::expand_table;
 use text_outline::GlyphOutliner;
 
 /// 出力（SVG/PDF）の色モード。図面の属性ではなく、エクスポート設定＋
@@ -437,6 +438,9 @@ fn push_entity(
             let ex = dimension::expand_diameter(dim, dim_render);
             push_dim(paths, &ex, color, width_mm, k, outliner);
         }
+        // 表の罫線は幅も線種も app 層の定数（表題欄と同じ）なので、`width_mm` も
+        // `linetype` も使わない。色だけスタイルに従う（M10 詳細設計1）。
+        EntityGeom::Table(table) => push_table(paths, table, color, k, outliner),
         // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は出力しない。
         _ => {}
     }
@@ -549,6 +553,42 @@ fn push_dim(
             text.angle,
             color,
         );
+    }
+}
+
+/// 表（[`TableGeom`]）を罫線パスとセル文字のアウトラインへ展開する（M10 タスク58）。
+///
+/// 組版は画面・ピックと同じ [`crate::table::expand_table`] が唯一の出所。展開結果の
+/// 座標は**ワールド**なので `÷ k` で紙 mm へ戻すが、罫線の幅 [`crate::table::TableSegment::width_mm`]
+/// と文字高さ [`mcad_core::TextGeom::height`] は**既に紙 mm** なので換算しない
+/// （[`push_dim`] が `DimExpansion` の高さをワールド長として `÷ k` するのとは違う。
+/// モジュール doc の単位表を参照）。
+///
+/// 罫線は常に実線（線種を持たない）で、線幅は表題欄と同じ app 層の定数
+/// （[`crate::frame::FRAME_BORDER_WIDTH_MM`] / [`crate::frame::FRAME_DIVIDER_WIDTH_MM`]）。
+/// セル文字は Text エンティティとまったく同じ経路（[`push_text`]）へ通す。
+fn push_table(
+    paths: &mut Vec<PlotPath>,
+    table: &TableGeom,
+    color: Rgb,
+    k: f64,
+    outliner: Option<&GlyphOutliner>,
+) {
+    let ex = expand_table(table, k);
+    for seg in &ex.segments {
+        let stroke = PlotStroke {
+            width_mm: seg.width_mm,
+            color,
+            dash_mm: None,
+        };
+        let cmds = vec![
+            PathCmd::MoveTo(world_to_paper(seg.a, k)),
+            PathCmd::LineTo(world_to_paper(seg.b, k)),
+        ];
+        paths.push(PlotPath::stroked(cmds, stroke));
+    }
+    for text in &ex.texts {
+        push_text(paths, text, color, k, outliner);
     }
 }
 
@@ -708,7 +748,7 @@ fn polyline_cmds(polyline: &Polyline, k: f64) -> Option<Vec<PathCmd>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
+    use crate::frame::{CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
     use mcad_core::{
         Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, DimStyle, Layer, Scale,
         SheetMeta, SizeTolerance, Style, WidthMm,
@@ -1233,6 +1273,139 @@ mod tests {
         assert_eq!(outlines[0].cmds, expected);
         // 塗りのみ（アウトラインは fill-rule nonzero で塗る）。
         assert!(outlines[0].stroke.is_none());
+    }
+
+    // ---- 4b: 表（M10 タスク58。罫線は紙 mm 幅、セル文字は Text と同じ経路） ----
+
+    /// 3 行 2 列・列幅 20/30mm・行高さ 8mm・文字高さ 3.5mm、セルは 3 つだけ非空。
+    fn sample_table(anchor: Point2) -> TableGeom {
+        TableGeom {
+            anchor,
+            col_widths_mm: vec![20.0, 30.0],
+            row_heights_mm: vec![8.0, 8.0, 8.0],
+            text_height_mm: 3.5,
+            cells: vec![
+                "1".to_owned(),
+                "PLATE".to_owned(),
+                String::new(),
+                String::new(),
+                "2".to_owned(),
+                String::new(),
+            ],
+        }
+    }
+
+    #[test]
+    fn table_outputs_rules_and_only_non_empty_cell_texts() {
+        let mut document = document_with_scale(1, 1);
+        add(
+            &mut document,
+            EntityGeom::Table(sample_table(Point2::ORIGIN)),
+        );
+        let page = plot_page(&document, PlotColorMode::Color);
+
+        // 罫線: 外枠4 + 行境界2 + 列境界1 = 7 本。すべて実線。
+        let rules = stroked(&page);
+        assert_eq!(rules.len(), 7);
+        assert!(rules.iter().all(|p| p.stroke.unwrap().dash_mm.is_none()));
+        let border_count = rules
+            .iter()
+            .filter(|p| (p.stroke.unwrap().width_mm - FRAME_BORDER_WIDTH_MM).abs() < f32::EPSILON)
+            .count();
+        let divider_count = rules
+            .iter()
+            .filter(|p| (p.stroke.unwrap().width_mm - FRAME_DIVIDER_WIDTH_MM).abs() < f32::EPSILON)
+            .count();
+        assert_eq!((border_count, divider_count), (4, 3));
+
+        // セル文字は非空の 3 つだけ（空欄はパスを作らない）。
+        assert_eq!(filled(&page).len(), 3);
+
+        // 外枠は表全体（50mm × 24mm）を囲む。
+        let outer: Vec<Point2> = rules
+            .iter()
+            .filter(|p| (p.stroke.unwrap().width_mm - FRAME_BORDER_WIDTH_MM).abs() < f32::EPSILON)
+            .flat_map(|p| cmd_points(&p.cmds))
+            .collect();
+        close_to(outer.iter().map(|p| p.x).fold(f64::MIN, f64::max), 50.0);
+        close_to(outer.iter().map(|p| p.y).fold(f64::MIN, f64::max), 24.0);
+    }
+
+    #[test]
+    fn table_geometry_stays_paper_mm_at_scale_one_to_two() {
+        // 尺度 1:2（k=2）で、アンカーのワールド座標を 2 倍にした同じ表は、紙の上で
+        // 1:1 のときとまったく同じ位置・同じ大きさに出る（列幅・行高さ・文字高さは
+        // 紙 mm 契約、罫線幅は `k` 非依存）。
+        let one_to_one = {
+            let mut document = document_with_scale(1, 1);
+            add(
+                &mut document,
+                EntityGeom::Table(sample_table(Point2::new(60.0, 20.0))),
+            );
+            plot_page(&document, PlotColorMode::Color)
+        };
+        let one_to_two = {
+            let mut document = document_with_scale(1, 2);
+            add(
+                &mut document,
+                EntityGeom::Table(sample_table(Point2::new(120.0, 40.0))),
+            );
+            plot_page(&document, PlotColorMode::Color)
+        };
+
+        let (a_rules, b_rules) = (stroked(&one_to_one), stroked(&one_to_two));
+        assert_eq!(a_rules.len(), b_rules.len());
+        for (a, b) in a_rules.iter().zip(b_rules.iter()) {
+            let ((a0, a1), (b0, b1)) = (endpoints(a), endpoints(b));
+            point_close_to(b0, a0.x, a0.y);
+            point_close_to(b1, a1.x, a1.y);
+            assert_eq!(a.stroke.unwrap().width_mm, b.stroke.unwrap().width_mm);
+        }
+
+        // セル文字も紙の上では同じ位置・同じ大きさ（アンカーだけ ÷k されて一致する）。
+        let (a_texts, b_texts) = (filled(&one_to_one), filled(&one_to_two));
+        assert_eq!(a_texts.len(), 3);
+        assert_eq!(a_texts.len(), b_texts.len());
+        for (a, b) in a_texts.iter().zip(b_texts.iter()) {
+            let (aw, ah) = bbox_size(&a.cmds);
+            let (bw, bh) = bbox_size(&b.cmds);
+            close_to(bw, aw);
+            close_to(bh, ah);
+            let (a_first, b_first) = (cmd_points(&a.cmds)[0], cmd_points(&b.cmds)[0]);
+            point_close_to(b_first, a_first.x, a_first.y);
+        }
+    }
+
+    #[test]
+    fn table_cell_text_uses_the_same_outline_path_as_a_text_entity() {
+        // セル文字は Text エンティティとまったく同じ経路（`push_text`）を通る:
+        // アンカーは「セル左下 + パディング / 垂直中央」、高さは紙 mm 素通し。
+        let outliner = GlyphOutliner::embedded().unwrap();
+        let mut document = document_with_scale(1, 2); // k = 2
+        let mut table = sample_table(Point2::new(100.0, 40.0));
+        table.cells = vec![
+            "X".to_owned(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
+        add(&mut document, EntityGeom::Table(table));
+        let page = plot_page(&document, PlotColorMode::Color);
+
+        let outlines = filled(&page);
+        assert_eq!(outlines.len(), 1);
+        // 紙 mm でのアンカー: 表の左下 (50, 20)、最上段（行 0）の下端は +16mm、
+        // 左詰め 1.5mm、垂直中央 (8 − 3.5)/2 = 2.25mm。
+        let expected = outliner.outline(
+            "X",
+            Point2::new(50.0 + CELL_TEXT_PAD_MM, 20.0 + 16.0 + 2.25),
+            3.5,
+            0.0,
+        );
+        assert!(!expected.is_empty());
+        assert_eq!(outlines[0].cmds, expected);
     }
 
     // ---- 5: 線幅はクランプしない ----

@@ -15,6 +15,7 @@ mod iso;
 mod ortho;
 mod plot;
 mod snap;
+mod table;
 mod tool;
 mod viewport;
 
@@ -26,12 +27,13 @@ use mcad_core::{
     ArrowPlacement, Command, DimAnnotation, DimDiameter, DimKind, DimLinear, DimRadial, DimStyle,
     Document, Entity, EntityGeom, EntityId, FitClass, Layer, LayerId, Linetype, MAX_DIM_DECIMALS,
     Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style,
-    TextGeom, TitleBlockFields, TitleBlockKind, WidthMm,
+    TableGeom, TextGeom, TitleBlockFields, TitleBlockKind, WidthMm,
 };
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use frame::{frame_layout, paper_to_world, parse_scale_input};
+use table::table_world_aabb;
 
 // 破線パターンの紙 mm 定数は「画面と出力の唯一の出所」として `plot` に置く（M8 タスク39）。
 // 画面側（`dash_pattern_px`）はここから参照するだけで、挙動は変えない。
@@ -42,8 +44,8 @@ use plot::dash_pattern_mm;
 use tool::{
     ArcTool, CircleTool, DimDiameterTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool,
     FilletTool, InputEvent, IsoCircleTool, LineTool, OffsetOutcome, PlacementKind,
-    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TextTool,
-    Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
+    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TableTool,
+    TextTool, Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -572,6 +574,7 @@ enum ToolKind {
     IsoCircle,
     Polyline,
     Text,
+    Table,
     DimLinear,
     DimRadial,
     DimDiameter,
@@ -595,6 +598,7 @@ impl ToolKind {
             ToolKind::IsoCircle => Some(Box::new(IsoCircleTool::default())),
             ToolKind::Polyline => Some(Box::new(PolylineTool::default())),
             ToolKind::Text => Some(Box::new(TextTool::default())),
+            ToolKind::Table => Some(Box::new(TableTool::default())),
             ToolKind::DimLinear => Some(Box::new(DimLinearTool::default())),
             ToolKind::DimRadial => Some(Box::new(DimRadialTool::default())),
             ToolKind::DimDiameter => Some(Box::new(DimDiameterTool::default())),
@@ -646,6 +650,7 @@ impl ToolKind {
             ToolKind::IsoCircle => "Iso Circle",
             ToolKind::Polyline => "Polyline",
             ToolKind::Text => "Text",
+            ToolKind::Table => "Table",
             ToolKind::DimLinear => "Linear Dim",
             ToolKind::DimRadial => "Radial Dim",
             ToolKind::DimDiameter => "Diameter Dim",
@@ -824,6 +829,9 @@ struct McadApp {
     /// 寸法スタイルダイアログの作業コピー。`Some` の間はモーダルが開いている
     /// (表題欄編集ダイアログと同じ流儀。M9タスク50-3)。
     dim_style_dialog: Option<DimStyleDialogState>,
+    /// 表編集ダイアログの作業コピー。`Some` の間はモーダルが開いている
+    /// (表題欄編集ダイアログと同じ流儀。M10タスク59)。
+    table_dialog: Option<TableDialogState>,
 }
 
 /// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
@@ -841,6 +849,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "I=Iso Circle",
     "P=Polyline",
     "T=Text",
+    "K=Table",
     "D=Linear Dim",
     "Shift+D=Radial Dim",
     "G=Diameter Dim",
@@ -1064,6 +1073,7 @@ impl McadApp {
             dim_decimals_input_error: None,
             dim_value_override_input: String::new(),
             dim_style_dialog: None,
+            table_dialog: None,
         };
         if let Some(warning) = startup.warning {
             // 起動時はまだ egui の InputState が無いため now=0.0（[`STATUS_MESSAGE_SECS_IMPORTANT`]
@@ -1082,6 +1092,7 @@ impl McadApp {
         self.confirm_state != ConfirmState::Idle
             || self.sheet_dialog.is_some()
             || self.dim_style_dialog.is_some()
+            || self.table_dialog.is_some()
     }
 
     /// 選択集合・進行中の作図ツール・スナップマーカーをリセットする。
@@ -1124,6 +1135,8 @@ impl McadApp {
         self.dim_decimals_input_error = None;
         self.dim_value_override_input.clear();
         self.dim_style_dialog = None;
+        // 表編集ダイアログも別図面へ持ち越さない。
+        self.table_dialog = None;
     }
 
     /// undo/redo が成功した直後の UI 状態の後始末。
@@ -1147,6 +1160,17 @@ impl McadApp {
         // 残り、「確定」で undo を打ち消す新コマンドになる（M9 タスク50 Codex 指摘）。
         // 対象集合を空にして、次フレームの `sync_dim_edit_state` に再同期させる。
         self.dim_edit_target.clear();
+        // 表編集ダイアログの対象が undo/redo で消えた（または表以外に変わった）場合は
+        // ダイアログを閉じる。開いたままだと OK 時に存在しない ID への
+        // `ModifyEntity` を試みて失敗するか、無関係のエンティティを書き換えかねない。
+        if let Some(dialog) = &self.table_dialog
+            && !matches!(
+                self.document.entity(dialog.id).map(|e| &e.geom),
+                Some(EntityGeom::Table(_))
+            )
+        {
+            self.table_dialog = None;
+        }
     }
 
     /// ファイル操作（新規・開く・インポート・保存・名前を付けて保存・エクスポート）の
@@ -1747,17 +1771,15 @@ fn ensure_pdf_extension(path: PathBuf) -> PathBuf {
 /// ドキュメント中の全エンティティを包む AABB。エンティティが1つもなければ `None`
 /// （M4タスク13: ズームフィット対象の算出。[`Viewport::fit_to_aabb`] に渡す）。
 ///
-/// Text は表示上のワールド AABB（[`text_world_aabb`]、`height * k`）を使う（タスク37。
+/// Text・表は表示上のワールド AABB（[`entity_world_aabb`]）を使う（タスク37。
 /// 判断(c)により Text はトグル非依存で常に `height * k` のため、ズームフィットも
-/// これに合わせないと拡大された文字がフィット範囲からはみ出す）。
+/// これに合わせないと拡大された文字がフィット範囲からはみ出す。表も同じ理由で
+/// 常に紙基準 = `k` 倍。M10 タスク58）。
 fn document_aabb(document: &Document) -> Option<Aabb> {
     let k = document.sheet().scale.world_mm_per_paper_mm();
     document
         .entities()
-        .map(|(_, entity)| match &entity.geom {
-            EntityGeom::Text(text) => text_world_aabb(text, k),
-            _ => entity.geom.aabb(),
-        })
+        .map(|(_, entity)| entity_world_aabb(&entity.geom, k))
         .reduce(|acc, bb| acc.union(&bb))
 }
 
@@ -2259,6 +2281,12 @@ impl eframe::App for McadApp {
                 &mut self.status,
                 now,
             );
+            table_panel(
+                ui,
+                &self.document,
+                self.select_tool.selection(),
+                &mut self.table_dialog,
+            );
             let (sheet_changed, plot_color_mode_changed) = sheet_panel(
                 ui,
                 &mut self.document,
@@ -2678,13 +2706,174 @@ impl eframe::App for McadApp {
                 self.dim_style_dialog = None;
             }
         }
+
+        // 表編集ダイアログ(M10タスク59)。表題欄編集ダイアログと同じ流儀(右パネルの
+        // 「表を編集…」ボタンから開き、OK で `Command::ModifyEntity` 1回、
+        // キャンセル/モーダル外クリックで無変更)。不正値は OK ボタンそのものを
+        // 無効化して理由を表示する(寸法スタイルダイアログは OK 後にエラー表示する
+        // 流儀だが、こちらは編集項目が多く誤操作の機会が多いため事前に防ぐ)。
+        if self.table_dialog.is_some() {
+            // セル・列幅欄の1列あたりの固定幅（日本語8文字程度が入る幅）。
+            // グリッドの `min_col_width`/`max_col_width` に加え `add_sized` でも
+            // 明示するため、列数が増えても1列の幅は変わらない
+            // （利用可能幅からの取り分ではなく定数 `TABLE_DIALOG_CELL_W` を使う）。
+            const TABLE_DIALOG_CELL_W: f32 = 96.0;
+            const TABLE_DIALOG_LABEL_W: f32 = 64.0;
+            const TABLE_DIALOG_ROW_H: f32 = 20.0;
+
+            let mut ok_clicked = false;
+            let mut cancel_clicked = false;
+            let modal = egui::Modal::new(egui::Id::new("table_dialog")).show(ui.ctx(), |ui| {
+                let dialog = self
+                    .table_dialog
+                    .as_mut()
+                    .expect("guarded by is_some() above");
+                // ダイアログ自体は画面幅の8割を上限にし、それを超える列数は
+                // 横スクロールへ逃がす（縦は行数が多いときのため既存どおり）。
+                let max_dialog_w = ui.ctx().input(|i| i.viewport_rect().width()) * 0.8;
+                ui.set_max_width(max_dialog_w);
+                ui.heading("表を編集");
+
+                ui.horizontal(|ui| {
+                    if ui.button("行を上に追加").clicked() {
+                        dialog.add_row_top();
+                    }
+                    if ui
+                        .add_enabled(dialog.cells.len() > 1, egui::Button::new("最上段を削除"))
+                        .clicked()
+                    {
+                        dialog.remove_top_row();
+                    }
+                    if ui.button("列を右に追加").clicked() {
+                        dialog.add_col_right();
+                    }
+                    if ui
+                        .add_enabled(
+                            dialog.col_widths_mm.len() > 1,
+                            egui::Button::new("右端の列を削除"),
+                        )
+                        .clicked()
+                    {
+                        dialog.remove_right_col();
+                    }
+                });
+                ui.add_space(4.0);
+
+                egui::Grid::new("table_dialog_size_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("行高さ[mm](全行共通):");
+                        ui.text_edit_singleline(&mut dialog.row_height_mm);
+                        ui.end_row();
+
+                        ui.label("文字高さ[mm]:");
+                        ui.text_edit_singleline(&mut dialog.text_height_mm);
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                ui.label("セル(行0が最上段)。1行目は各列の列幅[mm]:");
+                egui::ScrollArea::both()
+                    .max_height(280.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("table_dialog_cells_grid")
+                            .num_columns(dialog.col_widths_mm.len().max(1) + 1)
+                            .min_col_width(TABLE_DIALOG_CELL_W)
+                            .max_col_width(TABLE_DIALOG_CELL_W)
+                            .spacing([4.0, 4.0])
+                            .show(ui, |ui| {
+                                // ヘッダ行: 左端に「列幅」ラベル、各列に列幅[mm]入力欄。
+                                // セル本体と同じグリッド・同じ固定列幅に置くことで、
+                                // 列位置が常にセルの真上に揃う。
+                                ui.add_sized(
+                                    [TABLE_DIALOG_LABEL_W, TABLE_DIALOG_ROW_H],
+                                    egui::Label::new("列幅[mm]"),
+                                );
+                                for (c, width) in dialog.col_widths_mm.iter_mut().enumerate() {
+                                    ui.add_sized(
+                                        [TABLE_DIALOG_CELL_W, TABLE_DIALOG_ROW_H],
+                                        egui::TextEdit::singleline(width)
+                                            .hint_text(format!("列{}", c + 1)),
+                                    );
+                                }
+                                ui.end_row();
+
+                                for (r, row) in dialog.cells.iter_mut().enumerate() {
+                                    ui.add_sized(
+                                        [TABLE_DIALOG_LABEL_W, TABLE_DIALOG_ROW_H],
+                                        egui::Label::new(format!("行{r}")),
+                                    );
+                                    for cell in row.iter_mut() {
+                                        ui.add_sized(
+                                            [TABLE_DIALOG_CELL_W, TABLE_DIALOG_ROW_H],
+                                            egui::TextEdit::singleline(cell),
+                                        );
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+
+                let build_result = build_table_from_dialog(dialog);
+                if let Err(err) = &build_result {
+                    ui.add_space(4.0);
+                    ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(build_result.is_ok(), egui::Button::new("OK"))
+                        .clicked()
+                    {
+                        ok_clicked = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+            if ok_clicked {
+                let dialog = self.table_dialog.as_ref().expect("ok_clicked implies Some");
+                // OK ボタンは build_table_from_dialog が Ok のときしか有効化されないので、
+                // ここでの Err は事実上起こらない（念のためステータスへ出す）。
+                match build_table_from_dialog(dialog) {
+                    Ok(table) => {
+                        let id = dialog.id;
+                        match self.document.apply(Command::ModifyEntity {
+                            id,
+                            new_geom: EntityGeom::Table(table),
+                        }) {
+                            Ok(_) => self.table_dialog = None,
+                            Err(err) => {
+                                set_status(
+                                    &mut self.status,
+                                    now,
+                                    format!("表の変更に失敗しました: {err}"),
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        set_status(
+                            &mut self.status,
+                            now,
+                            format!("表の変更に失敗しました: {err}"),
+                        );
+                    }
+                }
+            } else if cancel_clicked || modal.should_close() {
+                self.table_dialog = None;
+            }
+        }
     }
 }
 
 /// キーボードショートカットでアクティブツールを切り替える（DESIGN.md 3.4 のツール群）。
 ///
 /// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `I`=Iso Circle, `P`=Polyline, `T`=Text,
-/// `D`/`Shift+D`=Linear/Radial Dim, `G`=Diameter Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
+/// `K`=Table, `D`/`Shift+D`=Linear/Radial Dim, `G`=Diameter Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
 /// 作図ツールへ切り替えるときは、描画中に古い選択ハイライトが残らないよう選択をクリアする。
 fn handle_tool_shortcut_keys(
@@ -2728,6 +2917,10 @@ fn handle_tool_shortcut_keys(
             requested = Some(ToolKind::Polyline);
         } else if i.key_pressed(Key::T) {
             requested = Some(ToolKind::Text);
+        } else if i.key_pressed(Key::K) {
+            // 未使用キー（2026-09-06、main.rs/tool.rs をともに `grep -n "Key::K"` して
+            // 確認済み）。DESIGN.md M10 詳細設計5。
+            requested = Some(ToolKind::Table);
         } else if i.key_pressed(Key::G) {
             // 未使用キー（G/H/I/J/K/N/Q/U/V/W のうち G を採用。2026-09-04、
             // main.rs/tool.rs をともに `grep -n "Key::G"` して未使用を確認済み）。
@@ -4776,6 +4969,188 @@ fn dim_style_panel(
     }
 }
 
+/// 表編集ダイアログの作業コピー（M10 タスク59）。表題欄・寸法スタイルの各ダイアログと
+/// 同じ流儀（作業コピー → OK で `Command::ModifyEntity` 1回 = undo 1単位、キャンセルで
+/// 無変更）。
+///
+/// 行高さは [`TableGeom::row_heights_mm`] が行ごとの値を持てる設計のままだが、UI では
+/// 全行共通の1欄しか出さない（DESIGN.md M10 詳細設計6）。OK 時にその1値を全行へ
+/// 適用するため、開いた時点で行高さが不揃いだった表を編集すると個別値は失われる
+/// （設計が明示的に選んだ割り切り）。
+struct TableDialogState {
+    /// 適用先エンティティの ID。
+    id: EntityId,
+    /// 表のアンカー（左下、ワールド座標）。このダイアログでは編集しない。
+    anchor: Point2,
+    /// セル文字列の作業コピー（行優先、行 0 = 最上段。`cells[r][c]`）。
+    cells: Vec<Vec<String>>,
+    /// 列幅の入力欄（列ごと、紙 mm）。
+    col_widths_mm: Vec<String>,
+    /// 行高さの入力欄（全行共通、紙 mm）。
+    row_height_mm: String,
+    /// 文字高さの入力欄（紙 mm）。
+    text_height_mm: String,
+}
+
+impl TableDialogState {
+    /// 現在の [`TableGeom`] から作業コピーを作る（ダイアログを開くとき）。
+    ///
+    /// 行高さが全行同値ならその値、不一致なら最小値を初期表示する
+    /// （DESIGN.md M10 詳細設計6）。
+    fn from_table(id: EntityId, table: &TableGeom) -> Self {
+        let rows = table.rows();
+        let cols = table.cols();
+        let cells = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| table.cell(r, c).unwrap_or("").to_owned())
+                    .collect()
+            })
+            .collect();
+        let col_widths_mm = table.col_widths_mm.iter().map(|w| w.to_string()).collect();
+        let row_height_mm = {
+            let first = table.row_heights_mm.first().copied().unwrap_or(0.0);
+            let uniform = table.row_heights_mm.iter().all(|&h| h == first);
+            let value = if uniform {
+                first
+            } else {
+                table
+                    .row_heights_mm
+                    .iter()
+                    .copied()
+                    .fold(f64::INFINITY, f64::min)
+            };
+            value.to_string()
+        };
+        Self {
+            id,
+            anchor: table.anchor,
+            cells,
+            col_widths_mm,
+            row_height_mm,
+            text_height_mm: table.text_height_mm.to_string(),
+        }
+    }
+
+    /// 「行を上に追加」: 行 0（最上段）へ空行を挿入する。列数は現状を引き継ぐ。
+    fn add_row_top(&mut self) {
+        let cols = self.col_widths_mm.len();
+        self.cells.insert(0, vec![String::new(); cols]);
+    }
+
+    /// 「最上段を削除」: 行 0 を削除する。最後の1行は削除しない（表は最低1行）。
+    fn remove_top_row(&mut self) {
+        if self.cells.len() > 1 {
+            self.cells.remove(0);
+        }
+    }
+
+    /// 「列を右に追加」: 右端へ既定幅30mmの空列を追加する。
+    fn add_col_right(&mut self) {
+        self.col_widths_mm.push("30".to_owned());
+        for row in &mut self.cells {
+            row.push(String::new());
+        }
+    }
+
+    /// 「右端の列を削除」: 右端の列を削除する。最後の1列は削除しない（表は最低1列）。
+    fn remove_right_col(&mut self) {
+        if self.col_widths_mm.len() > 1 {
+            self.col_widths_mm.pop();
+            for row in &mut self.cells {
+                row.pop();
+            }
+        }
+    }
+}
+
+/// [`TableDialogState`] の作業コピーをパース・検証して [`TableGeom`] を組み立てる
+/// （純関数、単体テスト対象）。行高さの1欄は全行へ適用する。パース失敗は日本語で、
+/// 範囲・整合性（0以下・非有限・文字高さ≥行高さ・行列上限超過など）は
+/// [`EntityGeom::validate`] へ委ね、その理由をそのまま返す（[`DimStyleDialogState::to_dim_style`]
+/// と同じ流儀）。
+///
+/// # Errors
+///
+/// パース失敗、または組み立てた [`TableGeom`] が [`EntityGeom::validate`] を通らない
+/// 場合に理由を返す。
+fn build_table_from_dialog(state: &TableDialogState) -> Result<TableGeom, String> {
+    let row_height_mm: f64 = state
+        .row_height_mm
+        .trim()
+        .parse()
+        .map_err(|_| "行高さは数値で入力してください".to_string())?;
+    let text_height_mm: f64 = state
+        .text_height_mm
+        .trim()
+        .parse()
+        .map_err(|_| "文字高さは数値で入力してください".to_string())?;
+    let mut col_widths_mm = Vec::with_capacity(state.col_widths_mm.len());
+    for (c, s) in state.col_widths_mm.iter().enumerate() {
+        let width: f64 = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("列{}の幅は数値で入力してください", c + 1))?;
+        col_widths_mm.push(width);
+    }
+    let rows = state.cells.len();
+    let row_heights_mm = vec![row_height_mm; rows];
+    let cells: Vec<String> = state
+        .cells
+        .iter()
+        .flat_map(|row| row.iter().cloned())
+        .collect();
+    let table = TableGeom {
+        anchor: state.anchor,
+        col_widths_mm,
+        row_heights_mm,
+        text_height_mm,
+        cells,
+    };
+    EntityGeom::Table(table.clone()).validate()?;
+    Ok(table)
+}
+
+/// 右パネルの「表」セクション（M10 タスク59）。選択集合にちょうど1つの表が含まれる
+/// ときだけ表示する（他の種類のエンティティが混在していても対象は絞れる）。複数の
+/// 表が選択されている間は編集対象を一意に決められないため、その旨を表示するだけで
+/// ボタンは出さない（DESIGN.md M10 詳細設計6）。
+fn table_panel(
+    ui: &mut egui::Ui,
+    document: &Document,
+    selection: &[EntityId],
+    table_dialog: &mut Option<TableDialogState>,
+) {
+    // 選択されていても墓標化・削除済みの ID、表以外のエンティティは除く
+    // （`dim_panel`/`entity_style_panel` と同じ防御）。
+    let tables: Vec<(EntityId, &TableGeom)> = selection
+        .iter()
+        .filter_map(|&id| {
+            let entity = document.entity(id)?;
+            match &entity.geom {
+                EntityGeom::Table(table) => Some((id, table)),
+                _ => None,
+            }
+        })
+        .collect();
+
+    if tables.is_empty() {
+        return;
+    }
+
+    ui.separator();
+    ui.heading("表");
+    if tables.len() > 1 {
+        ui.label("表を1つだけ選択してください");
+        return;
+    }
+    let (id, table) = tables[0];
+    ui.label(format!("表: {} 行 × {} 列", table.rows(), table.cols()));
+    if ui.button("表を編集…").clicked() {
+        *table_dialog = Some(TableDialogState::from_table(id, table));
+    }
+}
+
 /// 素のカーソル位置 `raw` にスナップを掛ける。有効かつ候補が見つかれば
 /// `(スナップ先, Some(結果))`、無効または候補なしなら `(raw, None)` を返す。
 ///
@@ -5738,23 +6113,19 @@ fn draw_paper_edge(painter: &egui::Painter, rect: Rect, viewport: &Viewport, she
 /// 「重ね順やエンティティ集合が変わったときだけ再計算するキャッシュ」が対策になるが、
 /// 現状の作図規模ではフレーム時間に測れる影響がないため先回りしない。
 ///
-/// `k` は紙 1mm あたりのワールド mm（判断4）。Text のカリング判定は表示上のワールド
-/// AABB（[`text_world_aabb`]、`height * k`）で行う（タスク37。判断(c)により Text は
-/// トグル非依存で常に `height * k` を使う）。
+/// `k` は紙 1mm あたりのワールド mm（判断4）。Text・表のカリング判定は表示上のワールド
+/// AABB（[`entity_world_aabb`]）で行う（タスク37 / M10 タスク58。判断(c)により Text は
+/// トグル非依存で常に `height * k` を使い、表も常に紙基準）。
 fn entities_in_draw_order<'a>(
     document: &'a Document,
     visible: &Aabb,
     k: f64,
 ) -> Vec<(EntityId, &'a Entity, &'a Layer)> {
-    let entity_aabb = |entity: &Entity| match &entity.geom {
-        EntityGeom::Text(text) => text_world_aabb(text, k),
-        _ => entity.geom.aabb(),
-    };
     let mut drawable: Vec<(EntityId, &Entity, &Layer)> = document
         .entities()
         .filter_map(|(id, entity)| {
             let layer = document.layer(entity.layer)?;
-            (layer.visible && entity_aabb(entity).intersects(visible))
+            (layer.visible && entity_world_aabb(&entity.geom, k).intersects(visible))
                 .then_some((id, entity, layer))
         })
         .collect();
@@ -5814,6 +6185,19 @@ fn draw_entities(
             EntityGeom::DimDiameter(dim) => {
                 let stroke = Stroke::new(stroke_px, color);
                 draw_dim_diameter(painter, rect, viewport, dim, stroke, render);
+            }
+            // 表は罫線の幅を app 層の定数（表題欄と同じ）から取るので `stroke_px` は
+            // 使わない。線種も見ない（常に実線）。M10 詳細設計1・タスク58。
+            EntityGeom::Table(table) => {
+                draw_table(
+                    painter,
+                    rect,
+                    viewport,
+                    table,
+                    color,
+                    paper_display_enabled,
+                    k,
+                );
             }
             // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
             _ => {}
@@ -6076,6 +6460,19 @@ fn draw_selection(
                     EntityGeom::DimDiameter(dim) => {
                         draw_dim_diameter(painter, rect, viewport, &dim, highlight, render);
                     }
+                    // 表は変換（移動・回転・鏡映・複製）で anchor だけが動く
+                    // （M10 設計方針3。回転しても表自体は回らない）。
+                    EntityGeom::Table(table) => {
+                        draw_table(
+                            painter,
+                            rect,
+                            viewport,
+                            &table,
+                            highlight.color,
+                            paper_display,
+                            k,
+                        );
+                    }
                     // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
                     _ => {}
                 }
@@ -6241,6 +6638,22 @@ fn draw_selected(
                     let ex = dimension::expand_diameter(dim, render);
                     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
                     draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
+                }
+                EntityGeom::Table(table) => {
+                    // 罫線・セル文字を強調色で上書きし、加えて表示上のワールド AABB
+                    // （[`table_world_aabb`]）の枠を描く（Text と同じ流儀。ヒットテストが
+                    // この AABB であることを可視化する）。
+                    draw_table(
+                        painter,
+                        rect,
+                        viewport,
+                        table,
+                        stroke.color,
+                        paper_display,
+                        k,
+                    );
+                    let aabb = table_world_aabb(table, k);
+                    draw_aabb_outline(painter, rect, viewport, &aabb, stroke);
                 }
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
                 _ => {}
@@ -6422,6 +6835,59 @@ fn text_world_aabb(text: &TextGeom, k: f64) -> Aabb {
     Aabb {
         min: scale_from_anchor(local.min),
         max: scale_from_anchor(local.max),
+    }
+}
+
+/// エンティティ 1 つの**表示上の**ワールド AABB。カリング（[`entities_in_draw_order`]）・
+/// ズームフィット（[`document_aabb`]）・矩形選択の内包判定（`tool.rs` の
+/// `SelectTool::on_drag_end`）が共有する唯一の規則。
+///
+/// 紙 mm 契約の寸法を持つ幾何だけが `mcad_core` の 1:1 解釈の `aabb()` と食い違う:
+///
+/// - Text: [`text_world_aabb`]（`height * k`。タスク37 判断(c)）
+/// - 表: [`table_world_aabb`]（列幅・行高さ × `k`。M10 設計方針4・タスク58）
+///
+/// それ以外（形状・寸法）はワールド座標そのものなので `aabb()` を素通しする。
+/// `EntityGeom` は `#[non_exhaustive]` なので、未知の幾何も素通し（1:1 解釈）にする。
+fn entity_world_aabb(geom: &EntityGeom, k: f64) -> Aabb {
+    match geom {
+        EntityGeom::Text(text) => text_world_aabb(text, k),
+        EntityGeom::Table(table) => table_world_aabb(table, k),
+        _ => geom.aabb(),
+    }
+}
+
+/// 表 1 つ（罫線 + セル文字）を Painter へ描く（M10 タスク58）。
+///
+/// 組版は [`table::expand_table`] が唯一の出所で、画面・SVG/PDF・ピックが同じ展開を
+/// 共有する。罫線の画面 px 幅だけは図面枠（[`draw_frame`]）と同じ
+/// [`resolve_stroke_px_with_toggle`] に従う（F9 OFF = 1px 固定、ON = 紙 mm 比例）。
+/// **位置と文字の大きさはトグル非依存で常に紙基準**（理由は `table` モジュール doc）。
+///
+/// 罫線は常に実線・幅は app 層の定数で、エンティティ／レイヤーのスタイルからは
+/// **色だけ**を受け取る（M10 詳細設計1）。セル文字は Text エンティティとまったく同じ
+/// 経路（[`draw_text`] にワールド高さ `height * k` を渡す）で描く。
+fn draw_table(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    table: &TableGeom,
+    color: Color32,
+    paper_display: bool,
+    k: f64,
+) {
+    let ex = table::expand_table(table, k);
+    for seg in &ex.segments {
+        let a = viewport.world_to_screen(rect, seg.a);
+        let b = viewport.world_to_screen(rect, seg.b);
+        let stroke_px =
+            resolve_stroke_px_with_toggle(paper_display, seg.width_mm, k, viewport.zoom);
+        painter.line_segment([a, b], Stroke::new(stroke_px, color));
+    }
+    for text in &ex.texts {
+        // `TextGeom::height` は紙 mm 契約のまま（`table` モジュール doc）なので、
+        // Text エンティティと同じく `height * k` をワールド高さとして渡す。
+        draw_text(painter, rect, viewport, text, text.height * k, color);
     }
 }
 
@@ -8827,6 +9293,61 @@ mod tests {
         assert!(aabb.max.y >= 10.0 - 1e-9, "aabb={aabb:?}");
     }
 
+    // --- M10 タスク58: 表の表示上のワールド AABB（カリング・ズームフィット・矩形選択） ---
+
+    /// 2 行 3 列（列幅 10mm・行高さ 8mm）の表。1:1 のワールド AABB は 30mm × 16mm。
+    fn sample_table(anchor: Point2) -> TableGeom {
+        TableGeom {
+            anchor,
+            col_widths_mm: vec![10.0, 10.0, 10.0],
+            row_heights_mm: vec![8.0, 8.0],
+            text_height_mm: 3.5,
+            cells: vec![String::new(); 6],
+        }
+    }
+
+    #[test]
+    fn entity_world_aabb_of_a_table_scales_the_paper_mm_extent_from_the_anchor() {
+        let table = sample_table(Point2::new(5.0, -3.0));
+        let geom = EntityGeom::Table(table);
+
+        // k=1 では core の 1:1 解釈の aabb と一致する。
+        let core = geom.aabb();
+        let at_one = entity_world_aabb(&geom, 1.0);
+        assert!((at_one.min.x - core.min.x).abs() < 1e-9);
+        assert!((at_one.max.y - core.max.y).abs() < 1e-9);
+
+        // k=2 ではアンカー（左下）を固定したまま伸びる。
+        let at_two = entity_world_aabb(&geom, 2.0);
+        assert!((at_two.min.x - 5.0).abs() < 1e-9);
+        assert!((at_two.min.y - -3.0).abs() < 1e-9);
+        assert!((at_two.max.x - (5.0 + 60.0)).abs() < 1e-9);
+        assert!((at_two.max.y - (-3.0 + 32.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn document_aabb_includes_table_scaled_bounds_at_sheet_scale() {
+        // 1:2 の図面ではズームフィット対象も紙 mm × 2 まで広がる（Text と同じ理由）。
+        let mut document = Document::new();
+        document
+            .apply(Command::SetSheet(mcad_core::SheetMeta {
+                scale: mcad_core::Scale::new(1, 2).unwrap(),
+                ..Default::default()
+            }))
+            .unwrap();
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::Table(sample_table(Point2::ORIGIN)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        let aabb = document_aabb(&document).expect("document has a table entity");
+        assert!((aabb.max.x - 60.0).abs() < 1e-9, "aabb={aabb:?}");
+        assert!((aabb.max.y - 32.0).abs() < 1e-9, "aabb={aabb:?}");
+    }
+
     #[test]
     fn dash_pattern_px_is_none_for_continuous() {
         assert!(dash_pattern_px(Linetype::Continuous, 1.0, 100.0).is_none());
@@ -9107,6 +9628,193 @@ mod tests {
         let mut dialog = DimStyleDialogState::from_style(&DimStyle::default());
         dialog.arrow_len_mm = "0".to_string();
         assert!(dialog.to_dim_style().is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // 表編集ダイアログ（M10タスク59）
+    // -----------------------------------------------------------------
+
+    /// 3行×3列・列幅30mm・行高さ8mm・文字高さ3.5mmの既定の表（`TableTool` の既定値と
+    /// 同じ）。セルは行優先で連番の文字列を入れる（並び順の確認用）。
+    fn default_table_for_dialog_tests() -> TableGeom {
+        TableGeom {
+            anchor: Point2::new(1.0, 2.0),
+            col_widths_mm: vec![30.0; 3],
+            row_heights_mm: vec![8.0; 3],
+            text_height_mm: 3.5,
+            cells: (0..9).map(|i| format!("c{i}")).collect(),
+        }
+    }
+
+    #[test]
+    fn table_dialog_round_trips_the_table_unchanged() {
+        let table = default_table_for_dialog_tests();
+        let dialog = TableDialogState::from_table(EntityId::default(), &table);
+        let rebuilt = build_table_from_dialog(&dialog).expect("valid round trip");
+        assert_eq!(rebuilt, table);
+    }
+
+    #[test]
+    fn table_dialog_from_table_shows_the_minimum_when_row_heights_differ() {
+        let mut table = default_table_for_dialog_tests();
+        table.row_heights_mm = vec![8.0, 5.0, 12.0];
+        let dialog = TableDialogState::from_table(EntityId::default(), &table);
+        assert_eq!(dialog.row_height_mm, "5");
+    }
+
+    #[test]
+    fn table_dialog_unchanged_ok_is_a_modify_entity_no_op() {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        let table = default_table_for_dialog_tests();
+        let new_ids = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::Table(table.clone()),
+                layer,
+                Style::inherited(),
+            )))
+            .expect("add table");
+        let id = new_ids.entities[0];
+        let dialog = TableDialogState::from_table(id, &table);
+        let rebuilt = build_table_from_dialog(&dialog).expect("valid round trip");
+
+        let generation_before = document.generation();
+        document
+            .apply(Command::ModifyEntity {
+                id,
+                new_geom: EntityGeom::Table(rebuilt),
+            })
+            .expect("no-op modify still succeeds");
+        assert_eq!(
+            document.generation(),
+            generation_before,
+            "unchanged geometry must not bump the generation (no undo entry)"
+        );
+    }
+
+    #[test]
+    fn table_dialog_add_row_top_inserts_an_empty_row_at_index_zero() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.add_row_top();
+        assert_eq!(dialog.cells.len(), 4);
+        assert_eq!(dialog.cells[0], vec![String::new(); 3]);
+        // 元の行は1つ下へ押し出される（行0=最上段が新しい空行に置き換わる）。
+        assert_eq!(dialog.cells[1], vec!["c0", "c1", "c2"]);
+
+        let rebuilt = build_table_from_dialog(&dialog).expect("valid");
+        assert_eq!(rebuilt.rows(), 4);
+        assert_eq!(rebuilt.cell(0, 0), Some(""));
+        assert_eq!(rebuilt.cell(1, 0), Some("c0"));
+        // 追加行にも共通の行高さ欄の値が適用される。
+        assert_eq!(rebuilt.row_heights_mm, vec![8.0; 4]);
+    }
+
+    #[test]
+    fn table_dialog_remove_top_row_drops_index_zero_but_keeps_at_least_one_row() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.remove_top_row();
+        assert_eq!(dialog.cells.len(), 2);
+        assert_eq!(dialog.cells[0], vec!["c3", "c4", "c5"]);
+
+        dialog.remove_top_row();
+        assert_eq!(dialog.cells.len(), 1);
+        // 最後の1行は削除しない。
+        dialog.remove_top_row();
+        assert_eq!(dialog.cells.len(), 1);
+    }
+
+    #[test]
+    fn table_dialog_add_col_right_appends_an_empty_column() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.add_col_right();
+        assert_eq!(dialog.col_widths_mm.len(), 4);
+        assert_eq!(dialog.col_widths_mm[3], "30");
+        for row in &dialog.cells {
+            assert_eq!(row.len(), 4);
+            assert_eq!(row[3], "");
+        }
+
+        let rebuilt = build_table_from_dialog(&dialog).expect("valid");
+        assert_eq!(rebuilt.cols(), 4);
+        assert_eq!(rebuilt.cell(0, 3), Some(""));
+        assert_eq!(rebuilt.cell(0, 0), Some("c0"));
+    }
+
+    #[test]
+    fn table_dialog_remove_right_col_drops_the_last_column_but_keeps_at_least_one() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.remove_right_col();
+        assert_eq!(dialog.col_widths_mm.len(), 2);
+        assert_eq!(dialog.cells[0], vec!["c0", "c1"]);
+
+        dialog.remove_right_col();
+        assert_eq!(dialog.col_widths_mm.len(), 1);
+        // 最後の1列は削除しない。
+        dialog.remove_right_col();
+        assert_eq!(dialog.col_widths_mm.len(), 1);
+    }
+
+    #[test]
+    fn table_dialog_rejects_unparsable_numbers() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.row_height_mm = "abc".to_string();
+        assert!(build_table_from_dialog(&dialog).is_err());
+
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.text_height_mm = "abc".to_string();
+        assert!(build_table_from_dialog(&dialog).is_err());
+
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.col_widths_mm[0] = "abc".to_string();
+        assert!(build_table_from_dialog(&dialog).is_err());
+    }
+
+    #[test]
+    fn table_dialog_rejects_zero_negative_and_non_finite_dimensions() {
+        for bad in ["0", "-1", "NaN", "inf"] {
+            let table = default_table_for_dialog_tests();
+            let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+            dialog.row_height_mm = bad.to_string();
+            assert!(
+                build_table_from_dialog(&dialog).is_err(),
+                "row height {bad} should be rejected"
+            );
+
+            let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+            dialog.col_widths_mm[0] = bad.to_string();
+            assert!(
+                build_table_from_dialog(&dialog).is_err(),
+                "col width {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn table_dialog_rejects_text_height_at_or_above_row_height() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        // 行高さ8mmに対して文字高さが等しい・上回る、いずれも拒否（等号も含む）。
+        dialog.text_height_mm = "8".to_string();
+        assert!(build_table_from_dialog(&dialog).is_err());
+        dialog.text_height_mm = "9".to_string();
+        assert!(build_table_from_dialog(&dialog).is_err());
+        dialog.text_height_mm = "7.9".to_string();
+        assert!(build_table_from_dialog(&dialog).is_ok());
+    }
+
+    #[test]
+    fn table_dialog_rejects_more_rows_than_the_core_limit() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        while dialog.cells.len() <= mcad_core::MAX_TABLE_ROWS {
+            dialog.add_row_top();
+        }
+        assert!(build_table_from_dialog(&dialog).is_err());
     }
 
     // -----------------------------------------------------------------

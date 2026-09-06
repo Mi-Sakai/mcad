@@ -184,7 +184,11 @@ pub fn snap(
             EntityGeom::Shape(shape) => enumerate_features(shape, cursor, r2, &mut best),
             // Text はアンカー点のみをスナップ源にする（端点扱い。DESIGN.md M6 設計判断1）。
             EntityGeom::Text(text) => best.consider(SnapKind::Endpoint, text.anchor, cursor, r2),
-            // 寸法はスナップ源にしない（DESIGN.md M6 設計判断1）。`EntityGeom` は
+            // 寸法はスナップ源にしない（DESIGN.md M6 設計判断1）。**表も同じく
+            // スナップ源にしない**（M10 タスク58）: 罫線の交点・端点をスナップ源に
+            // すると表 1 つで数十〜数百の候補点が増え、近傍探索が実質役に立たなく
+            // なるうえ、表は寸法を測る対象ではなく注記だから。表の位置合わせは
+            // 「表題欄の上に配置」ボタン（M10 タスク60）が担う。`EntityGeom` は
             // `#[non_exhaustive]` なので、未知の幾何も同じくスナップ源にしない。
             _ => {}
         }

@@ -55,7 +55,7 @@ pub use document::{Document, NewIds};
 pub use entity::Entity;
 pub use entity_geom::{
     DimDiameter, DimLinear, DimRadial, EntityGeom, MAX_TABLE_COLS, MAX_TABLE_MM, MAX_TABLE_ROWS,
-    TableGeom, TextGeom,
+    TableGeom, TextGeom, approx_text_width,
 };
 pub use error::CoreError;
 pub use id::{EntityId, LayerId};

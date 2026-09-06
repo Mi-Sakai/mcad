@@ -726,14 +726,21 @@ fn check_table_mm(value: f64, what: std::fmt::Arguments<'_>) -> Result<(), Strin
     Ok(())
 }
 
+/// 文字列の近似幅（文字数×高さ。CJK ≈ 1.0×height、ASCII ≈ 0.55×height。DESIGN.md M6
+/// 設計判断1）。[`EntityGeom::aabb`] の Text と、app 層の表（セル文字が列からはみ出す
+/// ぶんを表示 AABB へ足す `table_world_aabb`）が**同じ推定式**を使うための唯一の出所。
+#[must_use]
+pub fn approx_text_width(content: &str, height: f64) -> f64 {
+    content
+        .chars()
+        .map(|c| if c.is_ascii() { 0.55 } else { 1.0 } * height)
+        .sum()
+}
+
 /// テキストの近似 AABB。文字数×高さの近似幅（CJK≈1.0×height、ASCII≈0.55×height）で
 /// 局所ボックスを組み、ベースライン角で回転した 4 隅を包む（DESIGN.md M6 設計判断1）。
 fn text_aabb(text: &TextGeom) -> Aabb {
-    let width: f64 = text
-        .content
-        .chars()
-        .map(|c| if c.is_ascii() { 0.55 } else { 1.0 } * text.height)
-        .sum();
+    let width = approx_text_width(&text.content, text.height);
     // 局所座標（アンカー原点、ベースライン +x、上方向 +y）の 4 隅を回転して包む。
     let corners = [
         Vec2::new(0.0, 0.0),

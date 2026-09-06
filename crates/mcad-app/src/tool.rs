@@ -42,7 +42,7 @@ use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
     Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, Document, Entity, EntityGeom,
-    EntityId, LayerId, Linetype, NewIds, Style,
+    EntityId, LayerId, Linetype, NewIds, Style, TableGeom,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -421,6 +421,73 @@ impl Tool for PointTool {
                 Linetype::Continuous,
                 1.0,
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Table
+// ---------------------------------------------------------------------
+
+/// 表ツール（`K`）が置く既定の表（M10 詳細設計5）: 3 行 × 3 列、列幅 30mm、
+/// 行高さ 8mm、文字高さ 3.5mm、空セル。行列数の事前入力は設けない
+/// （セル・列幅・行高さの調整は右パネルの表編集ダイアログの方が往復が少ない）。
+fn default_table(anchor: Point2) -> TableGeom {
+    const ROWS: usize = 3;
+    const COLS: usize = 3;
+    TableGeom {
+        anchor,
+        col_widths_mm: vec![30.0; COLS],
+        row_heights_mm: vec![8.0; ROWS],
+        text_height_mm: 3.5,
+        cells: vec![String::new(); ROWS * COLS],
+    }
+}
+
+/// 表ツール。クリック1回でアンカー（表の左下、スナップ適用）を置き、
+/// [`default_table`] を確定する。[`PointTool`] と同じく状態を持ち越さないので、
+/// 確定後もクリックのたびに独立した表エンティティを確定し続ける（連続作図）。
+/// セル文字・列幅・行高さ・行列数の編集は右パネルの表編集ダイアログ
+/// （`main.rs` の `TableDialogState`、`Command::ModifyEntity` 経由）へ委ねる。
+#[derive(Debug, Default)]
+pub struct TableTool {
+    /// アンカー未確定時のカーソル位置（配置プレビュー用）。
+    cursor: Option<Point2>,
+}
+
+impl Tool for TableTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => ToolResult::Commit(Command::AddEntity(Entity::new(
+                EntityGeom::Table(default_table(p)),
+                ctx.layer,
+                ctx.style,
+            ))),
+            InputEvent::Cancel => ToolResult::Cancel,
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _render: crate::dimension::DimRender<'_>,
+    ) {
+        // アンカー位置に十字マーカーを描く（[`TextTool`] の未確定表示と同じ簡易
+        // プレビュー）。既定の表は固定値なので、罫線一式のプレビューまでは
+        // 出さない（確定後にダイアログで直せる）。
+        if let Some(p) = self.cursor {
+            let c = viewport.world_to_screen(rect, p);
+            let s = 5.0;
+            let stroke = preview_stroke();
+            painter.line_segment([c + egui::vec2(-s, 0.0), c + egui::vec2(s, 0.0)], stroke);
+            painter.line_segment([c + egui::vec2(0.0, -s), c + egui::vec2(0.0, s)], stroke);
         }
     }
 }
@@ -2412,6 +2479,12 @@ impl SelectTool {
                 EntityGeom::DimLinear(dim) => crate::dimension::linear_distance(dim, world),
                 EntityGeom::DimRadial(dim) => crate::dimension::radial_distance(dim, world),
                 EntityGeom::DimDiameter(dim) => crate::dimension::diameter_distance(dim, world),
+                // 表は表示上のワールド AABB（列幅・行高さ × k）への距離。Text と同じ
+                // 割り切りで、罫線 1 本ずつへの距離は取らない（面として掴む方が操作
+                // として自然。M10 タスク58、`table` モジュール doc）。
+                EntityGeom::Table(table) => {
+                    crate::table::table_world_aabb(table, k).distance_to_point(world)
+                }
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は近似 aabb への
                 // 距離で拾う（ピック対象から黙って消えるより穏当）。
                 _ => entity.geom.aabb().distance_to_point(world),
@@ -2525,16 +2598,12 @@ impl SelectTool {
         };
         let rect = Aabb::from_corners(start, world);
         let k = document.sheet().scale.world_mm_per_paper_mm();
-        let entity_aabb = |e: &Entity| match &e.geom {
-            // Text は紙基準表示（タスク37）の判断(g): 矩形選択の内包判定も
-            // height×k のワールド AABB を使う。
-            EntityGeom::Text(text) => crate::text_world_aabb(text, k),
-            _ => e.geom.aabb(),
-        };
+        // 内包判定は表示上のワールド AABB（`crate::entity_world_aabb`）。Text は紙基準
+        // 表示（タスク37）の判断(g) により height×k、表も同じく紙 mm × k（M10 タスク58）。
         self.selection = document
             .entities()
             .filter(|(_, e)| layer_visible(document, e))
-            .filter(|(_, e)| rect.contains(&entity_aabb(e)))
+            .filter(|(_, e)| rect.contains(&crate::entity_world_aabb(&e.geom, k)))
             .map(|(id, _)| id)
             .collect();
     }
@@ -3024,6 +3093,55 @@ mod tests {
     fn point_tool_cancel_returns_cancel() {
         let (_doc, ctx) = ctx();
         let mut tool = PointTool::default();
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+    }
+
+    // --- Table ---
+
+    fn table_of(result: ToolResult) -> TableGeom {
+        match result {
+            ToolResult::Commit(Command::AddEntity(entity)) => match entity.geom {
+                EntityGeom::Table(table) => table,
+                other => panic!("expected Table geom, got {other:?}"),
+            },
+            other => panic!("expected Commit(AddEntity(..)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_tool_commits_default_table_on_single_click() {
+        let (_doc, ctx) = ctx();
+        let mut tool = TableTool::default();
+        let anchor = Point2::new(3.0, -4.0);
+        let table = table_of(tool.on_input(&ctx, InputEvent::Click(anchor)));
+        assert_eq!(table.anchor, anchor);
+        assert_eq!(table.rows(), 3);
+        assert_eq!(table.cols(), 3);
+        assert_eq!(table.col_widths_mm, vec![30.0; 3]);
+        assert_eq!(table.row_heights_mm, vec![8.0; 3]);
+        assert_eq!(table.text_height_mm, 3.5);
+        assert_eq!(table.cells, vec![String::new(); 9]);
+        assert!(EntityGeom::Table(table).validate().is_ok());
+    }
+
+    #[test]
+    fn table_tool_keeps_committing_on_repeated_clicks() {
+        // PointTool と同じ「連続作図」: 確定後も状態を持ち越さず、次のクリックで
+        // 独立した表を確定し続ける。
+        let (_doc, ctx) = ctx();
+        let mut tool = TableTool::default();
+        let a = Point2::new(0.0, 0.0);
+        let b = Point2::new(10.0, 10.0);
+        let first = table_of(tool.on_input(&ctx, InputEvent::Click(a)));
+        let second = table_of(tool.on_input(&ctx, InputEvent::Click(b)));
+        assert_eq!(first.anchor, a);
+        assert_eq!(second.anchor, b);
+    }
+
+    #[test]
+    fn table_tool_cancel_returns_cancel() {
+        let (_doc, ctx) = ctx();
+        let mut tool = TableTool::default();
         assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
     }
 
@@ -5182,6 +5300,94 @@ mod tests {
         assert!(tool.selection().is_empty());
     }
 
+    // --- 表のヒットテスト（M10 タスク58） ---
+
+    /// カレントレイヤーへ 2 行 2 列（列幅 10mm・行高さ 8mm）の表を追加する。
+    /// 1:1 でのワールド AABB は x∈[0,20], y∈[0,16]（アンカーは左下）。
+    fn add_table(doc: &mut Document, anchor: Point2) -> EntityId {
+        let layer = doc.current_layer();
+        let entity = Entity::new(
+            EntityGeom::Table(mcad_core::TableGeom {
+                anchor,
+                col_widths_mm: vec![10.0, 10.0],
+                row_heights_mm: vec![8.0, 8.0],
+                text_height_mm: 3.5,
+                cells: vec![String::new(); 4],
+            }),
+            layer,
+            Style::inherited(),
+        );
+        doc.apply(Command::AddEntity(entity)).unwrap().entities[0]
+    }
+
+    #[test]
+    fn pick_hits_table_inside_its_world_aabb() {
+        let mut doc = Document::new();
+        let t = add_table(&mut doc, Point2::ORIGIN);
+
+        // AABB 内（セルの空白部分でも面として掴める）。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(5.0, 4.0), 0.01, false);
+        assert_eq!(tool.selection(), &[t]);
+
+        // AABB 外・tol 外は拾わない。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(25.0, 4.0), 0.01, false);
+        assert!(tool.selection().is_empty());
+
+        // AABB の外側でも tol 以内なら拾う（Text と同じ符号なし距離）。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(20.1, 4.0), 0.15, false);
+        assert_eq!(tool.selection(), &[t]);
+    }
+
+    #[test]
+    fn pick_table_follows_sheet_scale() {
+        // 列幅・行高さは紙 mm なので、ピック形状も尺度 k に追従する（M10 設計方針4）。
+        let mut doc = Document::new();
+        let t = add_table(&mut doc, Point2::ORIGIN);
+        let click = Point2::new(30.0, 24.0);
+        let tol = 0.01;
+
+        // 1:1: AABB は x∈[0,20], y∈[0,16] なので click は外。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, click, tol, false);
+        assert!(tool.selection().is_empty());
+
+        // 1:2（k=2）: AABB が x∈[0,40], y∈[0,32] へ広がり click を内包する。
+        doc.apply(Command::SetSheet(mcad_core::SheetMeta {
+            scale: mcad_core::Scale::new(1, 2).unwrap(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, click, tol, false);
+        assert_eq!(tool.selection(), &[t]);
+    }
+
+    #[test]
+    fn rect_selection_encloses_table_by_its_scaled_aabb() {
+        let mut doc = Document::new();
+        let t = add_table(&mut doc, Point2::ORIGIN);
+
+        // 1:1 の AABB（20×16）をちょうど包む矩形は選択する。
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(Point2::new(-1.0, -1.0));
+        tool.on_drag_end(&doc, Point2::new(21.0, 17.0));
+        assert_eq!(tool.selection(), &[t]);
+
+        // 1:2（k=2）では AABB が 40×32 へ広がり、同じ矩形には収まらない。
+        doc.apply(Command::SetSheet(mcad_core::SheetMeta {
+            scale: mcad_core::Scale::new(1, 2).unwrap(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(Point2::new(-1.0, -1.0));
+        tool.on_drag_end(&doc, Point2::new(21.0, 17.0));
+        assert!(tool.selection().is_empty());
+    }
+
     #[test]
     fn text_tool_click_sets_anchor_and_enters_editing() {
         let (_doc, ctx) = ctx();
@@ -5522,6 +5728,8 @@ mod tests {
     fn pick_shape_entity_excludes_text_and_dimensions() {
         let mut doc = Document::new();
         add_text(&mut doc, Point2::ORIGIN, "hi", 1.0);
+        // 表も形状ではない（トリム・延長・フィレット・オフセットの対象外。M10 タスク58）。
+        add_table(&mut doc, Point2::ORIGIN);
         doc.apply(Command::AddEntity(Entity::new(
             EntityGeom::DimLinear(DimLinear {
                 p1: Point2::ORIGIN,
@@ -5534,7 +5742,8 @@ mod tests {
         )))
         .unwrap();
 
-        // Text・寸法しか無いドキュメントでは（as_shape() が None のため）何もヒットしない。
+        // Text・寸法・表しか無いドキュメントでは（as_shape() が None のため）何も
+        // ヒットしない。
         assert!(pick_shape_entity(&doc, Point2::ORIGIN, 1.0).is_none());
     }
 

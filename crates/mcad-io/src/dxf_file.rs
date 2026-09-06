@@ -1416,6 +1416,34 @@ mod tests {
     }
 
     #[test]
+    fn export_skips_table_entities_without_panicking() {
+        // 表（`EntityGeom::Table`、M10）の DXF 分解 export はタスク61の範囲。
+        // タスク57 時点では最小限の確認として、`export_dxf` の match のワイルドカード
+        // 腕（`_ => { skipped_entities += 1; }`）が表もパニックせずスキップし、
+        // 既存の DimLinear 等と同じ流儀で件数に計上することだけを固定する。
+        use mcad_core::TableGeom;
+
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Table(TableGeom {
+                anchor: Point2::new(0.0, 0.0),
+                col_widths_mm: vec![30.0],
+                row_heights_mm: vec![8.0],
+                text_height_mm: 3.5,
+                cells: vec![String::new()],
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 1);
+        assert_eq!(export.drawing.entities().count(), 0);
+    }
+
+    #[test]
     fn unknown_layer_reference_is_added_on_the_fly() {
         // LAYER テーブルには存在しないレイヤー名を直接参照するエンティティ。
         //

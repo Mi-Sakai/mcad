@@ -14,6 +14,8 @@
 //!   [`fillet_lines`]（[`fillet`] モジュール）
 //! - 寸法記号: [`DimSymbol`], [`dim_symbol_glyph`]（[`symbol`] モジュール。φ・□ の
 //!   ジオメトリを生成し、他の記号はフォント文字として組版する側に委ねる）
+//! - 寸法矢先の種類: [`ArrowKind`]（[`symbol`] モジュール。`.mcad` v6・M10 タスク57で
+//!   導入、形状生成 `arrow_glyph` は M10 タスク63）
 //! - ジオメトリ検証: [`Shape::validate`]（非有限座標・負半径・空ポリラインなどを検出）
 //! - 数値許容量: [`EPS`] と、その相対化ヘルパ [`rel_tol`] / [`point_tol`]
 //!
@@ -38,7 +40,7 @@ pub use primitives::{
     Arc, Circle, LineSeg, OffsetError, Polyline, Shape, circumcircle, closest_point, distance_to,
 };
 pub use split::{SplitError, split};
-pub use symbol::{DimSymbol, SymbolGlyph, dim_symbol_glyph};
+pub use symbol::{ArrowKind, DimSymbol, SymbolGlyph, dim_symbol_glyph};
 pub use trim_extend::{TrimExtendError, TrimResult, extend, extend_reach, trim};
 pub use vec2::Vec2;
 

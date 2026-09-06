@@ -12,7 +12,7 @@
 //!   （[`FileLayer`]）として書く。core 側の型変更がファイル形式へ直接漏れないように
 //!   するため。
 //! - 生存中のレイヤー・エンティティのみを列挙する。undo/redo 履歴・墓標は保存しない。
-//! - `version` フィールド必須（現行は `5`）。書き出しは常に v5。読込は v1〜v4 を
+//! - `version` フィールド必須（現行は `6`）。書き出しは常に v6。読込は v1〜v5 を
 //!   後方互換で受理し、それ以外の未知バージョンは拒否する（[`from_json`]）。
 //!
 //! # バージョン履歴と後方互換の変換規則
@@ -23,7 +23,8 @@
 //! | 2 | 幾何が [`EntityGeom`]（M6 でテキスト・寸法を追加）。レイヤーは `order` なし | `order = 配列インデックス` |
 //! | 3 | レイヤーに `order`（重ね順）を追加 | なし |
 //! | 4 | 図面メタデータ `sheet`、レイヤーの `linetype`/`width_mm`、`style` の線幅を px から紙 mm の ByLayer モデルへ（M8） | `dim_style = 既定`（`annotation` は元々 `EntityGeom` の `#[serde(default)]` で無注記に補完される） |
-//! | 5 | 寸法注記（[`mcad_core::DimAnnotation`]）・文書単位の寸法スタイル（`dim_style`）を永続化（M9 タスク48）。現行 | なし |
+//! | 5 | 寸法注記（[`mcad_core::DimAnnotation`]）・文書単位の寸法スタイル（`dim_style`）を永続化（M9 タスク48） | `arrow_kind = ClosedFilled`。表（[`EntityGeom::Table`]）は概念自体が無いため、凍結 DTO（[`EntityGeomV5`]）が `Table` タグを拒否する |
+//! | 6 | 汎用テーブル（[`EntityGeom::Table`]、M10）・[`mcad_core::DimStyle::arrow_kind`]（矢先種別。M10 タスク57で `.mcad` へ導入、形状生成は M10 タスク63）を追加。現行 | なし |
 //!
 //! `order` を持たない v1/v2 のレイヤーには **配列内のインデックスをそのまま
 //! `order` として採用する**。export は常にデフォルトレイヤーを先頭に列挙してきた
@@ -100,7 +101,39 @@
 //!   強制的に無注記化していた）ため、`EntityGeom` 側の `#[serde(default)]` により
 //!   全 annotation が無注記（`decimals_override` を含め全フィールド既定値）へ
 //!   補完される。`dim_style` も同様に v1〜v4 では存在せず既定値へ補完される
-//!   （[`FileDocumentV4::into_v5`]）。
+//!   （[`FileDocumentV4::into_v6`]）。
+//!
+//! # 汎用テーブルと矢先種別の永続化（v6・M10 タスク57）
+//!
+//! M10 タスク56で `mcad-core` へ汎用テーブル（[`mcad_core::EntityGeom::Table`]）を
+//! 追加し、7章「随時対応」の「寸法矢印のブロック化」設計確定1で
+//! [`mcad_core::DimStyle::arrow_kind`] を追加した。**v6（本タスク）でこれを
+//! 永続化する**:
+//!
+//! - [`FileEntity::geom`] は現行の [`EntityGeom`] をそのまま serde するため、
+//!   [`EntityGeom::Table`] は追加の型を要らずそのまま書ける（既存の
+//!   [`EntityGeom::Text`] 等と同じ扱い）。[`FileDocument::dim_style`]
+//!   （[`mcad_core::DimStyle`]）も同様に `arrow_kind` を含めてそのまま書く。
+//! - **v5 以前の DTO は凍結する**。ここが v4 → v5 の移行と異なる点: v4 の DTO は
+//!   従来 v5 の [`FileEntity`]（= 現行の [`EntityGeom`]）を共有していたため、
+//!   [`EntityGeom::Table`] を追加しただけでは v4 と自称する手編集ファイルにも
+//!   `Table` ジオメトリが読めてしまい、「v4/v5 は表を持たない」という版数の意味が
+//!   壊れる（Codex adversarial review 2026-09-06 high 指摘）。これを避けるため、
+//!   [`EntityGeomV5`]（`Table` を持たない凍結ジオメトリ enum）と
+//!   [`FileEntityV5`]（それを使う凍結エンティティ DTO）を新設し、
+//!   [`FileDocumentV4`]・[`FileDocumentV5`] の両方がこれを共有する。v4/v5 として
+//!   読むファイルに手編集で `{"Table": ...}` を混ぜても、[`EntityGeomV5`] に
+//!   `Table` バリアントが無いため [`IoError::Json`] で拒否される
+//!   （回帰は `v4_file_with_table_geometry_is_rejected` /
+//!   `v5_file_with_table_geometry_is_rejected`）。
+//! - `arrow_kind` は [`mcad_core::DimStyle`] のフィールドとして
+//!   `#[serde(default)]` が付いているため、v1〜v5（このキーを持たない）は
+//!   [`mcad_geom::ArrowKind::ClosedFilled`] へ自動的に既定値補完される
+//!   （dim_style の他フィールドと同じ流儀。io 側で追加の変換コードは不要）。
+//! - v6 の読込は [`mcad_core::EntityGeom::validate`] を通常どおり通すため、
+//!   `Table` の不正値（M10 タスク56の検証: 行列数0・非有限・非正寸法・
+//!   セル数不整合・文字高さ過大・制御文字・右上隅の非有限）は
+//!   [`IoError::InvalidGeometry`] として読込境界で拒否される。
 
 use std::fs;
 use std::path::Path;
@@ -108,8 +141,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use mcad_core::{
-    Command, DimStyle, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Rgb, SheetMeta,
-    Style, WidthMm,
+    Command, DimDiameter, DimLinear, DimRadial, DimStyle, Document, Entity, EntityGeom, Layer,
+    LayerId, Linetype, Rgb, SheetMeta, Style, TextGeom, WidthMm,
 };
 use mcad_geom::Shape;
 
@@ -123,12 +156,15 @@ use crate::IoError;
 ///   紙 mm 線幅（ByLayer モデル）を追加。
 /// - v5（M9 タスク48）で寸法注記（[`mcad_core::DimAnnotation`]）と文書単位の
 ///   寸法スタイル（[`FileDocument::dim_style`]）を永続化。
+/// - v6（M10 タスク57）で汎用テーブル（[`mcad_core::EntityGeom::Table`]）と
+///   矢先種別（[`mcad_core::DimStyle::arrow_kind`]）を追加。
 ///
-/// 書き出しは常に v5。v1〜v4 のファイルは [`from_json`] が後方互換で読み込む
-/// （[`FileDocumentV1`] / [`FileDocumentV2`] / [`FileDocumentV3`] / [`FileDocumentV4`] 参照）。
-pub const FORMAT_VERSION: u32 = 5;
+/// 書き出しは常に v6。v1〜v5 のファイルは [`from_json`] が後方互換で読み込む
+/// （[`FileDocumentV1`] / [`FileDocumentV2`] / [`FileDocumentV3`] / [`FileDocumentV4`] /
+/// [`FileDocumentV5`] 参照）。
+pub const FORMAT_VERSION: u32 = 6;
 
-/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v5）。
+/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v6）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDocument {
     /// フォーマットバージョン。[`FORMAT_VERSION`] 以外は読込を拒否する。
@@ -148,12 +184,14 @@ pub struct FileDocument {
     pub current_layer: usize,
     /// エンティティ一覧。
     pub entities: Vec<FileEntity>,
-    /// 文書単位の寸法スタイル。v5 で追加。
+    /// 文書単位の寸法スタイル。v5 で追加、v6 で `arrow_kind`（矢先種別）を追加。
     ///
     /// core の [`mcad_core::DimStyle`] をそのまま書く（`sheet` と同じ扱い）。
     /// `#[serde(default)]` を付け、v1〜v4 のファイル（このキーを持たない）を
     /// 既定値補完で受理する（手編集ファイルへの寛容性は `annotation` 欠落補完と
-    /// 揃える）。
+    /// 揃える）。`DimStyle::arrow_kind` 自体も `#[serde(default)]` なので、
+    /// v1〜v5（`dim_style` キーはあるが `arrow_kind` キーが無い）は
+    /// `ArrowKind::ClosedFilled` へ既定値補完される。
     #[serde(default)]
     pub dim_style: DimStyle,
 }
@@ -220,7 +258,8 @@ pub struct FileEntity {
     pub layer: usize,
     /// 描画スタイル（v4 で線幅が紙 mm・線種つきの ByLayer モデルへ）。
     pub style: Style,
-    /// 幾何形状（v2 でテキスト・寸法を含む [`EntityGeom`] へ拡張）。
+    /// 幾何形状（v2 でテキスト・寸法を含む [`EntityGeom`] へ拡張、v6 で表
+    /// [`EntityGeom::Table`] を追加）。
     pub geom: EntityGeom,
 }
 
@@ -368,17 +407,22 @@ impl FileStyleV3 {
     }
 }
 
-/// v2・v3 のエンティティ 1 件を表す凍結 DTO（後方互換読込専用）。
+/// v2・v3 のエンティティ 1 件を表す凍結 DTO（後方互換読込専用）。`geom` は
+/// [`EntityGeomV5`]（`Table` を持たない）に固定する。**v1〜v3 に「表」の概念は
+/// 存在しないため**、[`FileEntityV5`] と同じ理由でここも凍結する
+/// （[`EntityGeomV5`] の doc 参照。この型が現行の [`EntityGeom`] を直接
+/// 共有していた旧実装では、v2/v3 と自称する手編集ファイルにも `Table` が
+/// 読めてしまっていた）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FileEntityV3 {
     layer: usize,
     style: FileStyleV3,
-    geom: EntityGeom,
+    geom: EntityGeomV5,
 }
 
-/// v2・v3 の `entities` 配列を現行の [`FileEntity`] 列へ移行し、線幅をクランプした
-/// 件数を返す。
-fn entities_v3_into_v4(entities: Vec<FileEntityV3>) -> (Vec<FileEntity>, usize) {
+/// v2・v3 の `entities` 配列を v4 相当の [`FileEntityV5`] 列へ移行し、線幅を
+/// クランプした件数を返す。
+fn entities_v3_into_v4(entities: Vec<FileEntityV3>) -> (Vec<FileEntityV5>, usize) {
     let mut clamped_widths = 0usize;
     let migrated = entities
         .into_iter()
@@ -387,7 +431,7 @@ fn entities_v3_into_v4(entities: Vec<FileEntityV3>) -> (Vec<FileEntity>, usize) 
             if clamped {
                 clamped_widths += 1;
             }
-            FileEntity {
+            FileEntityV5 {
                 layer: e.layer,
                 style,
                 geom: e.geom,
@@ -425,11 +469,11 @@ impl FileDocumentV3 {
     }
 
     /// v3 DTO を現行の v5 [`FileDocument`] へ変換する（[`FileDocumentV3::into_v4`] の
-    /// あと [`FileDocumentV4::into_v5`] を通す）。
-    fn into_v5(self) -> MigratedFile {
+    /// あと [`FileDocumentV4::into_v6`] を通す）。
+    fn into_v6(self) -> MigratedFile {
         let (v4, clamped_widths) = self.into_v4();
         MigratedFile {
-            file: v4.into_v5(),
+            file: v4.into_v6(),
             clamped_widths,
         }
     }
@@ -447,14 +491,14 @@ struct FileDocumentV2 {
 
 impl FileDocumentV2 {
     /// v2 DTO を v3 相当へ引き上げてから v5 へ変換する。
-    fn into_v5(self) -> MigratedFile {
+    fn into_v6(self) -> MigratedFile {
         FileDocumentV3 {
             version: 3,
             layers: layers_v2_into_v3(self.layers),
             current_layer: self.current_layer,
             entities: self.entities,
         }
-        .into_v5()
+        .into_v6()
     }
 }
 
@@ -477,9 +521,9 @@ struct FileEntityV1 {
 }
 
 impl FileDocumentV1 {
-    /// v1 DTO を v2 相当へ引き上げてから v5 へ変換する（各 `Shape` を
-    /// [`EntityGeom::Shape`] で包む）。
-    fn into_v5(self) -> MigratedFile {
+    /// v1 DTO を v2 相当へ引き上げてから v6 へ変換する（各 `Shape` を
+    /// [`EntityGeomV5::Shape`] で包む）。
+    fn into_v6(self) -> MigratedFile {
         FileDocumentV2 {
             version: 2,
             layers: self.layers,
@@ -490,18 +534,77 @@ impl FileDocumentV1 {
                 .map(|e| FileEntityV3 {
                     layer: e.layer,
                     style: e.style,
-                    geom: EntityGeom::Shape(e.geom),
+                    geom: EntityGeomV5::Shape(e.geom),
                 })
                 .collect(),
         }
-        .into_v5()
+        .into_v6()
+    }
+}
+
+/// v6 で [`EntityGeom::Table`] が追加される**前**のジオメトリを表す凍結 enum
+/// （後方互換読込専用、v4・v5 が共有する）。
+///
+/// [`FileDocumentV4`]・[`FileDocumentV5`] の `entities`（[`FileEntityV5`]）は、
+/// 現行の [`EntityGeom`] を直接 serde するのではなく、必ずこの型を経由する。
+/// **理由（Codex adversarial review 2026-09-06 high 指摘）**: 以前の v4 DTO は
+/// v5（当時の現行）の [`FileEntity`]（= 現行 `EntityGeom`）をそのまま共有していた
+/// ため、`EntityGeom::Table` を追加しただけで「v4 と自称する手編集ファイルにも
+/// 表が読めてしまう」= v4/v5 が `Table` を持たないという版数の意味が崩れていた。
+/// この型はバリアントを [`EntityGeom::Table`] 追加前の 5 種に固定するので、
+/// `{"Table": ...}` を含む v4/v5 JSON は [`IoError::Json`]（未知のバリアント）で
+/// 読込を拒否する（回帰は `v4_file_with_table_geometry_is_rejected` /
+/// `v5_file_with_table_geometry_is_rejected`）。
+///
+/// タグ名（`Shape`/`Text`/`DimLinear`/`DimRadial`/`DimDiameter`）は
+/// [`EntityGeom`] の外部タグ形式（serde 既定の外部タグ付け）と一致させる。
+/// 実際に v1〜v5 の export がこのタグで書いてきたため、形を変えると
+/// 既存ファイルが読めなくなる。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+enum EntityGeomV5 {
+    Shape(Shape),
+    Text(TextGeom),
+    DimLinear(DimLinear),
+    DimRadial(DimRadial),
+    DimDiameter(DimDiameter),
+}
+
+impl From<EntityGeomV5> for EntityGeom {
+    fn from(geom: EntityGeomV5) -> Self {
+        match geom {
+            EntityGeomV5::Shape(shape) => EntityGeom::Shape(shape),
+            EntityGeomV5::Text(text) => EntityGeom::Text(text),
+            EntityGeomV5::DimLinear(dim) => EntityGeom::DimLinear(dim),
+            EntityGeomV5::DimRadial(dim) => EntityGeom::DimRadial(dim),
+            EntityGeomV5::DimDiameter(dim) => EntityGeom::DimDiameter(dim),
+        }
+    }
+}
+
+/// v4・v5 のエンティティ 1 件を表す凍結 DTO（後方互換読込専用）。`style` は v4 で
+/// 紙 mm の ByLayer モデルへ移行済みなので現行の [`Style`] をそのまま使うが、
+/// `geom` は [`EntityGeomV5`]（`Table` を持たない）に固定する。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct FileEntityV5 {
+    layer: usize,
+    style: Style,
+    geom: EntityGeomV5,
+}
+
+impl From<FileEntityV5> for FileEntity {
+    fn from(entity: FileEntityV5) -> Self {
+        FileEntity {
+            layer: entity.layer,
+            style: entity.style,
+            geom: entity.geom.into(),
+        }
     }
 }
 
 /// v4 ファイル全体を表す凍結 DTO（後方互換読込専用）。v5 との差は `dim_style` が
-/// 無いこと。`layers`/`entities` の中身は v4 と v5 で同一（[`EntityGeom`] の
-/// `#[serde(default)]` により `annotation` 欠落は無注記へ補完される）ので、
-/// [`FileLayer`]/[`FileEntity`] をそのまま共有する（V2/V3 の凍結と同じ粒度）。
+/// 無いこと。レイヤーは（[`FileLayer`] に `Table` 由来の差分が無いため）現行の型を
+/// そのまま共有するが、エンティティは [`FileEntityV5`]（`Table` を含まない）を使う
+/// （V2/V3 の凍結と同じ粒度。`Table` を含めない理由は [`EntityGeomV5`] の doc）。
 ///
 /// `version` フィールドを持たない（[`from_json`] がバージョン先読み後にこの型
 /// そのものへ直接デシリアライズするため、フィールドを持たせても使わない）。
@@ -510,22 +613,61 @@ struct FileDocumentV4 {
     sheet: SheetMeta,
     layers: Vec<FileLayer>,
     current_layer: usize,
-    entities: Vec<FileEntity>,
+    entities: Vec<FileEntityV5>,
 }
 
 impl FileDocumentV4 {
-    /// v4 DTO を現行の v5 [`FileDocument`] へ変換する（`dim_style` は既定値で補完。
-    /// v4 の正規ファイルは export が寸法注記を強制無注記化していたため `annotation`
-    /// キーを持たず、デシリアライズ時点で全 annotation が既に無注記 =
-    /// `decimals_override` 全件 `None` になっている）。
-    fn into_v5(self) -> FileDocument {
-        FileDocument {
-            version: FORMAT_VERSION,
+    /// v4 DTO を v5 相当の凍結 DTO（[`FileDocumentV5`]）へ変換する（`dim_style` は
+    /// 既定値で補完。v4 の正規ファイルは export が寸法注記を強制無注記化していた
+    /// ため `annotation` キーを持たず、デシリアライズ時点で全 annotation が既に
+    /// 無注記 = `decimals_override` 全件 `None` になっている）。
+    fn into_v5(self) -> FileDocumentV5 {
+        FileDocumentV5 {
             sheet: self.sheet,
             layers: self.layers,
             current_layer: self.current_layer,
             entities: self.entities,
             dim_style: DimStyle::default(),
+        }
+    }
+
+    /// v4 DTO を現行の v6 [`FileDocument`] へ変換する（[`FileDocumentV4::into_v5`] の
+    /// あと [`FileDocumentV5::into_v6`] を通す）。
+    fn into_v6(self) -> FileDocument {
+        self.into_v5().into_v6()
+    }
+}
+
+/// v5 ファイル全体を表す凍結 DTO（後方互換読込専用）。v6 との差は `entities` が
+/// [`EntityGeomV5`]（`Table` を持たない）であること。`dim_style` は現行の
+/// [`DimStyle`] をそのまま使う — `arrow_kind` フィールド自身が
+/// `#[serde(default)]` を持つため、このキーを持たない v5 ファイルは
+/// [`mcad_geom::ArrowKind::ClosedFilled`] へ既定値補完される
+/// （凍結型を別に起こす必要が無い。dim_style 全体を v1〜v4 で既定値補完するのと
+/// 同じ流儀）。
+///
+/// `version` フィールドを持たない（[`FileDocumentV4`] と同じ理由）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct FileDocumentV5 {
+    sheet: SheetMeta,
+    layers: Vec<FileLayer>,
+    current_layer: usize,
+    entities: Vec<FileEntityV5>,
+    #[serde(default)]
+    dim_style: DimStyle,
+}
+
+impl FileDocumentV5 {
+    /// v5 DTO を現行の v6 [`FileDocument`] へ変換する（`entities` の
+    /// [`EntityGeomV5`] を現行 [`EntityGeom`] へ写す以外は無変換）。
+    fn into_v6(self) -> FileDocument {
+        FileDocument {
+            version: FORMAT_VERSION,
+            sheet: self.sheet,
+            layers: self.layers,
+            current_layer: self.current_layer,
+            entities: self.entities.into_iter().map(FileEntityV5::into).collect(),
+            dim_style: self.dim_style,
         }
     }
 }
@@ -699,18 +841,23 @@ pub struct LoadSummary {
 /// - `2`: [`FileDocumentV2`]（レイヤーは `order` なし）
 /// - `3`: [`FileDocumentV3`]（`sheet` なし、レイヤーは線種・線幅なし、線幅は px）
 /// - `4`: [`FileDocumentV4`]（`dim_style` なし、寸法注記は export 側の強制無注記化
-///   により実質的に存在しない）
-/// - `5`（[`FORMAT_VERSION`]）: 現行の [`FileDocument`]
+///   により実質的に存在しない、幾何は [`EntityGeomV5`] に固定＝表を持たない）
+/// - `5`: [`FileDocumentV5`]（`dim_style` はあるが `arrow_kind` を持たない → 既定値
+///   補完、幾何は [`EntityGeomV5`] に固定＝表を持たない）
+/// - `6`（[`FORMAT_VERSION`]）: 現行の [`FileDocument`]（表・矢先種別を含む）
 ///
-/// それ以外は [`IoError::UnsupportedVersion`] を返す。書き出しは常に v5。
+/// それ以外は [`IoError::UnsupportedVersion`] を返す。書き出しは常に v6。
 ///
 /// v3 以前の旧線幅はモジュール doc の規則で移行し、クランプ件数を
 /// [`LoadSummary::clamped_widths`] で返す。
 ///
-/// v4/v5 として読むファイルのレイヤーに `order` が欠けていれば [`IoError::Json`] で
+/// v4/v5/v6 として読むファイルのレイヤーに `order` が欠けていれば [`IoError::Json`] で
 /// 失敗する（暗黙の既定値で埋めない = 壊れたファイルを検出できる）。同様に、
 /// 不正な尺度・線幅（0・負・範囲外）も検証済み型の `try_from` が
-/// [`IoError::Json`] として弾く。
+/// [`IoError::Json`] として弾く。v4/v5 として読むファイルに `Table` ジオメトリを
+/// 手編集で混ぜても、[`EntityGeomV5`] にそのバリアントが無いため
+/// [`IoError::Json`] で拒否される（モジュール doc「汎用テーブルと矢先種別の
+/// 永続化」参照）。
 ///
 /// # Errors
 ///
@@ -725,11 +872,15 @@ pub fn from_json(json: &str) -> Result<LoadSummary, IoError> {
     }
     let probe: VersionProbe = serde_json::from_str(json)?;
     let migrated = match probe.version {
-        1 => serde_json::from_str::<FileDocumentV1>(json)?.into_v5(),
-        2 => serde_json::from_str::<FileDocumentV2>(json)?.into_v5(),
-        3 => serde_json::from_str::<FileDocumentV3>(json)?.into_v5(),
+        1 => serde_json::from_str::<FileDocumentV1>(json)?.into_v6(),
+        2 => serde_json::from_str::<FileDocumentV2>(json)?.into_v6(),
+        3 => serde_json::from_str::<FileDocumentV3>(json)?.into_v6(),
         4 => MigratedFile {
-            file: serde_json::from_str::<FileDocumentV4>(json)?.into_v5(),
+            file: serde_json::from_str::<FileDocumentV4>(json)?.into_v6(),
+            clamped_widths: 0,
+        },
+        5 => MigratedFile {
+            file: serde_json::from_str::<FileDocumentV5>(json)?.into_v6(),
             clamped_widths: 0,
         },
         FORMAT_VERSION => MigratedFile {
@@ -772,7 +923,7 @@ mod tests {
         MAX_TITLE_BLOCK_CELLS_PER_ROW, MAX_TITLE_BLOCK_ROWS, Orientation, PaperSize,
         ProjectionMethod, Rgb, Scale, TitleBlockFields, TitleBlockKind, TitleBlockTemplate,
     };
-    use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline};
+    use mcad_geom::{Arc, ArrowKind, Circle, LineSeg, Point2, Polyline};
 
     /// [`from_json`] の戻り値からドキュメントだけを取り出す（クランプ件数を検証
     /// しないテスト用。件数を見るテストは [`from_json`] を直接呼ぶ）。
@@ -931,12 +1082,12 @@ mod tests {
 
     #[test]
     fn unsupported_version_fails() {
-        // 現行は v5。未知の将来バージョン（6）は拒否する。
+        // 現行は v6。未知の将来バージョン（7）は拒否する。
         let mut file = export_document(&Document::new());
-        file.version = 6;
+        file.version = 7;
         assert!(matches!(
             import_document(&file),
-            Err(IoError::UnsupportedVersion(6))
+            Err(IoError::UnsupportedVersion(7))
         ));
     }
 
@@ -1027,6 +1178,27 @@ mod tests {
 
         // 読込後の書き出しは常に v3。
         assert_eq!(export_document(&doc).version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn v2_file_with_table_geometry_is_rejected() {
+        // v1〜v3 の `geom` も凍結 DTO（`EntityGeomV5`）を経由するため、v2/v3 と
+        // 自称する手編集ファイルにも `Table` は読めない（v4/v5 と同じ回帰。
+        // `FileEntityV3::geom` を `EntityGeomV5` へ固定した際の確認）。
+        let v2_json = format!(
+            r#"{{
+              "version": 2,
+              "layers": [
+                {{"name": "0", "color": {{"r": 255, "g": 255, "b": 255}}, "visible": true, "locked": false}}
+              ],
+              "current_layer": 0,
+              "entities": [
+                {{"layer": 0, "style": {{"color": null, "width": 1.0}},
+                 "geom": {TABLE_GEOM_JSON}}}
+              ]
+            }}"#
+        );
+        assert!(matches!(load(&v2_json), Err(IoError::Json(_))));
     }
 
     #[test]
@@ -1638,12 +1810,12 @@ mod tests {
     }
 
     #[test]
-    fn exported_json_declares_version_5() {
+    fn exported_json_declares_version_6() {
         let (doc, _geom) = document_with_annotated_dim_linear();
         let json = to_json(&doc).unwrap();
         assert!(
-            json.contains(r#""version": 5"#),
-            "export した JSON は version 5 を書くべき: {json}"
+            json.contains(r#""version": 6"#),
+            "export した JSON は version 6 を書くべき: {json}"
         );
     }
 
@@ -1706,6 +1878,7 @@ mod tests {
             ext_overshoot_mm: 2.5,
             text_gap_mm: 2.0,
             tolerance_scale: 0.5,
+            arrow_kind: ArrowKind::Open30,
         };
         assert_ne!(
             custom_style,
@@ -1863,6 +2036,108 @@ mod tests {
         assert!(matches!(
             from_json(&json),
             Err(IoError::Core(mcad_core::CoreError::InvalidDimStyle(_)))
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // v6（M10 タスク57）: 汎用テーブル・矢先種別
+    // -----------------------------------------------------------------
+
+    /// 表の JSON（`geom` の値そのもの）。列 1・行 1・文字高さ 3.5・空セル 1 つの
+    /// 最小の妥当な表。
+    const TABLE_GEOM_JSON: &str = r#"{"Table": {"anchor": {"x": 0.0, "y": 0.0},
+        "col_widths_mm": [30.0], "row_heights_mm": [8.0], "text_height_mm": 3.5,
+        "cells": [""]}}"#;
+
+    #[test]
+    fn v6_round_trip_is_lossless_including_table_and_arrow_kind() {
+        use mcad_core::TableGeom;
+
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Table(TableGeom {
+                anchor: Point2::new(5.0, -3.0),
+                col_widths_mm: vec![15.0, 65.0, 15.0, 35.0, 40.0],
+                row_heights_mm: vec![8.0, 8.0],
+                text_height_mm: 3.5,
+                cells: vec![String::new(); 10],
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::SetDimStyle(DimStyle {
+            arrow_kind: ArrowKind::Open90,
+            ..DimStyle::default()
+        }))
+        .unwrap();
+
+        let exported = export_document(&doc);
+        assert_eq!(exported.version, FORMAT_VERSION);
+        assert_eq!(exported.dim_style.arrow_kind, ArrowKind::Open90);
+
+        let json = to_json(&doc).unwrap();
+        let loaded = load(&json).unwrap();
+        assert_eq!(
+            export_document(&loaded),
+            exported,
+            "v6 往復は無損失であるべき"
+        );
+    }
+
+    #[test]
+    fn v1_to_v5_files_default_arrow_kind_to_closed_filled() {
+        // 表なし・矢先種別なしの旧ファイルは `ClosedFilled`（現行の見た目）へ補完される。
+        let v5 = v5_json(
+            r#"{"num": 1, "den": 1}"#,
+            "0.35",
+            "null",
+            &serde_json::to_string(&mcad_core::DimStyle::default()).unwrap(),
+        );
+        let doc = load(&v5).expect("v5 は読めるべき");
+        assert_eq!(doc.dim_style().arrow_kind, ArrowKind::ClosedFilled);
+
+        let v4 = v4_json(r#"{"num": 1, "den": 1}"#, "0.35", "null");
+        let doc = load(&v4).expect("v4 は読めるべき");
+        assert_eq!(doc.dim_style().arrow_kind, ArrowKind::ClosedFilled);
+    }
+
+    #[test]
+    fn v4_file_with_table_geometry_is_rejected() {
+        // v4 に「表」の概念は無い。凍結 DTO（`EntityGeomV5`）が `Table` タグを
+        // 持たないため、手編集で混ぜても JSON デシリアライズ段階で拒否される
+        // （Codex adversarial review 2026-09-06 high 指摘の回帰）。
+        let json = v4_json_with_dimension(TABLE_GEOM_JSON);
+        assert!(matches!(from_json(&json), Err(IoError::Json(_))));
+    }
+
+    #[test]
+    fn v5_file_with_table_geometry_is_rejected() {
+        // v5 も同様（v5 の正規ファイルは表を書けなかった）。
+        let json = v5_json_with_dimension(TABLE_GEOM_JSON);
+        assert!(matches!(from_json(&json), Err(IoError::Json(_))));
+    }
+
+    #[test]
+    fn v6_file_with_invalid_table_is_rejected() {
+        // v6 は表を読めるが、core の `validate`（M10 タスク56）に違反する値は
+        // 読込境界で拒否する（行数0）。
+        let default_style = serde_json::to_string(&mcad_core::DimStyle::default()).unwrap();
+        let base = v5_json(r#"{"num": 1, "den": 1}"#, "0.35", "null", &default_style).replacen(
+            "\"version\": 5",
+            "\"version\": 6",
+            1,
+        );
+        let bad_table = base.replace(
+            r#""geom": {"Shape": {"Point": {"x": 0.0, "y": 0.0}}}"#,
+            r#""geom": {"Table": {"anchor": {"x": 0.0, "y": 0.0},
+                "col_widths_mm": [], "row_heights_mm": [], "text_height_mm": 3.5, "cells": []}}"#,
+        );
+        assert_ne!(bad_table, base, "テスト前提: 置換が効いている");
+        assert!(matches!(
+            from_json(&bad_table),
+            Err(IoError::InvalidGeometry { .. })
         ));
     }
 

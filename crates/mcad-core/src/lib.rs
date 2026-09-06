@@ -12,6 +12,8 @@
 //!   [`DimAnnotation::validate`] に [`DimKind`] を渡して行う
 //! - 図面メタデータ: [`SheetMeta`]（[`Scale`] / [`PaperSize`] / [`Orientation`] /
 //!   [`TitleBlockKind`] / [`TitleBlockFields`]）と表題欄様式 [`TitleBlockTemplate`]
+//! - 表: [`TableGeom`]（[`EntityGeom::Table`] の中身。汎用表・部品表の土台。
+//!   行列数・寸法の上限は [`MAX_TABLE_ROWS`] / [`MAX_TABLE_COLS`] / [`MAX_TABLE_MM`]）
 //! - ドキュメント: [`Document`]（エンティティ・レイヤー・カレントレイヤー・
 //!   図面メタデータと履歴を保持）
 //! - 変更: [`Command`] を [`Document::apply`] に渡す。戻り値の [`NewIds`] で
@@ -51,7 +53,10 @@ pub use dim::{
 };
 pub use document::{Document, NewIds};
 pub use entity::Entity;
-pub use entity_geom::{DimDiameter, DimLinear, DimRadial, EntityGeom, TextGeom};
+pub use entity_geom::{
+    DimDiameter, DimLinear, DimRadial, EntityGeom, MAX_TABLE_COLS, MAX_TABLE_MM, MAX_TABLE_ROWS,
+    TableGeom, TextGeom,
+};
 pub use error::CoreError;
 pub use id::{EntityId, LayerId};
 pub use layer::Layer;

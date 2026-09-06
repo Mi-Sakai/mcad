@@ -805,10 +805,11 @@ mod tests {
     use super::*;
     use crate::{
         ArrowPlacement, DimAnnotation, DimDiameter, DimLinear, DimStyle, FitClass, Linetype,
-        MAX_DIM_DECIMALS, MAX_SCALE_TERM, Orientation, PaperSize, ProjectionMethod, Scale,
-        SizeTolerance, Style, TitleBlockFields, TitleBlockKind, TitleBlockTemplate, Unit, WidthMm,
+        MAX_DIM_DECIMALS, MAX_SCALE_TERM, MAX_TABLE_MM, MAX_TABLE_ROWS, Orientation, PaperSize,
+        ProjectionMethod, Scale, SizeTolerance, Style, TableGeom, TitleBlockFields, TitleBlockKind,
+        TitleBlockTemplate, Unit, WidthMm,
     };
-    use mcad_geom::{DimSymbol, LineSeg, Point2, Shape};
+    use mcad_geom::{ArrowKind, DimSymbol, LineSeg, Point2, Shape};
 
     fn line(x: f64) -> EntityGeom {
         EntityGeom::Shape(Shape::Line(LineSeg::new(
@@ -2120,6 +2121,162 @@ mod tests {
         assert_eq!(doc.entity_count(), before);
     }
 
+    // --- 表（M10 タスク56）---
+
+    /// 2 行 × 3 列の妥当な表（幅 120mm・高さ 18mm・文字 3.5mm）。
+    fn table() -> TableGeom {
+        TableGeom {
+            anchor: Point2::new(10.0, 20.0),
+            col_widths_mm: vec![30.0, 40.0, 50.0],
+            row_heights_mm: vec![8.0, 10.0],
+            text_height_mm: 3.5,
+            cells: ["a", "b", "", "d", "e", "f"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    /// コマンド境界が拒否すべき表の一覧（理由つき）。
+    fn invalid_tables() -> Vec<(&'static str, TableGeom)> {
+        let with = |f: fn(&mut TableGeom)| {
+            let mut t = table();
+            f(&mut t);
+            t
+        };
+        vec![
+            (
+                "no rows",
+                with(|t| {
+                    t.row_heights_mm.clear();
+                    t.cells.clear();
+                }),
+            ),
+            (
+                "no columns",
+                with(|t| {
+                    t.col_widths_mm.clear();
+                    t.cells.clear();
+                }),
+            ),
+            (
+                "cell count mismatch",
+                with(|t| {
+                    t.cells.pop();
+                }),
+            ),
+            (
+                "non-finite anchor",
+                with(|t| t.anchor = Point2::new(f64::NAN, 0.0)),
+            ),
+            (
+                "non-finite column width",
+                with(|t| t.col_widths_mm[0] = f64::INFINITY),
+            ),
+            (
+                "non-positive row height",
+                with(|t| t.row_heights_mm[1] = 0.0),
+            ),
+            (
+                "text height equal to the smallest row height",
+                with(|t| {
+                    t.text_height_mm = 8.0;
+                }),
+            ),
+            (
+                "control character in a cell",
+                with(|t| {
+                    t.cells[2] = "a\nb".to_owned();
+                }),
+            ),
+            (
+                "too many rows",
+                with(|t| {
+                    t.row_heights_mm = vec![1.0; MAX_TABLE_ROWS + 1];
+                    t.cells = vec![String::new(); (MAX_TABLE_ROWS + 1) * 3];
+                }),
+            ),
+            (
+                "total width over the limit",
+                with(|t| {
+                    t.col_widths_mm = vec![MAX_TABLE_MM * 0.9; 3];
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn valid_table_passes_the_command_boundary() {
+        // 受理側を固定する（検証が常に Err を返す実装への退行防止）。空セルは正当。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let geom = EntityGeom::Table(table());
+        let id = add_entity_get_id(
+            &mut doc,
+            Entity::new(geom.clone(), layer, Style::inherited()),
+        );
+        assert_eq!(doc.entity(id).unwrap().geom, geom);
+
+        // 行を 1 段増やす編集も通る（表は上へ伸び、アンカー＝左下は動かない）。
+        let mut grown = table();
+        grown.row_heights_mm.insert(0, 8.0);
+        grown.cells.splice(0..0, vec![String::new(); 3]);
+        let grown = EntityGeom::Table(grown);
+        doc.apply(Command::ModifyEntity {
+            id,
+            new_geom: grown.clone(),
+        })
+        .unwrap();
+        assert_eq!(doc.entity(id).unwrap().geom, grown);
+    }
+
+    #[test]
+    fn invalid_tables_are_rejected_by_add_entity() {
+        // `AddEntity` の実行前チェックで CoreError::InvalidGeometry になり、
+        // ドキュメントは一切変わらない。
+        for (why, bad) in invalid_tables() {
+            let mut doc = Document::new();
+            let before = doc.entity_count();
+            let generation_before = doc.generation();
+            let result = doc.apply(add_line(&doc, EntityGeom::Table(bad)));
+            assert!(
+                matches!(result, Err(CoreError::InvalidGeometry(_))),
+                "{why}: expected rejection, got {result:?}"
+            );
+            assert_eq!(doc.entity_count(), before, "{why}");
+            assert_eq!(doc.generation(), generation_before, "{why}");
+            assert!(!doc.can_undo(), "{why}");
+        }
+    }
+
+    #[test]
+    fn invalid_tables_are_rejected_by_modify_entity() {
+        // `ModifyEntity` も同じ境界を通る。元の幾何・履歴・世代が保たれること。
+        for (why, bad) in invalid_tables() {
+            let mut doc = Document::new();
+            let layer = doc.current_layer();
+            let original = EntityGeom::Table(table());
+            let id = add_entity_get_id(
+                &mut doc,
+                Entity::new(original.clone(), layer, Style::inherited()),
+            );
+            let generation_before = doc.generation();
+            let undo_len_before = doc.undo_stack.len();
+
+            let result = doc.apply(Command::ModifyEntity {
+                id,
+                new_geom: EntityGeom::Table(bad),
+            });
+            assert!(
+                matches!(result, Err(CoreError::InvalidGeometry(_))),
+                "{why}: expected rejection, got {result:?}"
+            );
+            assert_eq!(doc.entity(id).unwrap().geom, original, "{why}");
+            assert_eq!(doc.undo_stack.len(), undo_len_before, "{why}");
+            assert_eq!(doc.generation(), generation_before, "{why}");
+        }
+    }
+
     // --- 世代カウンタ（dirty 判定の基盤、DESIGN.md M4 タスク14）---
 
     #[test]
@@ -2366,6 +2523,7 @@ mod tests {
             ext_overshoot_mm: 2.5,
             text_gap_mm: 2.0,
             tolerance_scale: 0.5,
+            arrow_kind: ArrowKind::Open30,
         }
     }
 

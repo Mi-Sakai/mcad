@@ -144,6 +144,38 @@ fn square_glyph(h: f64) -> SymbolGlyph {
     }
 }
 
+/// 寸法矢先の種類（DESIGN.md 7章「随時対応」の「寸法矢印のブロック化」設計確定
+/// 1・3）。`.mcad` v6 で `mcad-core::DimStyle::arrow_kind`（文書単位で1つ）が
+/// この型を保持する。
+///
+/// JIS Z 8317-1:2008 附属書A の図示記号を優先し、AutoCAD の `DIMBLK` 系互換名は
+/// 参考に留める（設計確定3）。**形状生成（`arrow_glyph` 純関数）は M10 タスク63で
+/// 実装する** — このバリアント自体は `.mcad` v6 のスキーマ確定のため先に導入する
+/// （タスク57・63 の分割。設計確定1〜2）。
+///
+/// `#[non_exhaustive]`: 種別は今後も増えうる。未知バリアントは呼び出し側が
+/// [`ArrowKind::ClosedFilled`] として扱う（設計確定3。M9 判断1 と同じ「黙って
+/// 壊れるより保守的な既定」）。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ArrowKind {
+    /// 閉じた塗りつぶし矢（現行・既定）。
+    #[default]
+    ClosedFilled,
+    /// 閉じた白抜き矢（輪郭 stroke のみ。モノクロ出力・青図で背景色に依存しない）。
+    ClosedBlank,
+    /// 開いた矢、全開き角 30°（JIS Z 8317-1:2008 附属書A）。
+    Open30,
+    /// 開いた矢、全開き角 90°（JIS Z 8317-1:2008 附属書A）。
+    Open90,
+    /// 斜線（建築用チック、45°）。
+    Oblique,
+    /// 小円（塗りつぶし）。
+    Dot,
+    /// 矢先なし。
+    None,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +314,16 @@ mod tests {
             assert!((v2.x - v1.x * 2.0).abs() < 1e-9);
             assert!((v2.y - v1.y * 2.0).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn arrow_kind_defaults_to_closed_filled() {
+        // `.mcad` v1〜v5 の既定値補完先（設計確定1・3、`DimStyle::arrow_kind` の
+        // `#[serde(default)]` が使う値）。実際の JSON タグ名を含む serde 往復は
+        // `mcad-io`（v6 の実ファイル形式）側の
+        // `v6_round_trip_is_lossless_including_table_and_arrow_kind` で固定する
+        // （`mcad-geom` は `serde_json` に依存していないため、ここでは
+        // `Default` の値だけを固定する）。
+        assert_eq!(ArrowKind::default(), ArrowKind::ClosedFilled);
     }
 }

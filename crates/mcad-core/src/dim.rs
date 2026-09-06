@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use mcad_geom::{DimSymbol, Point2};
+use mcad_geom::{ArrowKind, DimSymbol, Point2};
 
 use crate::CoreError;
 
@@ -505,6 +505,15 @@ pub struct DimStyle {
     /// 公差文字を寸法値に対して何倍の高さで書くか。既定 0.7
     /// （規定 5-12-2 2)「公差数値の文字サイズは、寸法数値の 70% 程度に縮小する」）。
     pub tolerance_scale: f64,
+    /// 矢先の種類。既定 [`ArrowKind::ClosedFilled`]（現行の形。DESIGN.md 7章「随時
+    /// 対応」の「寸法矢印のブロック化」設計確定1）。
+    ///
+    /// 形状生成（`arrow_glyph`）と画面/plot への反映は M10 タスク63。ここではまだ
+    /// スキーマ（`.mcad` v6）とスタイル保持のみを持つ。`#[serde(default)]` を付け、
+    /// v1〜v5 の `.mcad`（このキーを持たない）を [`ArrowKind::ClosedFilled`] へ
+    /// 既定値補完する（`decimals` 等、他フィールドと同じ流儀）。
+    #[serde(default)]
+    pub arrow_kind: ArrowKind,
 }
 
 impl DimStyle {
@@ -520,6 +529,7 @@ impl DimStyle {
         ext_overshoot_mm: 2.0,
         text_gap_mm: 1.4,
         tolerance_scale: 0.7,
+        arrow_kind: ArrowKind::ClosedFilled,
     };
 
     /// スタイルが描画・出力に使える形か検証する。

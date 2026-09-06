@@ -28,7 +28,7 @@ use mcad_core::{
     Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style,
     TextGeom, TitleBlockFields, TitleBlockKind, WidthMm,
 };
-use mcad_geom::{Aabb, Arc, DimSymbol, Point2, Polyline, Shape};
+use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use frame::{frame_layout, paper_to_world, parse_scale_input};
@@ -4699,6 +4699,11 @@ struct DimStyleDialogState {
     ext_overshoot_mm: String,
     text_gap_mm: String,
     tolerance_scale: String,
+    /// 矢先の種類。ダイアログにコンボはまだ無い（M10 タスク63で追加）ので、開いた
+    /// ときの値をそのまま持ち回るだけ。ここで持たずに `DimStyle::DEFAULT` を常用
+    /// すると、v6 ファイルで既定以外の矢先を選んだ図面がこのダイアログの OK で
+    /// 黙って `ClosedFilled` へ戻ってしまう。
+    arrow_kind: ArrowKind,
     /// OK 時のパース/検証失敗をインライン表示するための直近エラー。
     error: Option<String>,
 }
@@ -4715,6 +4720,7 @@ impl DimStyleDialogState {
             ext_overshoot_mm: format!("{}", style.ext_overshoot_mm),
             text_gap_mm: format!("{}", style.text_gap_mm),
             tolerance_scale: format!("{}", style.tolerance_scale),
+            arrow_kind: style.arrow_kind,
             error: None,
         }
     }
@@ -4749,6 +4755,7 @@ impl DimStyleDialogState {
             ext_overshoot_mm,
             text_gap_mm,
             tolerance_scale,
+            arrow_kind: self.arrow_kind,
         };
         style.validate()?;
         Ok(style)

@@ -2,7 +2,7 @@
 
 *[日本語版 README](./README.md)*
 
-A 2D CAD application built with Rust and egui. Current version: **v0.9.1**.
+A 2D CAD application built with Rust and egui. Current version: **v0.10.0**.
 
 > **Note on language.** The project's design documents (`DESIGN.md`, `AGENTS.md`,
 > `CHANGELOG.md`) are written in Japanese, and the application UI is being migrated
@@ -23,10 +23,11 @@ for the design and [`AGENTS.md`](./AGENTS.md) for the development conventions
 
 ## Features
 
-- **Drawing**: points, line segments, circles, arcs (three-point: start / through / end), polylines, text (CJK supported), **dimensions** (linear, radial and diameter; auxiliary symbols φ/Sφ/□/R/SR/CR/C/t; tolerance support; style editing; drag text position)
+- **Drawing**: points, line segments, circles, arcs (three-point: start / through / end), polylines, text (CJK supported), **dimensions** (linear, radial and diameter; auxiliary symbols φ/Sφ/□/R/SR/CR/C/t; tolerance support; style editing; seven arrowhead styles; drag text position)
 - **Editing**: selection (click, rubber band, additive), move, duplicate, rotate, mirror, offset, **trim, extend, fillet, split**, delete
 - **Isometric drawing aids**: isometric grid (`F5`), isometric axes for orthogonal mode, and an isometric circle tool (`I`, four-centre method). No Z axis or true ellipse; everything stays 2D arcs
 - **Snapping**: endpoint, intersection, midpoint, center and grid candidates chosen by priority, with a distinct marker per kind
+- **Tables and parts lists**: a general table entity (`K`, with cells, column widths and row heights edited in a dedicated dialog) and a parts-list preset from the drafting standard (item no. / name / quantity / material / remarks, placed right above the title block). Entries are typed by hand; nothing is aggregated from the drawing automatically
 - **Layers**: color, visibility, lock, stacking order (front / back buttons), managed in a dedicated panel
 - **Undo/redo**: built on the command pattern
 - **Drawing frame and title block**: paper size, scale and title-block style (A/B/C) live in the sheet metadata and are drawn automatically; fields are filled in via a dedicated dialog
@@ -72,6 +73,7 @@ For everyday use, a release build is recommended: `cargo run --release -p mcad-a
 | `Shift+D` | Radial dimension (two clicks: a circle or arc, then the leader direction) |
 | `G` | Diameter dimension (two clicks: a circle or arc, then the direction of the dimension line) |
 | `I` | Isometric circle (click the centre, then a point at the radius; drawn as four arcs by the four-centre method. `Tab` during the preview cycles the face Top/Left/Right) |
+| `K` | Table (one click places an empty 3 × 3 table; edit cells, column widths, row heights, text height and the number of rows/columns from the 表を編集… (edit table) button in the right panel) |
 | `Enter` | Commit a polyline (two or more points, left open; clicking the start point closes and commits it) |
 | `Del` / `Backspace` | Delete the selected entities |
 | `Esc` | Cancel drawing or placement / discard a rubber-band drag / clear the selection |
@@ -92,7 +94,7 @@ a settings file and restored on the next launch (see "Settings" below).
 
 ## File formats
 
-- **`.mcad`**: the native JSON format. As of v0.9.0 the schema is v5; v1 through v4 files still load (backward compatible, with dimension settings filled in by defaults)
+- **`.mcad`**: the native JSON format. As of v0.10.0 the schema is v6; v1 through v5 files still load (backward compatible: v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era)
 - **New drawings** start with `"0"` plus five layers matching the drafting standard's line table (centre line, hidden line, outline, dimension line, text, with their linetypes and widths), and the current layer is the outline layer. Dimensions and text are placed automatically on layers named `寸法線` (dimension line) and `文字` (text) when those exist (in a loaded drawing without them, the current layer is used). The standard layers can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
 
 ## Settings
@@ -120,7 +122,9 @@ format — the original DXF file is never overwritten. Be aware of the following
 - **Line width**: per-entity line width round-trips, but a layer's default line width is not preserved and falls back to the default (0.35mm) — a limitation of the `dxf` crate 0.6.1
 - **Linetype**: continuous / dashed / dash-dot / dash-dot-dot round-trips for both layers and entities. Unknown linetype names fall back to continuous
 - **TEXT**: position, height and rotation are mapped. Height is converted against the drawing's scale, in paper mm. Strings containing CJK are written and restored as UTF-8 (the DXF header is R2007). TEXT with a non-standard justification — anything other than horizontal Left plus vertical Baseline — is skipped
-- **DIMENSION**: mcad dimensions are not exported to DXF, as there is no corresponding primitive; the number of skipped entities is shown in the status bar. They are saved normally in `.mcad`. Importing DXF DIMENSION is planned for M9
+- **DIMENSION**: mcad dimensions are not exported to DXF, as there is no corresponding primitive; the number of skipped entities is shown in the status bar. They are saved normally in `.mcad`. Importing DXF DIMENSION is planned for M11
+- **Tables**: a table is exported decomposed into its rules (`LINE`) and non-empty cell texts (`TEXT`). This is a **one-way trip** — reimporting does not rebuild the table entity, and the distinction between the outer border and the inner rules is lost. `ACAD_TABLE` written by other software is skipped, since the `dxf` crate 0.6.1 has no type for it (it is not even counted as skipped)
+- **Drawing frame and title block**: these are not exported to DXF, because DXF has nowhere to carry the sheet metadata. A reimported drawing draws its frame from the default paper and scale, so the frame no longer lines up with the geometry the way it did in the original
 - **CJK text in other applications**: CJK written by mcad may appear garbled in other CAD software (confirmed with LibreCAD). DXF cannot embed the font itself, so rendering depends on the fonts installed on the receiving side
 
 ## Architecture

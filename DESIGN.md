@@ -920,3 +920,142 @@ M11 では扱わない**。関連付け情報(DIMASSOC)は公開フィールド�
 以後の運用: マイルストーン完了時のドキュメント整合タスクで当該章を `docs/design/` へ移す。
 
 M11 以降の詳細設計は、各マイルストーン着手時に本章へ追記する(M4 までと同じ運用)。
+
+### M11: 性能と互換性(v0.11.0)の設計(2026-09-13 詳細設計、実装未着手)
+
+7章「随時対応」の「回転寸法と DXF DIMENSION の一括設計」で決めた3段階構成(M11-0 契約固定 →
+M11-1 最小 import → M11-2 UI と編集)を実装可能な粒度へ落とす。空間インデックスと M5〜M10 の
+残債解消も本マイルストーンに含む。
+
+#### M11-0 の成果: 契約の固定(2026-09-13、采配役)
+
+**(1) DXF 種別ごとの対応表**(`dxf` 0.6.1 の生成コードと `spec/EntitiesSpec.xml` を采配役が実測、
+2026-09-13)。クレートが読める DIMENSION は5型で、`DimensionBase`(共通)+ 型ごとの定義点を持つ。
+
+| DXF 種別(`DimensionType`) | クレートの型 | mcad の写像 | 備考 |
+|---|---|---|---|
+| Aligned = 1 | `RotatedDimension` | `DimLinear`(`direction = Aligned`) | 13/14 = 計測 2 点、10 = 寸法線の位置 |
+| RotatedHorizontalOrVertical = 0 | `RotatedDimension` | `DimLinear`(`direction = Rotated(50°)`) | 50 = 寸法線の角度(度)。**Aligned と同じ型**で `dimension_type` が区別する |
+| Radius = 4 | `RadialDimension` | `DimRadial` | 10 = 中心、15 = 円周上の点、40 = 引出長 |
+| Diameter = 3 | `DiameterDimension` | `DimDiameter` | 10 と 15 が直径の両端 |
+| AngularThreePoint = 5 | `AngularThreePointDimension` | `DimAngular`(新設) | 13/14 = 角の 2 点、15 = 頂点、10 = 弧の位置 |
+| Ordinate = 6 | `OrdinateDimension` | `DimOrdinate`(新設) | 13 = 計測点、14 = 引出線端、10 = 原点、`is_ordinate_x_type` が X/Y |
+| Angular(2直線) = 2 | **無し** | スキップ | クレートに `AcDb2LineAngularDimension` の読込分岐が無い |
+| 弧長(type 8) | **無し** | スキップ | `DimensionType` に値自体が無い |
+
+- **定義点の意味づけ(10/13/14/15 が実際に何を指すか)は M11-1 タスク67 で実ファイル
+  (AutoCAD・LibreCAD が書いた DXF)で検証してから確定する。** 上表は spec の group code と
+  DXF リファレンスの一般的な解釈であり、**采配役はフィールド名と型は実測したが、意味の
+  対応は未検証**。ここを推測のまま実装すると計測点と寸法線位置が入れ替わる。
+- 2直線角度・弧長は import でスキップし件数に計上する。**ただし M10 タスク61 で判明したとおり、
+  クレートが `EntityType` を持たない型はパーサ側で読み飛ばされ `entities()` に現れないため
+  計上できない。** 2直線角度と弧長がこれに該当するので、「読めない種別があった」ことは
+  ユーザーへ伝えられない。この制約を README と import summary の doc に明記する。
+- 関連付け(DIMASSOC)はクレートの公開フィールドに無いため、**すべて静的寸法として取り込む**
+  (M9 設計判断どおり非関連。図形を動かしても寸法値は追従しない)。
+
+**(2) 角度の単位**: DXF の角度フィールド(50 `rotation_angle`、51 `horizontal_direction_angle`、
+52 `extension_line_angle`、53 `text_rotation_angle`)は**すべて度**、mcad の角度は**すべてラジアン**
+(`TextGeom::angle`・`DimDiameter::angle`・`DimRadial::leader_angle` と同じ契約)。変換は
+**io 境界の 1 箇所**(`dxf_file.rs` の import/export 関数)に閉じ、`to_radians()` / `to_degrees()` を
+使う。角度を持つ寸法すべてについて「mcad → DXF → mcad」の往復で角度が一致することをテストで
+固定する(許容 1e-9 rad)。**core・app は度を一切扱わない。**
+
+**(3) `.mcad` v7 のデータモデル**(M11-1 で 1 回のバージョン上げにまとめる。v6 DTO は凍結):
+
+- `DimLinear` へ `direction: DimDirection` を追加(`#[serde(default)]`、既定 `Aligned`)。
+  `#[non_exhaustive] enum DimDirection { Aligned, Rotated(f64 /* ラジアン、絶対角 */) }`。
+  水平/鉛直は `Rotated(0)` / `Rotated(π/2)` で表し、**専用バリアントは設けない**(データとしては
+  同一で、UI のボタンが角度を入れるだけ。バリアントを増やすと「水平と Rotated(0) のどちらで
+  保存するか」という無意味な分岐が core・io・app の3層に生じる)。展開は計測 2 点を
+  `direction` の方向へ投影して寸法線の端点を決め、補助線は各計測点から寸法線へ下ろす。
+  `Aligned` のときの展開は現行と完全に同一(v6 以前の図面の見た目は変わらない)。
+- `DimAngular { vertex: Point2, p1: Point2, p2: Point2, arc_radius: f64, annotation }`(新バリアント)。
+  `p1`/`p2` は頂点から見た 2 方向を決める点(距離は寸法線の弧の位置に使わず、`arc_radius` が決める)。
+  値は 2 方向のなす角(度表示。単位記号 `°` を付ける)。**許容記号は無し**(`DimKind::Angular` の
+  `allowed_symbols` は空)。
+- `DimOrdinate { origin: Point2, feature: Point2, leader_end: Point2, axis: OrdinateAxis, annotation }`
+  (新バリアント)。`#[non_exhaustive] enum OrdinateAxis { X, Y }`。値は `feature − origin` の
+  該当成分。
+- `DimAnnotation` へ 3 フィールドを追加(いずれも `#[serde(default)]`):
+  - `text_rotation: Option<f64>`(ラジアン。`None` = 既定の読み取り方向規則に従う。
+    `Some(0.0)` で水平固定。DXF 53 の写像先)
+  - `value_style: ValueStyle`(`#[non_exhaustive] enum { Plain, Reference, TheoreticallyExact }`、
+    既定 `Plain`)。`Reference` は値を括弧 `(50)`、`TheoreticallyExact` は枠 `[50]` で囲む。
+    **`value_override` とは独立**(上書きした値にも括弧・枠は掛かる)。
+  - `prefix: Option<String>` / `suffix: Option<String>`(`2×φ10` の `2×`、`4-M6` の `-M6` 等)。
+    DXF group 1 の文字テンプレート(`<>` を実測値へ置換)はここへ写す — `<>` の前後を
+    prefix/suffix に分解し、`<>` を含まない文字列は `value_override` とする。
+- 全フィールドに既定値があり、既定は現行描画と同値。v1〜v6 は既定値補完で無損失。
+  検証(`validate`)は M9 と同じ 3 境界(core コマンド・v7 読込・UI 入力)で行う。
+
+#### 設計判断
+
+1. **展開の純関数を `mcad-core` へ移す**(タスク71)。現状 `crates/mcad-app/src/dimension.rs` と
+   `table.rs` にある展開(罫線・文字・矢先の座標を組む純関数)は app 層にあり、`mcad-io` から
+   使えない。そのため M10 タスク61 の DXF 表 export は**組版を io 側へ再実装しており、値が
+   乖離しても検出できない残債**になっている(M10 詳細設計の実装時追記)。寸法の分解 export
+   (下記2)で同じ二重化を繰り返さないよう、**展開を core へ移してから export を書く**。
+   移設後は app(画面)・io(DXF)・plot(SVG/PDF)が同じ実装を共有する。
+   - 移せる根拠: 展開は `TextGeom`(core)・`Shape` / `arrow_glyph`(geom)しか使わず、egui にも
+     `Document` にも依存しない。表示モード(F9)による寸法の大きさ解決は `DimRender` の
+     引数(ワールド長)として呼び出し側に残るので、core は表示状態を知らないまま保てる。
+2. **寸法・表は「分解して export」する**(2026-09-13 ユーザー選択、タスク72)。寸法線・補助線・
+   矢先・文字を `LINE` / 塗り(`SOLID` またはポリライン)/ `TEXT` へ分解して書く。理由:
+   (a) DXF の `DIMENSION` は見た目を構成する anonymous block への参照を持ち、それを書かないと
+   ビューアによっては何も表示されない。(b) 分解なら LibreCAD を含むどのビューアでも確実に
+   見える。(c) 表(M10)と同じ流儀で一貫する。**非対称往復**(読み戻しても寸法エンティティには
+   戻らない)であることを README・AGENTS.md・import summary の doc に明記する。
+   `.mcad` が正本であるという既存の位置づけ(DXF は交換用)は変えない。
+3. **空間インデックスは計測してから決める**(タスク66 → 76)。現状の実測が無いまま導入すると、
+   効果の無い複雑さを core へ持ち込む。数千エンティティの図面で描画・pick・矩形選択・
+   ズームフィットの時間を測り、**閾値(例: 1 フレーム 16ms を超える規模)が実在することを
+   確認してから**導入する。不要と判明したら「計測結果と見送りの判断」を記録して閉じる。
+4. **品質項目を先に置く**(タスク64・65)。M11-1 は寸法モデルを広げるため、既存の寸法描画が
+   変わっていないことを機械的に保証する土台(SVG スナップショット)と、v1〜v6 の実ファイルを
+   読める保証(fixture)が先に要る。
+5. **non-goal(明記)**: 2直線角度寸法・弧長寸法(クレートが読めない)/ 関連付き寸法の追従
+   (非関連のまま)/ DIMSTYLE の完全な写像(単一 `DimStyle` へ丸め、落ちる情報は警告)/
+   ACAD_TABLE の import / 引出線・幾何公差・表面性状(G3)/ 図面枠の DXF 出力(v1.0.0 後の課題)/
+   部品表の自動集計(M10 設計方針2)。
+
+#### タスク分割
+
+M11-0(契約固定)は本章の上記で完了。以下は M11-1(64〜72)・M11-2(73〜75)・性能(66・76)・
+整合(77)。タスク64〜66 は相互に独立で並列に出せる。
+
+| # | タスク | 内容 | 担当 | 依存 |
+|---|---|---|---|---|
+| 64 | test: 寸法描画のスナップショット | 寸法3種 × 矢先7種 × 記号・公差・表示値上書きの代表組合せを SVG 文字列へ出して固定(`crates/mcad-app/tests/` に fixture)。**M11-1 のモデル拡張で既存描画が変わらないことの土台**。差分が出たら意図的かをレビューで判断する運用を doc に書く | implement-sonnet | — |
+| 65 | test: `.mcad` v1〜v6 の後方互換 fixture | 各版の実ファイルを `crates/mcad-io/tests/fixtures/` へ置き、読込結果(エンティティ数・種別・既定値補完の値)を固定。既存の「固定 JSON 文字列」テストを実ファイルへ寄せる。v7 追加時にこの一式が回帰網になる | implement-sonnet | — |
+| 66 | perf: 大規模図面の実測 | 1k/5k/20k エンティティの図面を生成し、描画1フレーム・pick・矩形選択・ズームフィット・`.mcad` 保存/読込の時間を release で実測して記録(`資料/` か DESIGN.md へ)。**空間インデックス(76)の要否と対象をこの数値で決める** | implement-sonnet | — |
+| 67 | io: DXF DIMENSION import(既存3種) | **まず実ファイルで定義点の意味を検証**(AutoCAD/LibreCAD が書いた Aligned/Radius/Diameter の DXF を用意し、10/13/14/15 がどの点かを確かめて対応表を確定)。そのうえで既存モデル(`DimLinear`/`DimRadial`/`DimDiameter`)へ写す。角度の度→ラジアン変換、押し出し法線が (0,0,1) でない寸法の受入条件、実測値(42)と再計算値の優先順位、DIMSTYLE の単一 `DimStyle` への写像と落ちる情報、anonymous block の扱い、警告の分類を**このタスクで決めて DESIGN.md へ追記**(M11-0 で絞った残り論点) | implement-opus | — |
+| 68 | core+io: 回転寸法と `.mcad` v7 | `DimDirection` 新設と `DimLinear.direction` 追加、展開(投影して寸法線を決める)・pick・plot の追従、v7 スキーマ(v6 凍結 DTO)、Rotated の import、`Aligned` の描画が現行と一致することをタスク64 のスナップショットで確認 | implement-opus | 67 |
+| 69 | core+io: 角度寸法・座標寸法 | `DimAngular`/`DimOrdinate` バリアント新設(validate・aabb・変換)、展開(角度は弧+2本の補助線、座標は引出線+値)・pick・plot、v7 へ相乗り、3点角度と Ordinate の import | implement-opus | 68 |
+| 70 | core+io: 注記の拡張 | `DimAnnotation` へ `text_rotation` / `value_style` / `prefix` / `suffix` を追加、組版(括弧・枠・接頭辞/接尾辞)、v7 へ相乗り、DXF group 1 のテンプレート(`<>`)を prefix/suffix/value_override へ分解する写像 | implement-sonnet | 68 |
+| 71 | core: 展開の純関数を core へ移設 | `mcad-app` の `dimension.rs`(展開部)と `table.rs` を `mcad-core` へ移し、app・plot・io が同じ実装を使う。**M10 の組版二重化(io 側の表の再実装)もここで解消**。app 側は呼び出しのみ残す。移設で描画が変わらないことをタスク64 のスナップショットで保証 | implement-opus | 69, 70 |
+| 72 | io: 寸法・表の分解 export | 移設した展開を使い、寸法と表を `LINE` / 塗り / `TEXT` へ分解して DXF へ書く(設計判断2)。非対称往復を README・AGENTS.md・モジュール doc へ明記。スキップ件数から寸法を外す | implement-sonnet | 71 |
+| 73 | app: 回転寸法ツールと向き UI | 長さ寸法ツールに向き(整列/水平/鉛直/任意角)の切替を足す(キー割当・切替 UX はタスク内で確定)。直交モード時の向き自動判定。右パネル「寸法」で既存寸法の向きを変更 | implement-sonnet | 68 |
+| 74 | app: 角度寸法・座標寸法ツール | 角度寸法(3点クリック)・座標寸法(原点→計測点→引出線端)のツール、未使用キーの確認、右パネルの種別対応(角度寸法に記号コンボを出さない等) | implement-sonnet | 69 |
+| 75 | app: グリップ編集と連続/並列寸法 | 選択中の寸法の端点・寸法線位置をドラッグで編集(M9 の文字位置ドラッグと同じ別経路)、連続/並列寸法の連続入力、注記上書きの一括解除 | implement-sonnet | 73 |
+| 76 | geom/core: 空間インデックス | タスク66 の実測で必要と判明した操作に限って導入(候補: 一様グリッドまたは R-tree の最小実装を `mcad-geom` へ)。**不要なら見送りの判断と根拠を記録して閉じる**(タスク自体は残す) | implement-opus | 66 |
+| 77 | ドキュメント整合・v0.11.0 リリース | README・AGENTS.md(v7・寸法種別・DXF の非対称往復)・CHANGELOG・DESIGN.md 本章の反映と `docs/design/M11.md` への移設・リリース。**CHANGELOG は采配役が書く**(M9・M10 で haiku の草案に事実誤りがあったため) | implement-sonnet + 采配役 | 64-76 |
+
+#### 検収基準(M11完了の定義)
+
+- 他 CAD が書いた DXF の Aligned / Rotated / Radius / Diameter / 3点角度 / Ordinate の寸法が
+  読め、定義点の意味が実ファイルで検証済み(推測のまま実装していない)。2直線角度・弧長は
+  読み飛ばされること(および件数に計上できないこと)が doc に明記されている
+- DXF の角度が度で、mcad がラジアンであることが io 境界の 1 箇所に閉じており、角度を持つ
+  寸法すべてで往復一致がテストで固定されている
+- 回転寸法(水平/鉛直/任意角)・角度寸法・座標寸法が作図でき、画面と SVG/PDF で同一に描かれる。
+  `Aligned` の描画は v0.10.0 と一致する(スナップショットで確認)
+- 注記の拡張(文字回転・参考/理論寸法・接頭辞/接尾辞)が記入でき、3境界で不正値を拒否する
+- 寸法・表が DXF へ分解 export され、LibreCAD で罫線・文字・矢先が見える(手動確認)。
+  非対称往復であることが README・AGENTS.md に明記されている
+- `.mcad` v6 以前の読込が無損失(v1〜v6 の fixture で固定)、v7 往復が無損失
+- 大規模図面の実測値が記録され、空間インデックスの要否がその数値で判断されている
+  (導入したなら実測で改善が確認でき、見送ったなら根拠が記録されている)
+- 展開の純関数が core にあり、app・plot・io が同じ実装を使っている(M10 の組版二重化が解消)
+- `../tcad` の `cargo test --workspace` 通過、fmt / clippy / test 通過、GUI 変更は手動
+  スモークテストを記録する

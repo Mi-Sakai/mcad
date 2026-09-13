@@ -8,9 +8,12 @@
 //!
 //! TEXT（[`mcad_core::EntityGeom::Text`]）は M6 で export（タスク25）・import
 //! （タスク25b。当初 M9 予定だったが 2026-07-25 のユーザー判断で M6 へ前倒し）の
-//! 双方に対応した。寸法（DimLinear/DimRadial）は export も import も非対応
-//! （DXF の DIMENSION はブロック参照を伴い、対応するプリミティブがない設計判断。
-//! DESIGN.md M6 設計判断5、import 対応は M9 のまま）。
+//! 双方に対応した。
+//!
+//! 寸法は **import のみ M11 タスク67 で対応**した（下の「DIMENSION の import」）。
+//! **export は未対応**で、[`ExportSummary::skipped_entities`] に計上される
+//! （M11 タスク72 で「寸法線・補助線・矢先・文字へ分解して `LINE`/`TEXT` として
+//! 書く」方式になる予定。DESIGN.md M11 設計判断2。表と同じ非対称往復になる）。
 //!
 //! 表（[`mcad_core::EntityGeom::Table`]、M10）は**非対称往復**の best-effort で
 //! 対応する（DESIGN.md M10 設計方針6・詳細設計8、タスク61）:
@@ -29,8 +32,107 @@
 //!   に現れず読み飛ばされる（実測、詳細は
 //!   `tests::import_ignores_acad_table_and_still_reads_other_entities` の doc）。
 //!   したがってこの経路は `ImportSummary::skipped_entities` を増やさない
-//!   （DIMENSION・SPLINE 等、`EntityType` にバリアントはあるが `dxf_entity_to_geom`
+//!   （SPLINE・ELLIPSE 等、`EntityType` にバリアントはあるが `dxf_entity_to_geom`
 //!   が変換しないものは通常どおり計上される、という既存の区別と異なる）。
+//!
+//! **寸法の非対称は表と向きが逆**で、現状は import だけができる（M11 タスク67）。
+//! タスク72 で分解 export が入ると表と同じ向きの非対称（書けるが読み戻せない）にも
+//! なるため、そのときは「mcad が書いた寸法は読み戻せないが、他 CAD が書いた
+//! `DIMENSION` は読める」という二重の非対称になる。
+//!
+//! # DIMENSION の import（M11 タスク67）
+//!
+//! 他 CAD が書いた寸法を [`mcad_core::EntityGeom`] の `DimLinear` / `DimRadial` /
+//! `DimDiameter` へ写す（**export は未対応**。上記「設計方針」参照）。対応表は次のとおりで、
+//! 「クレートの型」は `dxf` 0.6.1 が group 100 のサブクラス名で選ぶ `EntityType`。
+//!
+//! | DXF 種別（group 70 の整数部） | クレートの型 | mcad | 備考 |
+//! |---|---|---|---|
+//! | 整列 = 1 | `RotatedDimension` | `DimLinear` | 13/14 = 計測 2 点、10 = 寸法線の位置 |
+//! | 回転 = 0 | `RotatedDimension` | `DimLinear`（条件付き） | 下記「回転寸法」 |
+//! | 直径 = 3 | `DiameterDimension` | `DimDiameter` | 10 と 15 が直径の両端 |
+//! | 半径 = 4 | `RadialDimension` | `DimRadial` | 10 = 中心、15 = 円周上の点 |
+//! | 3 点角度 = 5 | `AngularThreePointDimension` | **スキップ** | モデル新設は M11 タスク69 |
+//! | 座標 = 6 | `OrdinateDimension` | **スキップ** | 同上 |
+//! | 2 直線角度 = 2 | **無し** | **読めない** | 下記「読めない種別」 |
+//! | 弧長 | **無し** | **読めない** | `DimensionType` に値自体が無い |
+//!
+//! 整列寸法と回転寸法は**クレートでは同じ `RotatedDimension` 型**になる（区別は
+//! `dimension_base.dimension_type`）。group 70 は「0〜6 の整数 + 32/64/128 のビット」
+//! だが、クレートが `DimensionType` と `is_ordinate_x_type` /
+//! `is_at_user_defined_location` / `is_block_reference_referenced_by_this_block_only` へ
+//! 分解済みなので、このモジュールでビット演算はしない。
+//!
+//! ## 回転寸法は「整列寸法と同じ図になる」ものだけ受け入れる
+//!
+//! 回転寸法の値は計測 2 点を group 50 の方向へ**投影した長さ**で、
+//! [`mcad_core::DimLinear`] が描く `|p2 − p1|` とは一般に一致しない。向きを保存できる
+//! `DimDirection` が入るのは M11 タスク68 なので、それまでは**計測 2 点の向きが
+//! group 50 と平行なものだけ**を取り込み、残りは
+//! [`ImportSummary::skipped_dimensions`] へ計上してスキップする（対応している
+//! 種別だが表現できないだけで、「未対応の種別」ではない。判定と実測根拠は
+//! [`linear_dimension_to_geom`] の doc）。**水平／鉛直という向きの問題ではない**
+//! （斜辺に付けた水平寸法は落ち、鉛直に並んだ 2 点の鉛直寸法は通る）。
+//!
+//! ## 角度の単位
+//!
+//! DXF の角度フィールド（50 / 51 / 52 / 53）は**度**、mcad は**すべてラジアン**
+//! （DESIGN.md M11-0(2)）。変換はこのモジュールに閉じる。
+//!
+//! ## 読めない種別は件数にも出ない
+//!
+//! 2 直線角度寸法（`AcDb2LineAngularDimension`）と弧長寸法には `dxf` 0.6.1 に読込
+//! 分岐が無く、**`drawing.entities()` に現れないまま捨てられる**（実測: クレートの
+//! `Entity::read` は未知のサブクラス名で `continue 'new_entity` する）。したがって
+//! 「読めない寸法があった」ことをユーザーへ伝えられない（`ACAD_TABLE` と同じ制約）。
+//! LibreCAD の角度寸法はこの形式で書かれるため、**LibreCAD の角度寸法は無言で消える**。
+//!
+//! ## 見た目の anonymous block は読まない（これでよい）
+//!
+//! LibreCAD（libdxfrw）や AutoCAD は、寸法の見た目（寸法線・補助線・矢先・文字）を
+//! anonymous block（group 2 の `*D1` 等）として `BLOCKS` セクションへ書き、DIMENSION は
+//! それを参照する。mcad は `BLOCKS` を読まないので、**DIMENSION を取り込んでも同じ
+//! 線が二重に入らない**（block 側の `LINE`/`SOLID`/`MTEXT` は丸ごと無視される）。
+//! group 2 の参照名も使わない。回帰テストは `tests/dxf_dimensions.rs` の
+//! `synthetic_dimensions_fixture_imports_four_dimensions_and_skips_the_rotated_one`
+//! （取り込み後のエンティティ数が block の中身を含まないことを固定する）。
+//!
+//! ## 落ちる情報
+//!
+//! 寸法ごと捨てるものは 2 種類ある。**種別自体が未対応**（3 点角度寸法・座標寸法。
+//! [`ImportSummary::skipped_entities`]）と、**対応している種別（整列・回転・
+//! 半径・直径）だが mcad のモデルでは測定値や位置を変えずに表現できない**もの
+//! （回転寸法の非平行・group 51・押し出し法線が +Z でない・計測点の退化・実測値の
+//! 食い違い。[`ImportSummary::skipped_dimensions`]）。ここへさらに、取り込んだうえで
+//! 属性だけ捨てるもの（[`ImportSummary::dropped_dimension_details`]）と、
+//! **黙って捨てるもの**（計上しない）を合わせて 4 段階になる。どれがどれかは
+//! [`ImportSummary::skipped_dimensions`]・[`ImportSummary::dropped_dimension_details`]
+//! と [`dimension_annotation`] の doc に書いてある。押し出し法線が +Z でない寸法を
+//! 拒否する理由は [`is_dimension_plane_supported`] の doc。
+//!
+//! ### 実測値（group 42）が食い違う寸法は取り込まずスキップする
+//!
+//! group 42（`actual_measurement`、「書いた CAD が表示していた値」）が書かれていて、
+//! mcad が定義点から再計算した値と食い違う寸法は、[`ImportSummary::dropped_dimension_details`]
+//! へ計上して取り込む（＝値だけ黙って変わる）のではなく、**取り込まず
+//! [`ImportSummary::skipped_dimensions`] へ計上してスキップする**（判定は
+//! [`actual_measurement_mismatches`]）。典型的な原因は DIMSTYLE の測定倍率
+//! （DIMLFAC）で、mcad には測定倍率の概念が無いため表現できない。この食い違いは
+//! **幾何が平行のまま値だけ違う**ケースがあり、回転寸法の「計測 2 点が group 50 と
+//! 平行なものだけ受け入れる」判定（上記）では防げないため、別枠で判定する。
+//!
+//! group 42 が省略された DXF（実測: libdxfrw 0.6.3 = LibreCAD）では、省略と
+//! 「値が 0」を区別できないためこの検査自体が効かず、寸法は無条件で取り込まれる
+//! （`tests/fixtures/synthetic_dimensions.dxf` の回帰テストはこの経路を通る）。
+//!
+//! DIMSTYLE（group 3）は**名前ごと捨てる**。mcad は文書に 1 つの
+//! [`mcad_core::DimStyle`] しか持たない（M9 設計判断）ため、矢先の形・文字高さ・
+//! 桁数はすべて mcad 側の現在のスタイルで描かれ、**他 CAD で見たときと寸法の見た目は
+//! 一致しない**（値と定義点だけが保存される）。色の ACI 近似・未知線種の
+//! `Continuous` フォールバックと同じ「確定的に解釈して計上しない」扱い。
+//!
+//! 関連付け（DIMASSOC）はクレートの公開フィールドに無いため、**すべて静的寸法として
+//! 取り込む**（M9 設計判断どおり非関連。図形を動かしても寸法値は追従しない）。
 //!
 //! # 文字列は UTF-8 で書く（ヘッダバージョン R2007）
 //!
@@ -137,10 +239,10 @@
 //!
 //! # 未対応エンティティ・不正ジオメトリの扱い（import）
 //!
-//! - `EntityType` のうち Line/Circle/Arc/LwPolyline/ModelPoint/Text 以外
-//!   （DIMENSION・SPLINE・ELLIPSE・INSERT など）は無視し、`skipped_entities`
-//!   としてカウントする。DIMENSION の import 対応は M9 の予定（DESIGN.md M6
-//!   設計判断5）。
+//! - `EntityType` のうち Line/Circle/Arc/LwPolyline/ModelPoint/Text と、DIMENSION の
+//!   4 経路（整列・回転・半径・直径。上記「DIMENSION の import」）以外
+//!   （SPLINE・ELLIPSE・INSERT・3 点角度／座標寸法など）は無視し、
+//!   `skipped_entities` としてカウントする。
 //! - TEXT のうち位置基準（justification）が「水平 Left かつ垂直 Baseline」以外の
 //!   ものも無視してカウントする。この場合、文字位置は `location`（group code 10）
 //!   ではなく alignment point（group code 11）が持つが、mcad の
@@ -154,7 +256,10 @@
 //!   ファイル全体の import を失敗させたくないため。ただし DXF ファイル自体が
 //!   壊れている（構文が壊れている、テーブルが読めない等）場合は
 //!   `dxf::DxfError` 由来の [`crate::IoError::Dxf`] として失敗する
-//!   （こちらは個別エンティティの問題ではなく全体構造の異常）。
+//!   （こちらは個別エンティティの問題ではなく全体構造の異常）。この検証落ちが
+//!   寸法（`DimLinear`/`DimRadial`/`DimDiameter`。例: 半径・直径寸法の半径 0）で
+//!   起きた場合は、種別自体は対応しているため `skipped_entities` ではなく
+//!   `skipped_dimensions` へ計上する（[`ImportSummary::skipped_dimensions`] 参照）。
 //!
 //! # 未知のレイヤー名を参照するエンティティ
 //!
@@ -263,16 +368,19 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use dxf::entities::{
-    Arc as DxfArc, Circle as DxfCircle, Entity as DxfEntity, EntityType, Line as DxfLine,
-    LwPolyline, ModelPoint, Text as DxfText,
+    Arc as DxfArc, Circle as DxfCircle, DiameterDimension, DimensionBase, Entity as DxfEntity,
+    EntityType, Line as DxfLine, LwPolyline, ModelPoint, RadialDimension, RotatedDimension,
+    Text as DxfText,
 };
-use dxf::enums::{HorizontalTextJustification, Units as DxfUnits, VerticalTextJustification};
+use dxf::enums::{
+    DimensionType, HorizontalTextJustification, Units as DxfUnits, VerticalTextJustification,
+};
 use dxf::tables::{Layer as DxfLayer, LineType as DxfLineType};
 use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
 use mcad_core::{
-    Command, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Rgb, Style, TableGeom,
-    TextGeom, WidthMm, expand_table,
+    Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, Document, Entity, EntityGeom, Layer,
+    LayerId, Linetype, Rgb, Style, TableGeom, TextGeom, WidthMm, expand_table,
 };
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
@@ -308,13 +416,61 @@ pub struct ImportSummary {
     /// 再構築されたドキュメント。
     pub document: Document,
     /// 無視したエンティティ数（未対応の種別 + 不正なジオメトリ）。
+    ///
+    /// 寸法については**種別自体が未対応**（3 点角度寸法・座標寸法。上記
+    /// 「DIMENSION の import」対応表参照）のものだけがここに入る。整列・回転・
+    /// 半径・直径という対応している種別の寸法が個別の理由で取り込めなかった場合は
+    /// [`skipped_dimensions`](Self::skipped_dimensions) 側に入り、ここには含まれない。
     pub skipped_entities: usize,
+    /// **対応している種別**（整列・回転・半径・直径）の寸法のうち、mcad の
+    /// モデルでは測定値や位置を変えずに表現できないため取り込まなかった数
+    /// （M11 タスク67）。未対応の種別ではない（それは
+    /// [`skipped_entities`](Self::skipped_entities) 側）。
+    ///
+    /// 数えるのは次の 5 つ（詳細と実測根拠は
+    /// [`linear_dimension_to_geom`] / [`is_dimension_plane_supported`] /
+    /// [`actual_measurement_mismatches`] の doc）。
+    ///
+    /// - 回転寸法で、計測 2 点の向きが group 50 の方向と平行でない（投影値と
+    ///   実距離が食い違うため表現できない）
+    /// - 回転寸法で group 51（水平方向角）が 0 でない
+    /// - 押し出し法線（group 210/220/230）が +Z でない
+    /// - 計測点が退化している（長さ寸法の計測 2 点が同一、半径・直径寸法の半径が 0）
+    /// - 実測値（group 42）が mcad の再計算値と食い違う（典型的には DIMSTYLE の
+    ///   測定倍率 DIMLFAC が原因）
+    pub skipped_dimensions: usize,
     /// [`WidthMm`] の範囲（0.05..=5.0mm）外の DXF lineweight を範囲へクランプして
     /// 取り込んだ件数（レイヤー + エンティティの合計）。無視はしない（エンティティ
     /// ごと捨てる `skipped_entities` とは別枠）が、黙って値を変えたことを
     /// ステータス表示できるよう計上する（モジュール doc「線幅・線種は
     /// best-effort」参照）。
     pub clamped_line_widths: usize,
+    /// **取り込んだ**寸法のうち、mcad のモデルで表現できない属性を捨てた件数
+    /// （M11 タスク67、モジュール doc「DIMENSION の import」参照）。
+    ///
+    /// [`clamped_line_widths`](Self::clamped_line_widths) と同じ「捨てずに取り込むが
+    /// 黙って変えない」枠で、**寸法 1 件につき最大 1**（属性ごとではなく寸法ごとに
+    /// 数える）。読めなかった寸法そのものは種別が未対応なら
+    /// [`skipped_entities`](Self::skipped_entities)、対応している種別だが表現できない
+    /// なら [`skipped_dimensions`](Self::skipped_dimensions) 側に入る。
+    ///
+    /// 数えるのは次の 3 つ。
+    ///
+    /// - 文字テンプレート（group 1）が空でも `<>` でもない（スペース 1 文字の
+    ///   「文字を出さない」指定を含む）。M11 タスク70 までは無注記で取り込む
+    /// - 補助線の傾き（group 52 `extension_line_angle`）が 0 でない
+    /// - 寸法文字の回転（group 53 `text_rotation_angle`）が 0 でない
+    ///
+    /// 実測値（group 42 `actual_measurement`）が mcad の再計算値と食い違う寸法は
+    /// **ここへは計上せず**、取り込まずに [`skipped_dimensions`](Self::skipped_dimensions)
+    /// へ計上する（モジュール doc「実測値（group 42）が食い違う寸法は取り込まず
+    /// スキップする」参照）。
+    ///
+    /// DIMSTYLE 名（group 3）・引出線長（group 40）・文字の寄せ（group 71）は
+    /// **数えない**（全寸法で常に落ちる情報で、計上するとノイズにしかならない。
+    /// 色の ACI 近似・未知線種の `Continuous` フォールバックと同じ扱い。モジュール
+    /// doc 参照）。
+    pub dropped_dimension_details: usize,
 }
 
 /// DXF export の結果。
@@ -636,19 +792,327 @@ fn is_text_justification_supported(text: &DxfText) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------
+// DIMENSION の import（M11 タスク67）
+// ---------------------------------------------------------------------
+
+/// 押し出し法線（group 210/220/230）を +Z と見なす許容。
+///
+/// libdxfrw・AutoCAD とも 2D 図面では厳密に `(0,0,1)` を書く（または省略して
+/// クレート既定の `Vector::z_axis()` になる）ので、これは書式上の丸め誤差だけを
+/// 吸収するための値で、傾いた面を通すためのものではない。
+const DIM_NORMAL_EPS: f64 = 1e-9;
+
+/// 「2 方向が平行か」の許容（単位ベクトルの外積の絶対値）。
+///
+/// `1e-9` は角度にして約 6e-8 度。`50 = 90` の寸法で `cos(90°)` が `6.1e-17` に
+/// なる程度の丸めは通し、実際に傾いている寸法（例: [`linear_dimension_to_geom`] の
+/// doc が挙げる水平寸法の外積 0.137）は通さない。
+const DIM_PARALLEL_EPS: f64 = 1e-9;
+
+/// 実測値（group 42）と mcad の再計算値の一致判定に使う相対許容。
+const DIM_MEASUREMENT_REL_EPS: f64 = 1e-6;
+
+/// 寸法が mcad の XY 平面（法線 +Z）に載っているか。
+///
+/// mcad は 2D 専用で、[`EntityGeom`] の座標は常にワールド XY 平面上の点として
+/// 解釈される。押し出し法線が `(0,0,1)` 以外の DIMENSION は、定義点が OCS
+/// （object coordinate system）で書かれているため、そのまま WCS の座標として
+/// 読むと**鏡像・回転した位置に置かれる**（典型は法線 `(0,0,-1)` で、X 軸が
+/// 反転する）。逆変換して平面へ畳む方法は幾何的には書けるが、畳んだ結果は
+/// 元の 3D 配置とは別物であり、「mcad が表現できないものは黙って変形せず
+/// スキップして件数を通知する」既存方針（[`is_text_justification_supported`] の
+/// doc）に合わせて**拒否する**。
+///
+/// 拒否した寸法は（対応している種別なのに座標が平面に載らないため表現できない、
+/// という扱いなので）[`ImportSummary::skipped_dimensions`] に入る。
+fn is_dimension_plane_supported(base: &DimensionBase) -> bool {
+    let n = &base.normal;
+    n.x.abs() <= DIM_NORMAL_EPS
+        && n.y.abs() <= DIM_NORMAL_EPS
+        && (n.z - 1.0).abs() <= DIM_NORMAL_EPS
+}
+
+/// DIMENSION 共通部（[`DimensionBase`]）から [`DimAnnotation`] を組む。
+///
+/// mcad のモデルで表現できない属性があれば `dropped_detail` を立てる
+/// （[`ImportSummary::dropped_dimension_details`] へ 1 件として積まれる）。
+///
+/// # 写す
+///
+/// - **文字位置**: `is_at_user_defined_location`（group 70 の 128 ビット）が真なら、
+///   文字位置が作図者の明示指定なので `text_mid_point`（group 11）を
+///   [`DimAnnotation::text_anchor`] へ写す。偽なら DXF 側も自動配置なので `None`
+///   （mcad 側も自動配置）。**group 11 は自動配置でも「そのとき文字が置かれた位置」
+///   として書かれている**ため、常に写すと mcad の自動配置が効かなくなる。
+///
+/// # 捨てる（`dropped_detail` を立てる）
+///
+/// - **文字テンプレート**（group 1）: 空文字列と `<>` が「実測値を描く」＝ mcad の
+///   既定と同じなので何もしない。それ以外（スペース 1 文字の「文字を出さない」指定、
+///   `<>` を含むテンプレート、任意の固定文字列）は M11 タスク70 の
+///   `prefix` / `suffix` / `value_override` が入るまで表現できないので、
+///   **無注記で取り込んで計上する**（DESIGN.md M11-0「group 1 の扱い」）。
+/// - **文字の回転**（group 53）: [`DimAnnotation`] に `text_rotation` が入るのは
+///   M11 タスク70。
+///
+/// # 黙って捨てる（計上しない）
+///
+/// - **DIMSTYLE 名**（group 3）: mcad は文書に 1 つの [`mcad_core::DimStyle`] しか
+///   持たない（M9 設計判断）。外部 DXF はほぼ必ず名前付きスタイルを参照するため、
+///   計上すると全寸法が警告になりノイズにしかならない。色の ACI 近似・未知線種の
+///   `Continuous` フォールバックと同じ「確定的に解釈する」扱い。
+/// - **文字の寄せ**（group 71 `attachment_point`）・**行間**（41/72）: mcad の
+///   組版は寸法線に対する位置を自前で決める（`mcad_core::expand_dim_linear` 等）。
+/// - **anonymous block 参照**（group 2、`*D1` 等）: mcad は BLOCKS セクションを
+///   読まないため実害がない（モジュール doc「DIMENSION の import」参照）。
+fn dimension_annotation(base: &DimensionBase, dropped_detail: &mut bool) -> DimAnnotation {
+    // 空 / "<>" は「実測値を描く」。それ以外は M11 タスク70 まで表現できない。
+    if !(base.text.is_empty() || base.text == "<>") {
+        *dropped_detail = true;
+    }
+    if base.text_rotation_angle != 0.0 {
+        *dropped_detail = true;
+    }
+    DimAnnotation {
+        text_anchor: base
+            .is_at_user_defined_location
+            .then(|| from_dxf_point(&base.text_mid_point)),
+        ..DimAnnotation::unannotated()
+    }
+}
+
+/// 実測値（group 42）が書かれていて、mcad の再計算値と食い違うかを判定する。
+///
+/// mcad は寸法値を**保存せず毎回座標から計算する**（DESIGN.md M6 設計判断2）ので、
+/// 採用するのは常に再計算値のほうである。group 42 は「書いた CAD が表示していた値」
+/// なので、両者の食い違いは**定義点の解釈が食い違っているサイン**になる。典型的な
+/// 原因は DIMSTYLE の測定倍率（DIMLFAC）で、mcad には測定倍率の概念が無いため
+/// 表現できない。このケースは**幾何は平行のまま値だけ食い違う**ため、回転寸法の
+/// 平行判定（[`linear_dimension_to_geom`] の doc）では防げない。取り込むと DXF が
+/// 持っていた値と違う値を黙って表示することになるため、食い違う寸法は
+/// **取り込まずスキップする**（呼び出し側が `true` を見て `None` を返す。
+/// [`ImportSummary::skipped_dimensions`] へ計上される）。
+///
+/// group 42 は省略されることが多く（実測: libdxfrw 0.6.3 = LibreCAD は書かない）、
+/// クレートの既定値は `0.0` である。**省略と「値が 0」は区別できない**ため、`0` 以下は
+/// 「書かれていない」とみなして比較しない（このときこの検査は効かず、寸法は
+/// 無条件で取り込まれる。寸法値 0 自体が退化している）。
+///
+/// `expected` は DXF の group 42 と同じ量で渡すこと（直径寸法なら**直径**、
+/// 半径寸法なら半径、長さ寸法なら長さ）。
+fn actual_measurement_mismatches(base: &DimensionBase, expected: f64) -> bool {
+    let actual = base.actual_measurement;
+    if actual <= 0.0 || !actual.is_finite() {
+        return false;
+    }
+    (actual - expected).abs() > DIM_MEASUREMENT_REL_EPS * actual.abs()
+}
+
+/// `AcDbAlignedDimension` / `AcDbRotatedDimension`（クレートでは同じ
+/// [`RotatedDimension`]）を [`EntityGeom::DimLinear`] へ写す。
+///
+/// - `definition_point_2`（group 13）・`definition_point_3`（group 14）= 計測 2 点。
+/// - `dimension_base.definition_point_1`（group 10）= 寸法線の位置。
+///   [`mcad_core::DimLinear::offset`] は「計測線 `p1→p2` の法線方向に、寸法線まで
+///   取った符号付き距離」なので、`offset = (p10 − p1)・perp((p2−p1)/|p2−p1|)` で求まる
+///   （`perp` は左 90 度回転。`mcad_core::expand` の `linear_frame` が
+///   `p1 + perp(dir) * offset` で寸法線端を作るのと同じ式）。
+///
+/// # 回転寸法（`DimensionType::RotatedHorizontalOrVertical`）の受入条件
+///
+/// 回転寸法の値は「計測 2 点を group 50 の方向へ**投影した長さ**」であり、
+/// [`mcad_core::DimLinear`] が描く `|p2 − p1|` とは一般に一致しない。向きを保存できる
+/// `DimDirection` が入るのは M11 タスク68 なので、ここでは
+/// **投影長と実距離が一致する回転寸法、すなわち計測 2 点の向きが group 50 の方向と
+/// 平行なものだけ**を受け入れる（このとき整列寸法と描画が完全に同一になる）。
+/// 平行でないものは [`ImportSummary::skipped_dimensions`] へ計上してスキップする。
+///
+/// 実測（ユーザーが LibreCAD = libdxfrw 0.6.3 で描いた図面。fixture は同じ構造の合成データ）:
+///
+/// - 斜辺 `(115, 163.75)`–`(243.75, 146)` に付けた**水平**寸法（group 50 省略 = 0）は
+///   単位ベクトルの外積が `0.137` で平行でない。整列寸法として取り込むと表示値が
+///   `128.75` から `129.968` へ変わってしまうのでスキップする。
+/// - 垂直な辺に付けた**鉛直**寸法（group 50 = 90）は平行なので受け入れる。
+///   `cos(90°)` の丸め（`6.1e-17`）は [`DIM_PARALLEL_EPS`] が吸収する。
+///
+/// つまり「角度が 0 か」ではなく「回転寸法が整列寸法と同じ図になるか」で判定する。
+/// 水平／鉛直という**よくある向きでも、計測 2 点がその向きに並んでいなければ
+/// 投影が効いている**ため受け入れられない。
+///
+/// # そのほかの拒否条件
+///
+/// - `horizontal_direction_angle`（group 51）が 0 でない回転寸法。51 は寸法の
+///   水平方向（UCS の X 軸）を回す指定で、group 50 がどの基準からの角度になるかが
+///   変わる。誤った向きで平行判定をするより拒否するほうが安全（整列寸法は寸法線の
+///   向きを計測 2 点だけで決めるので、51 は文字の姿勢にしか効かず拒否しない）。
+/// - 計測 2 点がほぼ同一（法線が決まらず `offset` を定義できない）。
+/// - 押し出し法線が +Z でない（[`is_dimension_plane_supported`]）。
+/// - `dimension_type` が整列でも回転でもない（クレートは group 100 のサブクラス名で
+///   型を決めるため、group 70 と食い違う DXF はここへ来うる）。
+/// - 実測値（group 42）が書かれていて、mcad の再計算値と食い違う
+///   （[`actual_measurement_mismatches`]。典型的には DIMSTYLE の測定倍率 DIMLFAC が
+///   原因で、幾何が平行のままでも起きるため上記の平行判定では防げない）。
+fn linear_dimension_to_geom(
+    dim: &RotatedDimension,
+    dropped_detail: &mut bool,
+) -> Option<EntityGeom> {
+    let base = &dim.dimension_base;
+    if !is_dimension_plane_supported(base) {
+        return None;
+    }
+    let p1 = from_dxf_point(&dim.definition_point_2);
+    let p2 = from_dxf_point(&dim.definition_point_3);
+    let dir = (p2 - p1).normalize()?;
+    match base.dimension_type {
+        DimensionType::Aligned => {}
+        DimensionType::RotatedHorizontalOrVertical => {
+            if base.horizontal_direction_angle != 0.0 {
+                return None;
+            }
+            let (sin, cos) = dim.rotation_angle.to_radians().sin_cos();
+            if (dir.x * sin - dir.y * cos).abs() > DIM_PARALLEL_EPS {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    if actual_measurement_mismatches(base, (p2 - p1).length()) {
+        return None;
+    }
+    if dim.extension_line_angle != 0.0 {
+        *dropped_detail = true;
+    }
+    let offset = (from_dxf_point(&base.definition_point_1) - p1).dot(dir.perp());
+    Some(EntityGeom::DimLinear(DimLinear {
+        p1,
+        p2,
+        offset,
+        annotation: dimension_annotation(base, dropped_detail),
+    }))
+}
+
+/// `AcDbRadialDimension` を [`EntityGeom::DimRadial`] へ写す。
+///
+/// `dimension_base.definition_point_1`（group 10）= 円の中心、`definition_point_2`
+/// （group 15）= 円周上の点。半径は 2 点間の距離、
+/// [`mcad_core::DimRadial::leader_angle`] は中心から円周点を向く放射角。
+///
+/// 実測（`tests/fixtures/synthetic_dimensions.dxf`）: 中心・半径とも図面中の `CIRCLE`
+/// （中心 `(144.2322775263952, 137)`・半径 `13.4551940975304`）と一致する。
+///
+/// 引出線長（group 40 `leader_length`）は mcad が描画時に決めるため使わない
+/// （計上もしない。[`dimension_annotation`] の doc 参照）。半径 0（中心と円周点が
+/// 同一）は [`EntityGeom::validate`] が拒否するので、呼び出し側でスキップに回る。
+/// group 42（実測値）が半径と食い違えば取り込まずスキップする
+/// （[`actual_measurement_mismatches`]）。
+fn radial_dimension_to_geom(
+    dim: &RadialDimension,
+    dropped_detail: &mut bool,
+) -> Option<EntityGeom> {
+    let base = &dim.dimension_base;
+    if !is_dimension_plane_supported(base) {
+        return None;
+    }
+    let center = from_dxf_point(&base.definition_point_1);
+    let rim = from_dxf_point(&dim.definition_point_2);
+    let spoke = rim - center;
+    if actual_measurement_mismatches(base, spoke.length()) {
+        return None;
+    }
+    Some(EntityGeom::DimRadial(DimRadial {
+        center,
+        radius: spoke.length(),
+        leader_angle: spoke.angle(),
+        annotation: dimension_annotation(base, dropped_detail),
+    }))
+}
+
+/// `AcDbDiametricDimension` を [`EntityGeom::DimDiameter`] へ写す。
+///
+/// `dimension_base.definition_point_1`（group 10）と `definition_point_2`
+/// （group 15）は**直径の両端**（DXF Reference の言い方では 10 が「15 の反対側の点」）。
+/// したがって中心は 2 点の中点、[`mcad_core::DimDiameter::radius`] は 2 点間の
+/// 距離の半分、`angle` は 10 → 15 の向き（直径線は逆向きも同じ線なので、どちらを
+/// 向けても描画は同じ）。
+///
+/// 実測（`tests/fixtures/synthetic_dimensions.dxf`）: 中点が図面中の `CIRCLE` の中心と、
+/// 2 点間距離が直径（`2 × 13.4551940975304`）と一致する。
+///
+/// group 42（実測値）との比較は**直径**で行う（DXF の寸法値は直径寸法なら直径）。
+/// 食い違えば取り込まずスキップする（[`actual_measurement_mismatches`]）。
+fn diameter_dimension_to_geom(
+    dim: &DiameterDimension,
+    dropped_detail: &mut bool,
+) -> Option<EntityGeom> {
+    let base = &dim.dimension_base;
+    if !is_dimension_plane_supported(base) {
+        return None;
+    }
+    let far = from_dxf_point(&base.definition_point_1);
+    let near = from_dxf_point(&dim.definition_point_2);
+    let across = near - far;
+    if actual_measurement_mismatches(base, across.length()) {
+        return None;
+    }
+    Some(EntityGeom::DimDiameter(DimDiameter {
+        center: far.midpoint(near),
+        radius: across.length() * 0.5,
+        angle: across.angle(),
+        annotation: dimension_annotation(base, dropped_detail),
+    }))
+}
+
+/// [`dxf_entity_to_geom`] の結果。
+///
+/// エンティティを取り込めたかどうか（`Option`）とは別に、**取り込めたが一部の属性を
+/// 捨てた**ことを呼び出し側（[`import_dxf`]）へ伝えるために、ジオメトリと
+/// 「詳細を捨てたか」をまとめて返す。現状これが立つのは寸法だけなので、
+/// [`import_dxf`] は [`ImportSummary::dropped_dimension_details`] へ積む。
+struct ImportedGeom {
+    geom: EntityGeom,
+    dropped_detail: bool,
+}
+
+/// [`dxf_entity_to_geom`] が変換できなかったときの理由。呼び出し側
+/// （[`import_dxf`]）が [`ImportSummary::skipped_entities`] と
+/// [`ImportSummary::skipped_dimensions`] のどちらへ計上するかをこれで判定する。
+enum DxfImportSkip {
+    /// `EntityType` 自体が非対応（3 点角度寸法・座標寸法・SPLINE・ELLIPSE 等）、
+    /// または寸法以外（Shape・TEXT）で [`EntityGeom::validate`] が拒否する不正な
+    /// ジオメトリ。[`ImportSummary::skipped_entities`] へ計上する。
+    UnsupportedOrInvalid,
+    /// **対応している**寸法種別（整列・回転・半径・直径）だが、mcad のモデルでは
+    /// 測定値や位置を変えずに表現できないため取り込まなかった。「種別が未対応」
+    /// ではないので [`ImportSummary::skipped_dimensions`] へ計上する（詳細は
+    /// [`ImportSummary::skipped_dimensions`] の doc）。
+    Dimension,
+}
+
 /// DXF エンティティの `specific` を [`EntityGeom`] へ変換する。
 ///
 /// Shape 系（POINT / LINE / CIRCLE / ARC / LWPOLYLINE）に加え、TEXT を
 /// [`EntityGeom::Text`] へ変換する（タスク25b、[`text_to_dxf_entity`] の逆写像）。
-/// TEXT のうち位置基準が Left/Baseline 以外のものは変換せず `None` を返す
-/// （理由は [`is_text_justification_supported`] の doc）。
+/// TEXT のうち位置基準が Left/Baseline 以外のものは変換せず
+/// `Err(DxfImportSkip::UnsupportedOrInvalid)` を返す（理由は
+/// [`is_text_justification_supported`] の doc）。
+///
+/// DIMENSION は整列・回転（整列と同じ図になるものだけ）・半径・直径の 4 経路を
+/// [`EntityGeom`] の `DimLinear` / `DimRadial` / `DimDiameter` へ写す
+/// （M11 タスク67、[`linear_dimension_to_geom`] / [`radial_dimension_to_geom`] /
+/// [`diameter_dimension_to_geom`]）。この 4 経路が個別の理由で変換できなかった
+/// 場合は `Err(DxfImportSkip::Dimension)`（種別自体は対応しているので
+/// [`ImportSummary::skipped_dimensions`] 側）。3 点角度寸法・座標寸法はモデルが
+/// 無いので `Err(DxfImportSkip::UnsupportedOrInvalid)`、2 直線角度寸法・弧長寸法は
+/// そもそもクレートが読まない（モジュール doc「DIMENSION の import」参照）。
 ///
 /// 対応していない `EntityType`、または非有限座標・負半径・非正の文字高さなど
-/// [`EntityGeom::validate`] が拒否する不正なジオメトリは `None` を返す
+/// [`EntityGeom::validate`] が拒否する不正なジオメトリは `Err` を返す
 /// （呼び出し側で「無視」としてカウントする）。`Shape` バリアントの判定基準は
 /// `.mcad` import（[`crate::mcad_file::import_document`]）と同一であり、
 /// `EntityGeom::validate` が `Shape::validate` へ委譲するため divergence しない。
-fn dxf_entity_to_geom(specific: &EntityType) -> Option<EntityGeom> {
+fn dxf_entity_to_geom(specific: &EntityType) -> Result<ImportedGeom, DxfImportSkip> {
+    let mut dropped_detail = false;
     let geom: EntityGeom = match specific {
         EntityType::ModelPoint(p) => Shape::Point(from_dxf_point(&p.location)).into(),
         EntityType::Line(l) => {
@@ -678,7 +1142,7 @@ fn dxf_entity_to_geom(specific: &EntityType) -> Option<EntityGeom> {
         // 正しく逆算できないのでスキップする（is_text_justification_supported の doc）。
         EntityType::Text(t) => {
             if !is_text_justification_supported(t) {
-                return None;
+                return Err(DxfImportSkip::UnsupportedOrInvalid);
             }
             EntityGeom::Text(TextGeom {
                 anchor: from_dxf_point(&t.location),
@@ -687,12 +1151,38 @@ fn dxf_entity_to_geom(specific: &EntityType) -> Option<EntityGeom> {
                 angle: t.rotation.to_radians(),
             })
         }
-        _ => return None,
+        // DIMENSION（M11 タスク67）。クレートは group 100 のサブクラス名で型を分け、
+        // 整列寸法と回転寸法はどちらも `RotatedDimension` になる（区別は
+        // `dimension_base.dimension_type`）。これらの 4 経路は「種別としては対応
+        // している」ので、個別の理由で変換できなかった場合は
+        // `DxfImportSkip::Dimension`（skipped_dimensions）へ回す。
+        EntityType::RotatedDimension(d) => {
+            linear_dimension_to_geom(d, &mut dropped_detail).ok_or(DxfImportSkip::Dimension)?
+        }
+        EntityType::RadialDimension(d) => {
+            radial_dimension_to_geom(d, &mut dropped_detail).ok_or(DxfImportSkip::Dimension)?
+        }
+        EntityType::DiameterDimension(d) => {
+            diameter_dimension_to_geom(d, &mut dropped_detail).ok_or(DxfImportSkip::Dimension)?
+        }
+        // 3 点角度寸法・座標寸法（種別自体が非対応）はここへ来る。
+        _ => return Err(DxfImportSkip::UnsupportedOrInvalid),
     };
     if geom.validate().is_ok() {
-        Some(geom)
+        Ok(ImportedGeom {
+            geom,
+            dropped_detail,
+        })
+    } else if matches!(
+        geom,
+        EntityGeom::DimLinear(_) | EntityGeom::DimRadial(_) | EntityGeom::DimDiameter(_)
+    ) {
+        // 変換自体は成功したが、構築後の検証で拒否された寸法（例: 半径・直径寸法の
+        // 半径 0）。種別は対応しているため skipped_dimensions 側（モジュール doc
+        // 「落ちる情報」参照）。
+        Err(DxfImportSkip::Dimension)
     } else {
-        None
+        Err(DxfImportSkip::UnsupportedOrInvalid)
     }
 }
 
@@ -1014,11 +1504,26 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
     }
 
     let mut skipped_entities = 0usize;
+    let mut skipped_dimensions = 0usize;
+    let mut dropped_dimension_details = 0usize;
     for entity in drawing.entities() {
-        let Some(geom) = dxf_entity_to_geom(&entity.specific) else {
-            skipped_entities += 1;
-            continue;
+        let (geom, dropped_detail) = match dxf_entity_to_geom(&entity.specific) {
+            Ok(ImportedGeom {
+                geom,
+                dropped_detail,
+            }) => (geom, dropped_detail),
+            Err(DxfImportSkip::UnsupportedOrInvalid) => {
+                skipped_entities += 1;
+                continue;
+            }
+            Err(DxfImportSkip::Dimension) => {
+                skipped_dimensions += 1;
+                continue;
+            }
         };
+        if dropped_detail {
+            dropped_dimension_details += 1;
+        }
         let layer_id = resolve_layer(&mut doc, &mut layer_ids, &entity.common.layer)?;
         let (width_mm, width_clamped) =
             dxf_lineweight_to_style_width(entity.common.lineweight_enum_value);
@@ -1042,7 +1547,9 @@ pub fn import_dxf(drawing: &Drawing) -> Result<ImportSummary, IoError> {
     Ok(ImportSummary {
         document: doc,
         skipped_entities,
+        skipped_dimensions,
         clamped_line_widths,
+        dropped_dimension_details,
     })
 }
 
@@ -1078,8 +1585,9 @@ pub fn load_dxf(path: impl AsRef<Path>) -> Result<ImportSummary, IoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dxf::entities::RadialDimension;
-    use std::f64::consts::FRAC_PI_2;
+    use dxf::Vector as DxfVector;
+    use dxf::entities::{AngularThreePointDimension, Ellipse, OrdinateDimension};
+    use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2};
     use std::fs;
 
     const EPS: f64 = 1e-9;
@@ -1276,23 +1784,429 @@ mod tests {
 
     /// 「未対応エンティティ種別はスキップして数える」機構の回帰テスト。
     ///
-    /// タスク25b で TEXT が import 対応になったため、代表として引き続き未対応の
-    /// RADIALDIMENSION（DXF の DIMENSION 系。ブロック参照を伴い M9 予定、
-    /// DESIGN.md M6 設計判断5）を使う。
+    /// 代表は ELLIPSE。タスク25b で TEXT が、M11 タスク67 で DIMENSION の 4 経路
+    /// （整列・回転・半径・直径）が import 対応になったため、以前ここで使っていた
+    /// RADIALDIMENSION はもう「未対応種別」の代表にならない
+    /// （退化した既定値がジオメトリ検証で落ちるだけになる）。
     #[test]
     fn unsupported_entity_is_skipped_and_counted() {
         let doc = full_document();
         let mut drawing = export_dxf(&doc).drawing;
         let before = doc.entity_count();
 
-        let mut dim_entity =
-            DxfEntity::new(EntityType::RadialDimension(RadialDimension::default()));
-        dim_entity.common.layer = "0".to_string();
-        drawing.add_entity(dim_entity);
+        let mut ellipse = DxfEntity::new(EntityType::Ellipse(Ellipse::default()));
+        ellipse.common.layer = "0".to_string();
+        drawing.add_entity(ellipse);
 
         let summary = import_dxf(&drawing).unwrap();
         assert_eq!(summary.skipped_entities, 1);
         assert_eq!(summary.document.entity_count(), before);
+    }
+
+    // -----------------------------------------------------------------
+    // DIMENSION の import（M11 タスク67）
+    //
+    // 実ファイル（LibreCAD 出力）での検証は `tests/dxf_dimensions.rs`。ここでは
+    // その fixture に現れない条件（法線・文字位置の明示指定・文字テンプレート・
+    // 実測値の食い違い・退化）を合成データで固定する。
+    // -----------------------------------------------------------------
+
+    /// レイヤー "0" だけを持つ最小の `Drawing` へエンティティを 1 件載せる。
+    fn drawing_with_one_entity(specific: EntityType) -> Drawing {
+        let mut drawing = Drawing::new();
+        while drawing.remove_layer(0).is_some() {}
+        drawing.add_layer(DxfLayer {
+            name: "0".to_string(),
+            ..Default::default()
+        });
+        let mut entity = DxfEntity::new(specific);
+        entity.common.layer = "0".to_string();
+        drawing.add_entity(entity);
+        drawing
+    }
+
+    /// 整列寸法の共通部。計測 2 点は `(0,0)`–`(10,0)`、寸法線（group 10）は `y = 3`。
+    fn aligned_base() -> DimensionBase {
+        DimensionBase {
+            dimension_type: DimensionType::Aligned,
+            definition_point_1: DxfPoint::new(0.0, 3.0, 0.0),
+            ..Default::default()
+        }
+    }
+
+    /// `base` に計測 2 点 `p1`–`p2` を付けた `RotatedDimension`。
+    fn linear_dim(base: DimensionBase, p1: (f64, f64), p2: (f64, f64)) -> EntityType {
+        EntityType::RotatedDimension(RotatedDimension {
+            dimension_base: base,
+            definition_point_2: DxfPoint::new(p1.0, p1.1, 0.0),
+            definition_point_3: DxfPoint::new(p2.0, p2.1, 0.0),
+            ..Default::default()
+        })
+    }
+
+    /// 寸法 1 件だけを読み、
+    /// `(ジオメトリ, skipped_entities, skipped_dimensions, 捨てた属性の件数)` を返す。
+    fn import_one(specific: EntityType) -> (Option<EntityGeom>, usize, usize, usize) {
+        let summary = import_dxf(&drawing_with_one_entity(specific)).unwrap();
+        let geom = summary
+            .document
+            .entities()
+            .next()
+            .map(|(_, e)| e.geom.clone());
+        (
+            geom,
+            summary.skipped_entities,
+            summary.skipped_dimensions,
+            summary.dropped_dimension_details,
+        )
+    }
+
+    fn linear_of(geom: Option<EntityGeom>) -> DimLinear {
+        match geom {
+            Some(EntityGeom::DimLinear(d)) => d,
+            other => panic!("長さ寸法として取り込まれていない: {other:?}"),
+        }
+    }
+
+    /// `offset` の符号は `mcad-core` の契約（寸法線端 = `p1 + perp(dir) * offset`、
+    /// `perp` は左 90 度回転）と一致する。group 10 を計測線の左右へ振ると符号だけが
+    /// 反転する。
+    #[test]
+    fn linear_dimension_offset_follows_the_core_sign_convention() {
+        let left = linear_of(import_one(linear_dim(aligned_base(), (0.0, 0.0), (10.0, 0.0))).0);
+        approx_point(left.p1, Point2::new(0.0, 0.0));
+        approx_point(left.p2, Point2::new(10.0, 0.0));
+        assert!((left.offset - 3.0).abs() < EPS, "offset: {}", left.offset);
+
+        let right = linear_of(
+            import_one(linear_dim(
+                DimensionBase {
+                    definition_point_1: DxfPoint::new(0.0, -3.0, 0.0),
+                    ..aligned_base()
+                },
+                (0.0, 0.0),
+                (10.0, 0.0),
+            ))
+            .0,
+        );
+        assert!((right.offset + 3.0).abs() < EPS, "offset: {}", right.offset);
+    }
+
+    /// 回転寸法は「整列寸法と同じ図になる」ものだけ受け入れる。計測 2 点が group 50 の
+    /// 方向に並んでいなければ、DXF の寸法値（投影長）を mcad が表現できないのでスキップ。
+    #[test]
+    fn rotated_dimension_is_skipped_unless_its_points_lie_along_its_angle() {
+        // 水平（50 省略 = 0）なのに計測 2 点が斜め → 投影が効いている → スキップ。
+        let base = DimensionBase {
+            dimension_type: DimensionType::RotatedHorizontalOrVertical,
+            ..aligned_base()
+        };
+        let (geom, skipped_entities, skipped_dimensions, dropped) =
+            import_one(linear_dim(base, (0.0, 0.0), (10.0, 5.0)));
+        assert!(geom.is_none(), "斜めの計測点を持つ回転寸法が通った");
+        assert_eq!(
+            (skipped_entities, skipped_dimensions, dropped),
+            (0, 1, 0),
+            "種別は対応しているので skipped_dimensions へ計上する"
+        );
+
+        // 鉛直（50 = 90）で計測 2 点も鉛直 → 整列寸法と同一なので受け入れる。
+        let vertical = EntityType::RotatedDimension(RotatedDimension {
+            dimension_base: DimensionBase {
+                dimension_type: DimensionType::RotatedHorizontalOrVertical,
+                definition_point_1: DxfPoint::new(4.0, 0.0, 0.0),
+                ..aligned_base()
+            },
+            definition_point_2: DxfPoint::new(0.0, 0.0, 0.0),
+            definition_point_3: DxfPoint::new(0.0, 10.0, 0.0),
+            rotation_angle: 90.0,
+            ..Default::default()
+        });
+        let (geom, skipped_entities, skipped_dimensions, dropped) = import_one(vertical);
+        let dim = linear_of(geom);
+        approx_point(dim.p2, Point2::new(0.0, 10.0));
+        // dir = (0,1)、perp(dir) = (-1,0) なので group 10 =(4,0) は offset = -4。
+        assert!((dim.offset + 4.0).abs() < EPS, "offset: {}", dim.offset);
+        assert_eq!((skipped_entities, skipped_dimensions, dropped), (0, 0, 0));
+    }
+
+    /// group 51（寸法の水平方向 = UCS の X 軸）が 0 でない**回転**寸法は、group 50 の
+    /// 基準が変わるのでスキップする。**整列**寸法は寸法線の向きを計測 2 点だけで
+    /// 決めるので 51 の影響を受けず、そのまま受け入れる。
+    #[test]
+    fn rotated_dimension_with_a_rotated_ucs_is_skipped_but_aligned_one_is_not() {
+        let rotated = linear_dim(
+            DimensionBase {
+                dimension_type: DimensionType::RotatedHorizontalOrVertical,
+                horizontal_direction_angle: 30.0,
+                ..aligned_base()
+            },
+            (0.0, 0.0),
+            (10.0, 0.0),
+        );
+        assert_eq!(
+            import_one(rotated).2,
+            1,
+            "51 付きの回転寸法はスキップ（skipped_dimensions）"
+        );
+
+        let aligned = linear_dim(
+            DimensionBase {
+                horizontal_direction_angle: 30.0,
+                ..aligned_base()
+            },
+            (0.0, 0.0),
+            (10.0, 0.0),
+        );
+        let (geom, skipped_entities, skipped_dimensions, dropped) = import_one(aligned);
+        assert!(geom.is_some(), "51 付きの整列寸法まで落ちている");
+        assert_eq!((skipped_entities, skipped_dimensions, dropped), (0, 0, 0));
+    }
+
+    /// 押し出し法線（group 210/220/230）が +Z でない寸法は、定義点が OCS で書かれて
+    /// いるためスキップする（[`is_dimension_plane_supported`] の doc）。
+    #[test]
+    fn dimension_outside_the_xy_plane_is_skipped() {
+        for normal in [
+            DxfVector::new(0.0, 0.0, -1.0),
+            DxfVector::new(1.0, 0.0, 0.0),
+            DxfVector::new(0.0, FRAC_1_SQRT_2, FRAC_1_SQRT_2),
+        ] {
+            let base = DimensionBase {
+                normal: normal.clone(),
+                ..aligned_base()
+            };
+            let (geom, skipped_entities, skipped_dimensions, _) =
+                import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+            assert!(geom.is_none(), "法線 {normal:?} の寸法が通った");
+            assert_eq!((skipped_entities, skipped_dimensions), (0, 1));
+        }
+
+        // 半径・直径も同じ判定を通る。
+        let radial = EntityType::RadialDimension(RadialDimension {
+            dimension_base: DimensionBase {
+                normal: DxfVector::new(0.0, 0.0, -1.0),
+                ..Default::default()
+            },
+            definition_point_2: DxfPoint::new(5.0, 0.0, 0.0),
+            ..Default::default()
+        });
+        assert_eq!(import_one(radial).2, 1);
+    }
+
+    /// 文字位置の明示指定（group 70 の 128 ビット）があるときだけ、group 11 を
+    /// [`DimAnnotation::text_anchor`] へ写す。自動配置の寸法にも group 11 は書かれて
+    /// いるので、常に写すと mcad の自動配置が効かなくなる。
+    #[test]
+    fn user_defined_text_location_becomes_the_text_anchor() {
+        let with_override = DimensionBase {
+            is_at_user_defined_location: true,
+            text_mid_point: DxfPoint::new(2.0, 9.0, 0.0),
+            ..aligned_base()
+        };
+        let dim = linear_of(import_one(linear_dim(with_override, (0.0, 0.0), (10.0, 0.0))).0);
+        approx_point(
+            dim.annotation.text_anchor.expect("文字位置が写っていない"),
+            Point2::new(2.0, 9.0),
+        );
+
+        let automatic = DimensionBase {
+            text_mid_point: DxfPoint::new(2.0, 9.0, 0.0),
+            ..aligned_base()
+        };
+        let dim = linear_of(import_one(linear_dim(automatic, (0.0, 0.0), (10.0, 0.0))).0);
+        assert_eq!(dim.annotation, DimAnnotation::unannotated());
+    }
+
+    /// group 1（文字テンプレート）は空文字列と `<>` だけが「実測値を描く」＝ mcad の
+    /// 既定と同じ。それ以外（スペース 1 文字の「文字を出さない」指定、固定文字列、
+    /// `<>` を含むテンプレート）は M11 タスク70 まで表現できないので、**無注記で
+    /// 取り込んで計上する**。
+    #[test]
+    fn dimension_text_template_other_than_the_measured_value_is_dropped_and_counted() {
+        for text in ["", "<>"] {
+            let base = DimensionBase {
+                text: text.to_string(),
+                ..aligned_base()
+            };
+            let (geom, _, _, dropped) = import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+            assert!(geom.is_some());
+            assert_eq!(dropped, 0, "text {text:?} は既定と同じなので計上しない");
+        }
+        for text in [" ", "M10", "2×<>", "<> H7"] {
+            let base = DimensionBase {
+                text: text.to_string(),
+                ..aligned_base()
+            };
+            let (geom, _, _, dropped) = import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+            let dim = linear_of(geom);
+            assert_eq!(
+                dim.annotation,
+                DimAnnotation::unannotated(),
+                "text {text:?}"
+            );
+            assert_eq!(dropped, 1, "text {text:?} を計上していない");
+        }
+    }
+
+    /// 補助線の傾き（group 52）・寸法文字の回転（group 53）は mcad に概念が無いので
+    /// 捨てて計上する。**計上は寸法 1 件につき最大 1**（属性ごとに増やさない）。
+    #[test]
+    fn oblique_extension_lines_and_text_rotation_are_dropped_once_per_dimension() {
+        let oblique = EntityType::RotatedDimension(RotatedDimension {
+            dimension_base: aligned_base(),
+            definition_point_2: DxfPoint::new(0.0, 0.0, 0.0),
+            definition_point_3: DxfPoint::new(10.0, 0.0, 0.0),
+            extension_line_angle: 15.0,
+            ..Default::default()
+        });
+        let (geom, skipped_entities, skipped_dimensions, dropped) = import_one(oblique);
+        assert!(
+            geom.is_some(),
+            "52 付きの寸法は取り込む（捨てるのは 52 だけ）"
+        );
+        assert_eq!((skipped_entities, skipped_dimensions, dropped), (0, 0, 1));
+
+        let rotated_text = DimensionBase {
+            text_rotation_angle: 30.0,
+            ..aligned_base()
+        };
+        let (_, _, _, dropped) = import_one(linear_dim(rotated_text, (0.0, 0.0), (10.0, 0.0)));
+        assert_eq!(dropped, 1);
+
+        // 52 と 53 と文字テンプレートが同時に落ちても、計上は 1 件。
+        let everything = EntityType::RotatedDimension(RotatedDimension {
+            dimension_base: DimensionBase {
+                text: "M10".to_string(),
+                text_rotation_angle: 30.0,
+                ..aligned_base()
+            },
+            definition_point_2: DxfPoint::new(0.0, 0.0, 0.0),
+            definition_point_3: DxfPoint::new(10.0, 0.0, 0.0),
+            extension_line_angle: 15.0,
+            ..Default::default()
+        });
+        assert_eq!(import_one(everything).3, 1, "寸法ごとに 1 件だけ数える");
+    }
+
+    /// 実測値（group 42）は「書いた CAD が表示していた値」。mcad は座標から再計算した
+    /// 値を採るので、食い違う寸法は**値だけ黙って変わる**ことを避けるため取り込まず
+    /// スキップする（種別は対応しているので `dropped_dimension_details` ではなく
+    /// `skipped_dimensions` へ計上）。
+    /// 省略（クレート既定の `0.0`）は比較しない＝取り込む。許容内の微差（相対
+    /// `DIM_MEASUREMENT_REL_EPS` = 1e-6 の内側）も取り込む。
+    #[test]
+    fn actual_measurement_mismatch_is_skipped_not_mismeasured() {
+        for (measurement, expected_skipped) in [
+            (0.0, 0),         // 省略扱い（クレート既定）→ 比較しない
+            (10.0, 0),        // 一致
+            (10.0 + 1e-9, 0), // 許容内の微差
+            (12.0, 1),        // 食い違い → 取り込まずスキップ
+        ] {
+            let base = DimensionBase {
+                actual_measurement: measurement,
+                ..aligned_base()
+            };
+            let (geom, skipped_entities, skipped_dimensions, dropped) =
+                import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+            assert_eq!(
+                geom.is_some(),
+                expected_skipped == 0,
+                "42 = {measurement} の取り込み可否"
+            );
+            assert_eq!(
+                (skipped_entities, skipped_dimensions, dropped),
+                (0, expected_skipped, 0),
+                "42 = {measurement}"
+            );
+        }
+
+        // 直径寸法の group 42 は**直径**。半径と比べてはいけない。
+        let diameter = EntityType::DiameterDimension(DiameterDimension {
+            dimension_base: DimensionBase {
+                actual_measurement: 10.0,
+                definition_point_1: DxfPoint::new(-5.0, 0.0, 0.0),
+                ..Default::default()
+            },
+            definition_point_2: DxfPoint::new(5.0, 0.0, 0.0),
+            ..Default::default()
+        });
+        let (geom, skipped_entities, skipped_dimensions, dropped) = import_one(diameter);
+        match geom {
+            Some(EntityGeom::DimDiameter(d)) => {
+                assert!((d.radius - 5.0).abs() < EPS, "radius: {}", d.radius);
+                approx_point(d.center, Point2::new(0.0, 0.0));
+            }
+            other => panic!("直径寸法として取り込まれていない: {other:?}"),
+        }
+        assert_eq!(
+            (skipped_entities, skipped_dimensions, dropped),
+            (0, 0, 0),
+            "直径 10 と group 42 = 10 は一致している"
+        );
+    }
+
+    /// 回転寸法の平行判定（計測 2 点が group 50 の方向と平行）を通っても、group 42
+    /// が測定倍率（DIMLFAC 相当）で実距離と食い違えば、値が黙って変わらないよう
+    /// 取り込まずスキップする。平行判定だけでは防げないケースの回帰。
+    #[test]
+    fn parallel_dimension_with_mismatched_measurement_is_skipped_not_mismeasured() {
+        // 水平（50 省略 = 0）・計測 2 点も水平 → 平行判定は通る。
+        // 実距離は 10 だが group 42 = 20（DIMLFAC = 2 相当）で食い違う。
+        let base = DimensionBase {
+            dimension_type: DimensionType::RotatedHorizontalOrVertical,
+            actual_measurement: 20.0,
+            ..aligned_base()
+        };
+        let (geom, skipped_entities, skipped_dimensions, dropped) =
+            import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+        assert!(
+            geom.is_none(),
+            "平行判定を通ったのに測定倍率の食い違いで取り込まれた"
+        );
+        assert_eq!(
+            (skipped_entities, skipped_dimensions, dropped),
+            (0, 1, 0),
+            "食い違いは skipped_dimensions へ計上し、dropped_dimension_details には計上しない"
+        );
+    }
+
+    /// 退化した寸法（計測 2 点が同一 / 半径 0）はスキップして数える。長さ寸法は
+    /// 法線が決まらず `offset` を定義できず、半径・直径は
+    /// [`EntityGeom::validate`] が半径 0 を拒否する。種別自体は対応しているため
+    /// `skipped_dimensions` へ計上する（`skipped_entities` ではない）。
+    #[test]
+    fn degenerate_dimensions_are_skipped_and_counted() {
+        let (geom, skipped_entities, skipped_dimensions, _) =
+            import_one(linear_dim(aligned_base(), (1.0, 1.0), (1.0, 1.0)));
+        assert!(geom.is_none());
+        assert_eq!((skipped_entities, skipped_dimensions), (0, 1));
+
+        // 中心と円周点が同じ = 半径 0。
+        let radial = EntityType::RadialDimension(RadialDimension::default());
+        assert_eq!(import_one(radial).2, 1);
+
+        let diameter = EntityType::DiameterDimension(DiameterDimension::default());
+        assert_eq!(import_one(diameter).2, 1);
+    }
+
+    /// 3 点角度寸法・座標寸法は mcad にモデルが無いのでスキップして数える
+    /// （M11 タスク69 で対応）。2 直線角度寸法・弧長寸法は `dxf` 0.6.1 が
+    /// エンティティとして返さないため、そもそもここへ来ない（数えられない）。
+    #[test]
+    fn angular_and_ordinate_dimensions_are_skipped_and_counted() {
+        for specific in [
+            EntityType::AngularThreePointDimension(AngularThreePointDimension::default()),
+            EntityType::OrdinateDimension(OrdinateDimension::default()),
+        ] {
+            let (geom, skipped_entities, skipped_dimensions, dropped) = import_one(specific);
+            assert!(geom.is_none());
+            assert_eq!(
+                (skipped_entities, skipped_dimensions, dropped),
+                (1, 0, 0),
+                "種別自体が未対応なので skipped_entities（skipped_dimensions ではない）"
+            );
+        }
     }
 
     /// 不正な TextGeom（空文字列・非正の文字高さ）も、Shape の不正ジオメトリと同じ

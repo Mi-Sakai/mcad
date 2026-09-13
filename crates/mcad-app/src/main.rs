@@ -1514,7 +1514,9 @@ impl McadApp {
         let ImportSummary {
             document,
             skipped_entities,
+            skipped_dimensions,
             clamped_line_widths,
+            dropped_dimension_details,
         } = summary;
         self.document = document;
         self.current_path = None;
@@ -1527,9 +1529,19 @@ impl McadApp {
                 "{skipped_entities} entity(ies) skipped (unsupported type)"
             ));
         }
+        if skipped_dimensions > 0 {
+            notes.push(format!(
+                "{skipped_dimensions} dimension(s) skipped (cannot be represented without changing the measured value or position)"
+            ));
+        }
         if clamped_line_widths > 0 {
             notes.push(format!(
                 "{clamped_line_widths} line width(s) clamped to the 0.05..=5.0mm range"
+            ));
+        }
+        if dropped_dimension_details > 0 {
+            notes.push(format!(
+                "{dropped_dimension_details} dimension(s) imported without unsupported details"
             ));
         }
         let message = if notes.is_empty() {
@@ -7643,7 +7655,9 @@ mod tests {
         let summary = ImportSummary {
             document: imported,
             skipped_entities: 2,
+            skipped_dimensions: 0,
             clamped_line_widths: 0,
+            dropped_dimension_details: 0,
         };
 
         app.apply_imported_dxf(summary, 0.0);
@@ -7655,6 +7669,39 @@ mod tests {
             app.status
                 .as_ref()
                 .is_some_and(|m| m.text.contains('2') && m.text.contains("skipped"))
+        );
+    }
+
+    /// `skipped_dimensions`（対応している寸法種別だが測定値や位置を変えずに表現
+    /// できなかった件数）は、`skipped_entities`（未対応の種別）とは別枠の注記として
+    /// 出す。「unsupported type」という文言に巻き込まないことが本テストの主眼
+    /// （2026-09-13 のユーザー実機確認で判明した誤解を招く文言の修正）。
+    #[test]
+    fn apply_imported_dxf_reports_skipped_dimensions_with_a_precise_reason() {
+        let mut app = McadApp::new();
+        let summary = ImportSummary {
+            document: Document::new(),
+            skipped_entities: 0,
+            skipped_dimensions: 1,
+            clamped_line_widths: 0,
+            dropped_dimension_details: 0,
+        };
+
+        app.apply_imported_dxf(summary, 0.0);
+
+        let text = app
+            .status
+            .as_ref()
+            .expect("ステータスが立っていない")
+            .text
+            .clone();
+        assert!(
+            text.contains("1 dimension(s) skipped"),
+            "skipped_dimensions の件数が出ていない: {text}"
+        );
+        assert!(
+            !text.contains("unsupported type"),
+            "寸法のスキップを「未対応の種別」と誤解させてはいけない: {text}"
         );
     }
 
@@ -7685,7 +7732,9 @@ mod tests {
         let summary = ImportSummary {
             document: Document::new(),
             skipped_entities: 0,
+            skipped_dimensions: 0,
             clamped_line_widths: 0,
+            dropped_dimension_details: 0,
         };
         app.apply_imported_dxf(summary, 0.0);
 
@@ -7709,7 +7758,9 @@ mod tests {
         let summary = ImportSummary {
             document: sample_document(),
             skipped_entities: 0,
+            skipped_dimensions: 0,
             clamped_line_widths: 0,
+            dropped_dimension_details: 0,
         };
         app.apply_imported_dxf(summary, 0.0);
 
@@ -7727,7 +7778,9 @@ mod tests {
         let summary = ImportSummary {
             document: Document::new(),
             skipped_entities: 0,
+            skipped_dimensions: 0,
             clamped_line_widths: 0,
+            dropped_dimension_details: 0,
         };
         app.apply_imported_dxf(summary, 0.0);
 
@@ -8759,7 +8812,9 @@ mod tests {
             ImportSummary {
                 document: imported,
                 skipped_entities: 0,
+                skipped_dimensions: 0,
                 clamped_line_widths: 0,
+                dropped_dimension_details: 0,
             },
             0.0,
         );

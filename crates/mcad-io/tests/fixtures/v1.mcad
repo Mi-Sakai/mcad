@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "layers": [
+    {"name": "0", "color": {"r": 255, "g": 255, "b": 255}, "visible": true, "locked": false},
+    {"name": "parts", "color": {"r": 200, "g": 40, "b": 40}, "visible": true, "locked": false}
+  ],
+  "current_layer": 1,
+  "entities": [
+    {"layer": 0, "style": {"color": null, "width": 1.0},
+     "geom": {"Line": {"a": {"x": 0.0, "y": 0.0}, "b": {"x": 10.0, "y": 0.0}}}},
+    {"layer": 1, "style": {"color": {"r": 10, "g": 20, "b": 30}, "width": 2.5},
+     "geom": {"Circle": {"center": {"x": 5.0, "y": 5.0}, "radius": 3.0}}},
+    {"layer": 0, "style": {"color": null, "width": 1.0},
+     "geom": {"Polyline": {"vertices": [
+        {"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}, {"x": 2.0, "y": 0.0}
+      ], "closed": true}}}
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "version": 4,
+  "sheet": {
+    "unit": "Millimeter",
+    "scale": {"num": 1, "den": 2},
+    "paper": "A3",
+    "orientation": "Landscape",
+    "title_block": "B",
+    "fields": {
+      "drawing_number": "MCAD-V4-001",
+      "drawing_title": "v4 fixture",
+      "projection": "ThirdAngle",
+      "author": "almaz",
+      "date": "2026-09-13",
+      "revision": "A"
+    },
+    "frame_visible": true
+  },
+  "layers": [
+    {"name": "0", "color": {"r": 255, "g": 255, "b": 255},
+     "linetype": "Continuous", "width_mm": 0.35,
+     "visible": true, "locked": false, "order": 1},
+    {"name": "parts", "color": {"r": 200, "g": 40, "b": 40},
+     "linetype": "DashDot", "width_mm": 0.7,
+     "visible": true, "locked": false, "order": 0}
+  ],
+  "current_layer": 1,
+  "entities": [
+    {"layer": 0, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"Shape": {"Line": {"a": {"x": 0.0, "y": 0.0}, "b": {"x": 10.0, "y": 0.0}}}}},
+    {"layer": 1, "style": {"color": {"r": 0, "g": 0, "b": 0}, "width_mm": 0.13, "linetype": "Dashed"},
+     "geom": {"Text": {"anchor": {"x": 1.0, "y": 1.0}, "content": "v4 テキスト", "height": 3.5, "angle": 0.0}}},
+    {"layer": 0, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 10.0, "y": 0.0}, "offset": 5.0}}}
+  ]
+}

@@ -9,11 +9,15 @@
 
 mod bom;
 mod config;
+#[cfg(test)]
+mod dim_snapshot_tests;
 mod dimension;
 mod fonts;
 mod frame;
 mod iso;
 mod ortho;
+#[cfg(test)]
+mod perf_tests;
 mod plot;
 mod snap;
 mod table;

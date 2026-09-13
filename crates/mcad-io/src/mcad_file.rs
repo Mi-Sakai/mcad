@@ -1147,50 +1147,9 @@ mod tests {
         assert_eq!(export_document(&loaded), export_document(&doc));
     }
 
-    #[test]
-    fn v2_file_is_read_with_backward_compat() {
-        // v0.7.x 以前の v2 ファイル。レイヤーに order キーが無い。
-        // 幾何は v2 以降の EntityGeom（"Shape" ラッパーあり）。
-        let v2_json = r#"{
-          "version": 2,
-          "layers": [
-            {"name": "0", "color": {"r": 255, "g": 255, "b": 255}, "visible": true, "locked": false},
-            {"name": "middle", "color": {"r": 10, "g": 20, "b": 30}, "visible": false, "locked": true},
-            {"name": "top", "color": {"r": 40, "g": 50, "b": 60}, "visible": true, "locked": false}
-          ],
-          "current_layer": 2,
-          "entities": [
-            {"layer": 1, "style": {"color": null, "width": 1.0},
-             "geom": {"Shape": {"Line": {"a": {"x": 0.0, "y": 0.0}, "b": {"x": 3.0, "y": 4.0}}}}}
-          ]
-        }"#;
-
-        let doc = load(v2_json).expect("v2 ファイルは後方互換で読み込めるべき");
-
-        // order は配列インデックスで復元される（並びはファイル内の元の順序）。
-        let ordered: Vec<(String, i32)> = doc
-            .layers_in_order()
-            .into_iter()
-            .map(|(_, l)| (l.name.clone(), l.order))
-            .collect();
-        assert_eq!(
-            ordered,
-            vec![
-                ("0".to_owned(), 0),
-                ("middle".to_owned(), 1),
-                ("top".to_owned(), 2),
-            ]
-        );
-
-        // 他のプロパティ・カレントレイヤー・エンティティも従来どおり復元される。
-        let (_, middle) = doc.layers().find(|(_, l)| l.name == "middle").unwrap();
-        assert!(middle.locked && !middle.visible);
-        assert_eq!(doc.layer(doc.current_layer()).unwrap().name, "top");
-        assert_eq!(doc.entity_count(), 1);
-
-        // 読込後の書き出しは常に v3。
-        assert_eq!(export_document(&doc).version, FORMAT_VERSION);
-    }
+    // `v2_file_is_read_with_backward_compat` は `crates/mcad-io/tests/backward_compat.rs`
+    // の `v2_fixture_loads_with_expected_content`（M11 タスク65）へ移設した。
+    // fixture: `tests/fixtures/v2.mcad`。
 
     #[test]
     fn v2_file_with_table_geometry_is_rejected() {
@@ -1213,27 +1172,9 @@ mod tests {
         assert!(matches!(load(&v2_json), Err(IoError::Json(_))));
     }
 
-    #[test]
-    fn v1_file_layer_order_falls_back_to_array_index() {
-        // v1 もレイヤーは order なし。v2 と同じ「order = 配列インデックス」規則を通る。
-        let v1_json = r#"{
-          "version": 1,
-          "layers": [
-            {"name": "0", "color": {"r": 255, "g": 255, "b": 255}, "visible": true, "locked": false},
-            {"name": "front", "color": {"r": 1, "g": 2, "b": 3}, "visible": true, "locked": false}
-          ],
-          "current_layer": 0,
-          "entities": []
-        }"#;
-
-        let doc = load(v1_json).unwrap();
-        let ordered: Vec<(String, i32)> = doc
-            .layers_in_order()
-            .into_iter()
-            .map(|(_, l)| (l.name.clone(), l.order))
-            .collect();
-        assert_eq!(ordered, vec![("0".to_owned(), 0), ("front".to_owned(), 1)]);
-    }
+    // `v1_file_layer_order_falls_back_to_array_index` は `backward_compat.rs` の
+    // `v1_fixture_loads_with_expected_content`（M11 タスク65）へ移設した。
+    // fixture: `tests/fixtures/v1.mcad`。
 
     #[test]
     fn v3_file_without_layer_order_is_rejected() {
@@ -1251,39 +1192,9 @@ mod tests {
         assert!(matches!(load(broken), Err(IoError::Json(_))));
     }
 
-    #[test]
-    fn v1_file_is_read_with_backward_compat() {
-        // v0.5.0 以前の v1 ファイル。幾何は Shape が直下に来る（v2 の "Shape" ラッパーなし）。
-        let v1_json = r#"{
-          "version": 1,
-          "layers": [
-            {"name": "0", "color": {"r": 255, "g": 255, "b": 255}, "visible": true, "locked": false}
-          ],
-          "current_layer": 0,
-          "entities": [
-            {"layer": 0, "style": {"color": null, "width": 1.0},
-             "geom": {"Line": {"a": {"x": 0.0, "y": 0.0}, "b": {"x": 3.0, "y": 4.0}}}}
-          ]
-        }"#;
-
-        let doc = load(v1_json).expect("v1 ファイルは後方互換で読み込めるべき");
-        assert_eq!(doc.entity_count(), 1);
-        let (_, entity) = doc.entities().next().unwrap();
-        // v1 の Shape は EntityGeom::Shape へ包まれて受理される。
-        assert_eq!(
-            entity.geom,
-            EntityGeom::Shape(Shape::Line(LineSeg::new(
-                Point2::new(0.0, 0.0),
-                Point2::new(3.0, 4.0),
-            )))
-        );
-
-        // 読込後の書き出しは常に現行バージョン。往復しても内容が保たれる。
-        let reexported = export_document(&doc);
-        assert_eq!(reexported.version, FORMAT_VERSION);
-        let reimported = import_document(&reexported).unwrap();
-        assert_eq!(export_document(&reimported), reexported);
-    }
+    // `v1_file_is_read_with_backward_compat` は `backward_compat.rs` の
+    // `v1_fixture_loads_with_expected_content`（M11 タスク65）へ移設した。
+    // fixture: `tests/fixtures/v1.mcad`。
 
     // --- v4 移行（DESIGN.md M8 設計判断6、タスク35b）---
 
@@ -2114,22 +2025,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn v1_to_v5_files_default_arrow_kind_to_closed_filled() {
-        // 表なし・矢先種別なしの旧ファイルは `ClosedFilled`（現行の見た目）へ補完される。
-        let v5 = v5_json(
-            r#"{"num": 1, "den": 1}"#,
-            "0.35",
-            "null",
-            &serde_json::to_string(&mcad_core::DimStyle::default()).unwrap(),
-        );
-        let doc = load(&v5).expect("v5 は読めるべき");
-        assert_eq!(doc.dim_style().arrow_kind, ArrowKind::ClosedFilled);
-
-        let v4 = v4_json(r#"{"num": 1, "den": 1}"#, "0.35", "null");
-        let doc = load(&v4).expect("v4 は読めるべき");
-        assert_eq!(doc.dim_style().arrow_kind, ArrowKind::ClosedFilled);
-    }
+    // `v1_to_v5_files_default_arrow_kind_to_closed_filled` は `backward_compat.rs` の
+    // `v1_fixture_loads_with_expected_content` / `v4_fixture_loads_with_expected_content` /
+    // `v5_fixture_loads_with_expected_content`（M11 タスク65。いずれも `arrow_kind ==
+    // ClosedFilled` を確認する）へ移設した。
 
     #[test]
     fn v4_file_with_table_geometry_is_rejected() {

@@ -20,7 +20,6 @@ mod ortho;
 mod perf_tests;
 mod plot;
 mod snap;
-mod table;
 mod tool;
 mod viewport;
 
@@ -29,17 +28,19 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
-    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimKind, DimLinear, DimRadial, DimStyle,
-    Document, Entity, EntityGeom, EntityId, FitClass, Layer, LayerId, Linetype, MAX_DIM_DECIMALS,
-    Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style,
-    TableGeom, TextGeom, TitleBlockFields, TitleBlockKind, WidthMm,
+    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimExpansion, DimKind, DimLinear,
+    DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom, EntityId, FitClass, Layer,
+    LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize, ProjectionMethod, Rgb, Scale,
+    SheetMeta, SizeTolerance, Style, TableGeom, TextGeom, TitleBlockFields, TitleBlockKind,
+    WidthMm, arrow_kind_occupies_line, expand_diameter, expand_linear, expand_radial, expand_table,
+    label_box_center, label_box_contains, table_world_aabb,
 };
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use bom::{apply_bom_preset, bom_anchor_above_title_block};
+use dimension::dim_render;
 use frame::{frame_layout, paper_to_world, parse_scale_input};
-use table::table_world_aabb;
 
 // 破線パターンの紙 mm 定数は「画面と出力の唯一の出所」として `plot` に置く（M8 タスク39）。
 // 画面側（`dash_pattern_px`）はここから参照するだけで、挙動は変えない。
@@ -3889,7 +3890,8 @@ fn dim_arrow_placement_label(placement: ArrowPlacement) -> &'static str {
 
 /// 寸法スタイルダイアログの「矢先」コンボに並べる種別（M10 タスク63）。
 /// [`ArrowKind`] は `#[non_exhaustive]` なので網羅はこの配列が担保する
-/// （`dimension::tests::ALL_SYMBOLS` と同じ流儀。**種別を増やしたらここへ足す**）。
+/// （`mcad_core` の `expand::dimension::tests::ALL_SYMBOLS` と同じ流儀。
+/// **種別を増やしたらここへ足す**）。
 const ARROW_KIND_CHOICES: [ArrowKind; 7] = [
     ArrowKind::ClosedFilled,
     ArrowKind::ClosedBlank,
@@ -4506,11 +4508,11 @@ fn dim_panel(
 
     // --- 矢印の配置 ---
     // 文書の矢先が寸法線に沿って場所を取らない種別（斜線・点・なし）のときは、内向き・
-    // 外向きのどちらを選んでも描画が変わらない（`dimension::arrows_point_outward` が
+    // 外向きのどちらを選んでも描画が変わらない（`mcad_core` の `arrows_point_outward` が
     // 手動指定ごと内向きへ倒す）。選べてしまうと「効かない設定」になるのでコンボを
     // 無効化し、理由をホバーで示す（DESIGN.md 7章「寸法矢印のブロック化」設計確定4・6）。
     let arrow_kind = document.dim_style().arrow_kind;
-    let placement_matters = dimension::arrow_kind_occupies_line(arrow_kind);
+    let placement_matters = arrow_kind_occupies_line(arrow_kind);
     let arrow_common = all_same(live.iter().map(|(_, _, a)| a.arrow_placement));
     ui.horizontal(|ui| {
         ui.label("矢印の配置:");
@@ -6298,7 +6300,7 @@ fn draw_entities(
                 let stroke = Stroke::new(stroke_px, color);
                 draw_dim_diameter(painter, rect, viewport, dim, stroke, render);
             }
-            // 表は罫線の幅を app 層の定数（表題欄と同じ）から取るので `stroke_px` は
+            // 表は罫線の幅を固定の定数（表題欄と同じ）から取るので `stroke_px` は
             // 使わない。線種も見ない（常に実線）。M10 詳細設計1・タスク58。
             EntityGeom::Table(table) => {
                 draw_table(
@@ -6317,52 +6319,6 @@ fn draw_entities(
     }
 }
 
-/// 寸法の矢先の長さ・文字高さをワールド長で解決する（戻り値: `(arrow_len, text_height)`）。
-///
-/// 紙基準表示 ON（`paper_display`）: 文書スタイルの紙 mm
-/// （[`DimStyle::arrow_len_mm`]/[`DimStyle::text_height_mm`]）× `k`
-/// （ズーム非依存 → 図形と一緒に拡縮し、タスク39/40 の SVG/PDF 出力と一致する）。
-/// OFF: 画面固定 px（[`DIM_ARROW_PX`]/[`DIM_TEXT_PX`]）÷ `zoom`（タスク36b までの現行の
-/// 見た目。スタイルの影響を受けない画面専用モード）。ON モードの注記サイズに px 下限
-/// クランプは設けない（[`draw_text`] 既存の [`MIN_TEXT_PX`] 未満スキップに任せる）。
-///
-/// # 紙 mm の出所を [`DimStyle`] へ一本化してある（M9 タスク49-3）
-///
-/// タスク37〜39 はここで `plot::DIM_ARROW_MM` / `plot::DIM_TEXT_MM` という定数を使って
-/// いたが、M9 タスク49-2 で矢の内外判定（`dimension::arrows_point_outward`）と注記の
-/// 表示倍率（`dimension::DimRender::annotation_scale`）が [`DimStyle`] を読むように
-/// なったため、「実際に描かれる大きさは定数・判定と組版の比率はスタイル」という
-/// 二重の出所になっていた。既定値が一致していたので差は出ていなかったが、スタイル編集
-/// UI（M9 タスク50）で文字高さを変えた瞬間に両者が食い違う。ここをスタイル読みへ
-/// 揃えることで、画面・SVG・PDF の 3 経路が同じ 1 つの値から大きさを得る。
-fn dim_sizes(style: &DimStyle, paper_display: bool, k: f64, zoom: f64) -> (f64, f64) {
-    if paper_display {
-        (style.arrow_len_mm * k, style.text_height_mm * k)
-    } else {
-        (DIM_ARROW_PX / zoom, DIM_TEXT_PX / zoom)
-    }
-}
-
-/// 寸法展開のパラメータ（[`dimension::DimRender`]）を組み立てる。
-///
-/// 表示モードの解決（[`dim_sizes`]）はここで済ませ、`dimension` モジュールへは
-/// **ワールド長になった値だけ**を渡す。文書尺度 `k` は矢の内外判定を紙 mm で行うために
-/// 別枠で渡す（[`dimension::DimRender`] の doc: 2 つの換算係数を混同しないこと）。
-fn dim_render(
-    style: &DimStyle,
-    paper_display: bool,
-    k: f64,
-    zoom: f64,
-) -> dimension::DimRender<'_> {
-    let (arrow_len_world, text_height_world) = dim_sizes(style, paper_display, k, zoom);
-    dimension::DimRender {
-        style,
-        scale_world_per_paper_mm: k,
-        arrow_len_world,
-        text_height_world,
-    }
-}
-
 /// `world` が、**選択集合に含まれる**寸法いずれかの文字ブロック（表示サイズ依存の
 /// `label_box`）に入っていれば、その `(EntityId, 現在のラベル中心)` を返す（M9 タスク51）。
 ///
@@ -6374,7 +6330,7 @@ fn dim_label_hit(
     document: &Document,
     selection: &[EntityId],
     world: Point2,
-    render: dimension::DimRender<'_>,
+    render: DimRender<'_>,
 ) -> Option<(EntityId, Point2)> {
     for &id in selection {
         let Some(entity) = document.entity(id) else {
@@ -6385,56 +6341,56 @@ fn dim_label_hit(
             continue;
         }
         let ex = match &entity.geom {
-            EntityGeom::DimLinear(dim) => dimension::expand_linear(dim, render),
-            EntityGeom::DimRadial(dim) => dimension::expand_radial(dim, render),
-            EntityGeom::DimDiameter(dim) => dimension::expand_diameter(dim, render),
+            EntityGeom::DimLinear(dim) => expand_linear(dim, render),
+            EntityGeom::DimRadial(dim) => expand_radial(dim, render),
+            EntityGeom::DimDiameter(dim) => expand_diameter(dim, render),
             _ => continue,
         };
         if let Some(quad) = ex.label_box
-            && dimension::label_box_contains(&quad, world)
+            && label_box_contains(&quad, world)
         {
-            return Some((id, dimension::label_box_center(&quad)));
+            return Some((id, label_box_center(&quad)));
         }
     }
     None
 }
 
-/// 長さ寸法を描画する（純関数 helper [`dimension::expand_linear`] の展開を Painter へ）。
+/// 長さ寸法を描画する（純関数 helper [`expand_linear`] の展開を Painter へ）。
 fn draw_dim_linear(
     painter: &egui::Painter,
     rect: Rect,
     viewport: &Viewport,
     dim: &DimLinear,
     stroke: Stroke,
-    render: dimension::DimRender<'_>,
+    render: DimRender<'_>,
 ) {
-    let ex = dimension::expand_linear(dim, render);
+    let ex = expand_linear(dim, render);
     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
 }
 
-/// 半径寸法を描画する（純関数 helper [`dimension::expand_radial`] の展開を Painter へ）。
+/// 半径寸法を描画する（純関数 helper [`expand_radial`] の展開を Painter へ）。
 fn draw_dim_radial(
     painter: &egui::Painter,
     rect: Rect,
     viewport: &Viewport,
     dim: &DimRadial,
     stroke: Stroke,
-    render: dimension::DimRender<'_>,
+    render: DimRender<'_>,
 ) {
-    let ex = dimension::expand_radial(dim, render);
+    let ex = expand_radial(dim, render);
     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
 }
 
-/// 直径寸法を描画する（純関数 helper [`dimension::expand_diameter`] の展開を Painter へ）。
+/// 直径寸法を描画する（純関数 helper [`expand_diameter`] の展開を Painter へ）。
 fn draw_dim_diameter(
     painter: &egui::Painter,
     rect: Rect,
     viewport: &Viewport,
     dim: &DimDiameter,
     stroke: Stroke,
-    render: dimension::DimRender<'_>,
+    render: DimRender<'_>,
 ) {
-    let ex = dimension::expand_diameter(dim, render);
+    let ex = expand_diameter(dim, render);
     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
 }
 
@@ -6447,13 +6403,13 @@ fn draw_dim_diameter(
 /// から組み立てた高さなので、ここでは**そのまま** `draw_text` のワールド高さ引数へ渡す
 /// （`k` を掛けると二重換算になる。タスク37 判断(d)）。
 ///
-/// [`dimension::DimExpansion::symbol_strokes`]（φ・□ のストローク）は寸法線とまったく
+/// [`DimExpansion::symbol_strokes`]（φ・□ のストローク）は寸法線とまったく
 /// 同じ `stroke` で、既存の [`draw_shape`] へ通して描く（M9 タスク49-3）。
 fn draw_dim_expansion(
     painter: &egui::Painter,
     rect: Rect,
     viewport: &Viewport,
-    ex: &dimension::DimExpansion,
+    ex: &DimExpansion,
     stroke: Stroke,
 ) {
     for seg in &ex.segments {
@@ -6747,17 +6703,17 @@ fn draw_selected(
                     draw_aabb_outline(painter, rect, viewport, &aabb, stroke);
                 }
                 EntityGeom::DimLinear(dim) => {
-                    let ex = dimension::expand_linear(dim, render);
+                    let ex = expand_linear(dim, render);
                     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
                     draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
                 }
                 EntityGeom::DimRadial(dim) => {
-                    let ex = dimension::expand_radial(dim, render);
+                    let ex = expand_radial(dim, render);
                     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
                     draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
                 }
                 EntityGeom::DimDiameter(dim) => {
-                    let ex = dimension::expand_diameter(dim, render);
+                    let ex = expand_diameter(dim, render);
                     draw_dim_expansion(painter, rect, viewport, &ex, stroke);
                     draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
                 }
@@ -6784,7 +6740,7 @@ fn draw_selected(
     }
 }
 
-/// 選択中の寸法の文字ブロック外形（[`dimension::DimExpansion::label_box`]）を
+/// 選択中の寸法の文字ブロック外形（[`DimExpansion::label_box`]）を
 /// 細線で描く（M9 タスク51）。ドラッグで掴める場所をユーザーへ示すためだけの
 /// 表示で、ヒットテスト自体（`dim_label_hit`）は保存データではなく同じ展開を
 /// 再計算して使う（表示と判定を食い違わせないため、同じ `label_box` を共有する）。
@@ -6792,7 +6748,7 @@ fn draw_dim_label_box(
     painter: &egui::Painter,
     rect: Rect,
     viewport: &Viewport,
-    ex: &dimension::DimExpansion,
+    ex: &DimExpansion,
     color: Color32,
 ) {
     let Some(quad) = ex.label_box else {
@@ -6981,12 +6937,13 @@ fn entity_world_aabb(geom: &EntityGeom, k: f64) -> Aabb {
 
 /// 表 1 つ（罫線 + セル文字）を Painter へ描く（M10 タスク58）。
 ///
-/// 組版は [`table::expand_table`] が唯一の出所で、画面・SVG/PDF・ピックが同じ展開を
+/// 組版は [`expand_table`] が唯一の出所で、画面・SVG/PDF・ピックが同じ展開を
 /// 共有する。罫線の画面 px 幅だけは図面枠（[`draw_frame`]）と同じ
 /// [`resolve_stroke_px_with_toggle`] に従う（F9 OFF = 1px 固定、ON = 紙 mm 比例）。
-/// **位置と文字の大きさはトグル非依存で常に紙基準**（理由は `table` モジュール doc）。
+/// **位置と文字の大きさはトグル非依存で常に紙基準**（理由は `mcad_core` の
+/// `expand::table` モジュール doc）。
 ///
-/// 罫線は常に実線・幅は app 層の定数で、エンティティ／レイヤーのスタイルからは
+/// 罫線は常に実線・幅は固定の定数で、エンティティ／レイヤーのスタイルからは
 /// **色だけ**を受け取る（M10 詳細設計1）。セル文字は Text エンティティとまったく同じ
 /// 経路（[`draw_text`] にワールド高さ `height * k` を渡す）で描く。
 fn draw_table(
@@ -6998,7 +6955,7 @@ fn draw_table(
     paper_display: bool,
     k: f64,
 ) {
-    let ex = table::expand_table(table, k);
+    let ex = expand_table(table, k);
     for seg in &ex.segments {
         let a = viewport.world_to_screen(rect, seg.a);
         let b = viewport.world_to_screen(rect, seg.b);
@@ -7007,7 +6964,7 @@ fn draw_table(
         painter.line_segment([a, b], Stroke::new(stroke_px, color));
     }
     for text in &ex.texts {
-        // `TextGeom::height` は紙 mm 契約のまま（`table` モジュール doc）なので、
+        // `TextGeom::height` は紙 mm 契約のまま（core の `expand::table` モジュール doc）なので、
         // Text エンティティと同じく `height * k` をワールド高さとして渡す。
         draw_text(painter, rect, viewport, text, text.height * k, color);
     }
@@ -7128,6 +7085,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dimension::dim_sizes;
     use mcad_core::Entity;
     use mcad_geom::{Circle, LineSeg};
     // 紙 mm のダッシュパターン定数は `plot` が持つ（タスク39）。画面側の px 換算
@@ -9327,7 +9285,7 @@ mod tests {
 
         for style in [DimStyle::DEFAULT, large_dim_style()] {
             let render = dim_render(&style, true, k, 1.0);
-            let ex = dimension::expand_linear(&dim, render);
+            let ex = expand_linear(&dim, render);
 
             // 矢先の実長（先端 → 後端）はスタイルの矢先長 × k（既定の塗りつぶし矢は
             // `[先端, 後端+半幅, 後端−半幅]` の三角形 1 枚）。
@@ -9766,7 +9724,7 @@ mod tests {
         // 配置コンボを無効化する種別（`along_len == 0`）は 3 つ。
         let no_room = ARROW_KIND_CHOICES
             .iter()
-            .filter(|&&k| !dimension::arrow_kind_occupies_line(k))
+            .filter(|&&k| !arrow_kind_occupies_line(k))
             .count();
         assert_eq!(no_room, 3, "斜線・点・なしの 3 種のはず");
     }

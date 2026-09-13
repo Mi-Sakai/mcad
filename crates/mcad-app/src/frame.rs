@@ -20,15 +20,14 @@ use mcad_geom::Point2;
 /// 輪郭の余白（紙 mm、`製図規定.md` 2-3 の 1)。綴じ代なし・全周一律）。
 pub const FRAME_MARGIN_MM: f64 = 10.0;
 
-/// 輪郭線・表題欄外枠の線幅（紙 mm、`製図規定.md` 2-3 の 2) / 2-4-3 の a) 外枠）。
-pub const FRAME_BORDER_WIDTH_MM: f32 = 0.5;
-
-/// 表題欄内部の区切り線（行境界・セル境界）の線幅（紙 mm、`製図規定.md` 2-4-3 の a) 区切り線）。
-pub const FRAME_DIVIDER_WIDTH_MM: f32 = 0.13;
-
-/// セル左端から文字アンカーまでの詰め（紙 mm）。`製図規定.md` はセル内の文字の
-/// 詰め量までは規定していないため、可読な余白として自前で定義した値。
-pub const CELL_TEXT_PAD_MM: f64 = 1.5;
+/// 輪郭線・表題欄外枠の線幅・内部区切り線の線幅・セル内の文字詰め（いずれも紙 mm）。
+///
+/// **定義は `mcad-core` にあり、ここは再エクスポート**（M11 タスク71）。表
+/// （[`mcad_core::expand_table`]）が同じ値で組版する必要があり、その展開は
+/// `mcad-io` からも呼ばれるので、定数は core が持たないと共有できない
+/// （`mcad-io` は `mcad-app` へ依存できない）。図面枠・表題欄・表の 3 か所が
+/// この 1 つの値を共有する。
+pub use mcad_core::{CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
 
 /// 印刷対象の枠の線分 1 本（紙 mm 座標、原点=用紙左下、y-up）。
 pub struct FrameLine {

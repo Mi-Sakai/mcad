@@ -41,8 +41,10 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, Document, Entity, EntityGeom,
-    EntityId, LayerId, Linetype, NewIds, Style, TableGeom,
+    Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, DimRender, Document, Entity,
+    EntityGeom, EntityId, LayerId, Linetype, NewIds, Style, TableGeom, diameter_distance,
+    expand_diameter, expand_linear, expand_radial, linear_distance, radial_distance,
+    table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -197,7 +199,7 @@ pub trait Tool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        render: crate::dimension::DimRender<'_>,
+        render: DimRender<'_>,
     );
 
     /// 作図中（未確定）の頂点列。スナップエンジン（`crate::snap::snap`）が端点
@@ -409,7 +411,7 @@ impl Tool for PointTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         if let Some(p) = self.cursor {
             draw_shape(
@@ -477,7 +479,7 @@ impl Tool for TableTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         // アンカー位置に十字マーカーを描く（[`TextTool`] の未確定表示と同じ簡易
         // プレビュー）。既定の表は固定値なので、罫線一式のプレビューまでは
@@ -552,7 +554,7 @@ impl Tool for LineTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         if let (LineState::WaitingSecond(first), Some(cursor)) = (&self.state, self.cursor) {
             draw_shape(
@@ -637,7 +639,7 @@ impl Tool for CircleTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         if let (CircleState::WaitingRadiusPoint(center), Some(cursor)) = (&self.state, self.cursor)
         {
@@ -753,7 +755,7 @@ impl Tool for ArcTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         match (&self.state, self.cursor) {
             (ArcState::WaitingP2(p1), Some(cursor)) => {
@@ -906,7 +908,7 @@ impl Tool for IsoCircleTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         if let (IsoCircleState::WaitingRadius(center), Some(cursor)) = (self.state, self.cursor)
             && let Some(arcs) = self.arcs(center, cursor)
@@ -1009,7 +1011,7 @@ impl Tool for PolylineTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         if self.vertices.is_empty() {
             return;
@@ -1108,7 +1110,7 @@ impl Tool for TextTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         // アンカー確定後はその位置に小さな十字マーカーを描く（文字列プレビューは
         // 文字列・高さを持つ app 層が別途描く）。未確定時はカーソルにマーカーを描く。
@@ -1223,7 +1225,7 @@ impl Tool for DimLinearTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        render: crate::dimension::DimRender<'_>,
+        render: DimRender<'_>,
     ) {
         match (self.state, self.cursor) {
             // p2 待ち: 計測線の暫定（p1→カーソル）を細線で示す。
@@ -1247,7 +1249,7 @@ impl Tool for DimLinearTool {
                     offset,
                     annotation: DimAnnotation::default(),
                 };
-                let ex = crate::dimension::expand_linear(&dim, render);
+                let ex = expand_linear(&dim, render);
                 crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
             }
             _ => {}
@@ -1335,7 +1337,7 @@ impl Tool for DimRadialTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        render: crate::dimension::DimRender<'_>,
+        render: DimRender<'_>,
     ) {
         if let (DimRadialState::WaitingLeader { center, radius }, Some(cursor)) =
             (self.state, self.cursor)
@@ -1352,7 +1354,7 @@ impl Tool for DimRadialTool {
                 leader_angle,
                 annotation: DimAnnotation::default(),
             };
-            let ex = crate::dimension::expand_radial(&dim, render);
+            let ex = expand_radial(&dim, render);
             crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
         }
     }
@@ -1447,7 +1449,7 @@ impl Tool for DimDiameterTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        render: crate::dimension::DimRender<'_>,
+        render: DimRender<'_>,
     ) {
         if let (DimDiameterState::WaitingLine { center, radius }, Some(cursor)) =
             (self.state, self.cursor)
@@ -1462,7 +1464,7 @@ impl Tool for DimDiameterTool {
                 angle,
                 annotation: DimAnnotation::default(),
             };
-            let ex = crate::dimension::expand_diameter(&dim, render);
+            let ex = expand_diameter(&dim, render);
             crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
         }
     }
@@ -1675,7 +1677,7 @@ impl BoundaryTargetTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         // 選択済みの境界だけをハイライトして「今どちらを選んだか」を示す。カーソル追従の
         // ライブプレビューは行わない（上記のとおり）。
@@ -1760,7 +1762,7 @@ macro_rules! impl_tool_for_boundary_target {
                 painter: &Painter,
                 rect: Rect,
                 viewport: &Viewport,
-                render: crate::dimension::DimRender<'_>,
+                render: DimRender<'_>,
             ) {
                 self.0.draw_preview(painter, rect, viewport, render);
             }
@@ -1922,7 +1924,7 @@ impl Tool for FilletTool {
         painter: &Painter,
         rect: Rect,
         viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         // 選んだ 1 本目だけをハイライトする（トリム・延長が境界を示すのと同じ流儀）。
         if let FilletState::WaitingSecondLine { first, .. } = &self.state {
@@ -2035,7 +2037,7 @@ impl Tool for SplitTool {
         _painter: &Painter,
         _rect: Rect,
         _viewport: &Viewport,
-        _render: crate::dimension::DimRender<'_>,
+        _render: DimRender<'_>,
     ) {
         // 単一状態でハイライトすべき「選択済みの一部」が無いため、他ツールと違い
         // プレビュー描画自体を持たない。
@@ -2476,15 +2478,13 @@ impl SelectTool {
                 // height×k のワールド AABB へ追従させる（判断(c)により Text は
                 // トグル非依存で常に height×k）。
                 EntityGeom::Text(text) => crate::text_world_aabb(text, k).distance_to_point(world),
-                EntityGeom::DimLinear(dim) => crate::dimension::linear_distance(dim, world),
-                EntityGeom::DimRadial(dim) => crate::dimension::radial_distance(dim, world),
-                EntityGeom::DimDiameter(dim) => crate::dimension::diameter_distance(dim, world),
+                EntityGeom::DimLinear(dim) => linear_distance(dim, world),
+                EntityGeom::DimRadial(dim) => radial_distance(dim, world),
+                EntityGeom::DimDiameter(dim) => diameter_distance(dim, world),
                 // 表は表示上のワールド AABB（列幅・行高さ × k）への距離。Text と同じ
                 // 割り切りで、罫線 1 本ずつへの距離は取らない（面として掴む方が操作
-                // として自然。M10 タスク58、`table` モジュール doc）。
-                EntityGeom::Table(table) => {
-                    crate::table::table_world_aabb(table, k).distance_to_point(world)
-                }
+                // として自然。M10 タスク58、`mcad_core` の `expand::table` モジュール doc）。
+                EntityGeom::Table(table) => table_world_aabb(table, k).distance_to_point(world),
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は近似 aabb への
                 // 距離で拾う（ピック対象から黙って消えるより穏当）。
                 _ => entity.geom.aabb().distance_to_point(world),

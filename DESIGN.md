@@ -937,16 +937,31 @@ M11-1 最小 import → M11-2 UI と編集)を実装可能な粒度へ落とす�
 | Aligned = 1 | `RotatedDimension` | `DimLinear`(`direction = Aligned`) | 13/14 = 計測 2 点、10 = 寸法線の位置 |
 | RotatedHorizontalOrVertical = 0 | `RotatedDimension` | `DimLinear`(`direction = Rotated(50°)`) | 50 = 寸法線の角度(度)。**Aligned と同じ型**で `dimension_type` が区別する |
 | Radius = 4 | `RadialDimension` | `DimRadial` | 10 = 中心、15 = 円周上の点、40 = 引出長 |
-| Diameter = 3 | `DiameterDimension` | `DimDiameter` | 10 と 15 が直径の両端 |
+| Diameter = 3 | `DiameterDimension` | `DimDiameter` | 15 = 円周上の点、10 = **その反対側の点**(中心ではない)。結果として両端 |
 | AngularThreePoint = 5 | `AngularThreePointDimension` | `DimAngular`(新設) | 13/14 = 角の 2 点、15 = 頂点、10 = 弧の位置 |
 | Ordinate = 6 | `OrdinateDimension` | `DimOrdinate`(新設) | 13 = 計測点、14 = 引出線端、10 = 原点、`is_ordinate_x_type` が X/Y |
 | Angular(2直線) = 2 | **無し** | スキップ | クレートに `AcDb2LineAngularDimension` の読込分岐が無い |
 | 弧長(type 8) | **無し** | スキップ | `DimensionType` に値自体が無い |
 
-- **定義点の意味づけ(10/13/14/15 が実際に何を指すか)は M11-1 タスク67 で実ファイル
-  (AutoCAD・LibreCAD が書いた DXF)で検証してから確定する。** 上表は spec の group code と
-  DXF リファレンスの一般的な解釈であり、**采配役はフィールド名と型は実測したが、意味の
-  対応は未検証**。ここを推測のまま実装すると計測点と寸法線位置が入れ替わる。
+- **定義点の意味づけは Autodesk DXF Reference(2018 版)で確認済み(2026-09-13、research-scout、
+  采配役が結論を採用)**。確定した内容: Aligned/Rotated は 13/14 が補助線の起点(= 計測 2 点)で
+  10 が寸法線の位置。Radius は 10 = 中心・15 = 円周点。**Diameter の 10 は中心ではなく「15 の
+  反対側の点」**(当初案の「両端」は結果として同じだが表現を訂正)。3点角度は 15 = 頂点・
+  13/14 = 補助線の端点・10 = 弧の位置。Ordinate は 13 = 計測点・14 = 引出線端・10 = 作成時 UCS 原点。
+  **ただし文献は「どう書かれるべきか」であり、LibreCAD が実際にそう書くかは別問題**なので、
+  タスク67 で実ファイルを突き合わせて確認する(食い違えば実ファイル側に合わせる)。
+- **group 70 の構造**: 「下位3ビットが種別」ではなく、**0〜6 の整数値に 32 / 64 / 128 のビットが
+  加算される**形(32 は R13 以降常時、64 = Ordinate の X 型、128 = 文字位置がユーザー指定)。
+  dxf 0.6.1 はこれを `DimensionType` と `is_ordinate_x_type` /
+  `is_at_user_defined_location` / `is_block_reference_referenced_by_this_block_only` へ
+  分解済みなので、mcad 側でビット演算はしない。**`is_at_user_defined_location` が真の寸法は
+  文字位置が明示指定なので `DimAnnotation::text_anchor` へ写す**(タスク67 で扱う)。
+- **group 52(`extension_line_angle`)は絶対角ではなく 50 への加算値**(補助線を斜めにする
+  オブリーク補正)。mcad には対応する概念が無いので、0 以外なら警告に計上して無視する。
+- **group 1(`text`)の扱い**: 空文字列と `<>` は「実測値を描く」、**スペース 1 文字は「文字を
+  出さない」**、それ以外はその文字列を描く。`<>` を含む文字列は前後を接頭辞・接尾辞として
+  分解する(v7 の `prefix` / `suffix`)。スペース 1 文字は M11 では `value_override = Some(" ")`
+  ではなく**警告して無注記にする**(mcad に「文字を出さない寸法」の概念が無いため。タスク70 で確定)。
 - 2直線角度・弧長は import でスキップし件数に計上する。**ただし M10 タスク61 で判明したとおり、
   クレートが `EntityType` を持たない型はパーサ側で読み飛ばされ `entities()` に現れないため
   計上できない。** 2直線角度と弧長がこれに該当するので、「読めない種別があった」ことは
@@ -955,7 +970,10 @@ M11-1 最小 import → M11-2 UI と編集)を実装可能な粒度へ落とす�
   (M9 設計判断どおり非関連。図形を動かしても寸法値は追従しない)。
 
 **(2) 角度の単位**: DXF の角度フィールド(50 `rotation_angle`、51 `horizontal_direction_angle`、
-52 `extension_line_angle`、53 `text_rotation_angle`)は**すべて度**、mcad の角度は**すべてラジアン**
+52 `extension_line_angle`、53 `text_rotation_angle`)は**度**として扱う。**ただし Autodesk の
+DXF Reference には単位の明記が無く(2026-09-13 の調査で確認できず)、度であることは慣行と
+二次情報による。タスク67 で実ファイル(既知の角度を持つ寸法)を読んで確定する。**
+mcad の角度は**すべてラジアン**
 (`TextGeom::angle`・`DimDiameter::angle`・`DimRadial::leader_angle` と同じ契約)。変換は
 **io 境界の 1 箇所**(`dxf_file.rs` の import/export 関数)に閉じ、`to_radians()` / `to_degrees()` を
 使う。角度を持つ寸法すべてについて「mcad → DXF → mcad」の往復で角度が一致することをテストで

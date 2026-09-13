@@ -16,9 +16,10 @@
 //! 対応する（DESIGN.md M10 設計方針6・詳細設計8、タスク61）:
 //!
 //! - **export**: [`table_to_dxf_entities`] が罫線を `LINE`、非空セル文字を `TEXT`
-//!   へ分解して書く（`mcad-app` の `table::expand_table` と同じ組版規則を、依存
-//!   方向の制約から `mcad-io` 側に独立実装したもの）。分解できるため
-//!   `skipped_entities` には計上しない（Text と同じ「対応済み」扱い）。
+//!   へ分解して書く。組版は `mcad-core` の [`mcad_core::expand_table`]（画面・SVG/PDF と
+//!   同じ唯一の出所。M11 タスク71 で core へ移すまでは依存方向の制約から `mcad-io` 側に
+//!   独立実装していた）。分解できるため `skipped_entities` には計上しない
+//!   （Text と同じ「対応済み」扱い）。
 //! - **import**: DXF に「表」に相当するプリミティブは無いので、分解後の
 //!   `LINE`/`TEXT` を import しても [`mcad_core::EntityGeom::Table`] へは戻らず、
 //!   ただの直線・文字の集合として復元される。**表として export したファイルを
@@ -271,7 +272,7 @@ use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
 use mcad_core::{
     Command, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Rgb, Style, TableGeom,
-    TextGeom, WidthMm,
+    TextGeom, WidthMm, expand_table,
 };
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
@@ -718,113 +719,55 @@ fn text_to_dxf_entity(text: &TextGeom, world_mm_per_paper_mm: f64) -> DxfEntity 
     DxfEntity::new(specific)
 }
 
-/// 表（[`TableGeom`]、M10）の DXF 分解 export で使うセル文字の左パディング（紙 mm）。
-///
-/// `mcad-app` の `frame::CELL_TEXT_PAD_MM` と同じ値。`mcad-io` は `mcad-app` へ依存
-/// できない（アーキテクチャ不変条件、依存方向は app → io → core → geom）ため、
-/// ここに独立した定数として複製する（DESIGN.md M10 詳細設計8 が認めた割り切り。
-/// 定数の一致は `mcad-app` 側の統合テストに委ねる将来課題として DESIGN.md へ残債
-/// 記録済み）。
-const TABLE_CELL_TEXT_PAD_MM: f64 = 1.5;
-
 /// [`TableGeom`]（表・M10）を DXF の `LINE`（罫線）・`TEXT`（セル文字）へ**分解**する
 /// （タスク61、DESIGN.md M10 設計方針6・詳細設計8）。
 ///
 /// DXF に「表」に相当するプリミティブが無いため、[`crate::mcad_file`] のような
-/// ポータブル DTO 経由ではなく `mcad-app` の `table::expand_table` と**同じ組版規則を
-/// 独立に**実装する（`mcad-io` は `mcad-app` に依存できないため関数を再利用できない。
-/// 依存方向はモジュール doc・AGENTS.md 参照）。罫線の順序は
-/// 外枠4辺 →（上から）行境界 →（左から）列境界、セル文字は行優先（行0=最上段）で
-/// `expand_table` と揃えてあるが、**一致は本モジュールのテストでのみ固定**しており
-/// `expand_table` との突き合わせテストは無い（残債、DESIGN.md 参照）。
+/// ポータブル DTO 経由ではなく、罫線とセル文字の座標を組んでから書く。
 ///
-/// - 罫線の太さ（外枠 0.5mm・内部 0.13mm の区別）は**書かない**
-///   （[`export_dxf`] が呼び出し側でエンティティの [`Style::width_mm`] を全罫線へ
-///   一律に適用するため、表題欄と同じ「太い枠・細い仕切り」の描き分けは DXF には
+/// # 組版は `mcad-core` の [`expand_table`] が唯一の出所（M11 タスク71）
+///
+/// M10 タスク61 の時点では展開が `mcad-app` にあり、`mcad-io` は `mcad-app` へ依存
+/// できない（アーキテクチャ不変条件、依存方向は app → io → core → geom）ため
+/// **同じ組版規則をここへ独立に実装していた**。値が乖離しても検出できない残債だった
+/// ので、M11 設計判断1 で展開を `mcad-core` へ移し、この関数は
+/// [`expand_table`] の結果を DXF エンティティへ写すだけになった。セル内パディングの
+/// 定数（`CELL_TEXT_PAD_MM`）の複製もここで消えている。したがって
+/// **画面・SVG/PDF・DXF の罫線位置とセル文字位置は定義上一致する**。
+///
+/// - 罫線の順序は [`expand_table`] のまま（外枠4辺 →（上から）行境界 →
+///   （左から）列境界）。`LINE` をすべて出してから `TEXT` を出す。
+/// - 罫線の太さ（外枠 0.5mm・内部 0.13mm の区別、
+///   [`mcad_core::TableSegment::width_mm`]）は
+///   **書かない**（[`export_dxf`] が呼び出し側でエンティティの [`Style::width_mm`] を
+///   全罫線へ一律に適用するため、表題欄と同じ「太い枠・細い仕切り」の描き分けは DXF には
 ///   残らない。dxf 0.6.1 のレイヤー線幅と同じ「クレート側 API ではなく mcad の
 ///   設計上の割り切りとして保存されない」制約としてモジュール doc に記録する）。
 /// - セル文字の高さは [`text_to_dxf_entity`] と同じ尺度契約（`text_height_mm * k`）。
-/// - **空セルは出さない**（`expand_table` と同じ。描くものが無い）。
-/// - **退化した表（行数・列数が 0）は空を返す**（`EntityGeom::validate` を通していない
-///   値が渡っても panic しない全域関数。`expand_table` と同じ配慮）。
+/// - **空セルは出さない**・**退化した表（行数・列数が 0）は空を返す**のは
+///   [`expand_table`] の性質をそのまま受け継ぐ（`EntityGeom::validate` を通していない
+///   値が渡っても panic しない全域関数）。
 ///
 /// この分解は **非対称往復**（import しても表エンティティへは戻らない。モジュール doc
 /// 「未対応エンティティ・不正ジオメトリの扱い（import）」および AGENTS.md 参照）。
 fn table_to_dxf_entities(table: &TableGeom, world_mm_per_paper_mm: f64) -> Vec<DxfEntity> {
-    let (rows, cols) = (table.rows(), table.cols());
-    if rows == 0 || cols == 0 {
-        return Vec::new();
-    }
+    let expansion = expand_table(table, world_mm_per_paper_mm);
 
-    let k = world_mm_per_paper_mm;
-    let total_w = table.width_mm();
-    let total_h = table.height_mm();
-    // 局所（紙 mm、アンカー=原点、y-up）→ ワールド。`table::expand_table` と同じ
-    // 「anchor 基準で k 倍」の写像。
-    let to_world =
-        |x_mm: f64, y_mm: f64| Point2::new(table.anchor.x + x_mm * k, table.anchor.y + y_mm * k);
-
-    let mut entities = Vec::new();
-    let mut push_line = |ax: f64, ay: f64, bx: f64, by: f64| {
-        entities.push(DxfEntity::new(EntityType::Line(DxfLine {
-            p1: to_dxf_point(to_world(ax, ay)),
-            p2: to_dxf_point(to_world(bx, by)),
+    let lines = expansion.segments.iter().map(|seg| {
+        DxfEntity::new(EntityType::Line(DxfLine {
+            p1: to_dxf_point(seg.a),
+            p2: to_dxf_point(seg.b),
             ..Default::default()
-        })));
-    };
+        }))
+    });
+    // セル文字の `height` は紙 mm（`expand_table` の契約）なので、TEXT と同じく `× k`
+    // してモデル空間長へ直す（[`text_to_dxf_entity`] と同一の写像）。
+    let texts = expansion
+        .texts
+        .iter()
+        .map(|text| text_to_dxf_entity(text, world_mm_per_paper_mm));
 
-    // 外枠4辺。
-    push_line(0.0, 0.0, total_w, 0.0);
-    push_line(total_w, 0.0, total_w, total_h);
-    push_line(total_w, total_h, 0.0, total_h);
-    push_line(0.0, total_h, 0.0, 0.0);
-
-    // 行境界（最下段の下端は外枠と重なるので描かない）。
-    let mut row_top = total_h;
-    for (r, row_height) in table.row_heights_mm.iter().enumerate() {
-        let row_bottom = row_top - row_height;
-        if r + 1 < rows {
-            push_line(0.0, row_bottom, total_w, row_bottom);
-        }
-        row_top = row_bottom;
-    }
-
-    // 列境界（右端は外枠と重なるので描かない）。
-    let mut cell_right = 0.0;
-    for (c, col_width) in table.col_widths_mm.iter().enumerate() {
-        cell_right += col_width;
-        if c + 1 < cols {
-            push_line(cell_right, 0.0, cell_right, total_h);
-        }
-    }
-
-    // セル文字（非空のみ、行優先で行0=最上段から）。
-    let mut row_top = total_h;
-    for (r, row_height) in table.row_heights_mm.iter().enumerate() {
-        let row_bottom = row_top - row_height;
-        let mut cell_left = 0.0;
-        for (c, col_width) in table.col_widths_mm.iter().enumerate() {
-            if let Some(content) = table.cell(r, c)
-                && !content.is_empty()
-            {
-                let anchor = to_world(
-                    cell_left + TABLE_CELL_TEXT_PAD_MM,
-                    row_bottom + (row_height - table.text_height_mm) / 2.0,
-                );
-                entities.push(DxfEntity::new(EntityType::Text(DxfText {
-                    location: to_dxf_point(anchor),
-                    text_height: table.text_height_mm * k,
-                    value: content.to_owned(),
-                    rotation: 0.0,
-                    ..Default::default()
-                })));
-            }
-            cell_left += col_width;
-        }
-        row_top = row_bottom;
-    }
-
-    entities
+    lines.chain(texts).collect()
 }
 
 /// `Document` を `dxf::Drawing` へ変換する。

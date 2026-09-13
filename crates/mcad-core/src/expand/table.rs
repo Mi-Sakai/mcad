@@ -1,31 +1,37 @@
-//! 表（[`TableGeom`]）の展開（罫線セグメント + セル文字）。egui 非依存の純関数
-//! （DESIGN.md M10 詳細設計4、タスク58）。
+//! 表（[`TableGeom`]）の展開（罫線セグメント + セル文字）。GUI 非依存の純関数
+//! （DESIGN.md M10 詳細設計4、タスク58。M11 タスク71 で `mcad-app` から移設）。
 //!
 //! # 位置づけ
 //!
 //! [`TableGeom`] が持つのは「アンカー・列幅・行高さ・文字高さ・セル文字列」だけで、
 //! 罫線の太さ・セル内パディング・文字の寄せは**保存しない**（M10 詳細設計1）。
 //! それらを与えて実際の線分と文字へ組み上げるのがこのモジュールで、画面
-//! （`main.rs` の `draw_table`）・出力（`plot::push_table`）・ピック（`tool.rs`）の
-//! **唯一の出所**になる。表題欄（[`crate::frame::frame_layout`]）と同じ見え方に
-//! 揃えるため、線幅・パディング・垂直センタリングの式は `frame` の定数と実装を
-//! そのまま再利用する。
+//! （`mcad-app` の `draw_table`）・出力（`plot::push_table`）・ピック（`tool.rs`）・
+//! **DXF export（`mcad-io` の `table_to_dxf_entities`）**の**唯一の出所**になる。
+//! M10 タスク61 では `mcad-io` が依存方向の制約（io は app に依存できない）から
+//! 同じ組版を独立に実装しており、値が乖離しても検出できない残債になっていた。
+//! M11 設計判断1 でこのモジュールを core へ移し、その二重化を解消した。
+//!
+//! 表題欄（`mcad-app` の `frame::frame_layout`）と同じ見え方に揃えるため、線幅・
+//! パディング・垂直センタリングの式は表題欄と共通で、定数
+//! （[`FRAME_BORDER_WIDTH_MM`] / [`FRAME_DIVIDER_WIDTH_MM`] / [`CELL_TEXT_PAD_MM`]）も
+//! ここが唯一の定義で `mcad-app` の `frame` が再エクスポートしている。
 //!
 //! # 座標系と単位（**取り違え注意**）
 //!
 //! | 値 | 単位 |
 //! |---|---|
 //! | [`TableSegment::a`] / [`TableSegment::b`] | **ワールド座標** |
-//! | [`TableSegment::width_mm`] | **紙 mm**（`k` を掛けない。[`crate::frame::FrameLine`] と同じ） |
+//! | [`TableSegment::width_mm`] | **紙 mm**（`k` を掛けない。`mcad-app` の `frame::FrameLine` と同じ） |
 //! | [`TextGeom::anchor`] | **ワールド座標** |
 //! | [`TextGeom::height`] | **紙 mm**（[`TextGeom`] 本来の契約のまま） |
 //!
 //! 組版は紙 mm（アンカー = 局所原点、y-up）で行い、最後に `anchor + 局所 mm * k` で
-//! ワールドへ写す（`k` = [`mcad_core::Scale::world_mm_per_paper_mm`]）。これは
-//! `main.rs` の `text_world_aabb` が採る「anchor 基準で `k` 倍」と同じ写像である。
+//! ワールドへ写す（`k` = [`Scale::world_mm_per_paper_mm`](crate::Scale::world_mm_per_paper_mm)）。
+//! これは `mcad-app` の `text_world_aabb` が採る「anchor 基準で `k` 倍」と同じ写像である。
 //!
-//! **[`TextGeom::height`] を紙 mm のまま返すのは意図的**で、[`crate::dimension`] の
-//! [`crate::dimension::DimExpansion`]（高さがワールド長という既存の非対称）とは違える。
+//! **[`TextGeom::height`] を紙 mm のまま返すのは意図的**で、寸法の
+//! [`DimExpansion`](super::DimExpansion)（高さがワールド長という既存の非対称）とは違える。
 //! 表の文字高さは [`TableGeom::text_height_mm`] という**保存された紙 mm 値**であり、
 //! [`TextGeom::height`] とまったく同じ契約なので、consumers は Text エンティティ用の
 //! 既存経路（画面 `draw_text(.., text.height * k, ..)`、出力 `plot::push_text`）を
@@ -61,19 +67,34 @@
 //! 一時ベンチを 20 回平均）: 部品表規模の 100 行 × 5 列（全セル非空）で **約 0.10ms**、
 //! core が許す最大の 512 行 × 64 列（32768 セル全て非空）で **約 3.5ms**。前者は
 //! フレーム時間に埋もれる。後者は 60fps に対して無視できない大きさだが、
-//! [`mcad_core::MAX_TABLE_ROWS`] / [`mcad_core::MAX_TABLE_COLS`] が上限で押さえて
+//! [`MAX_TABLE_ROWS`](crate::MAX_TABLE_ROWS) /
+//! [`MAX_TABLE_COLS`](crate::MAX_TABLE_COLS) が上限で押さえて
 //! いるので**持続的な GUI 停止にはならない**（細工された `.mcad` に対する防御は
 //! core 側の上限が担う、という M10 タスク56 の整理どおり）。可視セルだけを展開する
 //! 最適化は、実使用でフレーム落ちが観測されてから検討する（先回りしない）。
 
-use mcad_core::{TableGeom, TextGeom, approx_text_width};
 use mcad_geom::{Aabb, Point2, Vec2};
 
-use crate::frame::{CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
+use crate::{TableGeom, TextGeom, approx_text_width};
+
+/// 輪郭線・表題欄外枠・表の外枠の線幅（紙 mm、`製図規定.md` 2-3 の 2) / 2-4-3 の a) 外枠）。
+///
+/// `mcad-app` の `frame` モジュールが再エクスポートしており、図面枠・表題欄・表の
+/// 3 か所がこの 1 つの値を共有する（M11 タスク71 で `mcad-app` から移設。展開が core へ
+/// 移った以上、展開が使う定数も core が持たないと `mcad-io` から参照できない）。
+pub const FRAME_BORDER_WIDTH_MM: f32 = 0.5;
+
+/// 表題欄・表の内部区切り線（行境界・セル境界）の線幅
+/// （紙 mm、`製図規定.md` 2-4-3 の a) 区切り線）。
+pub const FRAME_DIVIDER_WIDTH_MM: f32 = 0.13;
+
+/// セル左端から文字アンカーまでの詰め（紙 mm）。`製図規定.md` はセル内の文字の
+/// 詰め量までは規定していないため、可読な余白として自前で定義した値。
+pub const CELL_TEXT_PAD_MM: f64 = 1.5;
 
 /// 表の罫線 1 本（ワールド座標）。
 ///
-/// [`crate::frame::FrameLine`] と同じ形だが**座標の単位が違う**（あちらは紙 mm）ため
+/// `mcad-app` の `frame::FrameLine` と同じ形だが**座標の単位が違う**（あちらは紙 mm）ため
 /// 別型にしてある。混ぜると `k` の掛け忘れ・二重掛けが型で防げなくなる。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TableSegment {
@@ -92,7 +113,7 @@ pub struct TableExpansion {
     /// 罫線。並び順は **外枠4辺 →（上から）行境界 →（左から）列境界**。
     ///
     /// 外枠と重なる端（最上段の上端・最下段の下端・左端・右端）の内部境界は
-    /// 出さない（表題欄 [`crate::frame::frame_layout`] と同じ規則）。したがって
+    /// 出さない（表題欄 `mcad-app` の `frame::frame_layout` と同じ規則）。したがって
     /// `r` 行 `c` 列の表の本数は常に `4 + (r - 1) + (c - 1)`。
     pub segments: Vec<TableSegment>,
     /// セル文字。**空セルは含まない**（[`TableGeom::cells`] は空文字列を許すが、
@@ -104,11 +125,13 @@ pub struct TableExpansion {
 
 /// 表を罫線とセル文字へ展開する（このモジュールの唯一の入口、純関数）。
 ///
-/// `k` は [`mcad_core::Scale::world_mm_per_paper_mm`]（紙 1mm あたりのワールド mm）。
+/// `k` は [`Scale::world_mm_per_paper_mm`](crate::Scale::world_mm_per_paper_mm)
+/// （紙 1mm あたりのワールド mm）。
 ///
 /// # 全域関数（検証していない値でも panic しない）
 ///
-/// [`mcad_core::EntityGeom::validate`] を通していない [`TableGeom`] — 読込直後や
+/// [`EntityGeom::validate`](crate::EntityGeom::validate) を通していない
+/// [`TableGeom`] — 読込直後や
 /// 編集ダイアログの作業コピー（M10 タスク59）— を渡してもよい。`cells` の要素数が
 /// 行 × 列と食い違っていても [`TableGeom::cell`] が `None` を返すだけで、添字の
 /// パニックは起きない。**行または列が 0 の退化した表は空の展開を返す**（幅も高さも
@@ -192,7 +215,7 @@ pub fn expand_table(table: &TableGeom, k: f64) -> TableExpansion {
 /// 表の表示上のワールド AABB（列幅・行高さは紙 mm なので、ワールドでは `k` 倍。
 /// M10 設計方針4）。
 ///
-/// `mcad_core::EntityGeom::aabb()`（1:1 解釈）を anchor 基準に `k` 倍したものに等しい
+/// `EntityGeom::aabb()`（1:1 解釈）を anchor 基準に `k` 倍したものに等しい
 /// （`table_world_aabb_at_k_one_matches_core_aabb` / `..._scales_from_the_anchor` で
 /// 固定）。アンカーは左下なので、写像は右上隅を `anchor + (幅, 高さ) * k` へ動かす
 /// だけになる。
@@ -240,7 +263,7 @@ pub fn table_world_aabb(table: &TableGeom, k: f64) -> Aabb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcad_core::EntityGeom;
+    use crate::EntityGeom;
 
     const T: f64 = 1e-9;
 

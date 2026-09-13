@@ -14,6 +14,11 @@
 //!   [`TitleBlockKind`] / [`TitleBlockFields`]）と表題欄様式 [`TitleBlockTemplate`]
 //! - 表: [`TableGeom`]（[`EntityGeom::Table`] の中身。汎用表・部品表の土台。
 //!   行列数・寸法の上限は [`MAX_TABLE_ROWS`] / [`MAX_TABLE_COLS`] / [`MAX_TABLE_MM`]）
+//! - 展開（`expand` モジュール、M11 タスク71）: 寸法・表を描画可能な線・矢先・文字へ
+//!   組む純関数。寸法は [`expand_linear`] / [`expand_radial`] / [`expand_diameter`]
+//!   （パラメータは [`DimRender`]、結果は [`DimExpansion`]）、表は [`expand_table`]
+//!   （結果は [`TableExpansion`]）。ヒットテスト用の線分は [`linear_pick_segments`] 等、
+//!   値の組版は [`layout_dim_label`]。**画面・SVG/PDF・DXF export の唯一の出所**
 //! - ドキュメント: [`Document`]（エンティティ・レイヤー・カレントレイヤー・
 //!   図面メタデータと履歴を保持）
 //! - 変更: [`Command`] を [`Document::apply`] に渡す。戻り値の [`NewIds`] で
@@ -40,6 +45,7 @@ mod document;
 mod entity;
 mod entity_geom;
 mod error;
+mod expand;
 mod id;
 mod layer;
 mod sheet;
@@ -58,6 +64,13 @@ pub use entity_geom::{
     TableGeom, TextGeom, approx_text_width,
 };
 pub use error::CoreError;
+pub use expand::{
+    CELL_TEXT_PAD_MM, DimExpansion, DimLabel, DimRender, FRAME_BORDER_WIDTH_MM,
+    FRAME_DIVIDER_WIDTH_MM, TableExpansion, TableSegment, TextRun, arrow_kind_occupies_line,
+    diameter_distance, diameter_pick_segments, expand_diameter, expand_linear, expand_radial,
+    expand_table, label_box_center, label_box_contains, layout_dim_label, linear_distance,
+    linear_pick_segments, radial_distance, radial_pick_segments, table_world_aabb,
+};
 pub use id::{EntityId, LayerId};
 pub use layer::Layer;
 pub use sheet::{

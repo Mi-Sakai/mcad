@@ -88,13 +88,14 @@ pub use svg::to_svg;
 
 use std::f64::consts::FRAC_PI_2;
 
-use mcad_core::{Document, Entity, EntityGeom, Layer, Linetype, Rgb, TableGeom, TextGeom};
+use mcad_core::{
+    DimExpansion, DimRender, Document, Entity, EntityGeom, Layer, Linetype, Rgb, TableGeom,
+    TextGeom, expand_diameter, expand_linear, expand_radial, expand_table,
+};
 use mcad_geom::{Arc, Point2, Polyline, Shape, Vec2};
 use serde::{Deserialize, Serialize};
 
-use crate::dimension::{self, DimExpansion};
 use crate::frame::{FrameLayout, frame_layout};
-use crate::table::expand_table;
 use text_outline::GlyphOutliner;
 
 /// 出力（SVG/PDF）の色モード。図面の属性ではなく、エクスポート設定＋
@@ -143,8 +144,8 @@ pub const DASH_DOT_DOT_PATTERN_MM: [f32; 6] = [6.0, 1.2, 0.6, 1.2, 0.6, 1.2];
 // フィールドを `k` 倍してワールド長へ換算する。
 //
 // M8 タスク39 まではここに `DIM_TEXT_MM` / `DIM_ARROW_MM` を置いていたが、M9 タスク49 で
-// 矢の内外判定（`dimension::arrows_point_outward`）と注記の表示倍率
-// （`dimension::DimRender::annotation_scale`）が `DimStyle` を読むようになり、
+// 矢の内外判定（`mcad_core` の `arrows_point_outward`）と注記の表示倍率
+// （`DimRender::annotation_scale`）が `DimStyle` を読むようになり、
 // 「描かれる大きさは定数・判定はスタイル」という二重の出所になっていた。既定値が
 // たまたま一致していたので差は出ていなかったが、スタイル編集 UI（M9 タスク50）が
 // 入れば即座に破綻する組み合わせだったため、M9 タスク49-3 で定数側を削除した。
@@ -321,7 +322,7 @@ pub fn plot_page(document: &Document, mode: PlotColorMode) -> PlotPage {
     // 文書スタイルだけ**にする（定数を別に持つと矢の内外判定・注記の表示倍率が読む値と
     // 食い違う。M9 タスク49-3）。
     let dim_style = document.dim_style();
-    let dim_render = dimension::DimRender {
+    let dim_render = DimRender {
         style: dim_style,
         scale_world_per_paper_mm: k,
         arrow_len_world: dim_style.arrow_len_mm * k,
@@ -408,7 +409,7 @@ fn push_entity(
     k: f64,
     outliner: Option<&GlyphOutliner>,
     mode: PlotColorMode,
-    dim_render: dimension::DimRender<'_>,
+    dim_render: DimRender<'_>,
 ) {
     let color = plot_color(mode, entity.style.effective_color(layer.color));
     let width_mm = entity.style.effective_width(layer.width_mm).mm();
@@ -427,18 +428,18 @@ fn push_entity(
         EntityGeom::Text(text) => push_text(paths, text, color, k, outliner),
         // 寸法は製図慣行として常に実線で描く（線種は形状エンティティのみが対象）。
         EntityGeom::DimLinear(dim) => {
-            let ex = dimension::expand_linear(dim, dim_render);
+            let ex = expand_linear(dim, dim_render);
             push_dim(paths, &ex, color, width_mm, k, outliner);
         }
         EntityGeom::DimRadial(dim) => {
-            let ex = dimension::expand_radial(dim, dim_render);
+            let ex = expand_radial(dim, dim_render);
             push_dim(paths, &ex, color, width_mm, k, outliner);
         }
         EntityGeom::DimDiameter(dim) => {
-            let ex = dimension::expand_diameter(dim, dim_render);
+            let ex = expand_diameter(dim, dim_render);
             push_dim(paths, &ex, color, width_mm, k, outliner);
         }
-        // 表の罫線は幅も線種も app 層の定数（表題欄と同じ）なので、`width_mm` も
+        // 表の罫線は幅も線種も固定の定数（表題欄と同じ。core の `expand` が持つ）なので、`width_mm` も
         // `linetype` も使わない。色だけスタイルに従う（M10 詳細設計1）。
         EntityGeom::Table(table) => push_table(paths, table, color, k, outliner),
         // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は出力しない。
@@ -573,13 +574,13 @@ fn push_dim(
 
 /// 表（[`TableGeom`]）を罫線パスとセル文字のアウトラインへ展開する（M10 タスク58）。
 ///
-/// 組版は画面・ピックと同じ [`crate::table::expand_table`] が唯一の出所。展開結果の
-/// 座標は**ワールド**なので `÷ k` で紙 mm へ戻すが、罫線の幅 [`crate::table::TableSegment::width_mm`]
+/// 組版は画面・ピックと同じ [`expand_table`] が唯一の出所。展開結果の
+/// 座標は**ワールド**なので `÷ k` で紙 mm へ戻すが、罫線の幅 [`mcad_core::TableSegment::width_mm`]
 /// と文字高さ [`mcad_core::TextGeom::height`] は**既に紙 mm** なので換算しない
 /// （[`push_dim`] が `DimExpansion` の高さをワールド長として `÷ k` するのとは違う。
 /// モジュール doc の単位表を参照）。
 ///
-/// 罫線は常に実線（線種を持たない）で、線幅は表題欄と同じ app 層の定数
+/// 罫線は常に実線（線種を持たない）で、線幅は表題欄と同じ固定の定数
 /// （[`crate::frame::FRAME_BORDER_WIDTH_MM`] / [`crate::frame::FRAME_DIVIDER_WIDTH_MM`]）。
 /// セル文字は Text エンティティとまったく同じ経路（[`push_text`]）へ通す。
 fn push_table(
@@ -1062,13 +1063,13 @@ mod tests {
             add(&mut document, EntityGeom::DimLinear(dim.clone()));
             let page = plot_page(&document, PlotColorMode::Color);
 
-            let render = dimension::DimRender {
+            let render = DimRender {
                 style: &style,
                 scale_world_per_paper_mm: 1.0,
                 arrow_len_world: style.arrow_len_mm,
                 text_height_world: style.text_height_mm,
             };
-            let ex = dimension::expand_linear(&dim, render);
+            let ex = expand_linear(&dim, render);
             assert_eq!(ex.arrows.len(), 2, "{kind:?}");
 
             // 本数: 寸法線 1 + 補助線 2 + 矢先の線分、塗り: 値ラベル 1 + 矢先の塗り。

@@ -42,9 +42,8 @@ use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
     Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimRender, Document,
-    Entity, EntityGeom, EntityId, LayerId, Linetype, NewIds, Style, TableGeom, diameter_distance,
-    expand_diameter, expand_linear, expand_radial, linear_distance, radial_distance,
-    table_world_aabb,
+    Entity, EntityGeom, EntityId, LayerId, Linetype, NewIds, Style, TableGeom, dim_distance,
+    expand_diameter, expand_linear, expand_radial, table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -2482,9 +2481,17 @@ impl SelectTool {
                 // height×k のワールド AABB へ追従させる（判断(c)により Text は
                 // トグル非依存で常に height×k）。
                 EntityGeom::Text(text) => crate::text_world_aabb(text, k).distance_to_point(world),
-                EntityGeom::DimLinear(dim) => linear_distance(dim, world),
-                EntityGeom::DimRadial(dim) => radial_distance(dim, world),
-                EntityGeom::DimDiameter(dim) => diameter_distance(dim, world),
+                // 寸法はいずれも保存データだけで決まるズーム非依存の形状への距離。
+                // 種別ごとの呼び分けは core の [`dim_distance`] が唯一の表
+                // （M11 タスク69。角度寸法は弧の多角形近似 + 補助線 2 本、
+                // 座標寸法は引出線 1 本）。
+                EntityGeom::DimLinear(_)
+                | EntityGeom::DimRadial(_)
+                | EntityGeom::DimDiameter(_)
+                | EntityGeom::DimAngular(_)
+                | EntityGeom::DimOrdinate(_) => {
+                    dim_distance(&entity.geom, world).unwrap_or(f64::INFINITY)
+                }
                 // 表は表示上のワールド AABB（列幅・行高さ × k）への距離。Text と同じ
                 // 割り切りで、罫線 1 本ずつへの距離は取らない（面として掴む方が操作
                 // として自然。M10 タスク58、`mcad_core` の `expand::table` モジュール doc）。

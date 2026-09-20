@@ -29,8 +29,9 @@
 use std::path::{Path, PathBuf};
 
 use mcad_core::{
-    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial,
-    DimStyle, Document, Entity, EntityGeom, FitClass, Scale, SheetMeta, SizeTolerance,
+    ArrowPlacement, Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimLinear,
+    DimOrdinate, DimRadial, DimStyle, Document, Entity, EntityGeom, FitClass, OrdinateAxis, Scale,
+    SheetMeta, SizeTolerance,
 };
 use mcad_geom::{ArrowKind, DimSymbol, Point2};
 
@@ -327,4 +328,66 @@ fn linear_dimension_snapshot_at_scale_1_to_2() {
         }),
     );
     assert_snapshot("linear_scale_1_to_2", &document);
+}
+
+// ---------------------------------------------------------------------
+// 5: 角度寸法・座標寸法（M11 タスク69、DXF import 引き継ぎ分の回帰）
+// ---------------------------------------------------------------------
+
+#[test]
+fn angular_dimension_snapshot() {
+    let mut document = document_1_1();
+    add(
+        &mut document,
+        EntityGeom::DimAngular(DimAngular {
+            vertex: Point2::ORIGIN,
+            p1: Point2::new(100.0, 0.0),
+            p2: Point2::new(50.0, 50.0 * 3f64.sqrt()),
+            arc_radius: 40.0,
+            annotation: DimAnnotation::default(),
+        }),
+    );
+    assert_snapshot("angular_dimension", &document);
+}
+
+/// 矢先を既定（`ClosedFilled`）以外へ変えた角度寸法。矢が弧の接線方向へ置かれる
+/// 経路（[`mcad_core::expand_angular`] の doc）の回帰を検出する
+/// （矢先を既定のままにすると、この経路の崩れを検出できない。radial/diameter の
+/// 既存スナップショットと同じ理由）。
+#[test]
+fn angular_dimension_snapshot_with_open90_arrow() {
+    let mut document = document_1_1();
+    document
+        .apply(Command::SetDimStyle(DimStyle {
+            arrow_kind: ArrowKind::Open90,
+            ..DimStyle::DEFAULT
+        }))
+        .unwrap();
+    add(
+        &mut document,
+        EntityGeom::DimAngular(DimAngular {
+            vertex: Point2::ORIGIN,
+            p1: Point2::new(100.0, 0.0),
+            p2: Point2::new(50.0, 50.0 * 3f64.sqrt()),
+            arc_radius: 40.0,
+            annotation: DimAnnotation::default(),
+        }),
+    );
+    assert_snapshot("angular_dimension_arrow_open90", &document);
+}
+
+#[test]
+fn ordinate_dimension_snapshot() {
+    let mut document = document_1_1();
+    add(
+        &mut document,
+        EntityGeom::DimOrdinate(DimOrdinate {
+            origin: Point2::ORIGIN,
+            feature: Point2::new(60.0, 20.0),
+            leader_end: Point2::new(60.0, 45.0),
+            axis: OrdinateAxis::X,
+            annotation: DimAnnotation::default(),
+        }),
+    );
+    assert_snapshot("ordinate_dimension", &document);
 }

@@ -25,7 +25,12 @@
 //! | 4 | 図面メタデータ `sheet`、レイヤーの `linetype`/`width_mm`、`style` の線幅を px から紙 mm の ByLayer モデルへ（M8） | `dim_style = 既定`（`annotation` は元々 `EntityGeom` の `#[serde(default)]` で無注記に補完される） |
 //! | 5 | 寸法注記（[`mcad_core::DimAnnotation`]）・文書単位の寸法スタイル（`dim_style`）を永続化（M9 タスク48） | `arrow_kind = ClosedFilled`。表（[`EntityGeom::Table`]）は概念自体が無いため、凍結 DTO（[`EntityGeomV5`]）が `Table` タグを拒否する |
 //! | 6 | 汎用テーブル（[`EntityGeom::Table`]、M10）・[`mcad_core::DimStyle::arrow_kind`]（矢先種別。M10 タスク57で `.mcad` へ導入、形状生成は M10 タスク63）を追加 | `direction = Aligned`（凍結 DTO [`DimLinearV6`] が `direction` キーを拒否する） |
-//! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）を追加。現行 | なし |
+//! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）と、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）を追加。現行 | なし |
+//!
+//! **v7 は M11-1 の中で 2 度拡張した（タスク68 → 69）が、版は上げていない。**
+//! タスク68 の v7 は未リリースで、同じマイルストーンの中で版を刻む意味がないため
+//! （DESIGN.md M11-0(3)「M11-1 で 1 回のバージョン上げにまとめる」）。v6 以前の
+//! 凍結 DTO は両方の拡張をまとめて拒否する。
 //!
 //! ## 変換の連鎖（凍結 DTO をたどる順路）
 //!
@@ -181,6 +186,26 @@
 //!   M10 までと完全に同一**なので、旧ファイルの見た目は変わらない。
 //! - v7 の不正値（回転角が非有限）は [`mcad_core::EntityGeom::validate`] が
 //!   [`IoError::InvalidGeometry`] として読込境界で拒否する。
+//!
+//! # 角度寸法・座標寸法（v7 へ相乗り・M11 タスク69）
+//!
+//! M11 タスク69 で [`mcad_core::EntityGeom`] へ
+//! [`DimAngular`](mcad_core::DimAngular) / [`DimOrdinate`](mcad_core::DimOrdinate) の
+//! 2 バリアントを足した。**版は上げず v7 のスキーマを広げる**（v7 はタスク68 で
+//! 上げたばかりで未リリースなので、同じ M11-1 の中で 2 度上げる意味がない。
+//! DESIGN.md M11-0(3) の「M11-1 で 1 回のバージョン上げにまとめる」どおり）。
+//!
+//! - [`FileEntity::geom`] は現行の [`EntityGeom`] をそのまま serde するので、
+//!   タグ `DimAngular` / `DimOrdinate` がそのまま増えるだけで追加の型は要らない。
+//! - **v6 以前は凍結 DTO がタグごと拒否する**。[`EntityGeomV5`] / [`EntityGeomV6`] は
+//!   バリアントを列挙した閉じた enum なので、v1〜v6 と自称するファイルに
+//!   `{"DimAngular": ...}` を混ぜると [`IoError::Json`]（未知のバリアント）で
+//!   読込ごと失敗する（v4/v5 の `Table` 拒否とまったく同じ構造。回帰は
+//!   `v6_file_with_angular_dimension_is_rejected`）。**新しい凍結 DTO は要らない**
+//!   ことに注意 — 拒否は既存の enum が閉じていることから自動的に効く。
+//! - 不正値（非有限座標・`arc_radius <= 0`・頂点と一致する角の辺）は
+//!   [`mcad_core::EntityGeom::validate`] が [`IoError::InvalidGeometry`] として
+//!   読込境界で拒否する。
 
 use std::fs;
 use std::path::Path;
@@ -321,7 +346,8 @@ pub struct FileEntity {
     pub style: Style,
     /// 幾何形状（v2 でテキスト・寸法を含む [`EntityGeom`] へ拡張、v6 で表
     /// [`EntityGeom::Table`] を追加、v7 で長さ寸法の向き
-    /// [`mcad_core::DimDirection`] を追加）。
+    /// [`mcad_core::DimDirection`]・角度寸法 [`EntityGeom::DimAngular`]・
+    /// 座標寸法 [`EntityGeom::DimOrdinate`] を追加）。
     pub geom: EntityGeom,
 }
 
@@ -671,6 +697,10 @@ impl From<DimLinearV6> for DimLinear {
 /// 既存ファイルが読めなくなる。
 ///
 /// 長さ寸法は [`DimLinearV6`]（`direction` を持たない）に固定する（M11 タスク68）。
+///
+/// **M11 タスク69 の角度寸法・座標寸法も、この enum が閉じていることで自動的に
+/// 拒否される**（`{"DimAngular": ...}` / `{"DimOrdinate": ...}` は未知のバリアント）。
+/// バリアントを足さない限り追加作業は要らない。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 enum EntityGeomV5 {
     Shape(Shape),
@@ -699,7 +729,9 @@ impl From<EntityGeomV5> for EntityGeomV6 {
 ///
 /// [`EntityGeomV5`] との差は [`EntityGeomV6::Table`] を持つこと。長さ寸法は
 /// [`EntityGeomV5`] と同じ [`DimLinearV6`] で、`direction` を持たない
-/// （凍結の理由は [`DimLinearV6`] の doc）。
+/// （凍結の理由は [`DimLinearV6`] の doc）。角度寸法・座標寸法（M11 タスク69）も
+/// 持たないので、v6 と自称するファイルにそれらのタグを混ぜると読込ごと失敗する
+/// （回帰は `v6_file_with_angular_dimension_is_rejected`）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 enum EntityGeomV6 {
     Shape(Shape),
@@ -2356,6 +2388,147 @@ mod tests {
             offset: 1.5,
             direction: DimDirection::Rotated(f64::NAN),
             annotation: DimAnnotation::default(),
+        });
+        assert!(matches!(
+            import_document(&file),
+            Err(IoError::InvalidGeometry { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // v7（M11 タスク69）: 角度寸法・座標寸法（版は上げず v7 へ相乗り）
+    // -----------------------------------------------------------------
+
+    /// テスト用の角度寸法（頂点 (10,10) から +x / +y の 2 方向、直角）。
+    fn sample_angular() -> EntityGeom {
+        EntityGeom::DimAngular(mcad_core::DimAngular {
+            vertex: Point2::new(10.0, 10.0),
+            p1: Point2::new(40.0, 10.0),
+            p2: Point2::new(10.0, 25.0),
+            arc_radius: 18.0,
+            annotation: DimAnnotation::default(),
+        })
+    }
+
+    /// テスト用の座標寸法（基準 (0,0)、計測点 (-30,12)、Y 成分を読む）。
+    fn sample_ordinate() -> EntityGeom {
+        EntityGeom::DimOrdinate(mcad_core::DimOrdinate {
+            origin: Point2::new(0.0, 0.0),
+            feature: Point2::new(-30.0, 12.0),
+            leader_end: Point2::new(-30.0, 40.0),
+            axis: mcad_core::OrdinateAxis::Y,
+            annotation: DimAnnotation::default(),
+        })
+    }
+
+    #[test]
+    fn v7_round_trip_is_lossless_for_angular_and_ordinate_dimensions() {
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        for geom in [sample_angular(), sample_ordinate()] {
+            doc.apply(Command::AddEntity(Entity::new(
+                geom,
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        }
+
+        let exported = export_document(&doc);
+        assert_eq!(
+            exported.version, FORMAT_VERSION,
+            "版は上げない（v7 のまま）"
+        );
+
+        let json = to_json(&doc).unwrap();
+        assert!(json.contains("DimAngular"), "角度寸法のタグ: {json}");
+        assert!(json.contains("DimOrdinate"), "座標寸法のタグ: {json}");
+        let loaded = load(&json).unwrap();
+        assert_eq!(
+            export_document(&loaded),
+            exported,
+            "v7 往復は無損失であるべき"
+        );
+        let geoms: Vec<_> = loaded.entities().map(|(_, e)| e.geom.clone()).collect();
+        assert!(geoms.contains(&sample_angular()));
+        assert!(geoms.contains(&sample_ordinate()));
+    }
+
+    #[test]
+    fn v6_file_with_angular_or_ordinate_dimension_is_rejected() {
+        // v1〜v6 に角度寸法・座標寸法の概念は無い。凍結 DTO（`EntityGeomV5` /
+        // `EntityGeomV6`）が閉じた enum なので、手編集でタグを混ぜると未知の
+        // バリアントとして読込ごと失敗する（v4/v5 の `Table` 拒否と同じ構造）。
+        const ANGULAR: &str = r#"{"DimAngular": {"vertex": {"x": 0.0, "y": 0.0},
+            "p1": {"x": 1.0, "y": 0.0}, "p2": {"x": 0.0, "y": 1.0}, "arc_radius": 5.0}}"#;
+        const ORDINATE: &str = r#"{"DimOrdinate": {"origin": {"x": 0.0, "y": 0.0},
+            "feature": {"x": 3.0, "y": 4.0}, "leader_end": {"x": 3.0, "y": 9.0},
+            "axis": "X"}}"#;
+        for geom in [ANGULAR, ORDINATE] {
+            for json in [
+                v6_json_with_dimension(geom),
+                v5_json_with_dimension(geom),
+                v4_json_with_dimension(geom),
+            ] {
+                assert!(
+                    matches!(from_json(&json), Err(IoError::Json(_))),
+                    "角度寸法・座標寸法を持つ旧版ファイルは拒否されるべき: {json}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v7_rejects_invalid_angular_and_ordinate_dimensions_at_the_read_boundary() {
+        // 非有限は JSON で書けないので `import_document`（DTO を直接受ける公開 API）
+        // の境界で、JSON で書ける不正値（`arc_radius <= 0`・頂点と一致する辺）は
+        // `from_json` の境界で拒否されることを確かめる。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Shape(Shape::Point(Point2::ORIGIN)),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        let base = export_document(&doc);
+
+        // (a) 弧の半径が 0。
+        let mut file = base.clone();
+        file.entities[0].geom = EntityGeom::DimAngular(mcad_core::DimAngular {
+            arc_radius: 0.0,
+            ..match sample_angular() {
+                EntityGeom::DimAngular(d) => d,
+                _ => unreachable!(),
+            }
+        });
+        assert!(matches!(
+            import_document(&file),
+            Err(IoError::InvalidGeometry { .. })
+        ));
+
+        // (b) 角の辺が頂点と一致する（向きが決まらない）。
+        let mut file = base.clone();
+        file.entities[0].geom = EntityGeom::DimAngular(mcad_core::DimAngular {
+            p1: Point2::new(10.0, 10.0),
+            ..match sample_angular() {
+                EntityGeom::DimAngular(d) => d,
+                _ => unreachable!(),
+            }
+        });
+        assert!(matches!(
+            import_document(&file),
+            Err(IoError::InvalidGeometry { .. })
+        ));
+
+        // (c) 座標寸法の非有限座標。
+        let mut file = base;
+        file.entities[0].geom = EntityGeom::DimOrdinate(mcad_core::DimOrdinate {
+            feature: Point2::new(f64::NAN, 0.0),
+            ..match sample_ordinate() {
+                EntityGeom::DimOrdinate(d) => d,
+                _ => unreachable!(),
+            }
         });
         assert!(matches!(
             import_document(&file),

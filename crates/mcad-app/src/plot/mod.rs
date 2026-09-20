@@ -90,7 +90,7 @@ use std::f64::consts::FRAC_PI_2;
 
 use mcad_core::{
     DimExpansion, DimRender, Document, Entity, EntityGeom, Layer, Linetype, Rgb, TableGeom,
-    TextGeom, expand_diameter, expand_linear, expand_radial, expand_table,
+    TextGeom, expand_dim, expand_table,
 };
 use mcad_geom::{Arc, Point2, Polyline, Shape, Vec2};
 use serde::{Deserialize, Serialize};
@@ -427,17 +427,15 @@ fn push_entity(
         // `TextGeom::height` は既に紙 mm なので換算しない（anchor だけ `÷ k`）。
         EntityGeom::Text(text) => push_text(paths, text, color, k, outliner),
         // 寸法は製図慣行として常に実線で描く（線種は形状エンティティのみが対象）。
-        EntityGeom::DimLinear(dim) => {
-            let ex = expand_linear(dim, dim_render);
-            push_dim(paths, &ex, color, width_mm, k, outliner);
-        }
-        EntityGeom::DimRadial(dim) => {
-            let ex = expand_radial(dim, dim_render);
-            push_dim(paths, &ex, color, width_mm, k, outliner);
-        }
-        EntityGeom::DimDiameter(dim) => {
-            let ex = expand_diameter(dim, dim_render);
-            push_dim(paths, &ex, color, width_mm, k, outliner);
+        // 種別ごとの呼び分けは core の [`expand_dim`] が唯一の表（M11 タスク69）。
+        EntityGeom::DimLinear(_)
+        | EntityGeom::DimRadial(_)
+        | EntityGeom::DimDiameter(_)
+        | EntityGeom::DimAngular(_)
+        | EntityGeom::DimOrdinate(_) => {
+            if let Some(ex) = expand_dim(&entity.geom, dim_render) {
+                push_dim(paths, &ex, color, width_mm, k, outliner);
+            }
         }
         // 表の罫線は幅も線種も固定の定数（表題欄と同じ。core の `expand` が持つ）なので、`width_mm` も
         // `linetype` も使わない。色だけスタイルに従う（M10 詳細設計1）。
@@ -767,7 +765,7 @@ mod tests {
     use crate::frame::{CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
     use mcad_core::{
         Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimStyle, Layer,
-        Scale, SheetMeta, SizeTolerance, Style, WidthMm,
+        Scale, SheetMeta, SizeTolerance, Style, WidthMm, expand_linear,
     };
     use mcad_geom::{ArrowKind, Circle, LineSeg, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};

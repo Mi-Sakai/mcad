@@ -27,14 +27,17 @@ mod table;
 
 pub use dim_label::{DimLabel, TextRun, layout_dim_label};
 pub use dimension::{
-    DimExpansion, DimRender, arrow_kind_occupies_line, diameter_distance, diameter_pick_segments,
-    expand_diameter, expand_linear, expand_radial, label_box_center, label_box_contains,
-    linear_distance, linear_pick_segments, radial_distance, radial_pick_segments,
+    DimExpansion, DimRender, angular_distance, angular_pick_segments, arrow_kind_occupies_line,
+    diameter_distance, diameter_pick_segments, dim_distance, expand_angular, expand_diameter,
+    expand_dim, expand_linear, expand_ordinate, expand_radial, label_box_center,
+    label_box_contains, linear_distance, linear_pick_segments, ordinate_distance,
+    ordinate_pick_segments, radial_distance, radial_pick_segments,
 };
-/// 長さ寸法の AABB（[`crate::EntityGeom::aabb`]）が展開と同じ骨格を使うための
-/// クレート内公開。外部 API としては [`linear_pick_segments`] / [`expand_linear`] が
+/// 長さ寸法・角度寸法の AABB（[`crate::EntityGeom::aabb`]）が展開と同じ骨格を使う
+/// ためのクレート内公開。外部 API としては [`linear_pick_segments`] /
+/// [`expand_linear`]（角度は [`angular_pick_segments`] / [`expand_angular`]）が
 /// 同じ骨格を返すので、これを `pub` にはしない。
-pub(crate) use dimension::{linear_degenerate_dir_and_point, linear_frame};
+pub(crate) use dimension::{angular_frame, linear_degenerate_dir_and_point, linear_frame};
 pub use table::{
     CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM, TableExpansion, TableSegment,
     expand_table, table_world_aabb,

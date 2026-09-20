@@ -32,8 +32,8 @@ use mcad_core::{
     DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom, EntityId, FitClass, Layer,
     LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize, ProjectionMethod, Rgb, Scale,
     SheetMeta, SizeTolerance, Style, TableGeom, TextGeom, TitleBlockFields, TitleBlockKind,
-    WidthMm, arrow_kind_occupies_line, expand_diameter, expand_linear, expand_radial, expand_table,
-    label_box_center, label_box_contains, table_world_aabb,
+    WidthMm, arrow_kind_occupies_line, expand_dim, expand_table, label_box_center,
+    label_box_contains, table_world_aabb,
 };
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
@@ -4053,6 +4053,11 @@ fn dim_selection_summary(live: &[(EntityId, DimKind, DimAnnotation)]) -> String 
             DimKind::Linear => linear += 1,
             DimKind::Radial => radial += 1,
             DimKind::Diameter => diameter += 1,
+            // 角度寸法・座標寸法（M11 タスク69）は**まだこの経路へ来ない**。
+            // `live` を組む `dim_kind_and_annotation` が両者に `None` を返すため、
+            // 右パネルの「寸法」セクション自体が対象にしていない。種別対応と
+            // この内訳文言の追加はタスク74 の範囲。
+            DimKind::Angular | DimKind::Ordinate => {}
         }
     }
     format!(
@@ -6296,21 +6301,18 @@ fn draw_entities(
             EntityGeom::Text(text) => {
                 draw_text(painter, rect, viewport, text, text.height * k, color)
             }
-            EntityGeom::DimLinear(dim) => {
-                // 寸法は製図慣行として常に実線で描く（線種は形状エンティティのみが
-                // 対象。DESIGN.md M8 タスク36 は `draw_shape` が扱う形状に限定）。
-                // 線幅の紙 mm 解決はここでも同じ式を適用し、既定 0.35mm 相当で
-                // 従来と同じ見た目を保つ。
+            // 寸法は製図慣行として常に実線で描く（線種は形状エンティティのみが
+            // 対象。DESIGN.md M8 タスク36 は `draw_shape` が扱う形状に限定）。
+            // 線幅の紙 mm 解決はここでも同じ式を適用し、既定 0.35mm 相当で
+            // 従来と同じ見た目を保つ。種別ごとの呼び分けは core の `expand_dim`
+            // が唯一の表（M11 タスク69）。
+            EntityGeom::DimLinear(_)
+            | EntityGeom::DimRadial(_)
+            | EntityGeom::DimDiameter(_)
+            | EntityGeom::DimAngular(_)
+            | EntityGeom::DimOrdinate(_) => {
                 let stroke = Stroke::new(stroke_px, color);
-                draw_dim_linear(painter, rect, viewport, dim, stroke, render);
-            }
-            EntityGeom::DimRadial(dim) => {
-                let stroke = Stroke::new(stroke_px, color);
-                draw_dim_radial(painter, rect, viewport, dim, stroke, render);
-            }
-            EntityGeom::DimDiameter(dim) => {
-                let stroke = Stroke::new(stroke_px, color);
-                draw_dim_diameter(painter, rect, viewport, dim, stroke, render);
+                draw_dim_geom(painter, rect, viewport, &entity.geom, stroke, render);
             }
             // 表は罫線の幅を固定の定数（表題欄と同じ）から取るので `stroke_px` は
             // 使わない。線種も見ない（常に実線）。M10 詳細設計1・タスク58。
@@ -6352,11 +6354,8 @@ fn dim_label_hit(
             // 非表示レイヤーの寸法は当たり判定の対象外（描画・通常ピックと同じ扱い）。
             continue;
         }
-        let ex = match &entity.geom {
-            EntityGeom::DimLinear(dim) => expand_linear(dim, render),
-            EntityGeom::DimRadial(dim) => expand_radial(dim, render),
-            EntityGeom::DimDiameter(dim) => expand_diameter(dim, render),
-            _ => continue,
+        let Some(ex) = expand_dim(&entity.geom, render) else {
+            continue;
         };
         if let Some(quad) = ex.label_box
             && label_box_contains(&quad, world)
@@ -6367,43 +6366,26 @@ fn dim_label_hit(
     None
 }
 
-/// 長さ寸法を描画する（純関数 helper [`expand_linear`] の展開を Painter へ）。
-fn draw_dim_linear(
+/// 寸法エンティティを描画する（core の純関数 [`expand_dim`] の展開を Painter へ）。
+/// 寸法以外の幾何を渡しても何も描かない。
+///
+/// **M11 タスク69 で種別ごとの 3 関数（`draw_dim_linear` / `draw_dim_radial` /
+/// `draw_dim_diameter`）をこの 1 つへ統合した。** 中身はいずれも「展開して
+/// [`draw_dim_expansion`] へ渡す」だけで、呼び出し側（確定描画・選択ハイライト・
+/// ゴーストプレビュー・文字ドラッグのプレビュー）も種別で処理を変えていなかった。
+/// 種別が増えるたびに同じ `match` が 5 箇所で育つのを止めるための統合で、
+/// 呼び分けの表は core の [`expand_dim`] 1 箇所に閉じている。
+fn draw_dim_geom(
     painter: &egui::Painter,
     rect: Rect,
     viewport: &Viewport,
-    dim: &DimLinear,
+    geom: &EntityGeom,
     stroke: Stroke,
     render: DimRender<'_>,
 ) {
-    let ex = expand_linear(dim, render);
-    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
-}
-
-/// 半径寸法を描画する（純関数 helper [`expand_radial`] の展開を Painter へ）。
-fn draw_dim_radial(
-    painter: &egui::Painter,
-    rect: Rect,
-    viewport: &Viewport,
-    dim: &DimRadial,
-    stroke: Stroke,
-    render: DimRender<'_>,
-) {
-    let ex = expand_radial(dim, render);
-    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
-}
-
-/// 直径寸法を描画する（純関数 helper [`expand_diameter`] の展開を Painter へ）。
-fn draw_dim_diameter(
-    painter: &egui::Painter,
-    rect: Rect,
-    viewport: &Viewport,
-    dim: &DimDiameter,
-    stroke: Stroke,
-    render: DimRender<'_>,
-) {
-    let ex = expand_diameter(dim, render);
-    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+    if let Some(ex) = expand_dim(geom, render) {
+        draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+    }
 }
 
 /// 寸法の展開結果（線分・矢先・記号ストローク・文字）を Painter へ描く。プレビュー
@@ -6514,17 +6496,18 @@ fn draw_selection(
     }
 
     // 選択集合を `transform` で変換した先を強調色で仮表示する（配置先ゴースト）。
-    // Text も変換（移動・回転・鏡映・複製）に追従してゴースト表示する。寸法は後続タスク。
+    // Text も寸法も変換（移動・回転・鏡映・複製）に追従してゴースト表示する。
     let draw_ghost = |transform: &dyn Fn(&EntityGeom) -> EntityGeom| {
         for &id in select_tool.selection() {
             if let Some(entity) = document.entity(id) {
-                match transform(&entity.geom) {
+                let geom = transform(&entity.geom);
+                match &geom {
                     EntityGeom::Shape(shape) => {
                         draw_shape(
                             painter,
                             rect,
                             viewport,
-                            &shape,
+                            shape,
                             highlight,
                             Linetype::Continuous,
                             1.0,
@@ -6536,19 +6519,17 @@ fn draw_selection(
                             painter,
                             rect,
                             viewport,
-                            &text,
+                            text,
                             text.height * k,
                             highlight.color,
                         );
                     }
-                    EntityGeom::DimLinear(dim) => {
-                        draw_dim_linear(painter, rect, viewport, &dim, highlight, render);
-                    }
-                    EntityGeom::DimRadial(dim) => {
-                        draw_dim_radial(painter, rect, viewport, &dim, highlight, render);
-                    }
-                    EntityGeom::DimDiameter(dim) => {
-                        draw_dim_diameter(painter, rect, viewport, &dim, highlight, render);
+                    EntityGeom::DimLinear(_)
+                    | EntityGeom::DimRadial(_)
+                    | EntityGeom::DimDiameter(_)
+                    | EntityGeom::DimAngular(_)
+                    | EntityGeom::DimOrdinate(_) => {
+                        draw_dim_geom(painter, rect, viewport, &geom, highlight, render);
                     }
                     // 表は変換（移動・回転・鏡映・複製）で anchor だけが動く
                     // （M10 設計方針3。回転しても表自体は回らない）。
@@ -6557,7 +6538,7 @@ fn draw_selection(
                             painter,
                             rect,
                             viewport,
-                            &table,
+                            table,
                             highlight.color,
                             paper_display,
                             k,
@@ -6651,18 +6632,7 @@ fn draw_selection(
                 if new_annotation.validate(kind).is_ok()
                     && let Some(new_geom) = dim_geom_with_annotation(&entity.geom, new_annotation)
                 {
-                    match new_geom {
-                        EntityGeom::DimLinear(dim) => {
-                            draw_dim_linear(painter, rect, viewport, &dim, highlight, render)
-                        }
-                        EntityGeom::DimRadial(dim) => {
-                            draw_dim_radial(painter, rect, viewport, &dim, highlight, render)
-                        }
-                        EntityGeom::DimDiameter(dim) => {
-                            draw_dim_diameter(painter, rect, viewport, &dim, highlight, render)
-                        }
-                        _ => {}
-                    }
+                    draw_dim_geom(painter, rect, viewport, &new_geom, highlight, render);
                 }
             }
         }
@@ -6714,20 +6684,18 @@ fn draw_selected(
                     let aabb = text_world_aabb(text, k);
                     draw_aabb_outline(painter, rect, viewport, &aabb, stroke);
                 }
-                EntityGeom::DimLinear(dim) => {
-                    let ex = expand_linear(dim, render);
-                    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
-                    draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
-                }
-                EntityGeom::DimRadial(dim) => {
-                    let ex = expand_radial(dim, render);
-                    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
-                    draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
-                }
-                EntityGeom::DimDiameter(dim) => {
-                    let ex = expand_diameter(dim, render);
-                    draw_dim_expansion(painter, rect, viewport, &ex, stroke);
-                    draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
+                // 寸法は強調色で重ね描きし、加えて文字ブロック外形（ドラッグで
+                // 掴める場所）を示す（M9 タスク51）。種別ごとの呼び分けは core の
+                // [`expand_dim`] が唯一の表。
+                EntityGeom::DimLinear(_)
+                | EntityGeom::DimRadial(_)
+                | EntityGeom::DimDiameter(_)
+                | EntityGeom::DimAngular(_)
+                | EntityGeom::DimOrdinate(_) => {
+                    if let Some(ex) = expand_dim(&entity.geom, render) {
+                        draw_dim_expansion(painter, rect, viewport, &ex, stroke);
+                        draw_dim_label_box(painter, rect, viewport, &ex, stroke.color);
+                    }
                 }
                 EntityGeom::Table(table) => {
                     // 罫線・セル文字を強調色で上書きし、加えて表示上のワールド AABB
@@ -7098,7 +7066,7 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::dimension::dim_sizes;
-    use mcad_core::{DimDirection, Entity};
+    use mcad_core::{DimDirection, Entity, expand_linear};
     use mcad_geom::{Circle, LineSeg};
     // 紙 mm のダッシュパターン定数は `plot` が持つ（タスク39）。画面側の px 換算
     // （[`dash_pattern_px`]）の回帰テストが元の値と突き合わせるために参照する。

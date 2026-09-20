@@ -52,7 +52,7 @@ use crate::CoreError;
 /// [`DimKind::allowed_symbols`] の許可記号表も必ず一緒に更新しなければならない
 /// （更新漏れは「新種別にどの記号も付かない」または「全部付く」という静かな不具合になる）。
 /// 網羅 `match` のコンパイルエラーをその更新漏れの検出器として使いたいので、ここでは
-/// 意図的に閉じた列挙にする。角度寸法・弧長寸法は M9 の non-goal（DESIGN.md M9 判断10）。
+/// 意図的に閉じた列挙にする。弧長寸法は今も non-goal（DESIGN.md M9 判断10・M11 判断5）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DimKind {
     /// 長さ寸法（`DimLinear`）。
@@ -61,6 +61,12 @@ pub enum DimKind {
     Radial,
     /// 直径寸法（`DimDiameter`。M9 タスク47-2 で新設）。
     Diameter,
+    /// 角度寸法（`DimAngular`。M11 タスク69 で新設）。値は**度**で表示し、
+    /// 組版が単位記号 `°` を値の後ろへ付ける（[`crate::layout_dim_label`]）。
+    Angular,
+    /// 座標寸法（`DimOrdinate`。M11 タスク69 で新設）。値は原点からの符号つき
+    /// 座標成分で、単位記号も寸法補助記号も付かない。
+    Ordinate,
 }
 
 impl DimKind {
@@ -72,6 +78,13 @@ impl DimKind {
     /// | [`DimKind::Linear`] | φ / Sφ / □ / C / t |
     /// | [`DimKind::Radial`] | R / SR / CR |
     /// | [`DimKind::Diameter`] | φ / Sφ |
+    /// | [`DimKind::Angular`] | **なし** |
+    /// | [`DimKind::Ordinate`] | **なし** |
+    ///
+    /// 角度寸法・座標寸法が空なのは、規定 5-3 の寸法補助記号がいずれも**長さ**に
+    /// 付く記号（直径・半径・球・正方形・面取り・厚さ）だからである。角度の単位記号
+    /// `°` は寸法補助記号ではなく値の接尾辞として組版側が付ける
+    /// （[`crate::layout_dim_label`]）。
     ///
     /// [`DimSymbol`] を `match` せず**許可リストで持つ**のは、`DimSymbol` が
     /// `#[non_exhaustive]` だからである。将来 geom 側に記号が増えたとき、この表に
@@ -96,6 +109,8 @@ impl DimKind {
                 DimSymbol::ControlRadius,
             ],
             DimKind::Diameter => &[DimSymbol::Diameter, DimSymbol::SphereDiameter],
+            // 角度・座標には寸法補助記号を付けない（上の表の注記参照）。
+            DimKind::Angular | DimKind::Ordinate => &[],
         }
     }
 
@@ -643,7 +658,7 @@ mod tests {
 
     /// 種別 × 記号の期待値（DESIGN.md M9 設計判断2 の文法マトリクスを実装とは独立に
     /// 転記したオラクル）。列は [`ALL_SYMBOLS`] の順（φ / Sφ / □ / R / SR / CR / C / t）。
-    const GRAMMAR: [(DimKind, [bool; 8]); 3] = [
+    const GRAMMAR: [(DimKind, [bool; 8]); 5] = [
         (
             DimKind::Linear,
             [true, true, true, false, false, false, true, true],
@@ -655,6 +670,15 @@ mod tests {
         (
             DimKind::Diameter,
             [true, true, false, false, false, false, false, false],
+        ),
+        // 角度寸法・座標寸法にはどの寸法補助記号も付かない（M11 タスク69）。
+        (
+            DimKind::Angular,
+            [false, false, false, false, false, false, false, false],
+        ),
+        (
+            DimKind::Ordinate,
+            [false, false, false, false, false, false, false, false],
         ),
     ];
 

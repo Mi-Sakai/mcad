@@ -200,6 +200,154 @@ pub struct DimDiameter {
     pub annotation: DimAnnotation,
 }
 
+/// 座標寸法（[`DimOrdinate`]）がどちらの座標成分を測るか（M11 タスク69）。
+///
+/// # 図面の X/Y は**用紙の軸**であって図形に付随しない
+///
+/// [`EntityGeom::rotated`] / [`EntityGeom::mirrored`] はこの値を**変えない**。
+/// 座標寸法は「基準（原点）から見た X 座標／Y 座標」を読む寸法で、その X/Y は
+/// 図面（用紙）の軸である。図形を 90 度回したからといって「X 座標を読む寸法」が
+/// 「Y 座標を読む寸法」に化けてよいわけではなく、そうなると同じ図面の中で
+/// 座標系が図形ごとに違うことになる。回転・鏡映で変わるのは 3 つの点だけで、
+/// 結果として読み取られる値（成分）が変わる。
+///
+/// # `#[non_exhaustive]`
+///
+/// 将来の軸指定（任意方向の基準軸など）を足せるようにするため。
+/// [`DimDirection`] と同じ判断で、軸の解決は [`OrdinateAxis::component`] 1 箇所に
+/// 閉じている。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum OrdinateAxis {
+    /// X 座標（用紙の水平方向）を測る。
+    X,
+    /// Y 座標（用紙の鉛直方向）を測る。
+    Y,
+}
+
+impl OrdinateAxis {
+    /// 変位 `delta` のうち、この軸が読む成分。
+    ///
+    /// 軸の解決はこのメソッド 1 箇所に閉じる（`#[non_exhaustive]` の前提）。
+    #[inline]
+    #[must_use]
+    pub fn component(self, delta: Vec2) -> f64 {
+        match self {
+            OrdinateAxis::X => delta.x,
+            OrdinateAxis::Y => delta.y,
+        }
+    }
+}
+
+/// 角度寸法（非関連の静的寸法。M11 タスク69 で新設）。
+///
+/// 頂点 [`DimAngular::vertex`] と、そこから見た 2 方向を決める点
+/// [`DimAngular::p1`] / [`DimAngular::p2`] で角を表す。**頂点から `p1` / `p2` までの
+/// 距離は寸法に使わない**（方向だけを取る）。寸法線となる弧の位置は
+/// [`DimAngular::arc_radius`] が独立に決める。
+///
+/// # 値は 2 方向のなす角（0〜π）
+///
+/// [`DimAngular::measured_value`] は**ラジアン**で返し、度への変換と `°` の付加は
+/// 表示側（[`crate::expand_angular`] → [`crate::layout_dim_label`]）が行う。
+/// mcad の角度はすべてラジアンという既存契約（[`TextGeom::angle`]・
+/// [`DimDiameter::angle`]・[`DimDirection::Rotated`]）に揃えてある。
+///
+/// **優角（180 度を超える角）は扱わない。** 2 方向のなす角は常に短い側を取るので、
+/// `p1` と `p2` を入れ替えても値も描かれる弧も変わらない。
+///
+/// # 反平行（180 度ちょうど）は拒否する
+///
+/// 180 度未満なら「短い側」が一意に決まるが、`p1` 方向と `p2` 方向がちょうど
+/// 反平行（なす角 = π）のときは短い側が 2 つの半円のどちらとも決まらない。
+/// 実装は弧の開始角を `p1` の方向から取るため、`p1`/`p2` を入れ替えると測定値は
+/// π のままで弧・補助線・矢先・pick が反対側の半円へ飛ぶ（保存データだけからは
+/// どちらが正しいか分からない）。この不変条件を保つため
+/// [`EntityGeom::validate`] が反平行を拒否する（Codex adversarial review 指摘、
+/// M11 タスク69）。弧の側をモデルへ追加で持たせる案は、180 度の角度寸法が実務で
+/// ほぼ使われない一方 v7 スキーマと DXF 写像への影響が大きいため採らなかった。
+///
+/// `Copy` でない理由は [`DimLinear`] と同じ（[`DimAnnotation`] が `String` を持ちうる）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DimAngular {
+    /// 角の頂点（弧の中心でもある）。
+    pub vertex: Point2,
+    /// 一方の辺の向きを決める点（`vertex` からの距離は使わない）。
+    pub p1: Point2,
+    /// もう一方の辺の向きを決める点（`vertex` からの距離は使わない）。
+    pub p2: Point2,
+    /// 寸法線となる弧の半径（`vertex` からの距離。ワールド長、正）。
+    pub arc_radius: f64,
+    /// 寸法補助記号・公差などの注記（M9 設計判断2）。許容記号は**なし**
+    /// （[`DimKind::Angular`]）。
+    #[serde(default, skip_serializing_if = "DimAnnotation::is_unannotated")]
+    pub annotation: DimAnnotation,
+}
+
+impl DimAngular {
+    /// 表示する測定値（2 方向のなす角、**ラジアン**。`0 <= v <= π`）。
+    ///
+    /// `vertex` と `p1`（または `p2`）がほぼ同一で向きが決まらないときは `0.0`。
+    /// 表示側は `to_degrees()` して `°` を付ける（[`crate::expand_angular`]）。
+    #[must_use]
+    pub fn measured_value(&self) -> f64 {
+        match self.directions() {
+            // `clamp` は `dot` が丸めで ±1 を僅かに超えたときに `acos` が NaN を
+            // 返すのを防ぐ最終防衛線（単位ベクトル同士なので数学的には範囲内）。
+            Some((u1, u2)) => u1.dot(u2).clamp(-1.0, 1.0).acos(),
+            None => 0.0,
+        }
+    }
+
+    /// 頂点から見た 2 辺の単位方向ベクトル。どちらかが決まらなければ `None`。
+    ///
+    /// 値・弧・補助線・当たり判定のすべてがこの 2 方向から導かれるので、
+    /// 向きの解決はこのメソッド 1 箇所に閉じる（[`DimDirection::unit_vector`] と
+    /// 同じ流儀）。
+    #[must_use]
+    pub fn directions(&self) -> Option<(Vec2, Vec2)> {
+        let u1 = (self.p1 - self.vertex).normalize()?;
+        let u2 = (self.p2 - self.vertex).normalize()?;
+        Some((u1, u2))
+    }
+}
+
+/// 座標寸法（非関連の静的寸法。M11 タスク69 で新設）。
+///
+/// 基準点 [`DimOrdinate::origin`] から計測点 [`DimOrdinate::feature`] までの、
+/// [`DimOrdinate::axis`] が指す座標成分を**符号つきで**読む寸法。引出線は
+/// `feature` から [`DimOrdinate::leader_end`] へ 1 本だけ引く。
+///
+/// `Copy` でない理由は [`DimLinear`] と同じ。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DimOrdinate {
+    /// 座標の基準点（DXF の group 10、作成時 UCS 原点に相当）。
+    pub origin: Point2,
+    /// 計測点（引出線の起点）。
+    pub feature: Point2,
+    /// 引出線の終点（値ラベルはこの先へ置く）。
+    pub leader_end: Point2,
+    /// どちらの座標成分を読むか。**回転・鏡映でも変わらない**
+    /// （理由は [`OrdinateAxis`] の doc）。
+    pub axis: OrdinateAxis,
+    /// 寸法補助記号・公差などの注記（M9 設計判断2）。許容記号は**なし**
+    /// （[`DimKind::Ordinate`]）。
+    #[serde(default, skip_serializing_if = "DimAnnotation::is_unannotated")]
+    pub annotation: DimAnnotation,
+}
+
+impl DimOrdinate {
+    /// 表示する測定値（`feature − origin` の [`DimOrdinate::axis`] 成分、**符号つき**）。
+    ///
+    /// 負の値は負のまま表示する（`-30` など）。絶対値を取らないのは、座標寸法が
+    /// 「基準からどちら側か」を含めて読む寸法だからである。
+    #[inline]
+    #[must_use]
+    pub fn measured_value(&self) -> f64 {
+        self.axis.component(self.feature - self.origin)
+    }
+}
+
 /// 汎用テーブルの幾何（表・部品表の土台。DESIGN.md M10 設計方針1・詳細設計1）。
 ///
 /// # 座標系と単位
@@ -338,6 +486,10 @@ pub enum EntityGeom {
     DimDiameter(DimDiameter),
     /// 汎用テーブル（表・部品表。M10 設計方針1）。
     Table(TableGeom),
+    /// 角度寸法（M11 タスク69）。
+    DimAngular(DimAngular),
+    /// 座標寸法（M11 タスク69）。
+    DimOrdinate(DimOrdinate),
 }
 
 /// 点 `p` を `pivot` を中心に CCW へ `angle` ラジアン回転する（公開 Vec2/Point2 API で組む）。
@@ -432,6 +584,13 @@ impl EntityGeom {
                 table.anchor,
                 table.anchor + Vec2::new(table.width_mm(), table.height_mm()),
             ),
+            EntityGeom::DimAngular(dim) => dim_angular_aabb(dim),
+            // 座標寸法は保存されている 3 点（基準・計測点・引出線端）の箱。値ラベルは
+            // 引出線の先へ僅かに出るが、[`EntityGeom::DimRadial`] と同じく zoom fit
+            // 用途では十分な近似とする。
+            EntityGeom::DimOrdinate(dim) => {
+                Aabb::from_corners(dim.origin, dim.feature).extended(dim.leader_end)
+            }
         }
     }
 
@@ -472,6 +631,24 @@ impl EntityGeom {
             EntityGeom::Table(table) => EntityGeom::Table(TableGeom {
                 anchor: table.anchor + delta,
                 ..table.clone()
+            }),
+            // 角度寸法は 3 点を動かすだけ（`arc_radius` は頂点からの距離なので不変）。
+            EntityGeom::DimAngular(dim) => EntityGeom::DimAngular(DimAngular {
+                vertex: dim.vertex + delta,
+                p1: dim.p1 + delta,
+                p2: dim.p2 + delta,
+                arc_radius: dim.arc_radius,
+                annotation: transform_annotation(&dim.annotation, |p| p + delta),
+            }),
+            // 座標寸法は 3 点を動かす。**基準点も一緒に動く**ので測定値は変わらない
+            // （寸法全体を動かしたのだから当然だが、基準だけを据え置く解釈もありうる
+            // ため明示する。基準を据え置きたい場合はグリップ編集（タスク75）の仕事）。
+            EntityGeom::DimOrdinate(dim) => EntityGeom::DimOrdinate(DimOrdinate {
+                origin: dim.origin + delta,
+                feature: dim.feature + delta,
+                leader_end: dim.leader_end + delta,
+                axis: dim.axis,
+                annotation: transform_annotation(&dim.annotation, |p| p + delta),
             }),
         }
     }
@@ -531,6 +708,30 @@ impl EntityGeom {
             EntityGeom::Table(table) => EntityGeom::Table(TableGeom {
                 anchor: rotate_point(table.anchor, pivot, angle),
                 ..table.clone()
+            }),
+            // 角度寸法は 3 点を回すだけ。2 辺の向きが揃って回るので**なす角は不変**、
+            // `arc_radius` も頂点からの距離なので不変（角度を別フィールドで持たない
+            // 設計の利点。[`DimDiameter::angle`] のような加算は要らない）。
+            EntityGeom::DimAngular(dim) => EntityGeom::DimAngular(DimAngular {
+                vertex: rotate_point(dim.vertex, pivot, angle),
+                p1: rotate_point(dim.p1, pivot, angle),
+                p2: rotate_point(dim.p2, pivot, angle),
+                arc_radius: dim.arc_radius,
+                annotation: transform_annotation(&dim.annotation, |p| {
+                    rotate_point(p, pivot, angle)
+                }),
+            }),
+            // 座標寸法は 3 点を回す。**`axis` は回さない**（図面の X/Y は用紙の軸で
+            // あり図形に付随しないため。理由は [`OrdinateAxis`] の doc）。結果として
+            // 測定値は回転後の座標成分へ変わる。
+            EntityGeom::DimOrdinate(dim) => EntityGeom::DimOrdinate(DimOrdinate {
+                origin: rotate_point(dim.origin, pivot, angle),
+                feature: rotate_point(dim.feature, pivot, angle),
+                leader_end: rotate_point(dim.leader_end, pivot, angle),
+                axis: dim.axis,
+                annotation: transform_annotation(&dim.annotation, |p| {
+                    rotate_point(p, pivot, angle)
+                }),
             }),
         }
     }
@@ -622,6 +823,31 @@ impl EntityGeom {
                 anchor: mirror_point(table.anchor, axis_a, axis_b),
                 ..table.clone()
             }),
+            // 角度寸法は 3 点を鏡映するだけ。鏡映は向きを裏返すが、なす角は
+            // **短い側**（0〜π）と決めてあるので値も描かれる弧も鏡像として正しく写る
+            // （`p1`/`p2` の入れ替えに対して不変なため、辺の順序が裏返っても問題ない）。
+            // `arc_radius` は距離なので不変。
+            EntityGeom::DimAngular(dim) => EntityGeom::DimAngular(DimAngular {
+                vertex: mirror_point(dim.vertex, axis_a, axis_b),
+                p1: mirror_point(dim.p1, axis_a, axis_b),
+                p2: mirror_point(dim.p2, axis_a, axis_b),
+                arc_radius: dim.arc_radius,
+                annotation: transform_annotation(&dim.annotation, |p| {
+                    mirror_point(p, axis_a, axis_b)
+                }),
+            }),
+            // 座標寸法は 3 点を鏡映する。**`axis` は裏返さない**（回転と同じ理由。
+            // 理由は [`OrdinateAxis`] の doc）。y 軸鏡映した X 座標寸法は、鏡映後の
+            // 位置の X 座標をそのまま読む（符号が反転した値になる）。
+            EntityGeom::DimOrdinate(dim) => EntityGeom::DimOrdinate(DimOrdinate {
+                origin: mirror_point(dim.origin, axis_a, axis_b),
+                feature: mirror_point(dim.feature, axis_a, axis_b),
+                leader_end: mirror_point(dim.leader_end, axis_a, axis_b),
+                axis: dim.axis,
+                annotation: transform_annotation(&dim.annotation, |p| {
+                    mirror_point(p, axis_a, axis_b)
+                }),
+            }),
         }
     }
 
@@ -705,6 +931,50 @@ impl EntityGeom {
                 check_annotation(&dim.annotation, DimKind::Diameter)
             }
             EntityGeom::Table(table) => validate_table(table),
+            EntityGeom::DimAngular(dim) => {
+                if !finite_pt(dim.vertex) || !finite_pt(dim.p1) || !finite_pt(dim.p2) {
+                    return Err("non-finite angular dimension points".into());
+                }
+                if !dim.arc_radius.is_finite() || dim.arc_radius <= 0.0 {
+                    return Err(format!(
+                        "invalid angular dimension arc radius: {}",
+                        dim.arc_radius
+                    ));
+                }
+                // 2 辺の向きが決まらない（頂点と一致する）角度寸法は、値も弧も
+                // 補助線も定まらない。半径寸法の「半径 0」と同じ境界で拒否する。
+                let Some((u1, u2)) = dim.directions() else {
+                    return Err("angular dimension legs must not coincide with the vertex".into());
+                };
+                // p1 方向と p2 方向が反平行（なす角 = π）だと、弧をどちら側の半円へ
+                // 描くかが保存データ（vertex/p1/p2/arc_radius）だけから決まらない
+                // （`p1`/`p2` を入れ替えると弧が反対側へ飛ぶ。[`DimAngular`] の doc
+                // 「反平行（180 度ちょうど）は拒否する」参照）。
+                //
+                // 閾値 1e-6 ラジアン（≒ 0.00006 度）は「意図して 180 度ちょうどを
+                // 作った場合だけを弾き、179.99 度のような通常の角度は通す」ために
+                // 選んだ。f64 の acos は 1e-8 程度の丸め誤差を持ちうるので、それより
+                // 十分大きく、かつ通常の作図で意図せず踏むには小さすぎる値として
+                // 1e-6 を取った。
+                let angle = u1.dot(u2).clamp(-1.0, 1.0).acos();
+                if (std::f64::consts::PI - angle).abs() < 1e-6 {
+                    return Err(
+                        "angular dimension legs must not be antiparallel (arc side is ambiguous at 180°)"
+                            .into(),
+                    );
+                }
+                check_annotation(&dim.annotation, DimKind::Angular)
+            }
+            EntityGeom::DimOrdinate(dim) => {
+                if !finite_pt(dim.origin) || !finite_pt(dim.feature) || !finite_pt(dim.leader_end) {
+                    return Err("non-finite ordinate dimension points".into());
+                }
+                // 引出線長 0（`feature == leader_end`）は**拒否しない**。値は
+                // `feature − origin` だけで決まるので情報は落ちず、展開も引出線を
+                // 引かずにラベルだけを置く（`expand_ordinate`）。3 点が一致していても
+                // 「原点そのものを指す座標寸法（値 0）」として意味が通る。
+                check_annotation(&dim.annotation, DimKind::Ordinate)
+            }
         }
     }
 }
@@ -907,6 +1177,31 @@ fn dim_linear_aabb(dim: &DimLinear) -> Aabb {
             Some((_, p)) => base.extended(p),
             None => base,
         },
+    }
+}
+
+/// 角度寸法の AABB。**弧と、頂点から弧まで引かれる補助線 2 本**を包む。
+///
+/// 弧の箱は [`mcad_geom::Arc::aabb`]（象限の通過を見て端点だけでなく極値も含む実装）
+/// へ委譲し、そこへ頂点を足す。補助線は頂点と弧の端点を結ぶので、この 2 つの和で
+/// 覆われる。
+///
+/// **`p1` / `p2` は含めない。** 保存はされているが向きを決めるだけの点で、描かれない
+/// （距離は寸法に使わない。[`DimAngular`] の doc）。含めると、遠くの点で角を指定した
+/// だけでズームフィットが大きく外れる。
+///
+/// 補助線の突き出し（[`DimStyle::ext_overshoot_mm`](crate::DimStyle::ext_overshoot_mm)）と
+/// 値ラベルはこの箱の外へ僅かに出るが、[`EntityGeom::DimRadial`] と同じく zoom fit
+/// 用途では十分な近似とする（スタイル・表示状態に依存する量を AABB へ持ち込まない）。
+///
+/// 骨格（弧の中心・半径・始終角）は展開・pick と**同じ純関数**
+/// [`crate::expand::angular_frame`] から取る。退化（向きが決まらない／`arc_radius` が
+/// 不正）では頂点だけの箱を返す（展開も弧を描かない）。
+fn dim_angular_aabb(dim: &DimAngular) -> Aabb {
+    let base = Aabb::from_point(dim.vertex);
+    match crate::expand::angular_frame(dim) {
+        Some(frame) => base.union(&frame.arc().aabb()),
+        None => base,
     }
 }
 
@@ -1395,6 +1690,45 @@ mod tests {
             });
             assert_eq!(g.validate().is_ok(), allowed, "{symbol:?}");
         }
+    }
+
+    /// [`DimAngular`] の最小構成（テスト用の共通道具）。
+    fn angular(vertex: Point2, p1: Point2, p2: Point2) -> DimAngular {
+        DimAngular {
+            vertex,
+            p1,
+            p2,
+            arc_radius: 2.0,
+            annotation: DimAnnotation::default(),
+        }
+    }
+
+    #[test]
+    fn dim_angular_validate_rejects_antiparallel_legs() {
+        // 頂点 (0,0)、p1 = (10,0)（0 度方向）、p2 = (-10,0)（180 度方向）。
+        // なす角はちょうど π で、弧をどちらの半円へ描くか決まらないため拒否する
+        // （Codex adversarial review 指摘、M11 タスク69）。
+        let g = EntityGeom::DimAngular(angular(
+            Point2::ORIGIN,
+            Point2::new(10.0, 0.0),
+            Point2::new(-10.0, 0.0),
+        ));
+        let err = g.validate().unwrap_err();
+        assert!(err.contains("antiparallel"), "{err}");
+    }
+
+    #[test]
+    fn dim_angular_validate_accepts_179_9_degrees() {
+        // 179.9 度は反平行ではない通常の角度なので、拒否の閾値（1e-6 ラジアン）に
+        // 巻き込まれず通る（179.9 度と 180 度の差は約 0.0017 ラジアンで、
+        // 閾値よりはるかに大きい）。
+        let p2_angle = 179.9f64.to_radians();
+        let g = EntityGeom::DimAngular(angular(
+            Point2::ORIGIN,
+            Point2::new(10.0, 0.0),
+            Point2::new(10.0 * p2_angle.cos(), 10.0 * p2_angle.sin()),
+        ));
+        assert!(g.validate().is_ok());
     }
 
     #[test]

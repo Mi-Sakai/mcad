@@ -51,11 +51,11 @@
 //! 返す点でこのモジュールの展開関数とは責務が分かれている。ワールドへの合流は
 //! [`place_label`]（タスク49-2）が担う。
 
-use mcad_geom::{ArrowGlyph, ArrowKind, LineSeg, Point2, Shape, Vec2, arrow_glyph};
+use mcad_geom::{Arc, ArrowGlyph, ArrowKind, LineSeg, Point2, Shape, Vec2, arrow_glyph};
 
 use crate::{
-    ArrowPlacement, DimAnnotation, DimDiameter, DimDirection, DimKind, DimLinear, DimRadial,
-    DimStyle, TextGeom,
+    ArrowPlacement, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimKind, DimLinear,
+    DimOrdinate, DimRadial, DimStyle, TextGeom,
 };
 
 use super::dim_label::{DimLabel, layout_dim_label};
@@ -754,6 +754,416 @@ pub fn expand_diameter(dim: &DimDiameter, render: DimRender<'_>) -> DimExpansion
         DimKind::Diameter,
         render,
     )
+}
+
+// ---------------------------------------------------------------------
+// 角度寸法（M11 タスク69）
+// ---------------------------------------------------------------------
+
+/// 角度寸法の寸法線（弧）の骨格。保存データ（vertex/p1/p2/arc_radius）だけで決まり、
+/// スタイルにも表示状態にも依存しない。
+///
+/// 角は**常に短い側**（0〜π）を取る（優角は扱わない。[`DimAngular`] の doc）。
+/// `start_angle` → `end_angle` は CCW で、その掃引角がちょうど 2 辺のなす角になる。
+pub(crate) struct AngularFrame {
+    /// 弧の中心（= 角の頂点）。
+    pub(crate) center: Point2,
+    /// 弧の半径（[`DimAngular::arc_radius`]）。
+    pub(crate) radius: f64,
+    /// 弧の開始角（ラジアン、CCW の始点側）。
+    pub(crate) start_angle: f64,
+    /// 弧の終了角（`start_angle + value`）。
+    pub(crate) end_angle: f64,
+    /// 表示する測定値（2 辺のなす角、**ラジアン**。`0 <= value <= π`）。
+    pub(crate) value: f64,
+}
+
+impl AngularFrame {
+    /// 寸法線となる弧。
+    pub(crate) fn arc(&self) -> Arc {
+        Arc::new(self.center, self.radius, self.start_angle, self.end_angle)
+    }
+
+    /// 弧上の角度 `angle` に対応する点。
+    fn point_at(&self, angle: f64) -> Point2 {
+        let (sin, cos) = angle.sin_cos();
+        self.center + Vec2::new(cos, sin) * self.radius
+    }
+
+    /// 弧の始点・終点（この順）。補助線の足でもある。
+    fn ends(&self) -> (Point2, Point2) {
+        (
+            self.point_at(self.start_angle),
+            self.point_at(self.end_angle),
+        )
+    }
+}
+
+/// 角度寸法の弧の骨格を求める。
+///
+/// # `None`（弧を描かない）になる条件
+///
+/// - 2 辺の向きが決まらない（`p1` または `p2` が頂点とほぼ同一。
+///   [`DimAngular::directions`]）
+/// - `arc_radius` が非有限・非正
+///
+/// いずれも [`EntityGeom::validate`](crate::EntityGeom::validate) が 3 境界で拒否する
+/// 値だが、検証を通っていないデータで NaN を撒かないための防御である。展開
+/// （[`expand_angular`]）はこのとき**値ラベルだけを置く**（`panic` もしないし、
+/// 空の展開も返さない）。
+///
+/// # 短い側を取る作り
+///
+/// 2 辺の方向角の差を `(-π, π]` へ畳み、差が非負なら `p1` 側を、負なら `p2` 側を
+/// 弧の始点にする。こうすると掃引が常に `[0, π]` に収まり、`p1` / `p2` の順序に
+/// 依らず同じ弧になる（鏡映で辺の順序が裏返っても図が変わらない）。
+pub(crate) fn angular_frame(dim: &DimAngular) -> Option<AngularFrame> {
+    let (u1, u2) = dim.directions()?;
+    if !dim.arc_radius.is_finite() || dim.arc_radius <= 0.0 {
+        return None;
+    }
+    let a1 = u1.angle();
+    let a2 = u2.angle();
+    // `Vec2::angle` は `atan2` なので値域は (-π, π]。差は (-2π, 2π) に入るので、
+    // ±2π を 1 回足し引きすれば (-π, π] へ畳める。
+    let mut delta = a2 - a1;
+    if delta > std::f64::consts::PI {
+        delta -= std::f64::consts::TAU;
+    } else if delta <= -std::f64::consts::PI {
+        delta += std::f64::consts::TAU;
+    }
+    let (start_angle, value) = if delta >= 0.0 {
+        (a1, delta)
+    } else {
+        (a2, -delta)
+    };
+    Some(AngularFrame {
+        center: dim.vertex,
+        radius: dim.arc_radius,
+        start_angle,
+        end_angle: start_angle + value,
+        value,
+    })
+}
+
+/// 角度寸法のヒットテスト用線分（弧の多角形近似 + 頂点から弧の両端への 2 本）。
+///
+/// **保存データ（vertex/p1/p2/arc_radius）だけで決まる**ためズーム非依存で pick から
+/// 使える。弧の近似ステップは固定の [`ANGULAR_PICK_STEP`] なので、同じ寸法なら常に
+/// 同じ線分列になる（スタイル・表示状態・ズームのいずれも入らない）。
+///
+/// 頂点から弧へ引く 2 本は描画側の補助線に対応するが、**すきま・突き出しは付けない**
+/// （長さ寸法の [`linear_pick_segments`] が `[p1, d1]` をそのまま使うのと同じ規律）。
+///
+/// 退化（[`angular_frame`] が `None`）時は空。
+#[must_use]
+pub fn angular_pick_segments(dim: &DimAngular) -> Vec<[Point2; 2]> {
+    let Some(frame) = angular_frame(dim) else {
+        return Vec::new();
+    };
+    // 弧を等分する本数。掃引は [0, π] なので最大でも 36 本に収まる。
+    let steps = (frame.value / ANGULAR_PICK_STEP).ceil().max(1.0) as usize;
+    let step = frame.value / steps as f64;
+    let mut segs = Vec::with_capacity(steps + 2);
+    let mut prev = frame.point_at(frame.start_angle);
+    for i in 1..=steps {
+        let p = frame.point_at(frame.start_angle + step * i as f64);
+        segs.push([prev, p]);
+        prev = p;
+    }
+    let (s, e) = frame.ends();
+    segs.push([frame.center, s]);
+    segs.push([frame.center, e]);
+    segs
+}
+
+/// [`angular_pick_segments`] が弧を多角形近似するときの 1 本あたりの最大掃引角（5 度）。
+///
+/// 固定値にしてあるのが肝で、ズーム・スタイル・紙基準表示のどれにも依存しない
+/// （「同じクリックがズームで当たったり外れたりする」不具合を避ける。M6 タスク24 の教訓）。
+/// 5 度なら半径 `r` の弧に対する近似誤差（矢高）は `r * (1 - cos(2.5°)) ≈ r * 0.00095` で、
+/// 既定のピック許容量（画面 px 由来で、寸法の大きさに対してはるかに大きい）に対して
+/// 十分小さい。
+const ANGULAR_PICK_STEP: f64 = std::f64::consts::PI / 36.0;
+
+/// クリック点 `p` から角度寸法への最短距離（ヒットテスト用）。退化寸法は頂点への
+/// 距離で代替し、選択・削除だけはできるようにする（[`linear_distance`] と同じ流儀）。
+#[must_use]
+pub fn angular_distance(dim: &DimAngular, p: Point2) -> f64 {
+    let segs = angular_pick_segments(dim);
+    if segs.is_empty() {
+        p.distance(dim.vertex)
+    } else {
+        min_distance_to_segments(&segs, p)
+    }
+}
+
+/// 角度寸法を展開する（M11 タスク69）。
+///
+/// - **寸法線は弧**（中心 = 頂点、半径 = [`DimAngular::arc_radius`]、掃引 = 2 辺の
+///   なす角）。弧は [`DimExpansion::symbol_strokes`] へ [`Shape::Arc`] として入れる。
+///   φ 記号と同じ経路なので、画面・SVG/PDF とも既存の描画分岐のまま描ける
+///   （[`DimExpansion::segments`] は直線専用なので弧を入れられない）。
+/// - **補助線**は頂点から各辺の向きへ、[`DimStyle::ext_gap_mm`] のすきまを空けて
+///   始まり、弧を [`DimStyle::ext_overshoot_mm`] だけ越えて終わる。長さ寸法と同じ
+///   [`extension_line`] を通すので、すきまだけで弧に届いてしまう（`arc_radius` が
+///   すきま以下の）ときは引かない。
+///   **基準点が頂点であること**が長さ寸法との違い: 角度寸法は「どこまで実形状か」を
+///   保存しない（`p1`/`p2` は向きだけを決める）ので、頂点から引く以外に基準がない。
+/// - **矢先は弧の両端に、弧の接線方向**（CCW 接線は半径方向の `perp()`）。内向きでは
+///   弧の外側（始点では `-perp`、終点では `+perp`）を指し、外向き
+///   （[`arrows_point_outward`]）では反転して弧を矢先の占有長ぶん両端へ延ばす
+///   （長さ寸法の [`expand_straight`] と同じ規則を弧長で測ったもの）。
+/// - **値は度**で、[`layout_dim_label`](super::layout_dim_label) が [`DimKind::Angular`]
+///   の接尾辞として `°` を付ける。桁数・ゼロトリムは長さ寸法と同じ規則
+///   （[`DimAnnotation::decimals_override`] → [`DimStyle::decimals`]）。
+/// - **ラベルは弧の中央の外側**へ [`DimStyle::text_gap_mm`] のすきまで置き、読み方向は
+///   中央の接線（[`reading_direction`] で正規化）。[`DimAnnotation::text_anchor`] が
+///   `Some` ならそちらが優先される。
+///
+/// # 退化しても空を返さない
+///
+/// 2 辺の向きが決まらない、または `arc_radius` が不正なときは弧・補助線・矢先を
+/// 省き、**値ラベルだけ**を頂点へ置く（`panic` しない）。「描けるものだけ描く」方針で、
+/// 選択・削除のために何かが見えている必要があるため。
+///
+/// # 反平行（p1/p2 のなす角 = π）はここへ来ない
+///
+/// [`EntityGeom::validate`](crate::EntityGeom::validate) が構築時に反平行を拒否する
+/// ため（[`DimAngular`] の doc「反平行（180 度ちょうど）は拒否する」参照）、
+/// `Document` 経由で保持されている `DimAngular` がこの関数へ渡る時点で反平行では
+/// あり得ない。[`angular_frame`] の「短い側を取る作り」は 180 度未満のみを前提にした
+/// 一意な折り畳みで、反平行はその前提の外（両方向とも同じ長さ π になり得る）だが、
+/// 到達不能なので `expand_angular` 側で別途弾く必要はない。
+#[must_use]
+pub fn expand_angular(dim: &DimAngular, render: DimRender<'_>) -> DimExpansion {
+    let Some(frame) = angular_frame(dim) else {
+        return degenerate_label_only(
+            dim.measured_value().to_degrees(),
+            dim.vertex,
+            &dim.annotation,
+            DimKind::Angular,
+            render,
+        );
+    };
+
+    let degrees = frame.value.to_degrees();
+    let glyph = arrow_glyph(render.style.arrow_kind, render.arrow_len_world);
+    // 弧長で内外配置を決める（直線寸法が寸法線長で測るのと同じ量）。
+    let arc_len = frame.radius * frame.value;
+    let outward = arrows_point_outward(arc_len, degrees, &dim.annotation, DimKind::Angular, render);
+
+    // 矢先の占有長ぶんの掃引角。外向きのときだけ弧を両端へ伸ばす。
+    let extend = if outward && frame.radius > 0.0 {
+        glyph.along_len / frame.radius
+    } else {
+        0.0
+    };
+    let drawn = Arc::new(
+        frame.center,
+        frame.radius,
+        frame.start_angle - extend,
+        frame.end_angle + extend,
+    );
+
+    let (s, e) = frame.ends();
+    // 半径方向の単位ベクトル。その `perp()` が CCW の接線。
+    let us = (s - frame.center)
+        .normalize()
+        .unwrap_or(Vec2::new(1.0, 0.0));
+    let ue = (e - frame.center)
+        .normalize()
+        .unwrap_or(Vec2::new(1.0, 0.0));
+    // 内向き: 始点では弧の外（CCW の逆）、終点では弧の外（CCW の順）を指す。
+    let (tip_s, tip_e) = if outward {
+        (us.perp(), -ue.perp())
+    } else {
+        (-us.perp(), ue.perp())
+    };
+
+    let mut ex = DimExpansion::new(
+        Vec::new(),
+        vec![place_arrow(s, tip_s, &glyph), place_arrow(e, tip_e, &glyph)],
+    );
+    ex.symbol_strokes.push(Shape::Arc(drawn));
+
+    let gap = render.paper_mm_to_world(render.style.ext_gap_mm);
+    let overshoot = render.paper_mm_to_world(render.style.ext_overshoot_mm);
+    ex.segments
+        .extend(extension_line(frame.center, s, gap, overshoot));
+    ex.segments
+        .extend(extension_line(frame.center, e, gap, overshoot));
+
+    let label = layout_dim_label(
+        degrees,
+        &dim.annotation,
+        render.style,
+        DimKind::Angular,
+        render.text_height_world,
+    );
+    let mid_angle = frame.start_angle + frame.value * 0.5;
+    let mid = frame.point_at(mid_angle);
+    let out_dir = (mid - frame.center)
+        .normalize()
+        .unwrap_or(Vec2::new(0.0, 1.0));
+    let center = dim.annotation.text_anchor.unwrap_or_else(|| {
+        let text_gap = render.paper_mm_to_world(render.style.text_gap_mm);
+        mid + out_dir * (text_gap + label.height() * 0.5)
+    });
+    place_label(&label, center, reading_direction(out_dir.perp()), &mut ex);
+    ex
+}
+
+// ---------------------------------------------------------------------
+// 座標寸法（M11 タスク69）
+// ---------------------------------------------------------------------
+
+/// 座標寸法のヒットテスト用線分（引出線 1 本）。保存データ（feature/leader_end）
+/// だけで決まるためズーム非依存で pick から使える。描画の引出線も同じ線分なので、
+/// 描画とヒットテストの位置が一致する。
+///
+/// 基準点 [`DimOrdinate::origin`] は**含めない**。値の出所ではあるが図には何も
+/// 描かれない点なので、そこを掴めると「何も無いところで寸法が拾える」ことになる
+/// （角度寸法で `p1`/`p2` を AABB へ入れないのと同じ理由）。
+#[must_use]
+pub fn ordinate_pick_segments(dim: &DimOrdinate) -> Vec<[Point2; 2]> {
+    vec![[dim.feature, dim.leader_end]]
+}
+
+/// クリック点 `p` から座標寸法（引出線）への最短距離（ヒットテスト用）。
+///
+/// 引出線長 0（`feature == leader_end`）でも [`LineSeg::closest_point`] が始点を
+/// 返すので、計測点への距離として機能する。
+#[must_use]
+pub fn ordinate_distance(dim: &DimOrdinate, p: Point2) -> f64 {
+    min_distance_to_segments(&ordinate_pick_segments(dim), p)
+}
+
+/// 座標寸法を展開する（M11 タスク69）。
+///
+/// - **引出線は `feature` → `leader_end` の 1 本だけ**（[`DimExpansion::segments`] の
+///   先頭 = 寸法線という共通規約に従う）。**折れ線にはしない**: AutoCAD の ORDINATE は
+///   基準軸に直交する向きへ一度出てから折れるが、M11 では折れ点を保存しないので
+///   直線で引く（折れ線にするなら折れ位置をデータに持つ必要があり、それはグリップ
+///   編集（タスク75）と合わせて決めるべき設計事項）。
+/// - **矢先は付けない**。座標寸法は端末記号を持たない寸法である（値と引出線だけ）。
+/// - **値は `feature − origin` の [`DimOrdinate::axis`] 成分**（符号つき。負なら
+///   `-30` のように負の値を表示する）。組版は長さ寸法と同じ
+///   [`layout_dim_label`](super::layout_dim_label) で、[`DimKind::Ordinate`] には
+///   既定記号も単位記号も無い。
+/// - **ラベルは `leader_end` の先**（引出線の延長方向）へ [`DimStyle::text_gap_mm`] の
+///   すきまを空けて置く。読み方向は引出線方向を [`reading_direction`] で正規化した
+///   向き。[`DimAnnotation::text_anchor`] が `Some` ならそちらが優先される。
+///
+/// 引出線長 0（`feature == leader_end`）では向きが決まらないので線を引かず、
+/// ラベルを `leader_end` から +x 方向へ置く（`panic` しない）。
+#[must_use]
+pub fn expand_ordinate(dim: &DimOrdinate, render: DimRender<'_>) -> DimExpansion {
+    let value = dim.measured_value();
+    let Some(dir) = (dim.leader_end - dim.feature).normalize() else {
+        return degenerate_label_only(
+            value,
+            dim.leader_end,
+            &dim.annotation,
+            DimKind::Ordinate,
+            render,
+        );
+    };
+
+    let mut ex = DimExpansion::new(vec![[dim.feature, dim.leader_end]], Vec::new());
+    let label = layout_dim_label(
+        value,
+        &dim.annotation,
+        render.style,
+        DimKind::Ordinate,
+        render.text_height_world,
+    );
+    // ラベル外形は読み方向（`±dir`）に沿って `width()` ぶん広がるので、引出線の
+    // 延長方向へ「すきま + 幅の半分」進んだ点が外形の中心になる。
+    let center = dim.annotation.text_anchor.unwrap_or_else(|| {
+        let gap = render.paper_mm_to_world(render.style.text_gap_mm);
+        dim.leader_end + dir * (gap + label.width() * 0.5)
+    });
+    place_label(&label, center, reading_direction(dir), &mut ex);
+    ex
+}
+
+// ---------------------------------------------------------------------
+// 種別ディスパッチ
+// ---------------------------------------------------------------------
+
+/// 幾何が寸法なら展開し、寸法でなければ `None`（M11 タスク69）。
+///
+/// # なぜこれが core にあるか
+///
+/// 消費側（`mcad-app` の描画・選択ハイライト・ゴーストプレビュー・文字ブロック
+/// 当たり判定、`plot` の SVG/PDF 出力）は**どれも「寸法なら展開して同じように描く」**
+/// だけで、種別ごとの分岐を持つ理由がない。それでも M10 までは各所が
+/// `DimLinear`/`DimRadial`/`DimDiameter` の 3 腕を書き写していたため、種別が増える
+/// たびに同じ表が 6 箇所で育っていた。[`EntityGeom`](crate::EntityGeom) は
+/// `#[non_exhaustive]` でワイルドカード腕が必須なので、**書き足し漏れはコンパイル
+/// エラーにならず「その寸法だけ描かれない」という静かな不具合**になる。
+///
+/// 表をここ 1 つへ寄せることで、種別追加時に直す場所が 1 箇所になる
+/// （M11 設計判断1「展開の実装を 1 つにする」を、展開の**呼び分け**にも適用したもの）。
+///
+/// 寸法以外（[`EntityGeom::Shape`](crate::EntityGeom::Shape) ・
+/// [`Text`](crate::EntityGeom::Text) ・ [`Table`](crate::EntityGeom::Table)）と、
+/// 将来追加される未知の幾何は `None`。
+#[must_use]
+pub fn expand_dim(geom: &crate::EntityGeom, render: DimRender<'_>) -> Option<DimExpansion> {
+    use crate::EntityGeom as G;
+    match geom {
+        G::DimLinear(dim) => Some(expand_linear(dim, render)),
+        G::DimRadial(dim) => Some(expand_radial(dim, render)),
+        G::DimDiameter(dim) => Some(expand_diameter(dim, render)),
+        G::DimAngular(dim) => Some(expand_angular(dim, render)),
+        G::DimOrdinate(dim) => Some(expand_ordinate(dim, render)),
+        _ => None,
+    }
+}
+
+/// クリック点 `p` から寸法への最短距離。寸法でなければ `None`（M11 タスク69）。
+///
+/// [`expand_dim`] の pick 版で、置いてある理由も同じ（種別ごとの表を 1 箇所へ
+/// 寄せる）。返る距離は**保存データだけで決まるズーム非依存の形状**への距離で、
+/// 矢先・文字の見かけの大きさには依存しない（モジュール doc 参照）。
+#[must_use]
+pub fn dim_distance(geom: &crate::EntityGeom, p: Point2) -> Option<f64> {
+    use crate::EntityGeom as G;
+    match geom {
+        G::DimLinear(dim) => Some(linear_distance(dim, p)),
+        G::DimRadial(dim) => Some(radial_distance(dim, p)),
+        G::DimDiameter(dim) => Some(diameter_distance(dim, p)),
+        G::DimAngular(dim) => Some(angular_distance(dim, p)),
+        G::DimOrdinate(dim) => Some(ordinate_distance(dim, p)),
+        _ => None,
+    }
+}
+
+/// 向きが決まらない退化寸法のための「値ラベルだけの展開」。
+///
+/// 線も矢先も置けないが、**空の展開を返すと画面から消えて選択も削除もできなくなる**
+/// ため、値だけを `at` へ水平配置して返す（[`expand_angular`] / [`expand_ordinate`]）。
+/// `text_anchor` による手動配置は通常どおり優先する。
+fn degenerate_label_only(
+    value: f64,
+    at: Point2,
+    annotation: &DimAnnotation,
+    kind: DimKind,
+    render: DimRender<'_>,
+) -> DimExpansion {
+    let mut ex = DimExpansion::new(Vec::new(), Vec::new());
+    let label = layout_dim_label(
+        value,
+        annotation,
+        render.style,
+        kind,
+        render.text_height_world,
+    );
+    let center = annotation.text_anchor.unwrap_or(at);
+    place_label(&label, center, Vec2::new(1.0, 0.0), &mut ex);
+    ex
 }
 
 #[cfg(test)]
@@ -2148,5 +2558,63 @@ mod tests {
         assert!(label_box_contains(&quad, Point2::new(0.0, 0.0))); // 境界も含む
         assert!(!label_box_contains(&quad, Point2::new(3.0, 1.0)));
         assert!(!label_box_contains(&quad, Point2::new(1.0, -0.1)));
+    }
+
+    // --- 角度寸法（M11 タスク69・Codex adversarial review 指摘） ---
+
+    /// 頂点 (0,0)、p1 = 0 度方向、p2 = 60 度方向（どちらも距離 10）の角度寸法。
+    fn angular_60deg(swap: bool) -> DimAngular {
+        let p_0deg = Point2::new(10.0, 0.0);
+        let a60 = 60f64.to_radians();
+        let p_60deg = Point2::new(10.0 * a60.cos(), 10.0 * a60.sin());
+        let (p1, p2) = if swap {
+            (p_60deg, p_0deg)
+        } else {
+            (p_0deg, p_60deg)
+        };
+        DimAngular {
+            vertex: Point2::ORIGIN,
+            p1,
+            p2,
+            arc_radius: 4.0,
+            annotation: DimAnnotation::default(),
+        }
+    }
+
+    /// `p1`/`p2` を入れ替えても、180 度未満の角度寸法は同じ弧になる
+    /// （[`DimAngular`] の doc「優角は扱わない」が謳う契約。反平行〔180 度ちょうど〕は
+    /// `EntityGeom::validate` が拒否するので別枠 — `dim_angular_validate_rejects_antiparallel_legs`
+    /// 参照）。弧の端点（矢先の位置に対応する [`angular_frame`] の始点・終点）と
+    /// [`angular_pick_segments`] の両方が一致することを確かめる。
+    #[test]
+    fn angular_frame_and_pick_segments_are_invariant_under_p1_p2_swap() {
+        let a = angular_60deg(false);
+        let b = angular_60deg(true);
+
+        let fa = angular_frame(&a).expect("退化していない");
+        let fb = angular_frame(&b).expect("退化していない");
+        assert!((fa.start_angle - fb.start_angle).abs() < T);
+        assert!((fa.end_angle - fb.end_angle).abs() < T);
+        assert!((fa.value - fb.value).abs() < T);
+        let (sa, ea) = fa.ends();
+        let (sb, eb) = fb.ends();
+        assert!(approx(sa, sb));
+        assert!(approx(ea, eb));
+
+        let segs_a = angular_pick_segments(&a);
+        let segs_b = angular_pick_segments(&b);
+        assert_eq!(segs_a.len(), segs_b.len());
+        for (sa, sb) in segs_a.iter().zip(segs_b.iter()) {
+            assert!(approx(sa[0], sb[0]));
+            assert!(approx(sa[1], sb[1]));
+        }
+
+        // 展開（弧・矢先）も一致する。
+        let ex_a = expand_angular(&a, render(0.5, 1.0));
+        let ex_b = expand_angular(&b, render(0.5, 1.0));
+        assert_eq!(ex_a.arrows.len(), ex_b.arrows.len());
+        for (arrow_a, arrow_b) in ex_a.arrows.iter().zip(ex_b.arrows.iter()) {
+            assert!(approx(arrow_tip(arrow_a), arrow_tip(arrow_b)));
+        }
     }
 }

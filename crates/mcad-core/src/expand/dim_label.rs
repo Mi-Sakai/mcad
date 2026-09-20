@@ -182,6 +182,11 @@ pub fn layout_dim_label(
         ]);
     }
 
+    // 2') 単位記号（角度寸法の `°`）。値の直後へ隙間なく連結する。
+    if let Some(suffix) = value_suffix(kind) {
+        builder.push_run(suffix.to_string(), text_height, 0.0);
+    }
+
     // 3) サイズ公差（規定 5-12）。
     if let Some(tolerance) = &annotation.tolerance {
         // 値と公差の間は ASCII 空白 1 文字ぶん空ける（規定 5-12-2 1) の記入例
@@ -240,6 +245,28 @@ fn default_symbol(kind: DimKind) -> Option<DimSymbol> {
         DimKind::Linear => None,
         DimKind::Radial => Some(DimSymbol::Radius),
         DimKind::Diameter => Some(DimSymbol::Diameter),
+        // 角度・座標には寸法補助記号が付かない（`DimKind::allowed_symbols` も空）。
+        // 角度の単位記号 `°` は記号ではなく値の接尾辞（[`value_suffix`]）。
+        DimKind::Angular | DimKind::Ordinate => None,
+    }
+}
+
+/// 値の**直後**へ隙間なく置く単位記号（M11 タスク69）。
+///
+/// 角度寸法だけが `°` を持つ。[`DimSymbol`] ではなく素の文字列なのは、
+/// [`DimSymbol`] が「値の左へ置く寸法補助記号」（規定 5-2 4)）の型であり、
+/// 単位記号はそこへ入れると位置も意味も違ってしまうためである。
+/// [`DimKind::allowed_symbols`] が角度寸法に対して空であることとも整合する。
+///
+/// **非比例寸法（[`DimAnnotation::value_override`]）でも付ける。** 上書きされるのは
+/// 数値であって単位ではない（下線は値の部分だけに掛かり、`°` には掛からない）。
+///
+/// [`DimKind`] は `#[non_exhaustive]` ではない（種別追加をコンパイルエラーで検出する
+/// 設計）ので、ここも網羅 `match` で書く。
+fn value_suffix(kind: DimKind) -> Option<&'static str> {
+    match kind {
+        DimKind::Angular => Some("°"),
+        DimKind::Linear | DimKind::Radial | DimKind::Diameter | DimKind::Ordinate => None,
     }
 }
 

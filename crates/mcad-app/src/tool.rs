@@ -41,8 +41,8 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, DimRender, Document, Entity,
-    EntityGeom, EntityId, LayerId, Linetype, NewIds, Style, TableGeom, diameter_distance,
+    Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimRender, Document,
+    Entity, EntityGeom, EntityId, LayerId, Linetype, NewIds, Style, TableGeom, diameter_distance,
     expand_diameter, expand_linear, expand_radial, linear_distance, radial_distance,
     table_world_aabb,
 };
@@ -1202,6 +1202,9 @@ impl Tool for DimLinearTool {
                             p1,
                             p2,
                             offset,
+                            // 長さ寸法ツールは現状**整列寸法だけ**を作る。向き
+                            // （水平/鉛直/任意角）の切替 UI は M11 タスク73。
+                            direction: DimDirection::Aligned,
                             // 作図直後は無注記（記号・公差は右パネルで後付けする）。
                             annotation: DimAnnotation::default(),
                         }),
@@ -1247,6 +1250,7 @@ impl Tool for DimLinearTool {
                     p1,
                     p2,
                     offset,
+                    direction: DimDirection::Aligned,
                     annotation: DimAnnotation::default(),
                 };
                 let ex = expand_linear(&dim, render);
@@ -5735,6 +5739,7 @@ mod tests {
                 p1: Point2::ORIGIN,
                 p2: Point2::new(1.0, 0.0),
                 offset: 0.5,
+                direction: DimDirection::Aligned,
                 annotation: DimAnnotation::default(),
             }),
             doc.current_layer(),
@@ -6757,6 +6762,7 @@ mod tests {
                     p1: Point2::new(0.0, 0.0),
                     p2: Point2::new(4.0, 0.0),
                     offset: 2.0,
+                    direction: DimDirection::Aligned,
                     annotation: DimAnnotation::default(),
                 }),
                 layer,
@@ -6868,6 +6874,7 @@ mod tests {
                     p1: Point2::new(20.0, 0.0),
                     p2: Point2::new(24.0, 0.0),
                     offset: 2.0,
+                    direction: DimDirection::Aligned,
                     annotation: DimAnnotation::default(),
                 }),
                 layer,
@@ -6919,6 +6926,7 @@ mod tests {
                     p1: Point2::new(0.0, 0.0),
                     p2: Point2::new(4.0, 0.0),
                     offset: 2.0,
+                    direction: DimDirection::Aligned,
                     annotation: DimAnnotation::default(),
                 }),
                 layer,

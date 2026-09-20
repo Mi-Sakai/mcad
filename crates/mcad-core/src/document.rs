@@ -804,10 +804,10 @@ impl Default for Document {
 mod tests {
     use super::*;
     use crate::{
-        ArrowPlacement, DimAnnotation, DimDiameter, DimLinear, DimStyle, FitClass, Linetype,
-        MAX_DIM_DECIMALS, MAX_SCALE_TERM, MAX_TABLE_MM, MAX_TABLE_ROWS, Orientation, PaperSize,
-        ProjectionMethod, Scale, SizeTolerance, Style, TableGeom, TitleBlockFields, TitleBlockKind,
-        TitleBlockTemplate, Unit, WidthMm,
+        ArrowPlacement, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimStyle, FitClass,
+        Linetype, MAX_DIM_DECIMALS, MAX_SCALE_TERM, MAX_TABLE_MM, MAX_TABLE_ROWS, Orientation,
+        PaperSize, ProjectionMethod, Scale, SizeTolerance, Style, TableGeom, TitleBlockFields,
+        TitleBlockKind, TitleBlockTemplate, Unit, WidthMm,
     };
     use mcad_geom::{ArrowKind, DimSymbol, LineSeg, Point2, Shape};
 
@@ -1970,6 +1970,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 1.5,
+            direction: DimDirection::Aligned,
             annotation,
         })
     }
@@ -2613,6 +2614,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(10.0, 0.0),
             offset: 5.0,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation {
                 decimals_override: None,
                 ..DimAnnotation::default()
@@ -2622,6 +2624,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(20.0, 0.0),
             offset: 5.0,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation {
                 decimals_override: Some(1),
                 ..DimAnnotation::default()

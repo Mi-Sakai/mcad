@@ -13,9 +13,9 @@
 //!
 //! | ブロック参照 | group 70 | 種別 | 計測対象 | 本テストでの期待 |
 //! |---|---|---|---|---|
-//! | `*D1` | 33 | 整列 | 斜辺 `(0,0)`–`(120,30)` | `DimLinear` |
-//! | `*D2` | 32 | 回転（水平、group 50 省略 = 0） | 同じ斜辺 | **スキップ**（水平投影 120 と実距離 123.693… が違うため） |
-//! | `*D3` | 32 | 回転（鉛直、group 50 = 90） | 鉛直線 `(150,0)`–`(150,40)` | `DimLinear`（計測 2 点が鉛直で group 50 と平行なので整列寸法と同じ図になる） |
+//! | `*D1` | 33 | 整列 | 斜辺 `(0,0)`–`(120,30)` | `DimLinear`（`Aligned`、値 = 実距離 123.693…） |
+//! | `*D2` | 32 | 回転（水平、group 50 省略 = 0） | 同じ斜辺 | `DimLinear`（`Rotated(0)`、値 = 水平投影 **120**） |
+//! | `*D3` | 32 | 回転（鉛直、group 50 = 90） | 鉛直線 `(150,0)`–`(150,40)` | `DimLinear`（`Rotated(π/2)`、値 = 40） |
 //! | `*D4` | 36 | 半径 | 円（中心 `(60,80)`、半径 `25`） | `DimRadial` |
 //! | `*D5` | 35 | 直径 | 円（同上、直径両端 `(35,80)`–`(85,80)`） | `DimDiameter` |
 //! | `*D6` | 34 | 2 直線角度 | 頂点 `(0,50)` から 2 本の線 | **エンティティとして現れない**（`dxf` 0.6.1 が読まない） |
@@ -34,11 +34,20 @@
 //! `BLOCKS` セクションへ書く。この fixture では各ブロックの中身を `LINE` 1〜2 本まで
 //! 簡略化しているが、mcad は `BLOCKS` を読まないので、DIMENSION を取り込んでも
 //! **線が二重に入らない**ことに変わりはない。取り込み後のエンティティ数がちょうど
-//! 9 件（`LINE` 4 + `CIRCLE` 1 + 寸法 4）であることがその確認になっている。
+//! 10 件（`LINE` 4 + `CIRCLE` 1 + 寸法 5）であることがその確認になっている。
+//!
+//! # M11 タスク68 で `*D2` の期待値が変わった
+//!
+//! タスク67 の時点では `mcad_core::DimLinear` が寸法線の向きを持てず、`*D2`（斜辺に
+//! 付けた水平寸法）を取り込むと表示値が投影長 120 から実距離 123.693… へ**黙って
+//! 変わって**しまうため、`skipped_dimensions` へ計上してスキップしていた。
+//! タスク68 で `mcad_core::DimDirection` が入り `.mcad` v7 がこれを保存できるように
+//! なったので、いまは `Rotated(0)` として無損失に取り込む（`skipped_dimensions` は 0）。
 
+use std::f64::consts::FRAC_PI_2;
 use std::path::PathBuf;
 
-use mcad_core::{DimAnnotation, EntityGeom};
+use mcad_core::{DimAnnotation, DimDirection, EntityGeom};
 use mcad_geom::{Circle, Point2, Shape};
 use mcad_io::{ImportSummary, load_dxf};
 
@@ -89,28 +98,23 @@ fn assert_point_close(actual: Point2, expected: Point2, what: &str) {
     assert_close(actual.y, expected.y, &format!("{what}.y"));
 }
 
-/// 取り込み全体の内訳。`LINE` 4 + `CIRCLE` 1 + 寸法 4 = 9 件で、
-/// スキップは回転寸法 `*D2`（投影値を表現できないだけで種別自体は対応している）の
-/// 1 件だけ。種別が未対応なわけではないので `skipped_entities` は 0 のまま、
-/// `skipped_dimensions` が 1 になる。
+/// 取り込み全体の内訳。`LINE` 4 + `CIRCLE` 1 + 寸法 5 = 10 件で、**スキップは 0 件**
+/// （M11 タスク68 で `*D2` も向きごと取り込めるようになった）。
 ///
 /// 2 直線角度寸法 `*D6` は `dxf` 0.6.1 がそもそもエンティティとして返さないため
 /// **スキップ件数にも出ない**（M10 タスク61 で判明した `ACAD_TABLE` と同じ制約。
-/// モジュール doc 参照）。ここで取り込んだエンティティ数が 9 件（10 件ではない）
+/// モジュール doc 参照）。ここで取り込んだエンティティ数が 10 件（11 件ではない）
 /// であることを固定することが、その「読めない種別は通知できない」制約の回帰
 /// テストにもなっている。
 #[test]
-fn synthetic_dimensions_fixture_imports_four_dimensions_and_skips_the_rotated_one() {
+fn synthetic_dimensions_fixture_imports_all_five_readable_dimensions() {
     let summary = import();
     let geoms = geoms(&summary);
-    assert_eq!(geoms.len(), 9, "取り込んだエンティティ数");
+    assert_eq!(geoms.len(), 10, "取り込んだエンティティ数");
+    assert_eq!(summary.skipped_entities, 0, "未対応の種別は無い");
     assert_eq!(
-        summary.skipped_entities, 0,
-        "対応している回転寸法が個別の理由で落ちただけなので skipped_entities は 0"
-    );
-    assert_eq!(
-        summary.skipped_dimensions, 1,
-        "スキップした寸法（*D2、投影値を表現できない）"
+        summary.skipped_dimensions, 0,
+        "タスク68 以降、fixture の寸法はすべて表現できる"
     );
     assert_eq!(summary.dropped_dimension_details, 0, "捨てた寸法属性");
 
@@ -129,7 +133,8 @@ fn synthetic_dimensions_fixture_imports_four_dimensions_and_skips_the_rotated_on
     assert_eq!(
         kinds,
         vec![
-            "circle", "diameter", "line", "line", "line", "line", "linear", "linear", "radial",
+            "circle", "diameter", "line", "line", "line", "line", "linear", "linear", "linear",
+            "radial",
         ],
         "取り込んだ種別の内訳"
     );
@@ -147,7 +152,7 @@ fn aligned_dimension_keeps_its_two_measured_points_and_dimension_line_position()
     let dim = geoms(&summary)
         .into_iter()
         .find_map(|g| match g {
-            EntityGeom::DimLinear(d) if d.p1.x == 0.0 && d.p1.y == 0.0 => Some(d),
+            EntityGeom::DimLinear(d) if d.direction == DimDirection::Aligned => Some(d),
             _ => None,
         })
         .expect("整列寸法 *D1 がある");
@@ -155,7 +160,7 @@ fn aligned_dimension_keeps_its_two_measured_points_and_dimension_line_position()
     assert_point_close(dim.p1, Point2::new(0.0, 0.0), "p1（group 13）");
     assert_point_close(dim.p2, Point2::new(120.0, 30.0), "p2（group 14）");
     // 計測長は 2 点間の実距離（整列寸法なので投影しない）。
-    assert_close((dim.p2 - dim.p1).length(), 123.693_168_768_529_82, "計測長");
+    assert_close(dim.measured_value(), 123.693_168_768_529_82, "計測長");
     // offset は (10 − p1)・perp((p2−p1)/|p2−p1|)。dimension line position は中点から
     // 法線方向へちょうど 15 離した点になるよう作ってあるので offset = 15。
     assert_close(dim.offset, 15.0, "offset");
@@ -172,13 +177,14 @@ fn aligned_dimension_keeps_its_two_measured_points_and_dimension_line_position()
     assert_eq!(dim.annotation, DimAnnotation::unannotated(), "注記なし");
 }
 
-/// 鉛直な回転寸法 `*D3`（group 50 = 90）: 計測 2 点が鉛直に並んでいるので、投影長と
-/// 実距離が一致し、整列寸法として無損失で受け入れられる。
+/// 鉛直な回転寸法 `*D3`（group 50 = 90）: 向きは `Rotated(π/2)` として保存され、
+/// 度→ラジアンの変換が io 境界で行われる。計測 2 点が鉛直に並んでいるので投影長と
+/// 実距離は一致する。
 ///
 /// 合成データの生の値は 13 = `(150, 0)`・14 = `(150, 40)`・10 = `(130, 20)`
 /// （鉛直線から左へちょうど 20 離した点になるよう作ってある）。
 #[test]
-fn vertical_rotated_dimension_is_accepted_because_it_equals_the_aligned_one() {
+fn vertical_rotated_dimension_keeps_its_ninety_degree_angle() {
     let summary = import();
     let dim = geoms(&summary)
         .into_iter()
@@ -190,24 +196,27 @@ fn vertical_rotated_dimension_is_accepted_because_it_equals_the_aligned_one() {
 
     assert_point_close(dim.p1, Point2::new(150.0, 0.0), "p1（group 13）");
     assert_point_close(dim.p2, Point2::new(150.0, 40.0), "p2（group 14）");
+    let DimDirection::Rotated(theta) = dim.direction else {
+        panic!("回転寸法として取り込まれていない: {:?}", dim.direction);
+    };
+    assert_close(theta, FRAC_PI_2, "group 50 = 90 度 → π/2 ラジアン");
     // 2 点は鉛直に並んでいる（x が同じ）ので、group 50 = 90 への投影長 = 実距離。
     assert_close(dim.p1.x, dim.p2.x, "計測 2 点は鉛直");
-    assert_close((dim.p2 - dim.p1).length(), 40.0, "計測長");
+    assert_close(dim.measured_value(), 40.0, "計測長");
+    // dir = (0,1)、perp(dir) = (-1,0) なので group 10 =(130,20) は offset = 20。
     assert_close(dim.offset, 20.0, "offset");
     assert_eq!(dim.annotation, DimAnnotation::unannotated(), "注記なし");
 }
 
-/// 水平な回転寸法 `*D2` はスキップされる。
+/// 水平な回転寸法 `*D2` は**投影長のまま**取り込まれる（M11 タスク68）。
 ///
 /// 計測 2 点は `*D1` と同じ斜辺 `(0, 0)`–`(120, 30)` で、group 50 は省略（= 0、水平）。
-/// DXF の寸法値は水平方向への投影 `120` だが、[`mcad_core::DimLinear`] が描くのは
-/// 実距離 `123.693168768529…` なので、整列寸法として取り込むと表示値が変わって
-/// しまう。向きを保存できる `DimDirection` が入る M11 タスク68 までは受け入れない。
-///
-/// 「取り込まれていない」ことを、この 2 点を持つ `DimLinear` が `*D1` の 1 件しか
-/// 無いことで固定する（`*D2` が取り込まれていれば同じ 2 点を持つ 2 件目が現れる）。
+/// DXF の寸法値は水平方向への投影 `120` で、実距離 `123.693168768529…` ではない。
+/// 向きが [`mcad_core::DimDirection::Rotated`]`(0)` として保存されるので、mcad が
+/// 表示する値も `120` になる。**この 1 件がタスク68 の眼目**で、タスク67 までは
+/// 「値が黙って変わる」のを避けるためにスキップしていた。
 #[test]
-fn horizontal_rotated_dimension_over_a_slanted_edge_is_skipped_not_mismeasured() {
+fn horizontal_rotated_dimension_over_a_slanted_edge_measures_the_projection() {
     let summary = import();
     let matching: Vec<_> = geoms(&summary)
         .into_iter()
@@ -223,9 +232,25 @@ fn horizontal_rotated_dimension_over_a_slanted_edge_is_skipped_not_mismeasured()
         .collect();
     assert_eq!(
         matching.len(),
-        1,
-        "*D1（整列）だけが取り込まれ、*D2（回転・水平）は取り込まれていない: {matching:?}"
+        2,
+        "同じ斜辺に *D1（整列）と *D2（回転・水平）の 2 件が付く: {matching:?}"
     );
+
+    let rotated = matching
+        .iter()
+        .find(|d| d.direction != DimDirection::Aligned)
+        .expect("*D2 が回転寸法として取り込まれている");
+    assert_eq!(
+        rotated.direction,
+        DimDirection::Rotated(0.0),
+        "group 50 省略 = 0"
+    );
+    // **実距離 123.693… ではなく水平投影の 120。**
+    assert_close(rotated.measured_value(), 120.0, "計測長（水平投影）");
+    // group 10 = (60, 0) は寸法線（y = 0 の水平線）の上にあり、dir = (1,0)・
+    // perp(dir) = (0,1) なので offset = 0。
+    assert_close(rotated.offset, 0.0, "offset");
+    assert_eq!(rotated.annotation, DimAnnotation::unannotated(), "注記なし");
 }
 
 /// 半径寸法 `*D4`: group 10 = 中心・group 15 = 円周上の点。中心と半径が図面の

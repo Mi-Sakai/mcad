@@ -31,6 +31,10 @@ pub use dimension::{
     expand_diameter, expand_linear, expand_radial, label_box_center, label_box_contains,
     linear_distance, linear_pick_segments, radial_distance, radial_pick_segments,
 };
+/// 長さ寸法の AABB（[`crate::EntityGeom::aabb`]）が展開と同じ骨格を使うための
+/// クレート内公開。外部 API としては [`linear_pick_segments`] / [`expand_linear`] が
+/// 同じ骨格を返すので、これを `pub` にはしない。
+pub(crate) use dimension::{linear_degenerate_dir_and_point, linear_frame};
 pub use table::{
     CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM, TableExpansion, TableSegment,
     expand_table, table_world_aabb,

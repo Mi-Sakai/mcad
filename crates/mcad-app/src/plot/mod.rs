@@ -766,8 +766,8 @@ mod tests {
     use super::*;
     use crate::frame::{CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
     use mcad_core::{
-        Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, DimStyle, Layer, Scale,
-        SheetMeta, SizeTolerance, Style, WidthMm,
+        Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimStyle, Layer,
+        Scale, SheetMeta, SizeTolerance, Style, WidthMm,
     };
     use mcad_geom::{ArrowKind, Circle, LineSeg, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
@@ -932,6 +932,7 @@ mod tests {
                     p1: Point2::ORIGIN,
                     p2: Point2::new(40.0, 0.0),
                     offset: 10.0,
+                    direction: DimDirection::Aligned,
                     annotation: DimAnnotation::default(),
                 }),
             );
@@ -1058,6 +1059,7 @@ mod tests {
                 p1: Point2::ORIGIN,
                 p2: Point2::new(100.0, 0.0),
                 offset: 10.0,
+                direction: DimDirection::Aligned,
                 annotation: DimAnnotation::default(),
             };
             add(&mut document, EntityGeom::DimLinear(dim.clone()));
@@ -1122,6 +1124,7 @@ mod tests {
                 p1: Point2::ORIGIN,
                 p2: Point2::new(100.0, 0.0),
                 offset: 10.0,
+                direction: DimDirection::Aligned,
                 annotation: DimAnnotation::default(),
             }),
         );
@@ -1350,6 +1353,7 @@ mod tests {
                     p1: Point2::ORIGIN,
                     p2: Point2::new(40.0, 0.0),
                     offset: 10.0,
+                    direction: DimDirection::Aligned,
                     annotation,
                 }),
             );
@@ -1911,6 +1915,7 @@ mod tests {
                 p1: Point2::ORIGIN,
                 p2: Point2::new(10.0, 0.0),
                 offset: 5.0,
+                direction: DimDirection::Aligned,
                 annotation: DimAnnotation::default(),
             }),
         );

@@ -1,33 +1,35 @@
-//! `.mcad` v1〜v6 の後方互換 fixture テスト（M11 タスク65）。
+//! `.mcad` v1〜v7 の後方互換 fixture テスト（M11 タスク65、v7 はタスク68 で追加）。
 //!
 //! # fixture について
 //!
-//! `tests/fixtures/v{1..6}.mcad` は各バージョンのスキーマが表現できる要素を
+//! `tests/fixtures/v{1..7}.mcad` は各バージョンのスキーマが表現できる要素を
 //! 一通り含む実ファイル（レイヤー2枚・複数ジオメトリ種・その版で表現可能な
 //! メタデータ）。各版のスキーマの一次情報は
 //! `crates/mcad-io/src/mcad_file.rs` のモジュール doc と DTO 定義
-//! （`FileDocument` / `FileLayer` / `EntityGeomV5` 等）。
+//! （`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` / `DimLinearV6` 等）。
 //!
-//! 「不正な JSON の拒否」「偽装 `Table` の拒否」のような**壊れた入力**のテストは
-//! ここへは置かない（`mcad_file.rs` の `#[cfg(test)]` に残す）。fixture ディレクトリは
+//! 「不正な JSON の拒否」「偽装 `Table` の拒否」「v6 に `direction` を混ぜた
+//! ファイルの拒否」のような**壊れた入力**のテストはここへは置かない
+//! （`mcad_file.rs` の `#[cfg(test)]` に残す）。fixture ディレクトリは
 //! 「正規のサンプル」という位置づけを保つため。
 //!
-//! # v7 を追加するとき
+//! # v8 を追加するとき
 //!
-//! `.mcad` フォーマットが v7 へ上がったら:
+//! `.mcad` フォーマットが v8 へ上がったら:
 //!
 //! 1. 現行版の mcad で保存したファイル（または本ファイルと同じ流儀で手作りした
-//!    JSON）を `tests/fixtures/v7.mcad` として追加する。
-//! 2. 下の `fixture(u32)` に `7 => "v7.mcad"` を足す。
-//! 3. 本ファイルに `v7_*` の名前で新しいバージョンの検証項目
+//!    JSON）を `tests/fixtures/v8.mcad` として追加する。新フィールドを含めること。
+//! 2. 本ファイルに `v8_*` の名前で新しいバージョンの検証項目
 //!    （新フィールドの既定値補完・ラウンドトリップ）を1ケース足す。
-//! 4. 旧版（このときは v6）が変わらず読めることは、既存の `v6_*` テストが
+//! 3. `all_fixtures_declare_their_own_version_and_reexport_as_current` は
+//!    `1..=FORMAT_VERSION` を回すだけなので、`FORMAT_VERSION` を上げれば自動で対象に入る。
+//! 4. 旧版（このときは v7）が変わらず読めることは、既存の `v7_*` テストが
 //!    そのまま回帰網として働く。
 
 use std::fs;
 use std::path::PathBuf;
 
-use mcad_core::{ArrowPlacement, EntityGeom, Linetype};
+use mcad_core::{ArrowPlacement, DimDirection, EntityGeom, Linetype};
 use mcad_geom::{ArrowKind, DimSymbol};
 use mcad_io::{FORMAT_VERSION, export_document, from_json};
 
@@ -300,7 +302,7 @@ fn v5_fixture_loads_with_expected_content() {
 
 #[test]
 fn v6_fixture_loads_with_expected_content() {
-    // v6(現行): 汎用テーブル・矢先種別を追加。
+    // v6: 汎用テーブル・矢先種別を追加。
     let summary = from_json(&fixture(6)).expect("v6 fixture は読めるべき");
     let doc = summary.document;
 
@@ -328,6 +330,78 @@ fn v6_fixture_loads_with_expected_content() {
     assert_eq!(table.col_widths_mm.len(), 2);
     assert_eq!(table.row_heights_mm.len(), 2);
     assert_eq!(table.cells, vec!["No.", "部品名", "1", "ブラケット"]);
+
+    // v6 の長さ寸法は向きを持たないので Aligned へ補完される（M11 タスク68）。
+    let dim = doc
+        .entities()
+        .find_map(|(_, e)| match &e.geom {
+            EntityGeom::DimLinear(d) => Some(d.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(dim.direction, DimDirection::Aligned);
+
+    let exported = export_document(&doc);
+    assert_eq!(exported.version, FORMAT_VERSION);
+    let reloaded = from_json(&mcad_io::to_json(&doc).unwrap())
+        .unwrap()
+        .document;
+    assert_eq!(export_document(&reloaded), exported);
+}
+
+// ---------------------------------------------------------------------
+// v7
+// ---------------------------------------------------------------------
+
+#[test]
+fn v7_fixture_loads_with_expected_content() {
+    // v7(現行): 長さ寸法の向き（DimDirection）を追加。M11 タスク68。
+    let summary = from_json(&fixture(7)).expect("v7 fixture は読めるべき");
+    let doc = summary.document;
+
+    assert_eq!(doc.layer_count(), 2);
+    assert_eq!(doc.entity_count(), 4);
+
+    let mut kinds: Vec<GeomKind> = doc.entities().map(|(_, e)| geom_kind(&e.geom)).collect();
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        vec![
+            GeomKind::Shape,
+            GeomKind::DimLinear,
+            GeomKind::DimLinear,
+            GeomKind::DimLinear,
+        ]
+    );
+
+    // 同じ斜辺 (0,0)-(120,30) に 3 通りの向きで寸法が付いている。値はそれぞれ
+    // 実距離・水平投影・鉛直投影になる（fixture の座標から計算し直した期待値）。
+    let mut measured: Vec<(DimDirection, f64)> = doc
+        .entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::DimLinear(d) => Some((d.direction, d.measured_value())),
+            _ => None,
+        })
+        .collect();
+    measured.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    assert_eq!(
+        measured[0].0,
+        DimDirection::Rotated(std::f64::consts::FRAC_PI_2)
+    );
+    assert!(
+        (measured[0].1 - 30.0).abs() < 1e-9,
+        "鉛直投影: {measured:?}"
+    );
+    assert_eq!(measured[1].0, DimDirection::Rotated(0.0));
+    assert!(
+        (measured[1].1 - 120.0).abs() < 1e-9,
+        "水平投影: {measured:?}"
+    );
+    assert_eq!(measured[2].0, DimDirection::Aligned);
+    assert!(
+        (measured[2].1 - 123.693_168_768_529_82).abs() < 1e-9,
+        "実距離: {measured:?}"
+    );
 
     let exported = export_document(&doc);
     assert_eq!(exported.version, FORMAT_VERSION);

@@ -68,7 +68,7 @@ pub fn dim_render(style: &DimStyle, paper_display: bool, k: f64, zoom: f64) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcad_core::{DimAnnotation, DimExpansion, DimLinear, expand_linear};
+    use mcad_core::{DimAnnotation, DimDirection, DimExpansion, DimLinear, expand_linear};
     use mcad_geom::{Point2, Vec2};
 
     fn plain_linear(p1: Point2, p2: Point2, offset: f64) -> DimLinear {
@@ -76,6 +76,7 @@ mod tests {
             p1,
             p2,
             offset,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation::default(),
         }
     }

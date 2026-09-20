@@ -29,8 +29,8 @@
 use std::path::{Path, PathBuf};
 
 use mcad_core::{
-    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, DimStyle, Document,
-    Entity, EntityGeom, FitClass, Scale, SheetMeta, SizeTolerance,
+    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial,
+    DimStyle, Document, Entity, EntityGeom, FitClass, Scale, SheetMeta, SizeTolerance,
 };
 use mcad_geom::{ArrowKind, DimSymbol, Point2};
 
@@ -143,6 +143,7 @@ fn linear_dimension_snapshot_per_arrow_kind() {
                 p1: Point2::ORIGIN,
                 p2: Point2::new(100.0, 0.0),
                 offset: 20.0,
+                direction: DimDirection::Aligned,
                 annotation: DimAnnotation::default(),
             }),
         );
@@ -235,6 +236,7 @@ fn linear_with_annotation(annotation: DimAnnotation) -> Document {
             p1: Point2::ORIGIN,
             p2: Point2::new(50.0, 0.0),
             offset: 15.0,
+            direction: DimDirection::Aligned,
             annotation,
         }),
     );
@@ -320,6 +322,7 @@ fn linear_dimension_snapshot_at_scale_1_to_2() {
             p1: Point2::ORIGIN,
             p2: Point2::new(100.0, 0.0),
             offset: 20.0,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation::default(),
         }),
     );

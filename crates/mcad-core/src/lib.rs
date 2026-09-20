@@ -7,6 +7,8 @@
 //!
 //! - ID: [`EntityId`], [`LayerId`]（`slotmap` キー。undo/redo をまたいでも安定）
 //! - 値型: [`Rgb`], [`WidthMm`], [`Linetype`], [`Style`], [`Layer`], [`Entity`]
+//! - 長さ寸法の向き: [`DimDirection`]（[`DimLinear::direction`]。整列寸法と回転寸法。
+//!   M11 タスク68）
 //! - 寸法の注記とスタイル: [`DimAnnotation`]（[`SizeTolerance`] / [`FitClass`] /
 //!   [`ArrowPlacement`]）と文書単位の [`DimStyle`]。文法検証は
 //!   [`DimAnnotation::validate`] に [`DimKind`] を渡して行う
@@ -60,8 +62,8 @@ pub use dim::{
 pub use document::{Document, NewIds};
 pub use entity::Entity;
 pub use entity_geom::{
-    DimDiameter, DimLinear, DimRadial, EntityGeom, MAX_TABLE_COLS, MAX_TABLE_MM, MAX_TABLE_ROWS,
-    TableGeom, TextGeom, approx_text_width,
+    DimDiameter, DimDirection, DimLinear, DimRadial, EntityGeom, MAX_TABLE_COLS, MAX_TABLE_MM,
+    MAX_TABLE_ROWS, TableGeom, TextGeom, approx_text_width,
 };
 pub use error::CoreError;
 pub use expand::{

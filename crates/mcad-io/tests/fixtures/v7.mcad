@@ -1,0 +1,55 @@
+{
+  "version": 7,
+  "sheet": {
+    "unit": "Millimeter",
+    "scale": {"num": 1, "den": 1},
+    "paper": "A4",
+    "orientation": "Landscape",
+    "title_block": "B",
+    "fields": {
+      "drawing_number": "MCAD-V7-001",
+      "drawing_title": "v7 fixture",
+      "projection": "ThirdAngle",
+      "author": "almaz",
+      "date": "2026-09-20",
+      "revision": "A"
+    },
+    "frame_visible": true
+  },
+  "layers": [
+    {"name": "0", "color": {"r": 255, "g": 255, "b": 255},
+     "linetype": "Continuous", "width_mm": 0.35,
+     "visible": true, "locked": false, "order": 1},
+    {"name": "dims", "color": {"r": 40, "g": 120, "b": 200},
+     "linetype": "Continuous", "width_mm": 0.35,
+     "visible": true, "locked": false, "order": 0}
+  ],
+  "current_layer": 0,
+  "entities": [
+    {"layer": 0, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"Shape": {"Line": {"a": {"x": 0.0, "y": 0.0}, "b": {"x": 120.0, "y": 30.0}}}}},
+    {"layer": 1, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 120.0, "y": 30.0},
+       "offset": 15.0, "direction": "Aligned"}}},
+    {"layer": 1, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 120.0, "y": 30.0},
+       "offset": -20.0, "direction": {"Rotated": 0.0}}}},
+    {"layer": 1, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 120.0, "y": 30.0},
+       "offset": 10.0, "direction": {"Rotated": 1.5707963267948966},
+       "annotation": {"symbol": "Diameter", "tolerance": {"Fit": "H7"},
+        "decimals_override": 1, "text_anchor": null, "arrow_placement": "Outside",
+        "value_override": null}}}}
+  ],
+  "dim_style": {
+    "text_height_mm": 3.5,
+    "arrow_len_mm": 5.0,
+    "decimals": 2,
+    "trim_trailing_zeros": true,
+    "ext_gap_mm": 1.0,
+    "ext_overshoot_mm": 2.0,
+    "text_gap_mm": 1.4,
+    "tolerance_scale": 0.7,
+    "arrow_kind": "Open90"
+  }
+}

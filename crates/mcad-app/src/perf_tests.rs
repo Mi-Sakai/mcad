@@ -36,7 +36,9 @@
 
 use std::time::{Duration, Instant};
 
-use mcad_core::{Command, DimAnnotation, DimLinear, Document, Entity, EntityGeom, Style, TextGeom};
+use mcad_core::{
+    Command, DimAnnotation, DimDirection, DimLinear, Document, Entity, EntityGeom, Style, TextGeom,
+};
 use mcad_geom::{Arc, LineSeg, Point2, Polyline, Shape};
 
 use crate::plot::{PlotColorMode, plot_page};
@@ -118,6 +120,7 @@ fn build_document(n: usize) -> Document {
                 p1: pt(&mut rng),
                 p2: pt(&mut rng),
                 offset: rng.next_f64(5.0, 30.0),
+                direction: DimDirection::Aligned,
                 annotation: DimAnnotation::unannotated(),
             })
         };

@@ -48,8 +48,8 @@
 //!
 //! | DXF 種別（group 70 の整数部） | クレートの型 | mcad | 備考 |
 //! |---|---|---|---|
-//! | 整列 = 1 | `RotatedDimension` | `DimLinear` | 13/14 = 計測 2 点、10 = 寸法線の位置 |
-//! | 回転 = 0 | `RotatedDimension` | `DimLinear`（条件付き） | 下記「回転寸法」 |
+//! | 整列 = 1 | `RotatedDimension` | `DimLinear`（`Aligned`） | 13/14 = 計測 2 点、10 = 寸法線の位置 |
+//! | 回転 = 0 | `RotatedDimension` | `DimLinear`（`Rotated(50°)`） | 下記「回転寸法」 |
 //! | 直径 = 3 | `DiameterDimension` | `DimDiameter` | 10 と 15 が直径の両端 |
 //! | 半径 = 4 | `RadialDimension` | `DimRadial` | 10 = 中心、15 = 円周上の点 |
 //! | 3 点角度 = 5 | `AngularThreePointDimension` | **スキップ** | モデル新設は M11 タスク69 |
@@ -63,16 +63,18 @@
 //! `is_at_user_defined_location` / `is_block_reference_referenced_by_this_block_only` へ
 //! 分解済みなので、このモジュールでビット演算はしない。
 //!
-//! ## 回転寸法は「整列寸法と同じ図になる」ものだけ受け入れる
+//! ## 回転寸法は向きごと取り込む（M11 タスク68）
 //!
-//! 回転寸法の値は計測 2 点を group 50 の方向へ**投影した長さ**で、
-//! [`mcad_core::DimLinear`] が描く `|p2 − p1|` とは一般に一致しない。向きを保存できる
-//! `DimDirection` が入るのは M11 タスク68 なので、それまでは**計測 2 点の向きが
-//! group 50 と平行なものだけ**を取り込み、残りは
-//! [`ImportSummary::skipped_dimensions`] へ計上してスキップする（対応している
-//! 種別だが表現できないだけで、「未対応の種別」ではない。判定と実測根拠は
-//! [`linear_dimension_to_geom`] の doc）。**水平／鉛直という向きの問題ではない**
-//! （斜辺に付けた水平寸法は落ち、鉛直に並んだ 2 点の鉛直寸法は通る）。
+//! 回転寸法の値は計測 2 点を group 50 の方向へ**投影した長さ**で、整列寸法が描く
+//! `|p2 − p1|` とは一般に一致しない。M11 タスク68 で
+//! [`mcad_core::DimDirection`] が入り `.mcad` v7 がこれを保存できるようになったので、
+//! **group 50 を [`mcad_core::DimDirection::Rotated`] の絶対角（ラジアン）へ写して
+//! そのまま取り込む**。斜辺に付けた水平寸法も、投影長のまま無損失で読める。
+//!
+//! タスク67 の時点では向きを保存できなかったため「計測 2 点が group 50 と平行な
+//! 回転寸法（＝整列寸法と同じ図になるもの）」だけを受け入れ、残りを
+//! [`ImportSummary::skipped_dimensions`] へ計上していた。**その制限は外れた**
+//! （受入条件の全文は [`linear_dimension_to_geom`] の doc）。
 //!
 //! ## 角度の単位
 //!
@@ -102,7 +104,7 @@
 //! 寸法ごと捨てるものは 2 種類ある。**種別自体が未対応**（3 点角度寸法・座標寸法。
 //! [`ImportSummary::skipped_entities`]）と、**対応している種別（整列・回転・
 //! 半径・直径）だが mcad のモデルでは測定値や位置を変えずに表現できない**もの
-//! （回転寸法の非平行・group 51・押し出し法線が +Z でない・計測点の退化・実測値の
+//! （group 51・押し出し法線が +Z でない・計測点の退化・実測値の
 //! 食い違い。[`ImportSummary::skipped_dimensions`]）。ここへさらに、取り込んだうえで
 //! 属性だけ捨てるもの（[`ImportSummary::dropped_dimension_details`]）と、
 //! **黙って捨てるもの**（計上しない）を合わせて 4 段階になる。どれがどれかは
@@ -117,9 +119,9 @@
 //! へ計上して取り込む（＝値だけ黙って変わる）のではなく、**取り込まず
 //! [`ImportSummary::skipped_dimensions`] へ計上してスキップする**（判定は
 //! [`actual_measurement_mismatches`]）。典型的な原因は DIMSTYLE の測定倍率
-//! （DIMLFAC）で、mcad には測定倍率の概念が無いため表現できない。この食い違いは
-//! **幾何が平行のまま値だけ違う**ケースがあり、回転寸法の「計測 2 点が group 50 と
-//! 平行なものだけ受け入れる」判定（上記）では防げないため、別枠で判定する。
+//! （DIMLFAC）で、mcad には測定倍率の概念が無いため表現できない。**向き（group 50）を
+//! 正しく写しても値だけが食い違う**ので、この検査は回転寸法の対応が入った
+//! M11 タスク68 以降も別枠で必要である。
 //!
 //! group 42 が省略された DXF（実測: libdxfrw 0.6.3 = LibreCAD）では、省略と
 //! 「値が 0」を区別できないためこの検査自体が効かず、寸法は無条件で取り込まれる
@@ -379,8 +381,8 @@ use dxf::tables::{Layer as DxfLayer, LineType as DxfLineType};
 use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
 use mcad_core::{
-    Command, DimAnnotation, DimDiameter, DimLinear, DimRadial, Document, Entity, EntityGeom, Layer,
-    LayerId, Linetype, Rgb, Style, TableGeom, TextGeom, WidthMm, expand_table,
+    Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, Document, Entity,
+    EntityGeom, Layer, LayerId, Linetype, Rgb, Style, TableGeom, TextGeom, WidthMm, expand_table,
 };
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
@@ -431,13 +433,16 @@ pub struct ImportSummary {
     /// [`linear_dimension_to_geom`] / [`is_dimension_plane_supported`] /
     /// [`actual_measurement_mismatches`] の doc）。
     ///
-    /// - 回転寸法で、計測 2 点の向きが group 50 の方向と平行でない（投影値と
-    ///   実距離が食い違うため表現できない）
     /// - 回転寸法で group 51（水平方向角）が 0 でない
+    /// - 回転寸法で group 50（寸法線の角度）が非有限
     /// - 押し出し法線（group 210/220/230）が +Z でない
     /// - 計測点が退化している（長さ寸法の計測 2 点が同一、半径・直径寸法の半径が 0）
     /// - 実測値（group 42）が mcad の再計算値と食い違う（典型的には DIMSTYLE の
     ///   測定倍率 DIMLFAC が原因）
+    ///
+    /// **M11 タスク67 にあった「計測 2 点が group 50 と平行でない回転寸法」は
+    /// タスク68 で外れた**（[`mcad_core::DimDirection`] が向きを保存できるように
+    /// なったため、投影長のまま取り込める）。
     pub skipped_dimensions: usize,
     /// [`WidthMm`] の範囲（0.05..=5.0mm）外の DXF lineweight を範囲へクランプして
     /// 取り込んだ件数（レイヤー + エンティティの合計）。無視はしない（エンティティ
@@ -803,13 +808,6 @@ fn is_text_justification_supported(text: &DxfText) -> bool {
 /// 吸収するための値で、傾いた面を通すためのものではない。
 const DIM_NORMAL_EPS: f64 = 1e-9;
 
-/// 「2 方向が平行か」の許容（単位ベクトルの外積の絶対値）。
-///
-/// `1e-9` は角度にして約 6e-8 度。`50 = 90` の寸法で `cos(90°)` が `6.1e-17` に
-/// なる程度の丸めは通し、実際に傾いている寸法（例: [`linear_dimension_to_geom`] の
-/// doc が挙げる水平寸法の外積 0.137）は通さない。
-const DIM_PARALLEL_EPS: f64 = 1e-9;
-
 /// 実測値（group 42）と mcad の再計算値の一致判定に使う相対許容。
 const DIM_MEASUREMENT_REL_EPS: f64 = 1e-6;
 
@@ -914,45 +912,46 @@ fn actual_measurement_mismatches(base: &DimensionBase, expected: f64) -> bool {
 ///
 /// - `definition_point_2`（group 13）・`definition_point_3`（group 14）= 計測 2 点。
 /// - `dimension_base.definition_point_1`（group 10）= 寸法線の位置。
-///   [`mcad_core::DimLinear::offset`] は「計測線 `p1→p2` の法線方向に、寸法線まで
-///   取った符号付き距離」なので、`offset = (p10 − p1)・perp((p2−p1)/|p2−p1|)` で求まる
-///   （`perp` は左 90 度回転。`mcad_core::expand` の `linear_frame` が
-///   `p1 + perp(dir) * offset` で寸法線端を作るのと同じ式）。
+///   [`mcad_core::DimLinear::offset`] は「`p1` から寸法線までの、**寸法線方向の**
+///   法線に沿った符号付き距離」なので、`offset = (p10 − p1)・perp(dir)` で求まる
+///   （`dir` は寸法線方向 = [`mcad_core::DimDirection::unit_vector`]、`perp` は左 90 度
+///   回転。`mcad_core::expand` が `p1 + perp(dir) * offset` で寸法線端を作るのと
+///   同じ式）。
 ///
-/// # 回転寸法（`DimensionType::RotatedHorizontalOrVertical`）の受入条件
+/// # 向き（`dimension_type` と group 50）の写像
 ///
-/// 回転寸法の値は「計測 2 点を group 50 の方向へ**投影した長さ**」であり、
-/// [`mcad_core::DimLinear`] が描く `|p2 − p1|` とは一般に一致しない。向きを保存できる
-/// `DimDirection` が入るのは M11 タスク68 なので、ここでは
-/// **投影長と実距離が一致する回転寸法、すなわち計測 2 点の向きが group 50 の方向と
-/// 平行なものだけ**を受け入れる（このとき整列寸法と描画が完全に同一になる）。
-/// 平行でないものは [`ImportSummary::skipped_dimensions`] へ計上してスキップする。
+/// | `dimension_type` | mcad | `dir` |
+/// |---|---|---|
+/// | `Aligned`（group 70 の整数部 1） | [`DimDirection::Aligned`] | `(p2 − p1)/|p2 − p1|` |
+/// | `RotatedHorizontalOrVertical`（同 0） | [`DimDirection::Rotated`]`(θ)` | `(cos θ, sin θ)` |
 ///
-/// 実測（ユーザーが LibreCAD = libdxfrw 0.6.3 で描いた図面。fixture は同じ構造の合成データ）:
+/// θ は group 50（`rotation_angle`、**度**）をラジアンへ直した絶対角
+/// （DESIGN.md M11-0(2)。省略された DXF ではクレート既定の `0.0` = 水平になる。
+/// 実測: libdxfrw 0.6.3 は水平寸法に 50 を書かない）。
 ///
-/// - 斜辺 `(115, 163.75)`–`(243.75, 146)` に付けた**水平**寸法（group 50 省略 = 0）は
-///   単位ベクトルの外積が `0.137` で平行でない。整列寸法として取り込むと表示値が
-///   `128.75` から `129.968` へ変わってしまうのでスキップする。
-/// - 垂直な辺に付けた**鉛直**寸法（group 50 = 90）は平行なので受け入れる。
-///   `cos(90°)` の丸め（`6.1e-17`）は [`DIM_PARALLEL_EPS`] が吸収する。
+/// **M11 タスク67 では回転寸法を「整列寸法と同じ図になるもの」だけに絞っていたが、
+/// タスク68 で [`DimDirection`] が入ったのでその制限は外した。** 投影長を表現できる
+/// ようになったため、斜辺に付けた水平寸法（かつて `skipped_dimensions` に計上して
+/// 捨てていた形）も本来の向きのまま取り込める。
 ///
-/// つまり「角度が 0 か」ではなく「回転寸法が整列寸法と同じ図になるか」で判定する。
-/// 水平／鉛直という**よくある向きでも、計測 2 点がその向きに並んでいなければ
-/// 投影が効いている**ため受け入れられない。
-///
-/// # そのほかの拒否条件
+/// # 拒否条件
 ///
 /// - `horizontal_direction_angle`（group 51）が 0 でない回転寸法。51 は寸法の
 ///   水平方向（UCS の X 軸）を回す指定で、group 50 がどの基準からの角度になるかが
-///   変わる。誤った向きで平行判定をするより拒否するほうが安全（整列寸法は寸法線の
+///   変わる。誤った向きで取り込むより拒否するほうが安全（整列寸法は寸法線の
 ///   向きを計測 2 点だけで決めるので、51 は文字の姿勢にしか効かず拒否しない）。
-/// - 計測 2 点がほぼ同一（法線が決まらず `offset` を定義できない）。
+/// - 計測 2 点がほぼ同一（整列寸法の向きが決まらない。回転寸法でも補助線の足が
+///   1 点へ潰れるので同じ扱いにする）。
+/// - group 50 が非有限（向きが決まらない。[`mcad_core::EntityGeom::validate`] も
+///   同じ値を拒否する）。
 /// - 押し出し法線が +Z でない（[`is_dimension_plane_supported`]）。
 /// - `dimension_type` が整列でも回転でもない（クレートは group 100 のサブクラス名で
 ///   型を決めるため、group 70 と食い違う DXF はここへ来うる）。
 /// - 実測値（group 42）が書かれていて、mcad の再計算値と食い違う
 ///   （[`actual_measurement_mismatches`]。典型的には DIMSTYLE の測定倍率 DIMLFAC が
-///   原因で、幾何が平行のままでも起きるため上記の平行判定では防げない）。
+///   原因で、**向きを正しく写しても値だけが食い違う**ため別途判定が要る）。
+///   比較する側の値は [`mcad_core::DimLinear::measured_value`]、すなわち回転寸法では
+///   投影長である（DXF の group 42 と同じ量）。
 fn linear_dimension_to_geom(
     dim: &RotatedDimension,
     dropped_detail: &mut bool,
@@ -963,32 +962,38 @@ fn linear_dimension_to_geom(
     }
     let p1 = from_dxf_point(&dim.definition_point_2);
     let p2 = from_dxf_point(&dim.definition_point_3);
-    let dir = (p2 - p1).normalize()?;
-    match base.dimension_type {
-        DimensionType::Aligned => {}
+    // 計測 2 点の退化はどちらの向きでも拒否する（補助線の足が 1 点へ潰れる）。
+    (p2 - p1).normalize()?;
+    let direction = match base.dimension_type {
+        DimensionType::Aligned => DimDirection::Aligned,
         DimensionType::RotatedHorizontalOrVertical => {
             if base.horizontal_direction_angle != 0.0 {
                 return None;
             }
-            let (sin, cos) = dim.rotation_angle.to_radians().sin_cos();
-            if (dir.x * sin - dir.y * cos).abs() > DIM_PARALLEL_EPS {
-                return None;
-            }
+            DimDirection::Rotated(dim.rotation_angle.to_radians())
         }
         _ => return None,
-    }
-    if actual_measurement_mismatches(base, (p2 - p1).length()) {
+    };
+    // 寸法線方向。`Rotated` の θ が非有限ならここで `None` になる。
+    let dir = direction.unit_vector(p1, p2)?;
+    let offset = (from_dxf_point(&base.definition_point_1) - p1).dot(dir.perp());
+    let geom = DimLinear {
+        p1,
+        p2,
+        offset,
+        direction,
+        annotation: DimAnnotation::unannotated(),
+    };
+    // 値の検査は注記より先（食い違って捨てるなら `dropped_detail` を立てない）。
+    if actual_measurement_mismatches(base, geom.measured_value()) {
         return None;
     }
     if dim.extension_line_angle != 0.0 {
         *dropped_detail = true;
     }
-    let offset = (from_dxf_point(&base.definition_point_1) - p1).dot(dir.perp());
     Some(EntityGeom::DimLinear(DimLinear {
-        p1,
-        p2,
-        offset,
         annotation: dimension_annotation(base, dropped_detail),
+        ..geom
     }))
 }
 
@@ -1097,7 +1102,7 @@ enum DxfImportSkip {
 /// `Err(DxfImportSkip::UnsupportedOrInvalid)` を返す（理由は
 /// [`is_text_justification_supported`] の doc）。
 ///
-/// DIMENSION は整列・回転（整列と同じ図になるものだけ）・半径・直径の 4 経路を
+/// DIMENSION は整列・回転・半径・直径の 4 経路を
 /// [`EntityGeom`] の `DimLinear` / `DimRadial` / `DimDiameter` へ写す
 /// （M11 タスク67、[`linear_dimension_to_geom`] / [`radial_dimension_to_geom`] /
 /// [`diameter_dimension_to_geom`]）。この 4 経路が個別の理由で変換できなかった
@@ -1892,25 +1897,33 @@ mod tests {
         assert!((right.offset + 3.0).abs() < EPS, "offset: {}", right.offset);
     }
 
-    /// 回転寸法は「整列寸法と同じ図になる」ものだけ受け入れる。計測 2 点が group 50 の
-    /// 方向に並んでいなければ、DXF の寸法値（投影長）を mcad が表現できないのでスキップ。
+    /// 回転寸法は計測 2 点が group 50 と平行でなくても取り込む（M11 タスク68）。
+    /// 向きが [`DimDirection::Rotated`] として保存されるので、DXF の寸法値（投影長）が
+    /// そのまま表現できる。
     #[test]
-    fn rotated_dimension_is_skipped_unless_its_points_lie_along_its_angle() {
-        // 水平（50 省略 = 0）なのに計測 2 点が斜め → 投影が効いている → スキップ。
+    fn rotated_dimension_keeps_its_angle_and_measures_the_projection() {
+        // 水平（50 省略 = 0）なのに計測 2 点が斜め。タスク67 ではここでスキップして
+        // いたが、いまは Rotated(0) として取り込み、値は水平投影 10 になる。
         let base = DimensionBase {
             dimension_type: DimensionType::RotatedHorizontalOrVertical,
             ..aligned_base()
         };
         let (geom, skipped_entities, skipped_dimensions, dropped) =
             import_one(linear_dim(base, (0.0, 0.0), (10.0, 5.0)));
-        assert!(geom.is_none(), "斜めの計測点を持つ回転寸法が通った");
-        assert_eq!(
-            (skipped_entities, skipped_dimensions, dropped),
-            (0, 1, 0),
-            "種別は対応しているので skipped_dimensions へ計上する"
+        let dim = linear_of(geom);
+        assert_eq!(dim.direction, DimDirection::Rotated(0.0), "50 省略 = 0 度");
+        approx_point(dim.p2, Point2::new(10.0, 5.0));
+        // dir = (1,0)、perp(dir) = (0,1) なので group 10 =(0,3) は offset = 3。
+        assert!((dim.offset - 3.0).abs() < EPS, "offset: {}", dim.offset);
+        // 表示値は実距離 11.18… ではなく水平投影の 10。
+        assert!(
+            (dim.measured_value() - 10.0).abs() < EPS,
+            "measured: {}",
+            dim.measured_value()
         );
+        assert_eq!((skipped_entities, skipped_dimensions, dropped), (0, 0, 0));
 
-        // 鉛直（50 = 90）で計測 2 点も鉛直 → 整列寸法と同一なので受け入れる。
+        // 鉛直（50 = 90）。度→ラジアンの変換が io 境界に閉じていること。
         let vertical = EntityType::RotatedDimension(RotatedDimension {
             dimension_base: DimensionBase {
                 dimension_type: DimensionType::RotatedHorizontalOrVertical,
@@ -1924,10 +1937,91 @@ mod tests {
         });
         let (geom, skipped_entities, skipped_dimensions, dropped) = import_one(vertical);
         let dim = linear_of(geom);
+        let DimDirection::Rotated(theta) = dim.direction else {
+            panic!("回転寸法として取り込まれていない: {:?}", dim.direction);
+        };
+        assert!(
+            (theta - std::f64::consts::FRAC_PI_2).abs() < EPS,
+            "50 = 90 度 → π/2 ラジアン: {theta}"
+        );
         approx_point(dim.p2, Point2::new(0.0, 10.0));
         // dir = (0,1)、perp(dir) = (-1,0) なので group 10 =(4,0) は offset = -4。
         assert!((dim.offset + 4.0).abs() < EPS, "offset: {}", dim.offset);
         assert_eq!((skipped_entities, skipped_dimensions, dropped), (0, 0, 0));
+    }
+
+    /// group 13/14 の順序を入れ替えても、`mcad-core` 側の展開（寸法線・測定値）は
+    /// 変わらない（M11 タスク68 Codex レビュー指摘1 の回帰）。
+    ///
+    /// `dxf` 0.6.1 は計測点の順序を正規化せず読んだままの 13/14 を
+    /// `definition_point_2`/`definition_point_3`（`p1`/`p2`）へ渡す（モジュール doc）。
+    /// 実ファイルでは他 CAD が書いた順序次第で入れ替わりうる。回転寸法で投影が負に
+    /// なる（計測点の順序が寸法線の向きと逆）ケースでも、`mcad_core::expand` の
+    /// `LinearFrame::dir` が `(d2-d1)` に揃っていれば、寸法線・測定値は入れ替え前後で
+    /// 一致する（展開の中身までを固定するテストは
+    /// `crates/mcad-core/src/expand/dimension.rs` の
+    /// `rotated_linear_negative_projection_matches_swapped_measurement_order`。
+    /// ここでは import 経路を通しても同じ結果になることを固定する）。
+    #[test]
+    fn rotated_dimension_definition_point_order_does_not_change_the_imported_dimension() {
+        let base = DimensionBase {
+            dimension_type: DimensionType::RotatedHorizontalOrVertical,
+            ..aligned_base()
+        };
+        let forward = linear_of(import_one(linear_dim(base.clone(), (0.0, 0.0), (10.0, 5.0))).0);
+        let swapped = linear_of(import_one(linear_dim(base, (10.0, 5.0), (0.0, 0.0))).0);
+
+        // p1/p2 はそのまま入れ替わる（正規化しない設計。モジュール doc）。
+        approx_point(forward.p1, swapped.p2);
+        approx_point(forward.p2, swapped.p1);
+
+        // それでも測定値・寸法線（展開の骨格）は一致する。
+        assert!(
+            (forward.measured_value() - swapped.measured_value()).abs() < EPS,
+            "測定値: {} != {}",
+            forward.measured_value(),
+            swapped.measured_value()
+        );
+        let forward_segs = mcad_core::linear_pick_segments(&forward);
+        let swapped_segs = mcad_core::linear_pick_segments(&swapped);
+        assert_eq!(forward_segs.len(), swapped_segs.len());
+        // 寸法線（segs[0]）は端点の順序だけが入れ替わりうるので、集合として比較する。
+        let as_sorted = |[a, b]: [Point2; 2]| if a.x <= b.x { [a, b] } else { [b, a] };
+        assert_eq!(
+            as_sorted(forward_segs[0]),
+            as_sorted(swapped_segs[0]),
+            "寸法線が定義点の順序で変わった"
+        );
+    }
+
+    /// 整列寸法は `direction = Aligned` で取り込む（回転寸法と取り違えない）。
+    #[test]
+    fn aligned_dimension_keeps_the_aligned_direction() {
+        let dim = linear_of(import_one(linear_dim(aligned_base(), (0.0, 0.0), (10.0, 5.0))).0);
+        assert_eq!(dim.direction, DimDirection::Aligned);
+        // 整列寸法の値は実距離。
+        assert!((dim.measured_value() - 125.0_f64.sqrt()).abs() < EPS);
+    }
+
+    /// group 50 が非有限な回転寸法は向きが決まらないのでスキップする
+    /// （`EntityGeom::validate` が拒否する値を core へ渡さない）。
+    #[test]
+    fn rotated_dimension_with_a_non_finite_angle_is_skipped() {
+        for angle in [f64::NAN, f64::INFINITY] {
+            let specific = EntityType::RotatedDimension(RotatedDimension {
+                dimension_base: DimensionBase {
+                    dimension_type: DimensionType::RotatedHorizontalOrVertical,
+                    ..aligned_base()
+                },
+                definition_point_2: DxfPoint::new(0.0, 0.0, 0.0),
+                definition_point_3: DxfPoint::new(10.0, 0.0, 0.0),
+                rotation_angle: angle,
+                ..Default::default()
+            });
+            let (geom, skipped_entities, skipped_dimensions, _) = import_one(specific);
+            assert!(geom.is_none(), "50 = {angle} の寸法が通った");
+            assert_eq!((skipped_entities, skipped_dimensions), (0, 1));
+        }
     }
 
     /// group 51（寸法の水平方向 = UCS の X 軸）が 0 でない**回転**寸法は、group 50 の
@@ -2357,6 +2451,7 @@ mod tests {
                 p1: Point2::new(0.0, 0.0),
                 p2: Point2::new(2.0, 0.0),
                 offset: 1.0,
+                direction: DimDirection::Aligned,
                 annotation: DimAnnotation::default(),
             }),
             layer,

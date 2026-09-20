@@ -2,7 +2,7 @@
 
 | ファイル | 用途 | テスト |
 |---|---|---|
-| `v1.mcad`〜`v6.mcad` | `.mcad` の後方互換 | `tests/backward_compat.rs` |
+| `v1.mcad`〜`v7.mcad` | `.mcad` の後方互換 | `tests/backward_compat.rs` |
 | `synthetic_dimensions.dxf` | 他 CAD が書いた DXF の DIMENSION import | `tests/dxf_dimensions.rs` |
 
 ## `synthetic_dimensions.dxf`
@@ -13,7 +13,8 @@ LibreCAD で描いた図面はそのまま同梱できない。座標は単純�
 など）へ差し替えてあるが、**構造（group code の並び・subclass marker・anonymous
 block）は LibreCAD（libdxfrw 0.6.3）が実際に書いたファイルのまま踏襲している**。
 `ENTITIES` は `LINE` 4・`CIRCLE` 1・`DIMENSION` 6 を持ち、寸法 6 件は整列・
-回転（水平/鉛直）・半径・直径・2 直線角度を 1 件ずつ含む。
+回転（水平/鉛直）・半径・直径・2 直線角度を 1 件ずつ含む。M11 タスク68 以降、
+2 直線角度以外の 5 件がすべて取り込まれる（回転寸法は `DimDirection::Rotated`）。
 
 定義点（group 10/11/13〜16 等）の解釈が正しいことは、差し替え前の実ファイル
 （ユーザーが LibreCAD で描いた図面）で検証済み（DESIGN.md M11 章参照）。この
@@ -31,27 +32,33 @@ fixture 自体の役割は「今後の実装変更で読込結果が変わらな
 
 ## `.mcad` 後方互換 fixture
 
-`v1.mcad` 〜 `v6.mcad` は各フォーマットバージョンのスキーマが表現できる要素を
+`v1.mcad` 〜 `v7.mcad` は各フォーマットバージョンのスキーマが表現できる要素を
 一通り含む実ファイル。テストは `crates/mcad-io/tests/backward_compat.rs`。
 
 各版のスキーマの一次情報は `crates/mcad-io/src/mcad_file.rs` のモジュール doc と
-DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` 等）。fixture を手で書くときは
-必ずそちらを見て、その版のスキーマに存在しないキーを混ぜないこと。
+DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
+`DimLinearV6` 等）。fixture を手で書くときは必ずそちらを見て、その版のスキーマに
+存在しないキーを混ぜないこと（**v6 以前に `DimLinear.direction` を書くと読込が
+失敗する** — 凍結 DTO が未知フィールドを拒否する）。
 
 **壊れた入力(不正 JSON・偽装 `Table` 等)のテストはここへ置かない。** それらは
 「正規のサンプル」という fixture ディレクトリの位置づけと紛らわしいので、
 `mcad_file.rs` の `#[cfg(test)]` に残す。
 
-## v7 を追加するとき
+## 次の版を追加するとき
 
-`.mcad` フォーマットが v7 へ上がったら:
+`.mcad` フォーマットが v8 へ上がったら:
 
 1. 現行版の mcad で保存したファイル(または既存 fixture と同じ流儀で手作りした
-   JSON)を `v7.mcad` として追加する。新フィールドを含めること。
-2. `backward_compat.rs` に `v7_fixture_loads_with_expected_content` を1ケース足す
+   JSON)を `v8.mcad` として追加する。新フィールドを含めること。
+2. `backward_compat.rs` に `v8_fixture_loads_with_expected_content` を1ケース足す
    (新フィールドの既定値補完・ラウンドトリップを確認)。
 3. `all_fixtures_declare_their_own_version_and_reexport_as_current` は
-   `1..=FORMAT_VERSION` を回すだけなので、`FORMAT_VERSION` を7へ上げれば
-   自動的に v7 も対象に入る。
-4. 旧版(v1〜v6)が変わらず読めることは、既存の `v1_*`〜`v6_*` テストがそのまま
+   `1..=FORMAT_VERSION` を回すだけなので、`FORMAT_VERSION` を上げれば
+   自動的に新版も対象に入る。
+4. 旧版(v1〜v7)が変わらず読めることは、既存の `v1_*`〜`v7_*` テストがそのまま
    回帰網として働く(変更不要)。
+
+`v7.mcad` は M11 タスク68 で追加。同じ斜辺 `(0,0)`–`(120,30)` に整列・水平回転・
+鉛直回転の 3 通りの長さ寸法を付けてあり、向きによって表示値が実距離 123.693…・
+水平投影 120・鉛直投影 30 と変わることを `backward_compat.rs` が固定している。

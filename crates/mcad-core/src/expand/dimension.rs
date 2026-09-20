@@ -54,7 +54,8 @@
 use mcad_geom::{ArrowGlyph, ArrowKind, LineSeg, Point2, Shape, Vec2, arrow_glyph};
 
 use crate::{
-    ArrowPlacement, DimAnnotation, DimDiameter, DimKind, DimLinear, DimRadial, DimStyle, TextGeom,
+    ArrowPlacement, DimAnnotation, DimDiameter, DimDirection, DimKind, DimLinear, DimRadial,
+    DimStyle, TextGeom,
 };
 
 use super::dim_label::{DimLabel, layout_dim_label};
@@ -479,21 +480,103 @@ fn expand_straight(
 // 長さ寸法
 // ---------------------------------------------------------------------
 
-/// 長さ寸法の寸法線 2 端点 `(d1, d2)` と、寸法線方向の単位ベクトルを返す。
-/// 計測 2 点がほぼ同一（法線が定まらない）なら `None`。
-fn linear_frame(dim: &DimLinear) -> Option<(Point2, Point2, Vec2)> {
-    let dir = (dim.p2 - dim.p1).normalize()?;
+/// 長さ寸法の寸法線の骨格（M11 タスク68）。保存データ（p1/p2/offset/direction）
+/// だけで決まり、スタイルにも表示状態にも依存しない。
+pub(crate) struct LinearFrame {
+    /// 寸法線の端点（`p1` を寸法線へ投影した足）。
+    pub(crate) d1: Point2,
+    /// 寸法線の端点（`p2` を寸法線へ投影した足）。
+    pub(crate) d2: Point2,
+    /// **描画用**の寸法線方向の単位ベクトル（`(d2 − d1)` の向きに揃えてある）。
+    ///
+    /// `offset`（寸法線の位置決め）は [`DimDirection::unit_vector`] 由来の向きで
+    /// 計算し終えてから、この場は「矢の内外配置・寸法線の延長方向」の基準として
+    /// **`d1` から `d2` を向く向き**へ揃え直す（M11 タスク68 Codex レビュー指摘1）。
+    /// `Rotated` で投影が負（計測点の順序が寸法線の向きと逆）だと 2 つの向きが
+    /// 食い違い、揃えないと矢先・寸法線の延長が反転したまま描かれる。`Aligned` は
+    /// 元々 `dir ∥ (p2 − p1)` で一致しているため実質変わらない。
+    pub(crate) dir: Vec2,
+    /// 表示する測定値（`|d2 − d1|`。[`DimLinear::measured_value`] と同値）。
+    pub(crate) value: f64,
+}
+
+/// 長さ寸法の寸法線の骨格を求める（M11 タスク68 で回転寸法へ一般化）。
+///
+/// 寸法線は「[`DimLinear::offset`] が指す点 `p1 + dir.perp() * offset` を通る `dir`
+/// 方向の直線」で、その 2 端点は計測 2 点をその直線へ**投影**した足である
+/// （`dir` は [`DimDirection::unit_vector`]）。**`offset` の適用（寸法線の位置決め）は
+/// 常にこの `dir`（`DimDirection` 由来）で行う**。[`LinearFrame::dir`] として返す値は
+/// 描画用に向きを揃え直したもので、これとは別（doc 参照）。
+///
+/// # `Aligned` は閉じた形で計算する
+///
+/// [`DimDirection::Aligned`] では `dir ∥ (p2 − p1)` なので投影は恒等写像になり、
+/// 端点は `p1 + shift` / `p2 + shift`（`shift = dir.perp() * offset`）そのものである。
+/// 一般式（内積で投影パラメータを出して `dir` 倍する）を通しても数学的には同じだが
+/// 最終桁が動きうるため、**M10 以前に保存された図面の描画をビット単位で保つ**ために
+/// 閉じた形のまま残す（回帰網は `mcad-app` の寸法スナップショット 29 ケース）。
+///
+/// # `None`（描かない）になる条件
+///
+/// - [`DimDirection::Aligned`] で計測 2 点がほぼ同一（向きが定まらない。M10 までと同じ）
+/// - [`DimDirection::Rotated`] で θ が非有限（向きが定まらない）
+/// - [`DimDirection::Rotated`] で投影長が 0（**寸法線の長さが 0**）。計測 2 点が
+///   寸法線の法線上に並んだ場合で、値 0 の寸法を描いても読めないため引かない。
+pub(crate) fn linear_frame(dim: &DimLinear) -> Option<LinearFrame> {
+    let dir = dim.direction.unit_vector(dim.p1, dim.p2)?;
     let shift = dir.perp() * dim.offset;
-    Some((dim.p1 + shift, dim.p2 + shift, dir))
+    match dim.direction {
+        DimDirection::Aligned => Some(LinearFrame {
+            d1: dim.p1 + shift,
+            d2: dim.p2 + shift,
+            dir,
+            value: (dim.p2 - dim.p1).length(),
+        }),
+        DimDirection::Rotated(_) => {
+            let span = (dim.p2 - dim.p1).dot(dir);
+            // 寸法線長 0（投影がつぶれた）は描かない。`Vec2::normalize` と同じ
+            // 最終防衛線の閾値で判定する（座標スケールに依らない量ではないが、
+            // ここも「0 で割らない」ための下限でしかない）。
+            if span.abs() <= mcad_geom::EPS {
+                return None;
+            }
+            let d1 = dim.p1 + shift;
+            Some(LinearFrame {
+                d1,
+                d2: d1 + dir * span,
+                // 描画用の向きは `(d2 − d1)` へ揃える（`span` が負なら `dir` の逆側）。
+                // `offset` に使った `shift` はこの前で確定済みなので位置決めには
+                // 影響しない。
+                dir: dir * span.signum(),
+                value: span.abs(),
+            })
+        }
+    }
+}
+
+/// [`linear_frame`] が `None`（投影長 0 の `Rotated`、または `Aligned`/`Rotated` で
+/// 向きそのものが決まらない）を返すときに、展開（[`expand_linear`]）が寸法線の代わりに
+/// 使う「方向・点」のうち、**方向が決まる場合**の値。
+///
+/// 方向 `dir`（[`DimDirection::unit_vector`]）が決まらない（`Aligned` で計測 2 点が
+/// ほぼ同一、または `Rotated` で θ が非有限）ときは `None`。
+///
+/// AABB（`entity_geom::dim_linear_aabb`）はこの点を展開と共有するためにこの関数を呼ぶ
+/// （M11 タスク68 Codex レビュー指摘2）。展開・AABB のどちらかだけを直して食い違わせる
+/// ことがないよう、計算をこの 1 箇所へ寄せてある。
+#[must_use]
+pub(crate) fn linear_degenerate_dir_and_point(dim: &DimLinear) -> Option<(Vec2, Point2)> {
+    let dir = dim.direction.unit_vector(dim.p1, dim.p2)?;
+    Some((dir, dim.p1 + dir.perp() * dim.offset))
 }
 
 /// 長さ寸法のヒットテスト用線分（寸法線＋補助線 2 本）。矢先・文字の大きさに依らず
-/// 保存データ（p1/p2/offset）だけで決まるため、ズーム非依存で pick から使える。
-/// 退化（p1≈p2）時は空。
+/// 保存データ（p1/p2/offset/direction）だけで決まるため、ズーム非依存で pick から
+/// 使える。退化（[`linear_frame`] が `None`）時は空。
 #[must_use]
 pub fn linear_pick_segments(dim: &DimLinear) -> Vec<[Point2; 2]> {
     match linear_frame(dim) {
-        Some((d1, d2, _)) => vec![[d1, d2], [dim.p1, d1], [dim.p2, d2]],
+        Some(f) => vec![[f.d1, f.d2], [dim.p1, f.d1], [dim.p2, f.d2]],
         None => Vec::new(),
     }
 }
@@ -512,26 +595,55 @@ pub fn linear_distance(dim: &DimLinear, p: Point2) -> f64 {
 
 /// 長さ寸法を展開する（規定 5-2 3)・5-4 2)・5-4 4)）。
 ///
-/// - 寸法線は `d1`→`d2`。矢は `arrows_point_outward` の判定で内外が決まり、外向きの
-///   ときは寸法線を両端へ矢先長ぶん延長する。
-/// - 補助線は計測点から [`DimStyle::ext_gap_mm`] のすきまを空けて始まり、寸法線を
-///   [`DimStyle::ext_overshoot_mm`] だけ越えて終わる（退化時の扱いは `extension_line`）。
+/// - 寸法線は `d1`→`d2`（[`linear_frame`]。回転寸法では計測 2 点を投影した足）。
+///   矢は `arrows_point_outward` の判定で内外が決まり、外向きのときは寸法線を
+///   両端へ矢先長ぶん延長する。
+/// - 補助線は計測点から**その足まで** [`DimStyle::ext_gap_mm`] のすきまを空けて始まり、
+///   寸法線を [`DimStyle::ext_overshoot_mm`] だけ越えて終わる（退化時の扱いは
+///   `extension_line`）。回転寸法では補助線が計測線と直交しない（寸法線の法線方向へ
+///   引かれる）が、これは JIS でも一般的な回転寸法の描き方である。
 /// - 値ラベルは寸法線の**上側**へ [`DimStyle::text_gap_mm`] のすきまで置く。
 ///   `offset` の符号では側を変えない（M9 タスク49-2 の意図した可視差）。
+/// - 表示値は**寸法線の 2 端点間の距離**（[`DimLinear::measured_value`]）。
+///   [`DimDirection::Aligned`] では `|p2 − p1|` に一致する。
 #[must_use]
 pub fn expand_linear(dim: &DimLinear, render: DimRender<'_>) -> DimExpansion {
-    // 退化時も破綻しない安全な既定方向（+x）を使う。通常はツールが p1≈p2 を弾く。
-    let (d1, d2, dir) = linear_frame(dim).unwrap_or((dim.p1, dim.p2, Vec2::new(1.0, 0.0)));
+    // 退化時も破綻しない骨格へ倒す（通常はツールが p1≈p2 を弾く）。
+    // - 向きが決まる（回転寸法で投影長だけが 0）: 位置と向きは正しいので長さ 0 の
+    //   寸法線を置く。
+    // - 向きも決まらない（`Aligned` で p1≈p2 / θ が非有限）: M10 までと同じく
+    //   計測 2 点をそのまま使い、向きは +x へ倒す。
+    let frame = linear_frame(dim).unwrap_or_else(|| match linear_degenerate_dir_and_point(dim) {
+        Some((dir, d)) => LinearFrame {
+            d1: d,
+            d2: d,
+            dir,
+            value: 0.0,
+        },
+        None => LinearFrame {
+            d1: dim.p1,
+            d2: dim.p2,
+            dir: Vec2::new(1.0, 0.0),
+            value: (dim.p2 - dim.p1).length(),
+        },
+    });
 
-    let value = (dim.p2 - dim.p1).length();
-    let mut ex = expand_straight(d1, d2, dir, value, &dim.annotation, DimKind::Linear, render);
+    let mut ex = expand_straight(
+        frame.d1,
+        frame.d2,
+        frame.dir,
+        frame.value,
+        &dim.annotation,
+        DimKind::Linear,
+        render,
+    );
 
     let gap = render.paper_mm_to_world(render.style.ext_gap_mm);
     let overshoot = render.paper_mm_to_world(render.style.ext_overshoot_mm);
     ex.segments
-        .extend(extension_line(dim.p1, d1, gap, overshoot));
+        .extend(extension_line(dim.p1, frame.d1, gap, overshoot));
     ex.segments
-        .extend(extension_line(dim.p2, d2, gap, overshoot));
+        .extend(extension_line(dim.p2, frame.d2, gap, overshoot));
     ex
 }
 
@@ -707,7 +819,17 @@ mod tests {
             p1,
             p2,
             offset,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation::default(),
+        }
+    }
+
+    /// 回転寸法（絶対角 `theta` ラジアン）。計測 2 点・オフセットは
+    /// [`plain_linear`] と同じ引数。
+    fn rotated_linear(p1: Point2, p2: Point2, offset: f64, theta: f64) -> DimLinear {
+        DimLinear {
+            direction: DimDirection::Rotated(theta),
+            ..plain_linear(p1, p2, offset)
         }
     }
 
@@ -745,6 +867,168 @@ mod tests {
         let dim = plain_linear(Point2::new(1.0, 1.0), Point2::new(1.0, 1.0), 3.0);
         assert!(linear_pick_segments(&dim).is_empty());
         assert!((linear_distance(&dim, Point2::new(1.0, 4.0)) - 3.0).abs() < T);
+    }
+
+    // --- 回転寸法（M11 タスク68）---
+
+    #[test]
+    fn rotated_linear_projects_the_measured_points_onto_the_dimension_line() {
+        // 斜辺 (0,0)-(120,30) に付けた**水平**寸法（θ = 0、offset = 0）。
+        // 寸法線は p1 を通る水平線なので、端点は (0,0) と (120,0)。
+        let dim = rotated_linear(Point2::new(0.0, 0.0), Point2::new(120.0, 30.0), 0.0, 0.0);
+        let segs = linear_pick_segments(&dim);
+        assert_eq!(segs.len(), 3);
+        assert!(approx(segs[0][0], Point2::new(0.0, 0.0)));
+        assert!(approx(segs[0][1], Point2::new(120.0, 0.0)));
+        // 補助線は各計測点からその足まで（p1 の足は p1 自身なので長さ 0）。
+        assert!(approx(segs[1][0], Point2::new(0.0, 0.0)));
+        assert!(approx(segs[1][1], Point2::new(0.0, 0.0)));
+        assert!(approx(segs[2][0], Point2::new(120.0, 30.0)));
+        assert!(approx(segs[2][1], Point2::new(120.0, 0.0)));
+    }
+
+    #[test]
+    fn rotated_linear_measures_the_projected_length_not_the_distance() {
+        // 同じ斜辺でも θ = 0 なら 120、θ = π/2 なら 30、整列なら実距離。
+        let p1 = Point2::new(0.0, 0.0);
+        let p2 = Point2::new(120.0, 30.0);
+        assert!((rotated_linear(p1, p2, 0.0, 0.0).measured_value() - 120.0).abs() < T);
+        assert!((rotated_linear(p1, p2, 0.0, FRAC_PI_2).measured_value() - 30.0).abs() < T);
+        let aligned = plain_linear(p1, p2, 0.0).measured_value();
+        assert!((aligned - 123.693_168_768_529_82).abs() < T);
+        // 展開が使う値も同じ（ラベルの内容で確認する）。
+        let ex = expand_linear(&rotated_linear(p1, p2, 20.0, 0.0), render(0.5, 1.0));
+        assert_eq!(contents_of(&ex), vec!["120"]);
+    }
+
+    #[test]
+    fn rotated_linear_offset_is_measured_along_the_dimension_line_normal() {
+        // θ = π/2（鉛直な寸法線）。法線は perp((0,1)) = (-1,0) なので、
+        // offset +20 は p1 から x 方向へ **−20** 進んだ側に寸法線を置く。
+        let dim = rotated_linear(
+            Point2::new(150.0, 0.0),
+            Point2::new(150.0, 40.0),
+            20.0,
+            FRAC_PI_2,
+        );
+        let segs = linear_pick_segments(&dim);
+        assert!(approx(segs[0][0], Point2::new(130.0, 0.0)));
+        assert!(approx(segs[0][1], Point2::new(130.0, 40.0)));
+        assert!((dim.measured_value() - 40.0).abs() < T);
+    }
+
+    #[test]
+    fn rotated_linear_equals_aligned_when_the_angle_matches_the_measured_points() {
+        // 計測 2 点が θ と平行なら、回転寸法は整列寸法と同じ図になる
+        // （DXF import の受入条件が M11 タスク67 で依拠していた性質）。
+        let p1 = Point2::new(1.0, 2.0);
+        let p2 = Point2::new(1.0, 42.0);
+        let aligned = linear_pick_segments(&plain_linear(p1, p2, 7.0));
+        let rotated = linear_pick_segments(&rotated_linear(p1, p2, 7.0, FRAC_PI_2));
+        assert_eq!(aligned.len(), rotated.len());
+        for (a, r) in aligned.iter().zip(rotated.iter()) {
+            assert!(approx(a[0], r[0]) && approx(a[1], r[1]), "{a:?} != {r:?}");
+        }
+    }
+
+    #[test]
+    fn rotated_linear_with_zero_projection_is_not_drawn() {
+        // 計測 2 点が寸法線の法線上に並ぶ（投影長 0）。値 0 の寸法は描かない。
+        let dim = rotated_linear(Point2::new(0.0, 0.0), Point2::new(0.0, 40.0), 5.0, 0.0);
+        assert!(linear_pick_segments(&dim).is_empty());
+        assert!((dim.measured_value() - 0.0).abs() < T);
+        // 展開は破綻せず、寸法線長 0・向きは θ のままの骨格へ倒れる（値 0 では矢が
+        // 外向きになるので、描かれる線は骨格の 1 点を中心に矢先長ぶん両側へ伸びる）。
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        let [a, b] = ex.segments[0];
+        assert!(approx(a.midpoint(b), Point2::new(0.0, 5.0)));
+        assert!((a.y - b.y).abs() < T, "寸法線は θ = 0 の向き: {a:?}-{b:?}");
+        assert_eq!(contents_of(&ex), vec!["0"]);
+    }
+
+    #[test]
+    fn rotated_linear_with_non_finite_angle_is_not_drawn() {
+        // `EntityGeom::validate` が 3 境界で弾く値だが、展開が NaN を撒かないこと。
+        let dim = rotated_linear(Point2::new(0.0, 0.0), Point2::new(4.0, 0.0), 2.0, f64::NAN);
+        assert!(linear_pick_segments(&dim).is_empty());
+        assert_eq!(dim.measured_value(), 0.0);
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        assert!(ex.segments.iter().flatten().all(|p| p.x.is_finite()));
+    }
+
+    #[test]
+    fn rotated_linear_negative_projection_matches_swapped_measurement_order() {
+        // θ = 0（水平）で計測点の順序が寸法線の向きと逆（p1 が右 120、p2 が左 0）。
+        // Codex レビュー指摘1: `linear_frame` が返す描画用 `dir` を `(d2-d1)` へ揃えて
+        // いないと、投影が負のときだけ矢先の向き・外向き延長の方向が反転する。
+        // 矢の内外配置を `Outside` に固定して外向き延長を強制的に発生させる。
+        fn outside(p1: Point2, p2: Point2) -> DimLinear {
+            DimLinear {
+                annotation: DimAnnotation {
+                    arrow_placement: ArrowPlacement::Outside,
+                    ..DimAnnotation::default()
+                },
+                ..rotated_linear(p1, p2, 5.0, 0.0)
+            }
+        }
+
+        // 投影が負（バグの温床）と、p1/p2 を入れ替えた投影が正の参照。物理的には
+        // 同じ寸法線（x=0〜x=120, y=5）を表すはずで、矢先・延長の形は一致するべき。
+        let neg = outside(Point2::new(120.0, 0.0), Point2::new(0.0, 0.0));
+        let pos = outside(Point2::new(0.0, 0.0), Point2::new(120.0, 0.0));
+        let render = render(0.5, 1.0);
+        let ex_neg = expand_linear(&neg, render);
+        let ex_pos = expand_linear(&pos, render);
+
+        // 寸法線の 2 端点は正しい位置（x=0〜120, y=5 のどこか）にあり、順序に依らず一致。
+        let as_sorted = |[a, b]: [Point2; 2]| {
+            if a.x <= b.x { [a, b] } else { [b, a] }
+        };
+        let [neg_lo, neg_hi] = as_sorted(ex_neg.segments[0]);
+        let [pos_lo, pos_hi] = as_sorted(ex_pos.segments[0]);
+        assert!(approx(neg_lo, pos_lo) && approx(neg_hi, pos_hi));
+        assert!((neg_lo.y - 5.0).abs() < T && (neg_hi.y - 5.0).abs() < T);
+        // 外向きなので寸法線は矢先ぶん両側へ延び、計測値 120 より長くなる
+        // （内側へ縮むのが指摘1の症状）。
+        assert!(
+            neg_hi.x - neg_lo.x > 120.0,
+            "外向きなのに寸法線が延長されていない: {neg_lo:?}-{neg_hi:?}"
+        );
+
+        // 矢先（先端位置と、先端から胴へ向かう向き）の集合は計測点の順序に依らず一致する。
+        let arrow_key = |ex: &DimExpansion| -> Vec<(Point2, Vec2)> {
+            ex.arrows
+                .iter()
+                .map(|g| {
+                    let tri = &g.fills[0];
+                    let tip = tri[0];
+                    let back_mid = tri[1].midpoint(tri[2]);
+                    (
+                        tip,
+                        (tip - back_mid).normalize().expect("矢の胴は退化しない"),
+                    )
+                })
+                .collect()
+        };
+        let mut keys_neg = arrow_key(&ex_neg);
+        let mut keys_pos = arrow_key(&ex_pos);
+        let by_x = |v: &mut Vec<(Point2, Vec2)>| {
+            v.sort_by(|a, b| a.0.x.partial_cmp(&b.0.x).unwrap());
+        };
+        by_x(&mut keys_neg);
+        by_x(&mut keys_pos);
+        assert_eq!(keys_neg.len(), 2);
+        assert_eq!(keys_neg.len(), keys_pos.len());
+        for ((p_neg, d_neg), (p_pos, d_pos)) in keys_neg.iter().zip(keys_pos.iter()) {
+            assert!(
+                approx(*p_neg, *p_pos),
+                "矢先の位置が計測順序で変わった: {p_neg:?} != {p_pos:?}"
+            );
+            assert!(
+                d_neg.dot(*d_pos) > 0.999,
+                "矢先の向きが計測順序で変わった: {d_neg:?} != {d_pos:?}"
+            );
+        }
     }
 
     #[test]
@@ -899,6 +1183,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation {
                 value_override: Some("50".to_string()),
                 ..DimAnnotation::default()
@@ -922,6 +1207,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(40.0, 0.0),
             offset: 2.0,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation {
                 tolerance: Some(SizeTolerance::Deviations {
                     upper: 0.2,
@@ -955,6 +1241,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
+            direction: DimDirection::Aligned,
             annotation: annotation.clone(),
         };
         let ex = expand_linear(&dim, render(0.5, 1.0));
@@ -1000,6 +1287,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(p2x, 0.0),
             offset: 2.0,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation {
                 arrow_placement: placement,
                 ..DimAnnotation::default()
@@ -1290,6 +1578,7 @@ mod tests {
                     // 5mm は「5」+ 矢 2 つが収まらない長さ（自動なら確実に外向き）。
                     p2: Point2::new(5.0, 0.0),
                     offset: 2.0,
+                    direction: DimDirection::Aligned,
                     annotation: DimAnnotation {
                         arrow_placement: placement,
                         ..DimAnnotation::default()
@@ -1835,6 +2124,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation {
                 text_anchor: Some(anchor),
                 ..DimAnnotation::default()

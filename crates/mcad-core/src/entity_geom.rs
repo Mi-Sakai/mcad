@@ -42,9 +42,67 @@ pub struct TextGeom {
     pub angle: f64,
 }
 
+/// 長さ寸法の**寸法線の向き**（M11 タスク68、DESIGN.md M11-0(3)）。
+///
+/// # 水平・鉛直の専用バリアントを設けない
+///
+/// 水平は [`DimDirection::Rotated`]`(0.0)`、鉛直は `Rotated(π/2)` で表す。データとしては
+/// 同一で、UI のボタンが角度を入れるだけだからである。専用バリアントを足すと
+/// 「水平を `Horizontal` と `Rotated(0)` のどちらで保存するか」という**意味の無い分岐**が
+/// core・io・app の 3 層すべてに生じる（DESIGN.md M11-0(3)）。
+///
+/// # `#[non_exhaustive]`
+///
+/// 将来の向き指定（例: 他エンティティへ従属する向き）を足せるようにするため、
+/// 下位クレート・外部クレートからの網羅 `match` を禁じる。[`DimKind`] を
+/// 意図的に閉じた列挙にしているのとは逆の判断で、理由は「バリアントが増えても
+/// 各所で必ず更新しなければならない表が無い」こと（向きの解決は
+/// [`DimDirection::unit_vector`] 1 箇所に閉じている）。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum DimDirection {
+    /// 計測 2 点を結ぶ向き（**整列寸法**）。既定値であり、v6 以前の `.mcad` は
+    /// すべてこれとして読む。展開は M10 までと完全に同一（[`crate::expand_linear`]）。
+    #[default]
+    Aligned,
+    /// 絶対角（**ラジアン**、CCW、+x 軸基準）で固定した向き（**回転寸法**）。
+    ///
+    /// 寸法線はこの向きに引かれ、計測 2 点はそこへ投影される。したがって表示値は
+    /// 計測 2 点の実距離ではなく**投影長**になる（[`DimLinear::measured_value`]）。
+    /// DXF の group 50（度）の写像先で、度→ラジアンの変換は io 境界に閉じる
+    /// （DESIGN.md M11-0(2)）。
+    Rotated(f64),
+}
+
+impl DimDirection {
+    /// 寸法線方向の単位ベクトル。向きが決まらなければ `None`。
+    ///
+    /// - [`DimDirection::Aligned`]: `(p2 − p1)` を正規化した向き。計測 2 点がほぼ同一
+    ///   （[`mcad_geom::EPS`] 以下）なら `None`。
+    /// - [`DimDirection::Rotated`]: `(cos θ, sin θ)`。θ が非有限なら `None`
+    ///   （[`EntityGeom::validate`] が 3 境界で弾くが、検証を通っていない値で
+    ///   NaN を撒かないための防御）。
+    ///
+    /// **寸法線の位置・測定値・当たり判定はすべてこの向きから導く**ので、向きの
+    /// 解決はこのメソッド 1 箇所に閉じる。
+    #[must_use]
+    pub fn unit_vector(self, p1: Point2, p2: Point2) -> Option<Vec2> {
+        match self {
+            DimDirection::Aligned => (p2 - p1).normalize(),
+            DimDirection::Rotated(theta) => {
+                if !theta.is_finite() {
+                    return None;
+                }
+                let (sin, cos) = theta.sin_cos();
+                Some(Vec2::new(cos, sin))
+            }
+        }
+    }
+}
+
 /// 長さ寸法（非関連の静的寸法）。計測対象への参照は持たず、作成時に座標を採取する
-/// （DESIGN.md M6 設計判断2）。表示値は保存せず、描画時に `|p2 − p1|` を計算する側の
-/// 責務とする（点が編集されれば値も追従する）。
+/// （DESIGN.md M6 設計判断2）。表示値は保存せず、描画時に計算する側の責務とする
+/// （点が編集されれば値も追従する。計算式は [`DimLinear::measured_value`]）。
 ///
 /// **`Copy` ではない**（M9 タスク47-2）: [`DimAnnotation`] が [`crate::FitClass`]（`String`）を
 /// 持ちうるため。値渡しの箇所は `.clone()` へ切り替える。
@@ -54,12 +112,49 @@ pub struct DimLinear {
     pub p1: Point2,
     /// 計測点その 2。
     pub p2: Point2,
-    /// 計測線から寸法線までの符号付き距離（法線方向）。
+    /// **`p1` から寸法線までの、寸法線方向の法線に沿った符号付き距離**
+    /// （法線は `dir.perp()` = `dir` を左 90 度回した向き。`dir` は
+    /// [`DimDirection::unit_vector`]）。すなわち寸法線は
+    /// `p1 + dir.perp() * offset` を通る `dir` 方向の直線で、その 2 端点は
+    /// 計測 2 点をこの直線へ投影した点になる。
+    ///
+    /// **[`DimDirection::Aligned`] では `dir = (p2 − p1)/|p2 − p1|` なので、
+    /// M10 までの「計測線から寸法線までの符号付き距離」と完全に同じ意味**
+    /// （投影が恒等になり、寸法線の 2 端点は `p1 + shift` / `p2 + shift` そのもの）。
+    /// v6 以前のファイルの見た目は変わらない（M11 タスク68 で意味を一般化した）。
     pub offset: f64,
+    /// 寸法線の向き（M11 タスク68）。既定は [`DimDirection::Aligned`]（整列寸法）で、
+    /// v6 以前の `.mcad` はこの値で補完される。
+    #[serde(default)]
+    pub direction: DimDirection,
     /// 寸法補助記号・公差などの注記（M9 設計判断2）。既定は無注記で、そのときの描画は
     /// M8 までと完全に同じ。許容記号は φ/Sφ/□/C/t（[`DimKind::Linear`]）。
     #[serde(default, skip_serializing_if = "DimAnnotation::is_unannotated")]
     pub annotation: DimAnnotation,
+}
+
+impl DimLinear {
+    /// 表示する測定値（**寸法線の 2 端点間の距離**）。
+    ///
+    /// [`DimDirection::Aligned`] では計測 2 点の実距離 `|p2 − p1|`、
+    /// [`DimDirection::Rotated`] では寸法線方向への投影長 `|(p2 − p1)・dir|` になる。
+    /// θ が非有限で向きが決まらないときだけ `0.0`（`Aligned` の退化は `|p2 − p1|`
+    /// がそのまま 0 近傍の値になるので、特別扱いは要らない）。
+    ///
+    /// **`Aligned` は `|p2 − p1|` を直接計算する**（投影の一般式
+    /// `(p2 − p1)・dir` を通さない）。数学的には同値だが、正規化と内積を経由すると
+    /// 最終桁が動きうるため、M10 以前に保存された図面の描画を**ビット単位で**
+    /// 保つほうを優先した（回帰網は `mcad-app` の寸法スナップショット 29 ケース）。
+    #[must_use]
+    pub fn measured_value(&self) -> f64 {
+        match self.direction {
+            DimDirection::Aligned => (self.p2 - self.p1).length(),
+            DimDirection::Rotated(_) => match self.direction.unit_vector(self.p1, self.p2) {
+                Some(dir) => (self.p2 - self.p1).dot(dir).abs(),
+                None => 0.0,
+            },
+        }
+    }
 }
 
 /// 半径寸法（非関連の静的寸法）。作成時に円／円弧から中心・半径を採取する
@@ -356,6 +451,8 @@ impl EntityGeom {
                 p1: dim.p1 + delta,
                 p2: dim.p2 + delta,
                 offset: dim.offset,
+                // 平行移動では向きは変わらない（絶対角のまま）。
+                direction: dim.direction,
                 annotation: transform_annotation(&dim.annotation, |p| p + delta),
             }),
             EntityGeom::DimRadial(dim) => EntityGeom::DimRadial(DimRadial {
@@ -395,6 +492,14 @@ impl EntityGeom {
                 p1: rotate_point(dim.p1, pivot, angle),
                 p2: rotate_point(dim.p2, pivot, angle),
                 offset: dim.offset,
+                // 回転寸法の絶対角は回転量を加算して図形と一緒に回す（加算しないと
+                // 図形だけが回って寸法線の向きが取り残される。[`DimDiameter::angle`]・
+                // [`DimRadial::leader_angle`] と同じ扱い）。`Aligned` は計測 2 点から
+                // 向きを導くので何も足さない。
+                direction: match dim.direction {
+                    DimDirection::Aligned => DimDirection::Aligned,
+                    DimDirection::Rotated(theta) => DimDirection::Rotated(theta + angle),
+                },
                 annotation: transform_annotation(&dim.annotation, |p| {
                     rotate_point(p, pivot, angle)
                 }),
@@ -457,8 +562,23 @@ impl EntityGeom {
             EntityGeom::DimLinear(dim) => EntityGeom::DimLinear(DimLinear {
                 p1: mirror_point(dim.p1, axis_a, axis_b),
                 p2: mirror_point(dim.p2, axis_a, axis_b),
-                // 符号付きオフセットは鏡映で向きが反転する。
+                // 符号付きオフセットは鏡映で向きが反転する。鏡映 M は向きを裏返す
+                // ので `perp(M(dir)) = −M(perp(dir))` となり、`Aligned` / `Rotated` の
+                // どちらでも同じ「符号反転」で寸法線が元の位置へ写る。
                 offset: -dim.offset,
+                // 回転寸法の絶対角は、方向ベクトルを軸に対して鏡映した角度
+                // （`2·alpha − theta`）。退化軸では角度が定まらないため元の角度を保つ
+                // （Text のベースライン角・[`DimRadial::leader_angle`] と同じ規則）。
+                direction: match dim.direction {
+                    DimDirection::Aligned => DimDirection::Aligned,
+                    DimDirection::Rotated(theta) => {
+                        let axis = axis_b - axis_a;
+                        DimDirection::Rotated(match axis.normalize() {
+                            Some(_) => 2.0 * axis.angle() - theta,
+                            None => theta,
+                        })
+                    }
+                },
                 annotation: transform_annotation(&dim.annotation, |p| {
                     mirror_point(p, axis_a, axis_b)
                 }),
@@ -550,6 +670,13 @@ impl EntityGeom {
                 }
                 if !dim.offset.is_finite() {
                     return Err("non-finite linear dimension offset".into());
+                }
+                // 回転寸法の絶対角（M11 タスク68）。非有限だと寸法線の向きが決まらず、
+                // 展開・pick・AABB のすべてが NaN を撒く。
+                if let DimDirection::Rotated(theta) = dim.direction
+                    && !theta.is_finite()
+                {
+                    return Err("non-finite linear dimension direction angle".into());
                 }
                 check_annotation(&dim.annotation, DimKind::Linear)
             }
@@ -754,16 +881,32 @@ fn text_aabb(text: &TextGeom) -> Aabb {
     Aabb::from_points(pts).unwrap_or_else(|| Aabb::from_point(text.anchor))
 }
 
-/// 長さ寸法の AABB。計測 2 点と、そこから法線方向へ `offset` ずらした寸法線 2 点を包む。
+/// 長さ寸法の AABB。計測 2 点と寸法線の 2 端点を包む。
+///
+/// 寸法線の端点は展開（`crate::expand`）と**同じ純関数**
+/// [`crate::expand::linear_frame`] から取る。回転寸法では端点が計測 2 点の箱の外へ
+/// 出るため、ここで独自に `p1 + perp * offset` を組むと zoom fit と描画がずれる
+/// （M11 設計判断1 の「展開の実装を 1 つにする」をこの経路にも適用した）。
+///
+/// 投影長 0（方向は決まるが寸法線長が 0）の回転寸法では、展開（[`expand_linear`]
+/// ※`crate::expand`）が寸法線・補助線の代わりに描く点
+/// （`p1 + dir.perp() * offset`。[`crate::expand::linear_degenerate_dir_and_point`]）
+/// まで箱を広げる。ここを計測 2 点だけの箱のままにすると、`offset` が大きいときに
+/// 可視ジオメトリが AABB の外へ出て、ズームフィット・カリング・矩形選択が
+/// 取りこぼす（M11 タスク68 Codex レビュー指摘2）。
+///
+/// 向きそのものも決まらない退化寸法（`Aligned` で計測 2 点がほぼ同一 / `Rotated` で
+/// θ が非有限）では、計測 2 点のみの箱を返す（展開もこのとき計測 2 点をそのまま使う）。
+///
+/// [`expand_linear`]: crate::expand::expand_linear
 fn dim_linear_aabb(dim: &DimLinear) -> Aabb {
     let base = Aabb::from_corners(dim.p1, dim.p2);
-    match (dim.p2 - dim.p1).perp().normalize() {
-        Some(normal) => {
-            let shift = normal * dim.offset;
-            base.extended(dim.p1 + shift).extended(dim.p2 + shift)
-        }
-        // 計測 2 点がほぼ同一で法線が定まらない場合は 2 点のみのボックスを返す。
-        None => base,
+    match crate::expand::linear_frame(dim) {
+        Some(frame) => base.extended(frame.d1).extended(frame.d2),
+        None => match crate::expand::linear_degenerate_dir_and_point(dim) {
+            Some((_, p)) => base.extended(p),
+            None => base,
+        },
     }
 }
 
@@ -890,6 +1033,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset: 1.5,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation::default(),
         };
         let g = EntityGeom::DimLinear(dim);
@@ -915,6 +1059,7 @@ mod tests {
             p1: Point2::ORIGIN,
             p2: Point2::new(1.0, 0.0),
             offset: 0.0,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation::default(),
         });
         assert!(ok.validate().is_ok());
@@ -922,9 +1067,193 @@ mod tests {
             p1: Point2::ORIGIN,
             p2: Point2::new(1.0, 0.0),
             offset: f64::INFINITY,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation::default(),
         });
         assert!(bad.validate().is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // M11 タスク68: 回転寸法（`DimDirection`）
+    // -----------------------------------------------------------------
+
+    /// 斜辺 (0,0)-(120,30) に付けた回転寸法（既定は水平 θ = 0、offset 0）。
+    fn rotated_linear(theta: f64) -> DimLinear {
+        DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(120.0, 30.0),
+            offset: 0.0,
+            direction: DimDirection::Rotated(theta),
+            annotation: DimAnnotation::default(),
+        }
+    }
+
+    #[test]
+    fn dim_direction_defaults_to_aligned_and_resolves_the_unit_vector() {
+        assert_eq!(DimDirection::default(), DimDirection::Aligned);
+        let p1 = Point2::new(2.0, 2.0);
+        let p2 = Point2::new(2.0, 8.0);
+        // Aligned は計測 2 点の向き。
+        let dir = DimDirection::Aligned.unit_vector(p1, p2).unwrap();
+        assert!(approx(Point2::ORIGIN + dir, Point2::new(0.0, 1.0)));
+        // Aligned の退化は None。
+        assert!(DimDirection::Aligned.unit_vector(p1, p1).is_none());
+        // Rotated は計測 2 点に依らず絶対角で決まる。
+        let dir = DimDirection::Rotated(PI).unit_vector(p1, p2).unwrap();
+        assert!(approx(Point2::ORIGIN + dir, Point2::new(-1.0, 0.0)));
+        // 非有限な角は None（NaN を撒かない）。
+        assert!(
+            DimDirection::Rotated(f64::NAN)
+                .unit_vector(p1, p2)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dim_linear_measured_value_projects_for_rotated_directions() {
+        // 整列は実距離、水平回転は x 成分、鉛直回転は y 成分。
+        let aligned = DimLinear {
+            direction: DimDirection::Aligned,
+            ..rotated_linear(0.0)
+        };
+        assert!((aligned.measured_value() - 123.693_168_768_529_82).abs() < T);
+        assert!((rotated_linear(0.0).measured_value() - 120.0).abs() < T);
+        assert!((rotated_linear(FRAC_PI_2).measured_value() - 30.0).abs() < T);
+        // 向きが逆でも長さは正。
+        assert!((rotated_linear(PI).measured_value() - 120.0).abs() < T);
+        assert_eq!(rotated_linear(f64::INFINITY).measured_value(), 0.0);
+    }
+
+    #[test]
+    fn dim_linear_rotate_adds_to_the_rotated_angle_and_leaves_aligned_alone() {
+        let g = EntityGeom::DimLinear(rotated_linear(0.0));
+        let EntityGeom::DimLinear(r) = g.rotated(Point2::ORIGIN, FRAC_PI_2) else {
+            panic!();
+        };
+        assert_eq!(r.direction, DimDirection::Rotated(FRAC_PI_2));
+        // 図形と一緒に回るので、投影長は回転前と変わらない。
+        assert!((r.measured_value() - 120.0).abs() < T);
+
+        let aligned = EntityGeom::DimLinear(DimLinear {
+            direction: DimDirection::Aligned,
+            ..rotated_linear(0.0)
+        });
+        let EntityGeom::DimLinear(r) = aligned.rotated(Point2::ORIGIN, FRAC_PI_2) else {
+            panic!();
+        };
+        assert_eq!(r.direction, DimDirection::Aligned);
+    }
+
+    #[test]
+    fn dim_linear_mirror_reflects_the_rotated_angle_and_flips_the_offset() {
+        // x 軸鏡映（alpha = 0）: θ → −θ、offset は符号反転。
+        let g = EntityGeom::DimLinear(DimLinear {
+            offset: 7.0,
+            ..rotated_linear(FRAC_PI_2)
+        });
+        let EntityGeom::DimLinear(m) = g.mirrored(Point2::ORIGIN, Point2::new(1.0, 0.0)) else {
+            panic!();
+        };
+        assert!((m.offset + 7.0).abs() < T);
+        let DimDirection::Rotated(theta) = m.direction else {
+            panic!("回転寸法のまま");
+        };
+        assert!((theta + FRAC_PI_2).abs() < T, "θ = {theta}");
+        // 退化軸では角度が定まらないため元の角度を保つ。
+        let EntityGeom::DimLinear(m) = g.mirrored(Point2::ORIGIN, Point2::ORIGIN) else {
+            panic!();
+        };
+        assert_eq!(m.direction, DimDirection::Rotated(FRAC_PI_2));
+    }
+
+    #[test]
+    fn dim_linear_aabb_covers_the_rotated_dimension_line() {
+        // 斜辺に付けた水平寸法（offset 0）。寸法線は (0,0)-(120,0) なので、計測 2 点の
+        // 箱（y 0..30）と合わせて x 0..120 / y 0..30 に収まる。
+        let bb = EntityGeom::DimLinear(rotated_linear(0.0)).aabb();
+        assert!(approx(bb.min, Point2::new(0.0, 0.0)));
+        assert!(approx(bb.max, Point2::new(120.0, 30.0)));
+
+        // offset −25（寸法線が下へ出る）。寸法線は y = −25 なので箱が下へ広がる。
+        let bb = EntityGeom::DimLinear(DimLinear {
+            offset: -25.0,
+            ..rotated_linear(0.0)
+        })
+        .aabb();
+        assert!(approx(bb.min, Point2::new(0.0, -25.0)));
+        assert!(approx(bb.max, Point2::new(120.0, 30.0)));
+    }
+
+    #[test]
+    fn dim_linear_aabb_of_an_aligned_dimension_is_unchanged() {
+        // M11 タスク68 で AABB の算出を展開（`expand::linear_frame`）へ寄せたが、
+        // 整列寸法の結果は M10 までと同じ「計測 2 点 + 法線方向へ offset ずらした
+        // 2 点」の箱である。水平な計測 (0,0)-(4,0) に offset +2 → y 0..2。
+        let bb = EntityGeom::DimLinear(linear(2.0)).aabb();
+        assert!(approx(bb.min, Point2::new(0.0, 0.0)));
+        assert!(approx(bb.max, Point2::new(4.0, 2.0)));
+        // 符号を反転すると反対側へ広がる。
+        let bb = EntityGeom::DimLinear(linear(-2.0)).aabb();
+        assert!(approx(bb.min, Point2::new(0.0, -2.0)));
+        assert!(approx(bb.max, Point2::new(4.0, 0.0)));
+        // 退化（p1≈p2）は計測 2 点のみの箱（向きが決まらないので寸法線を足せない）。
+        let bb = EntityGeom::DimLinear(DimLinear {
+            p2: Point2::new(0.0, 0.0),
+            ..linear(2.0)
+        })
+        .aabb();
+        assert!(approx(bb.min, Point2::ORIGIN));
+        assert!(approx(bb.max, Point2::ORIGIN));
+    }
+
+    #[test]
+    fn dim_linear_aabb_includes_the_expansion_fallback_point_at_zero_projection() {
+        // Codex レビュー指摘2: 投影長 0（`Rotated(π/2)` で計測 2 点が寸法線の法線上に
+        // 並ぶ）のとき、展開（`expand::expand_linear`）は `linear_frame` の代わりに
+        // `p1 + dir.perp() * offset` へ長さ 0 の寸法線と補助線を描く。AABB がこの点を
+        // 含まないと、offset が大きいときにズームフィット・カリング・矩形選択が
+        // 可視ジオメトリを取りこぼす。
+        let dim = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(50.0, 0.0),
+            offset: 100.0,
+            direction: DimDirection::Rotated(FRAC_PI_2),
+            annotation: DimAnnotation::default(),
+        };
+        assert!(
+            dim.measured_value().abs() < T,
+            "この検証は投影長 0 が前提: {}",
+            dim.measured_value()
+        );
+
+        let bb = EntityGeom::DimLinear(dim).aabb();
+        // dir = (cos π/2, sin π/2) = (0,1) なので dir.perp() = (-1,0)。
+        // フォールバック点 = (0,0) + (-1,0) * 100 = (-100, 0)。
+        let fallback = Point2::new(-100.0, 0.0);
+        assert!(
+            bb.min.x <= fallback.x
+                && fallback.x <= bb.max.x
+                && bb.min.y <= fallback.y
+                && fallback.y <= bb.max.y,
+            "AABB {bb:?} が展開のフォールバック点 {fallback:?} を含まない"
+        );
+    }
+
+    #[test]
+    fn dim_linear_validate_rejects_non_finite_direction_angle() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                EntityGeom::DimLinear(rotated_linear(bad))
+                    .validate()
+                    .is_err(),
+                "θ = {bad} は拒否されるべき"
+            );
+        }
+        assert!(
+            EntityGeom::DimLinear(rotated_linear(0.0))
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -960,6 +1289,7 @@ mod tests {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
             offset,
+            direction: DimDirection::Aligned,
             annotation: DimAnnotation::default(),
         }
     }
@@ -1226,12 +1556,29 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn unannotated_dimensions_serialize_exactly_like_v4() {
-        // 無注記なら `annotation` フィールドごと出力されない ＝ M8 までの JSON と同一。
+    fn unannotated_dimensions_omit_the_annotation_field() {
+        // 無注記なら `annotation` フィールドごと出力されない。
+        //
+        // **`DimLinear` だけは v4 と同形ではなくなった**（M11 タスク68）: `direction` は
+        // `DimStyle::arrow_kind`（M10）と同じく `#[serde(default)]` のみで
+        // `skip_serializing_if` を付けない方針なので、整列寸法でも必ず書かれる。
+        // 読み手が既定値を知らなくても整列／回転が判るほうが、1 トークン分の
+        // ファイル増より価値がある（annotation を省くのは「無注記が大多数で、
+        // かつ深い入れ子だから」という別の理由による）。
         let json = serde_json::to_string(&EntityGeom::DimLinear(linear(1.5))).unwrap();
         assert_eq!(
             json,
-            r#"{"DimLinear":{"p1":{"x":0.0,"y":0.0},"p2":{"x":4.0,"y":0.0},"offset":1.5}}"#
+            r#"{"DimLinear":{"p1":{"x":0.0,"y":0.0},"p2":{"x":4.0,"y":0.0},"offset":1.5,"direction":"Aligned"}}"#
+        );
+        // 回転寸法は絶対角（ラジアン）を外部タグ形式で持つ。
+        let json = serde_json::to_string(&EntityGeom::DimLinear(DimLinear {
+            direction: DimDirection::Rotated(FRAC_PI_2),
+            ..linear(1.5)
+        }))
+        .unwrap();
+        assert!(
+            json.contains(r#""direction":{"Rotated":1.5707963267948966}"#),
+            "回転寸法の JSON: {json}"
         );
 
         let json = serde_json::to_string(&EntityGeom::DimRadial(DimRadial {

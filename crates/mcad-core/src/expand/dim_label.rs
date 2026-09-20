@@ -28,7 +28,7 @@
 
 use mcad_geom::{Aabb, DimSymbol, Point2, Shape, SymbolGlyph, Vec2, dim_symbol_glyph};
 
-use crate::{DimAnnotation, DimKind, DimStyle, SizeTolerance};
+use crate::{DimAnnotation, DimKind, DimStyle, SizeTolerance, ValueStyle};
 
 /// 文字幅の近似係数。[`crate::approx_text_width`] と同じ ASCII 係数 0.55×height で幅を
 /// 近似する（純関数のまま中央寄せ配置を決めるための割り切り。DESIGN.md M6 設計判断1 の
@@ -55,6 +55,17 @@ const DEVIATION_LINE_GAP_RATIO: f64 = 0.1;
 /// 標準慣行（寸法数値の下に実線を 1 本引く）で実装している。規定側に本文が入った
 /// 時点で、この定数と [`DimLabel::underline`] の生成規則を突き合わせること。
 const UNDERLINE_DROP_RATIO: f64 = 0.15;
+
+/// [`ValueStyle::Reference`]（参考寸法）の括弧と、[`ValueStyle::TheoreticallyExact`]
+/// （理論的に正確な寸法）の枠が、中身（記号・値・接尾辞）の外形からどれだけ余白を
+/// 取るか ÷ 基準文字高さ。
+///
+/// **`製図規定.md` にはこの余白の値を定める本文が無い**（[`ValueStyle::TheoreticallyExact`]
+/// の doc 参照。参考寸法の括弧自体の根拠は JIS B 0001:2019 11.1 / JIS Z 8317-1:2008 7.11
+/// だが、括弧・枠と中身の余白量までは規定していない）。[`UNDERLINE_DROP_RATIO`] と同じ
+/// 考え方（触れ合わずに読め、全体が膨らみすぎない値）で 0.15 を採る。括弧はこの余白ぶん
+/// 中身の左右を空けて `(` `)` を置き、枠はこの余白を四辺すべてに取った矩形にする。
+const VALUE_FRAME_MARGIN_RATIO: f64 = 0.15;
 
 /// 組版済みラベルの中の、フォント文字として描く 1 まとまり。
 ///
@@ -96,7 +107,11 @@ pub struct DimLabel {
     /// 非比例寸法（規定 5-10）の下線。`None` は下線なし。値の部分だけに掛かり、
     /// 記号・公差には掛からない。
     pub underline: Option<[Point2; 2]>,
-    /// 外形（記号・値・公差・下線をすべて含む組版ボックス）。
+    /// 理論的に正確な寸法（[`crate::ValueStyle::TheoreticallyExact`]）の枠（M11 タスク70）。
+    /// `None` は枠なし。4 頂点はローカル座標で、始点から反時計回りに並ぶ（[`Self::underline`]
+    /// と同じ「値の一部だけを囲む」流儀で、記号・接尾辞は囲むが `prefix`・公差は囲まない）。
+    pub frame: Option<[Point2; 4]>,
+    /// 外形（記号・値・公差・下線・括弧・枠をすべて含む組版ボックス）。
     pub bounds: Aabb,
 }
 
@@ -135,6 +150,14 @@ impl DimLabel {
 /// - **公差**（5-12）: 対称許容差は `± v` を同じ文字高さで値の右へ（5-12-2 1)）、
 ///   上下偏差は値の右に上下 2 段で [`DimStyle::tolerance_scale`] 倍に縮小して
 ///   （5-12-2 2)・3)）、はめあい記号は値の直後へ隙間なく連結して（5-12-3 2)）置く。
+/// - **接頭辞・接尾辞**（M11 タスク70。規定に対応する章は無く、DXF group 1 の文字
+///   テンプレートの写像先としての実装）: 全体の並び順は
+///   `prefix → 記号 → 値(+下線+単位記号) → suffix → 公差`。[`DimAnnotation::prefix`] は
+///   先頭、[`DimAnnotation::suffix`] は値・単位記号の直後かつ公差の手前に置く。
+/// - **表記方式**（[`DimAnnotation::value_style`]。M11 タスク70。同じく規定に対応する
+///   章は無い）: `記号・値・suffix` の範囲（`prefix` と公差は含まない）を
+///   [`crate::ValueStyle::Reference`] なら丸括弧で、[`crate::ValueStyle::TheoreticallyExact`]
+///   なら [`DimLabel::frame`] の矩形枠で囲む。`value_override` とは独立に効く。
 ///
 /// # 未知バリアントの扱い
 ///
@@ -160,23 +183,34 @@ pub fn layout_dim_label(
     let trim = style.trim_trailing_zeros;
     let mut builder = LabelBuilder::new();
 
+    // 0) 接頭辞（M11 タスク70）。公差・括弧・枠の対象には含まれない（関数 doc の並び順）。
+    if let Some(prefix) = &annotation.prefix {
+        builder.push_run(prefix.clone(), text_height, 0.0);
+    }
+
+    // 記号・値・接尾辞は独立した一時ビルダー（`core`）へ組んでから、括弧・枠の
+    // 有無に応じて `builder` へ合流する（[`ValueStyle`] の分岐を 1 箇所へ集約するため。
+    // `LabelBuilder::merge_shifted` の doc 参照）。
+    let core_offset = builder.cursor;
+    let mut core = LabelBuilder::new();
+
     // 1) 寸法補助記号は数値の左（規定 5-2 4)）。
     if let Some(symbol) = annotation.symbol.or_else(|| default_symbol(kind)) {
-        builder.push_symbol(symbol, text_height);
+        core.push_symbol(symbol, text_height);
     }
 
     // 2) 値。非比例寸法は数値を差し替えて下線を引く（規定 5-10）。
-    let value_x = builder.cursor;
+    let value_x = core.cursor;
     let value_text = match &annotation.value_override {
         Some(text) => text.clone(),
         None => format_number(value, decimals, trim),
     };
-    let value_width = builder.push_run(value_text, text_height, 0.0);
-    let mut underline = None;
+    let value_width = core.push_run(value_text, text_height, 0.0);
+    let mut underline_local = None;
     if annotation.value_override.is_some() {
         let y = -text_height * UNDERLINE_DROP_RATIO;
-        builder.include(value_x, y, value_x + value_width, y);
-        underline = Some([
+        core.include(value_x, y, value_x + value_width, y);
+        underline_local = Some([
             Point2::new(value_x, y),
             Point2::new(value_x + value_width, y),
         ]);
@@ -184,10 +218,56 @@ pub fn layout_dim_label(
 
     // 2') 単位記号（角度寸法の `°`）。値の直後へ隙間なく連結する。
     if let Some(suffix) = value_suffix(kind) {
-        builder.push_run(suffix.to_string(), text_height, 0.0);
+        core.push_run(suffix.to_string(), text_height, 0.0);
     }
 
-    // 3) サイズ公差（規定 5-12）。
+    // 2'') 接尾辞（M11 タスク70）。単位記号のさらに後、公差の前。
+    if let Some(suffix) = &annotation.suffix {
+        core.push_run(suffix.clone(), text_height, 0.0);
+    }
+
+    // 記号・値・単位記号・接尾辞（`core`）を、表記方式に応じて `builder` へ合流する。
+    // `underline` はどの腕でも代入する（未代入のまま抜ける経路は無い）。
+    let underline;
+    let mut frame = None;
+    match annotation.value_style {
+        ValueStyle::Plain => {
+            builder.merge_shifted(&core, core_offset);
+            underline = underline_local.map(|[a, b]| shift_point_pair([a, b], core_offset));
+            builder.cursor = core_offset + core.cursor;
+        }
+        ValueStyle::Reference => {
+            // 参考寸法（丸括弧。JIS B 0001:2019 11.1 / JIS Z 8317-1:2008 7.11）。
+            let open_width = builder.place_run(core_offset, "(".to_string(), text_height, 0.0);
+            let dx = core_offset + open_width;
+            builder.merge_shifted(&core, dx);
+            underline = underline_local.map(|[a, b]| shift_point_pair([a, b], dx));
+            let close_x = dx + core.cursor;
+            let close_width = builder.place_run(close_x, ")".to_string(), text_height, 0.0);
+            builder.cursor = close_x + close_width;
+        }
+        ValueStyle::TheoreticallyExact => {
+            // 理論的に正確な寸法（矩形の枠。規定に本文が無い。[`ValueStyle`] の doc 参照）。
+            let margin = text_height * VALUE_FRAME_MARGIN_RATIO;
+            let dx = core_offset + margin;
+            builder.merge_shifted(&core, dx);
+            underline = underline_local.map(|[a, b]| shift_point_pair([a, b], dx));
+            let frame_left = core_offset;
+            let frame_right = dx + core.cursor + margin;
+            let frame_bottom = core.bounds.min.y - margin;
+            let frame_top = core.bounds.max.y + margin;
+            builder.include(frame_left, frame_bottom, frame_right, frame_top);
+            frame = Some([
+                Point2::new(frame_left, frame_bottom),
+                Point2::new(frame_right, frame_bottom),
+                Point2::new(frame_right, frame_top),
+                Point2::new(frame_left, frame_top),
+            ]);
+            builder.cursor = frame_right;
+        }
+    }
+
+    // 3) サイズ公差（規定 5-12）。括弧・枠の対象には含まれない。
     if let Some(tolerance) = &annotation.tolerance {
         // 値と公差の間は ASCII 空白 1 文字ぶん空ける（規定 5-12-2 1) の記入例
         // `50 ± 0.5` の空白に相当。独自の定数を作らず文字幅係数をそのまま使う）。
@@ -223,8 +303,16 @@ pub fn layout_dim_label(
         runs: builder.runs,
         strokes: builder.strokes,
         underline,
+        frame,
         bounds: builder.bounds,
     }
+}
+
+/// ローカル座標の 2 点の x だけを `dx` だけ動かす（[`layout_dim_label`] が下線を
+/// `core` ビルダーの座標系から `builder` の座標系へ写すのに使う）。
+#[inline]
+fn shift_point_pair([a, b]: [Point2; 2], dx: f64) -> [Point2; 2] {
+    [Point2::new(a.x + dx, a.y), Point2::new(b.x + dx, b.y)]
 }
 
 /// 記号が明示されていないとき（[`DimAnnotation::symbol`] が `None`）に、寸法種別から
@@ -350,6 +438,32 @@ impl LabelBuilder {
     fn include(&mut self, x0: f64, y0: f64, x1: f64, y1: f64) {
         let cell = Aabb::new(Point2::new(x0, y0), Point2::new(x1, y1));
         self.bounds = self.bounds.union(&cell);
+    }
+
+    /// 別のビルダー（`other`）の要素（ラン・ストローク・外形）を x 方向へ `dx` だけ
+    /// ずらして取り込む。y 方向は動かさない（両ビルダーが同じベースライン基準の座標系
+    /// を使うため）。**`self.cursor` は変えない**（呼び出し側が括弧・枠ぶんの余白を
+    /// 込みで決める。[`super::dim_label::layout_dim_label`] の `ValueStyle` 分岐参照）。
+    ///
+    /// [`layout_dim_label`] が記号・値・接尾辞を独立した一時ビルダー（`core`）へ組んで
+    /// からここで合流させるのは、[`ValueStyle::Reference`]（括弧）・
+    /// [`ValueStyle::TheoreticallyExact`]（枠）のどちらでも「中身の外形をまず確定させ、
+    /// その外側へ括弧・枠を足す」という同じ形で扱えるようにするため。中身を直接
+    /// `builder` へ組んでから後付けで括弧・枠を挿入しようとすると、挿入した分だけ
+    /// 既存要素の位置と外形を巻き戻して補正する必要が生じ複雑になる。
+    fn merge_shifted(&mut self, other: &LabelBuilder, dx: f64) {
+        for run in &other.runs {
+            self.runs.push(TextRun {
+                content: run.content.clone(),
+                origin: Point2::new(run.origin.x + dx, run.origin.y),
+                height: run.height,
+            });
+        }
+        for shape in &other.strokes {
+            self.strokes.push(shape.translated(Vec2::new(dx, 0.0)));
+        }
+        let b = other.bounds;
+        self.include(b.min.x + dx, b.min.y, b.max.x + dx, b.max.y);
     }
 
     /// 文字を伴わない送り（すきま）。

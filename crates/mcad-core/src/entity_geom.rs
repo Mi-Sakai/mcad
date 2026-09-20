@@ -504,11 +504,28 @@ fn mirror_point(p: Point2, axis_a: Point2, axis_b: Point2) -> Point2 {
     axis_a + (p - axis_a).reflected(axis_b - axis_a)
 }
 
+/// 絶対角 `theta` を `axis_a`→`axis_b` を通る直線に対して鏡映した角度（`2·alpha − theta`、
+/// `alpha` は軸の方向角）。退化軸（2 点がほぼ同一）では角度が定まらないため `theta` を
+/// そのまま返す（[`DimDirection::Rotated`] の鏡映と同じ規則）。
+#[inline]
+fn mirror_angle(axis_a: Point2, axis_b: Point2, theta: f64) -> f64 {
+    let axis = axis_b - axis_a;
+    match axis.normalize() {
+        Some(_) => 2.0 * axis.angle() - theta,
+        None => theta,
+    }
+}
+
 /// 寸法注記を幾何変換に追従させる（[`DimAnnotation::text_anchor`] へ `f` を適用する）。
 ///
 /// 文字位置の手動上書きは**ワールド座標**なので、寸法本体を動かしたら一緒に動かさないと
 /// 文字だけが元の場所へ取り残される。自動配置（`None`）はそのまま `None` を保つ。
 /// 記号・公差・桁数・矢配置は座標を持たないので変換の影響を受けない。
+///
+/// [`DimAnnotation::text_rotation`]（M11 タスク70）はここでは**動かさない**
+/// （平行移動では絶対角は変わらない）。回転・鏡映は角度も変わるので、呼び出し側
+/// （[`EntityGeom::rotated`] / [`EntityGeom::mirrored`]）が [`transform_annotation_rotation`]
+/// で別途上書きする。
 #[inline]
 fn transform_annotation(
     annotation: &DimAnnotation,
@@ -516,6 +533,23 @@ fn transform_annotation(
 ) -> DimAnnotation {
     DimAnnotation {
         text_anchor: annotation.text_anchor.map(f),
+        ..annotation.clone()
+    }
+}
+
+/// [`transform_annotation`] に加えて [`DimAnnotation::text_rotation`] へ `rot` を適用する
+/// （M11 タスク70）。文字位置（`text_anchor`）は `pos` で動かし、絶対角の手動固定
+/// （`text_rotation`）は `rot` で動かす — 2 つは独立な変換（回転は加算、鏡映は
+/// `2·alpha − theta`）なので、それぞれの関数を受け取る形にしてある。
+#[inline]
+fn transform_annotation_rotation(
+    annotation: &DimAnnotation,
+    pos: impl FnOnce(Point2) -> Point2,
+    rot: impl FnOnce(f64) -> f64,
+) -> DimAnnotation {
+    DimAnnotation {
+        text_anchor: annotation.text_anchor.map(pos),
+        text_rotation: annotation.text_rotation.map(rot),
         ..annotation.clone()
     }
 }
@@ -677,17 +711,23 @@ impl EntityGeom {
                     DimDirection::Aligned => DimDirection::Aligned,
                     DimDirection::Rotated(theta) => DimDirection::Rotated(theta + angle),
                 },
-                annotation: transform_annotation(&dim.annotation, |p| {
-                    rotate_point(p, pivot, angle)
-                }),
+                // 文字姿勢の手動固定（[`DimAnnotation::text_rotation`]、M11 タスク70）も
+                // 絶対角なので、寸法線の向きと同じく回転量を加算する。
+                annotation: transform_annotation_rotation(
+                    &dim.annotation,
+                    |p| rotate_point(p, pivot, angle),
+                    |theta| theta + angle,
+                ),
             }),
             EntityGeom::DimRadial(dim) => EntityGeom::DimRadial(DimRadial {
                 center: rotate_point(dim.center, pivot, angle),
                 radius: dim.radius,
                 leader_angle: dim.leader_angle + angle,
-                annotation: transform_annotation(&dim.annotation, |p| {
-                    rotate_point(p, pivot, angle)
-                }),
+                annotation: transform_annotation_rotation(
+                    &dim.annotation,
+                    |p| rotate_point(p, pivot, angle),
+                    |theta| theta + angle,
+                ),
             }),
             // 直径線の向き `angle` は [`DimRadial::leader_angle`] と同じ扱い（回転量を
             // 加算して図形と一緒に回す）。加算しないと図形だけが回って寸法線の向きが
@@ -696,9 +736,11 @@ impl EntityGeom {
                 center: rotate_point(dim.center, pivot, angle),
                 radius: dim.radius,
                 angle: dim.angle + angle,
-                annotation: transform_annotation(&dim.annotation, |p| {
-                    rotate_point(p, pivot, angle)
-                }),
+                annotation: transform_annotation_rotation(
+                    &dim.annotation,
+                    |p| rotate_point(p, pivot, angle),
+                    |theta| theta + angle,
+                ),
             }),
             // **表は回さない**（DESIGN.md M10 設計方針3・詳細設計1）。[`TableGeom`] は
             // 回転角フィールド自体を持たないので、回転はアンカーの移動としてのみ
@@ -717,9 +759,11 @@ impl EntityGeom {
                 p1: rotate_point(dim.p1, pivot, angle),
                 p2: rotate_point(dim.p2, pivot, angle),
                 arc_radius: dim.arc_radius,
-                annotation: transform_annotation(&dim.annotation, |p| {
-                    rotate_point(p, pivot, angle)
-                }),
+                annotation: transform_annotation_rotation(
+                    &dim.annotation,
+                    |p| rotate_point(p, pivot, angle),
+                    |theta| theta + angle,
+                ),
             }),
             // 座標寸法は 3 点を回す。**`axis` は回さない**（図面の X/Y は用紙の軸で
             // あり図形に付随しないため。理由は [`OrdinateAxis`] の doc）。結果として
@@ -729,9 +773,11 @@ impl EntityGeom {
                 feature: rotate_point(dim.feature, pivot, angle),
                 leader_end: rotate_point(dim.leader_end, pivot, angle),
                 axis: dim.axis,
-                annotation: transform_annotation(&dim.annotation, |p| {
-                    rotate_point(p, pivot, angle)
-                }),
+                annotation: transform_annotation_rotation(
+                    &dim.annotation,
+                    |p| rotate_point(p, pivot, angle),
+                    |theta| theta + angle,
+                ),
             }),
         }
     }
@@ -780,9 +826,13 @@ impl EntityGeom {
                         })
                     }
                 },
-                annotation: transform_annotation(&dim.annotation, |p| {
-                    mirror_point(p, axis_a, axis_b)
-                }),
+                // 文字姿勢の手動固定（M11 タスク70）も絶対角なので、寸法線の向きと
+                // 同じ鏡映式（`2·alpha − theta`）で写す。
+                annotation: transform_annotation_rotation(
+                    &dim.annotation,
+                    |p| mirror_point(p, axis_a, axis_b),
+                    |theta| mirror_angle(axis_a, axis_b, theta),
+                ),
             }),
             EntityGeom::DimRadial(dim) => {
                 let axis = axis_b - axis_a;
@@ -794,9 +844,11 @@ impl EntityGeom {
                     center: mirror_point(dim.center, axis_a, axis_b),
                     radius: dim.radius,
                     leader_angle,
-                    annotation: transform_annotation(&dim.annotation, |p| {
-                        mirror_point(p, axis_a, axis_b)
-                    }),
+                    annotation: transform_annotation_rotation(
+                        &dim.annotation,
+                        |p| mirror_point(p, axis_a, axis_b),
+                        |theta| mirror_angle(axis_a, axis_b, theta),
+                    ),
                 })
             }
             // 直径線の向きは半径寸法の引出方向と同じ規則で鏡映する（退化軸では角度が
@@ -811,9 +863,11 @@ impl EntityGeom {
                     center: mirror_point(dim.center, axis_a, axis_b),
                     radius: dim.radius,
                     angle,
-                    annotation: transform_annotation(&dim.annotation, |p| {
-                        mirror_point(p, axis_a, axis_b)
-                    }),
+                    annotation: transform_annotation_rotation(
+                        &dim.annotation,
+                        |p| mirror_point(p, axis_a, axis_b),
+                        |theta| mirror_angle(axis_a, axis_b, theta),
+                    ),
                 })
             }
             // **表はアンカーのみ鏡映する**（DESIGN.md M10 設計方針3・詳細設計1）。
@@ -832,9 +886,11 @@ impl EntityGeom {
                 p1: mirror_point(dim.p1, axis_a, axis_b),
                 p2: mirror_point(dim.p2, axis_a, axis_b),
                 arc_radius: dim.arc_radius,
-                annotation: transform_annotation(&dim.annotation, |p| {
-                    mirror_point(p, axis_a, axis_b)
-                }),
+                annotation: transform_annotation_rotation(
+                    &dim.annotation,
+                    |p| mirror_point(p, axis_a, axis_b),
+                    |theta| mirror_angle(axis_a, axis_b, theta),
+                ),
             }),
             // 座標寸法は 3 点を鏡映する。**`axis` は裏返さない**（回転と同じ理由。
             // 理由は [`OrdinateAxis`] の doc）。y 軸鏡映した X 座標寸法は、鏡映後の
@@ -844,9 +900,11 @@ impl EntityGeom {
                 feature: mirror_point(dim.feature, axis_a, axis_b),
                 leader_end: mirror_point(dim.leader_end, axis_a, axis_b),
                 axis: dim.axis,
-                annotation: transform_annotation(&dim.annotation, |p| {
-                    mirror_point(p, axis_a, axis_b)
-                }),
+                annotation: transform_annotation_rotation(
+                    &dim.annotation,
+                    |p| mirror_point(p, axis_a, axis_b),
+                    |theta| mirror_angle(axis_a, axis_b, theta),
+                ),
             }),
         }
     }
@@ -1208,7 +1266,7 @@ fn dim_angular_aabb(dim: &DimAngular) -> Aabb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dim::{ArrowPlacement, FitClass, SizeTolerance};
+    use crate::dim::{ArrowPlacement, FitClass, SizeTolerance, ValueStyle};
     use mcad_geom::{DimSymbol, LineSeg, Shape};
     use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -1861,6 +1919,51 @@ mod tests {
         assert_eq!(at.annotation.text_anchor, None);
     }
 
+    /// 文字姿勢の手動固定（[`DimAnnotation::text_rotation`]、M11 タスク70）も絶対角
+    /// なので、寸法線の向き（[`DimDirection::Rotated`]）や引出角と同じ規則で追従する
+    /// （回転は加算、鏡映は `2·alpha − theta`）。平行移動では変わらない。
+    #[test]
+    fn text_rotation_follows_the_geometry_transform() {
+        let rotated_annotation = || DimAnnotation {
+            text_rotation: Some(0.3),
+            ..DimAnnotation::default()
+        };
+        let g = EntityGeom::DimLinear(DimLinear {
+            annotation: rotated_annotation(),
+            ..linear(1.5)
+        });
+
+        // 平行移動: 絶対角は変わらない。
+        let EntityGeom::DimLinear(t) = g.translated(Vec2::new(1.0, 1.0)) else {
+            panic!();
+        };
+        assert!((t.annotation.text_rotation.unwrap() - 0.3).abs() < T);
+
+        // 回転: 回転量がそのまま加算される。
+        let EntityGeom::DimLinear(r) = g.rotated(Point2::ORIGIN, FRAC_PI_2) else {
+            panic!();
+        };
+        assert!((r.annotation.text_rotation.unwrap() - (0.3 + FRAC_PI_2)).abs() < T);
+
+        // 鏡映（x 軸に対して）: `alpha = 0` なので `2*0 - 0.3 = -0.3`。
+        let EntityGeom::DimLinear(m) = g.mirrored(Point2::ORIGIN, Point2::new(1.0, 0.0)) else {
+            panic!();
+        };
+        assert!((m.annotation.text_rotation.unwrap() - (-0.3)).abs() < T);
+
+        // 自動（`None`）はどの変換でも `None` のまま。
+        let auto = EntityGeom::DimRadial(DimRadial {
+            center: Point2::ORIGIN,
+            radius: 1.0,
+            leader_angle: 0.0,
+            annotation: DimAnnotation::default(),
+        });
+        let EntityGeom::DimRadial(ar) = auto.rotated(Point2::ORIGIN, FRAC_PI_2) else {
+            panic!();
+        };
+        assert_eq!(ar.annotation.text_rotation, None);
+    }
+
     #[test]
     fn transforms_keep_the_non_geometric_annotation_fields() {
         let annotation = DimAnnotation {
@@ -1870,6 +1973,10 @@ mod tests {
             text_anchor: Some(Point2::new(1.0, 1.0)),
             arrow_placement: ArrowPlacement::Outside,
             value_override: Some("5-10".to_string()),
+            text_rotation: Some(0.2),
+            value_style: ValueStyle::Reference,
+            prefix: Some("2×".to_string()),
+            suffix: Some("-M6".to_string()),
         };
         let g = EntityGeom::DimLinear(DimLinear {
             annotation: annotation.clone(),
@@ -1956,6 +2063,10 @@ mod tests {
                 text_anchor: Some(Point2::new(1.0, 2.0)),
                 arrow_placement: ArrowPlacement::Inside,
                 value_override: Some("5-10".to_string()),
+                text_rotation: Some(0.1),
+                value_style: ValueStyle::TheoreticallyExact,
+                prefix: Some("2×".to_string()),
+                suffix: Some("-M6".to_string()),
             },
             ..diameter()
         });

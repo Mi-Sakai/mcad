@@ -337,6 +337,36 @@ pub enum ArrowPlacement {
 /// 要素数へ上限を置いたのと同じ考え方）。
 pub const MAX_DIM_DECIMALS: u8 = 4;
 
+/// [`DimAnnotation::prefix`] / [`DimAnnotation::suffix`] の文字数上限。
+///
+/// [`DimAnnotation::value_override`] には長さ上限が無い（既存コードに前例が無い自由文字列
+/// のため）が、`prefix` / `suffix` はそれとは別の新設フィールドで前例が無い。「2×」
+/// 「-M6」のような短い接頭辞・接尾辞（規定の実例）を通すのに十分な余裕を持たせつつ、
+/// [`MAX_DIM_DECIMALS`] や [`crate::MAX_TITLE_BLOCK_ROWS`] と同じ理由（桁数・要素数が
+/// そのまま組版・pick・SVG/PDF 出力の負荷になる）で上限を置く、という独自の妥当値として
+/// 32 文字を採る。
+pub const MAX_DIM_AFFIX_LEN: usize = 32;
+
+/// 寸法値の表記方式（M11 タスク70）。
+///
+/// [`DimAnnotation::value_override`] とは独立して効く（上書きした値にも括弧・枠が掛かる）。
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum ValueStyle {
+    /// 通常表記。
+    #[default]
+    Plain,
+    /// 参考寸法（丸括弧で値を囲む）。根拠は JIS B 0001:2019 11.1 / JIS Z 8317-1:2008 7.11
+    /// （`製図規定.md` 参照）。
+    Reference,
+    /// 理論的に正確な寸法（矩形の枠で値を囲む）。
+    ///
+    /// **`製図規定.md` に本文の規定が無い**（非比例寸法の下線と同種の欠落。組版側の
+    /// `UNDERLINE_DROP_RATIO` の doc 参照）。実装は JIS の慣行（細い実線の矩形で値を
+    /// 囲む）に倣う。規定側に本文が入った時点でこの表記と突き合わせること。
+    TheoreticallyExact,
+}
+
 /// 寸法へ付ける注記（寸法補助記号・サイズ公差・桁数上書き・文字位置・矢配置）。
 ///
 /// 寸法値そのものは持たない（M6 設計判断2 のとおり、値は座標から毎回計算する）。
@@ -368,6 +398,35 @@ pub struct DimAnnotation {
     /// M9 タスク49 の責務で、ここは差し替え値の保持と文法検証のみを持つ）。空文字列・
     /// 空白のみ・制御文字を含む値は [`DimAnnotation::validate`] が拒否する。
     pub value_override: Option<String>,
+    /// 寸法値テキストの文字姿勢（ワールドの絶対角、ラジアン）の手動上書き（M11 タスク70）。
+    ///
+    /// `None` は既定の読み取り方向規則（寸法線・引出線の向きから決める、現行どおりの
+    /// 動作）に従う。`Some(0.0)` にすると斜めの寸法でも文字を水平固定できる。
+    /// DXF import では group 53（`text_rotation_angle`）の写像先（`mcad-io` 側の
+    /// 変換式は import 実装の doc を参照）。
+    ///
+    /// `#[serde(default)]`: M11 タスク70 で `DimAnnotation` へ追加した 3 フィールドの
+    /// 1 つ。この既存構造体に生えている既存の v7 `.mcad`（`annotation` オブジェクト自体は
+    /// 書かれているが新フィールドを持たない）を無損失で読むための個別デフォルト
+    /// （バージョン番号自体は据え置き。`.mcad::FORMAT_VERSION` の doc 参照）。
+    #[serde(default)]
+    pub text_rotation: Option<f64>,
+    /// 寸法値の表記方式（参考寸法・理論的に正確な寸法）。既定 [`ValueStyle::Plain`]。
+    #[serde(default)]
+    pub value_style: ValueStyle,
+    /// 値の**前**に付ける接頭辞（`2×φ10` の `2×` 等）。`None` は付けない。
+    ///
+    /// 空文字列は許さない（空文字列は `None` で表すべき、という
+    /// [`DimAnnotation::value_override`] の空白拒否と同じ思想）。DXF import では group 1
+    /// の文字テンプレート（`<>` の前）の写像先。上限は [`MAX_DIM_AFFIX_LEN`]。
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// 値の**後**（単位記号・公差より前）に付ける接尾辞（`4-M6` の `-M6` 等）。
+    /// `None` は付けない。空文字列は許さない（[`DimAnnotation::prefix`] と同じ理由）。
+    /// DXF import では group 1 の文字テンプレート（`<>` の後）の写像先。上限は
+    /// [`MAX_DIM_AFFIX_LEN`]。
+    #[serde(default)]
+    pub suffix: Option<String>,
 }
 
 impl DimAnnotation {
@@ -386,6 +445,10 @@ impl DimAnnotation {
             text_anchor: None,
             arrow_placement: ArrowPlacement::Auto,
             value_override: None,
+            text_rotation: None,
+            value_style: ValueStyle::Plain,
+            prefix: None,
+            suffix: None,
         }
     }
 
@@ -450,6 +513,40 @@ impl DimAnnotation {
             if value.chars().any(char::is_control) {
                 return Err(CoreError::InvalidDimAnnotation(format!(
                     "value override must not contain control characters: {value:?}"
+                )));
+            }
+        }
+        if let Some(theta) = self.text_rotation
+            && !theta.is_finite()
+        {
+            return Err(CoreError::InvalidDimAnnotation(format!(
+                "text rotation must be finite: {theta}"
+            )));
+        }
+        Self::validate_affix("prefix", &self.prefix)?;
+        Self::validate_affix("suffix", &self.suffix)?;
+        Ok(())
+    }
+
+    /// [`DimAnnotation::prefix`] / [`DimAnnotation::suffix`] の共通検証。
+    ///
+    /// 空文字列（[`DimAnnotation::value_override`] の空白拒否と同じ思想）・制御文字
+    /// （同フィールドと同じパターン）・[`MAX_DIM_AFFIX_LEN`] 超えを拒否する。
+    fn validate_affix(name: &str, affix: &Option<String>) -> Result<(), CoreError> {
+        if let Some(text) = affix {
+            if text.is_empty() {
+                return Err(CoreError::InvalidDimAnnotation(format!(
+                    "{name} must not be empty (use None instead)"
+                )));
+            }
+            if text.chars().any(char::is_control) {
+                return Err(CoreError::InvalidDimAnnotation(format!(
+                    "{name} must not contain control characters: {text:?}"
+                )));
+            }
+            if text.chars().count() > MAX_DIM_AFFIX_LEN {
+                return Err(CoreError::InvalidDimAnnotation(format!(
+                    "{name} exceeds the limit of {MAX_DIM_AFFIX_LEN} characters: {text:?}"
                 )));
             }
         }
@@ -989,6 +1086,10 @@ mod tests {
             text_anchor: Some(Point2::new(12.5, -4.25)),
             arrow_placement: ArrowPlacement::Outside,
             value_override: Some("5-10".to_string()),
+            text_rotation: Some(0.5),
+            value_style: ValueStyle::Reference,
+            prefix: Some("2×".to_string()),
+            suffix: Some("-M6".to_string()),
         };
         let json = serde_json::to_string(&annotation).unwrap();
         assert_eq!(

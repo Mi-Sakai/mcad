@@ -62,8 +62,8 @@ mod title_block;
 
 pub use command::Command;
 pub use dim::{
-    ArrowPlacement, DimAnnotation, DimKind, DimStyle, FitClass, MAX_DIM_DECIMALS, MAX_DIM_STYLE_MM,
-    SizeTolerance,
+    ArrowPlacement, DimAnnotation, DimKind, DimStyle, FitClass, MAX_DIM_AFFIX_LEN,
+    MAX_DIM_DECIMALS, MAX_DIM_STYLE_MM, SizeTolerance, ValueStyle,
 };
 pub use document::{Document, NewIds};
 pub use entity::Entity;

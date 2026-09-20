@@ -470,12 +470,19 @@ pub struct ImportSummary {
     /// [`skipped_entities`](Self::skipped_entities)、対応している種別だが表現できない
     /// なら [`skipped_dimensions`](Self::skipped_dimensions) 側に入る。
     ///
-    /// 数えるのは次の 3 つ。
+    /// 数えるのは次の 4 つ（[`dimension_text_template`] と [`dimension_annotation`]
+    /// の doc も参照）。
     ///
-    /// - 文字テンプレート（group 1）が空でも `<>` でもない（スペース 1 文字の
-    ///   「文字を出さない」指定を含む）。M11 タスク70 までは無注記で取り込む
+    /// - 文字テンプレート（group 1）がスペース 1 文字（「文字を出さない」指定）
+    /// - 文字テンプレート（group 1）に書式コード・制御文字が含まれる、または
+    ///   `<>` を 2 個以上含む（[`dimension_text_has_format_codes`] が保守的に判定する。
+    ///   Codex adversarial review [high] 指摘・M11 タスク70 で追加）
     /// - 補助線の傾き（group 52 `extension_line_angle`）が 0 でない
-    /// - 寸法文字の回転（group 53 `text_rotation_angle`）が 0 でない
+    /// - 寸法文字の回転（group 53 `text_rotation_angle`）が 0 でない。**M11 タスク70 で
+    ///   一度は寸法線・引出線の角度からの変換を試みたが、DXF の group 53 は
+    ///   DIMSTYLE 依存の基準角からの相対値であり、DIMSTYLE を読まない mcad では
+    ///   基準を復元できない（Codex adversarial review [high] 指摘で撤回）。
+    ///   常に変換せず捨てて計上する（[`dimension_annotation`] の doc）
     ///
     /// 実測値（group 42 `actual_measurement`）が mcad の再計算値と食い違う寸法は
     /// **ここへは計上せず**、取り込まずに [`skipped_dimensions`](Self::skipped_dimensions)
@@ -855,15 +862,31 @@ fn is_dimension_plane_supported(base: &DimensionBase) -> bool {
 ///   （mcad 側も自動配置）。**group 11 は自動配置でも「そのとき文字が置かれた位置」
 ///   として書かれている**ため、常に写すと mcad の自動配置が効かなくなる。
 ///
+/// # 写す（M11 タスク70）
+///
+/// - **文字テンプレート**（group 1）: [`dimension_text_template`] が分解する
+///   （プレフィックス・サフィックス・値の上書き。解釈できる部分集合は同関数の
+///   doc 参照）。
+///
 /// # 捨てる（`dropped_detail` を立てる）
 ///
-/// - **文字テンプレート**（group 1）: 空文字列と `<>` が「実測値を描く」＝ mcad の
-///   既定と同じなので何もしない。それ以外（スペース 1 文字の「文字を出さない」指定、
-///   `<>` を含むテンプレート、任意の固定文字列）は M11 タスク70 の
-///   `prefix` / `suffix` / `value_override` が入るまで表現できないので、
-///   **無注記で取り込んで計上する**（DESIGN.md M11-0「group 1 の扱い」）。
-/// - **文字の回転**（group 53）: [`DimAnnotation`] に `text_rotation` が入るのは
-///   M11 タスク70。
+/// - **文字テンプレート**（group 1）がスペース 1 文字（「文字を出さない」指定）、
+///   書式コード・制御文字を含む、または `<>` を 2 個以上含む: mcad に対応する
+///   概念が無い、または一部だけ解釈すると意味が変わるので無注記へ倒す
+///   （[`dimension_text_template`]）。
+/// - **文字の回転**（group 53）が非 0。
+///
+/// [`DimAnnotation::text_rotation`] は常に `None` になる。**group 53 は DXF の
+/// 「寸法文字の既定の向き」からの相対角で、既定の向きは DIMSTYLE（文字を寸法線に
+/// 沿わせるか水平にするか）と文字が内側/外側かで決まる。mcad は DIMSTYLE を
+/// 取り込まない（M9 設計判断）ため、この基準角を復元できない**。M11 タスク70では
+/// 一度「寸法線・引出線の角度 = 既定の向き」と仮定して `base_angle + 53.to_radians()`
+/// を変換していたが、この仮定は DIMSTYLE 次第で成り立たない（元 CAD が水平に描いて
+/// いた文字が寸法線の角度だけ回って取り込まれる恐れがある）。**間違った向きで
+/// 黙って取り込むより、落として通知する**という M11 の一貫した方針（DIMSTYLE 依存の
+/// 他の属性と同じ扱い）に合わせ、Codex adversarial review [high] 指摘で撤回した。
+/// `text_rotation` フィールド自体は mcad 側から水平固定にする用途（タスク73 以降）で
+/// 残す。将来 DIMSTYLE を取り込むようになれば、そのときの基準角から変換し直せる。
 ///
 /// # 黙って捨てる（計上しない）
 ///
@@ -876,10 +899,9 @@ fn is_dimension_plane_supported(base: &DimensionBase) -> bool {
 /// - **anonymous block 参照**（group 2、`*D1` 等）: mcad は BLOCKS セクションを
 ///   読まないため実害がない（モジュール doc「DIMENSION の import」参照）。
 fn dimension_annotation(base: &DimensionBase, dropped_detail: &mut bool) -> DimAnnotation {
-    // 空 / "<>" は「実測値を描く」。それ以外は M11 タスク70 まで表現できない。
-    if !(base.text.is_empty() || base.text == "<>") {
-        *dropped_detail = true;
-    }
+    let (value_override, prefix, suffix) = dimension_text_template(base, dropped_detail);
+    // group 53 は基準角（DIMSTYLE 依存）を復元できないため取り込まない
+    // （このモジュール doc・関数 doc「group 53 は DIMSTYLE 依存」参照）。
     if base.text_rotation_angle != 0.0 {
         *dropped_detail = true;
     }
@@ -887,8 +909,86 @@ fn dimension_annotation(base: &DimensionBase, dropped_detail: &mut bool) -> DimA
         text_anchor: base
             .is_at_user_defined_location
             .then(|| from_dxf_point(&base.text_mid_point)),
+        value_override,
+        prefix,
+        suffix,
+        text_rotation: None,
         ..DimAnnotation::unannotated()
     }
+}
+
+/// group 1（文字テンプレート）を分解する（M11 タスク70。Codex adversarial review
+/// [high] 指摘で「解釈する部分集合」を明示するよう改めた）。
+///
+/// DXF の寸法文字には `\X`（公差の改行）・`\U+XXXX`（記号エスケープ）・`%%c`
+/// （直径記号）等の**書式コード**が入りうる。mcad はこれらのミニ言語を解釈しない
+/// ため、素通りさせると文字として画面にそのまま出る（バックスラッシュの並びや
+/// `%%c` が見えてしまう）か、[`DimAnnotation::validate`] に後段で拒否される。
+/// これを避けるため、**解釈できると分かっている部分集合だけを取り込み、それ以外は
+/// 無注記へ倒して `dropped_detail` を立てる**（寸法自体は取り込む。落とすのは
+/// 文字テンプレートの解釈だけ）。
+///
+/// 取り込む（`dropped_detail` を立てない）:
+///
+/// - 空文字列・`"<>"`: 「実測値を描く」＝ mcad の既定と同じ。何も返さない。
+/// - `<>` を**ちょうど 1 個**含み、かつ書式コード・制御文字を含まない文字列:
+///   `<>` の前を `prefix`・後ろを `suffix` にする（[`DimAnnotation::prefix`] /
+///   [`DimAnnotation::suffix`]）。前後どちらかが空文字列なら `None` にする
+///   （`DimAnnotation::validate` が空文字列の `prefix`/`suffix` を拒否するため。
+///   空文字列は「付けない」で表現すべきという思想）。
+/// - `<>` を含まず、書式コード・制御文字を含まない非空文字列（スペース 1 文字を
+///   除く）: [`DimAnnotation::value_override`] として丸ごと取り込む。
+///
+/// 取り込まない（無注記へ倒して `dropped_detail` を立てる）:
+///
+/// - スペース 1 文字: 「文字を出さない」指定。mcad に対応する概念が無い。
+/// - 書式コード・制御文字を含む文字列（[`dimension_text_has_format_codes`]。
+///   保守的な判定で、`<>` の有無によらず弾く）。
+/// - `<>` を 2 個以上含む文字列: 最初の 1 個だけを分割すると残りが literal に
+///   なり黙って意味が変わるため、丸ごと取り込まない。
+fn dimension_text_template(
+    base: &DimensionBase,
+    dropped_detail: &mut bool,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let text = &base.text;
+    if text.is_empty() || text == "<>" {
+        return (None, None, None);
+    }
+    if text == " " {
+        *dropped_detail = true;
+        return (None, None, None);
+    }
+    if dimension_text_has_format_codes(text) {
+        *dropped_detail = true;
+        return (None, None, None);
+    }
+    let occurrences = text.matches("<>").count();
+    if occurrences >= 2 {
+        *dropped_detail = true;
+        return (None, None, None);
+    }
+    if occurrences == 1 {
+        let pos = text
+            .find("<>")
+            .expect("occurrences == 1 で見つかっているはず");
+        let prefix = &text[..pos];
+        let suffix = &text[pos + "<>".len()..];
+        let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        return (None, non_empty(prefix), non_empty(suffix));
+    }
+    (Some(text.clone()), None, None)
+}
+
+/// [`dimension_text_template`] が「書式コード・制御文字あり」とみなすかを判定する。
+///
+/// バックスラッシュ `\`（`\X` = 公差の改行、`\U+XXXX` = 記号エスケープ等）または
+/// `%%`（`%%c` = 直径記号、`%%d` = 度記号等）を含む、または制御文字（改行等）を
+/// 含む文字列を「書式コードあり」とみなす。**保守的に弾いている**（過剰検出を
+/// 許容する。取り込まないだけで寸法自体は無注記のまま取り込まれるため、誤検出の
+/// 実害は小さい）。正確な DXF の書式コード仕様（エスケープの対応表・ネスト等）に
+/// 対応するのは将来の課題。
+fn dimension_text_has_format_codes(text: &str) -> bool {
+    text.contains('\\') || text.contains("%%") || text.chars().any(|c| c.is_control())
 }
 
 /// 実測値（group 42）が書かれていて、mcad の再計算値と食い違うかを判定する。
@@ -2230,9 +2330,12 @@ mod tests {
     }
 
     /// group 1（文字テンプレート）は空文字列と `<>` だけが「実測値を描く」＝ mcad の
-    /// 既定と同じ。それ以外（スペース 1 文字の「文字を出さない」指定、固定文字列、
-    /// `<>` を含むテンプレート）は M11 タスク70 まで表現できないので、**無注記で
-    /// 取り込んで計上する**。
+    /// 既定と同じ。スペース 1 文字（「文字を出さない」指定）は mcad に対応する概念が
+    /// 無いので無注記へ倒して計上する。固定文字列・`<>` を 1 個だけ含むテンプレートは
+    /// M11 タスク70 で `prefix` / `suffix` / `value_override` へ写せるようになった
+    /// ので、**計上しない**。書式コード・制御文字を含む文字列や `<>` を 2 個以上含む
+    /// 文字列は、一部だけ解釈すると意味が変わるため**取り込まず計上する**
+    /// （Codex adversarial review [high] 指摘。[`dimension_text_template`] のテスト）。
     #[test]
     fn dimension_text_template_other_than_the_measured_value_is_dropped_and_counted() {
         for text in ["", "<>"] {
@@ -2244,7 +2347,82 @@ mod tests {
             assert!(geom.is_some());
             assert_eq!(dropped, 0, "text {text:?} は既定と同じなので計上しない");
         }
-        for text in [" ", "M10", "2×<>", "<> H7"] {
+
+        // スペース 1 文字だけは「文字を出さない」指定で、mcad に対応する概念が無いので
+        // 無注記へ倒して計上する（M11 タスク70 でも変わらない）。
+        let base = DimensionBase {
+            text: " ".to_string(),
+            ..aligned_base()
+        };
+        let (geom, _, _, dropped) = import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+        let dim = linear_of(geom);
+        assert_eq!(dim.annotation, DimAnnotation::unannotated(), "text \" \"");
+        assert_eq!(dropped, 1, "text \" \" を計上していない");
+
+        // `<>` を含まない非空文字列は value_override としてそのまま取り込む。
+        let base = DimensionBase {
+            text: "M10".to_string(),
+            ..aligned_base()
+        };
+        let (geom, _, _, dropped) = import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+        let dim = linear_of(geom);
+        assert_eq!(dim.annotation.value_override.as_deref(), Some("M10"));
+        assert_eq!(dim.annotation.prefix, None);
+        assert_eq!(dim.annotation.suffix, None);
+        assert_eq!(dropped, 0, "value_override へ表現できたので計上しない");
+
+        // `<>` を含む文字列は前後を prefix / suffix へ分解する。
+        let base = DimensionBase {
+            text: "2×<>".to_string(),
+            ..aligned_base()
+        };
+        let (geom, _, _, dropped) = import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+        let dim = linear_of(geom);
+        assert_eq!(dim.annotation.prefix.as_deref(), Some("2×"));
+        assert_eq!(
+            dim.annotation.suffix, None,
+            "<> の後ろは空文字列なので None"
+        );
+        assert_eq!(dim.annotation.value_override, None);
+        assert_eq!(dropped, 0);
+
+        let base = DimensionBase {
+            text: "<> H7".to_string(),
+            ..aligned_base()
+        };
+        let (geom, _, _, dropped) = import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+        let dim = linear_of(geom);
+        assert_eq!(dim.annotation.prefix, None, "<> の前は空文字列なので None");
+        assert_eq!(dim.annotation.suffix.as_deref(), Some(" H7"));
+        assert_eq!(dropped, 0);
+    }
+
+    /// `<>` を 2 個以上含む文字列は、最初の 1 個だけを分割すると残りが literal に
+    /// なり黙って意味が変わるため、丸ごと取り込まず計上する（Codex adversarial
+    /// review [high] 指摘）。
+    #[test]
+    fn dimension_text_template_with_two_or_more_placeholders_is_dropped_and_counted() {
+        let base = DimensionBase {
+            text: "<> x <>".to_string(),
+            ..aligned_base()
+        };
+        let (geom, _, _, dropped) = import_one(linear_dim(base, (0.0, 0.0), (10.0, 0.0)));
+        let dim = linear_of(geom);
+        assert_eq!(
+            dim.annotation,
+            DimAnnotation::unannotated(),
+            "`<>` 2 個は解釈せず無注記のまま"
+        );
+        assert_eq!(dropped, 1);
+    }
+
+    /// 書式コード（`\` を含むエスケープ、`%%` の記号コード）や制御文字を含む
+    /// 文字列は、そのまま表示すると意味が変わる（もしくは `DimAnnotation::validate`
+    /// に後段で拒否される）ため取り込まず計上する（Codex adversarial review
+    /// [high] 指摘。[`dimension_text_has_format_codes`] は保守的な判定）。
+    #[test]
+    fn dimension_text_template_with_format_codes_is_dropped_and_counted() {
+        for text in ["\\X<>", "%%c<>", "M10\u{0007}", "<>\\U+00F8", "%%d<>"] {
             let base = DimensionBase {
                 text: text.to_string(),
                 ..aligned_base()
@@ -2254,16 +2432,19 @@ mod tests {
             assert_eq!(
                 dim.annotation,
                 DimAnnotation::unannotated(),
-                "text {text:?}"
+                "text {text:?} は書式コード/制御文字ありなので無注記のまま"
             );
             assert_eq!(dropped, 1, "text {text:?} を計上していない");
         }
     }
 
-    /// 補助線の傾き（group 52）・寸法文字の回転（group 53）は mcad に概念が無いので
-    /// 捨てて計上する。**計上は寸法 1 件につき最大 1**（属性ごとに増やさない）。
+    /// 補助線の傾き（group 52）は mcad に概念が無いので捨てて計上する。
+    /// 寸法文字の回転（group 53）は DIMSTYLE 依存の基準角を復元できないため
+    /// 常に取り込まず計上する（Codex adversarial review [high] 指摘で撤回。
+    /// [`dimension_annotation`] の doc）。**計上は寸法 1 件につき最大 1**
+    /// （属性ごとに増やさない）。
     #[test]
-    fn oblique_extension_lines_and_text_rotation_are_dropped_once_per_dimension() {
+    fn oblique_extension_lines_and_text_rotation_are_dropped_and_counted() {
         let oblique = EntityType::RotatedDimension(RotatedDimension {
             dimension_base: aligned_base(),
             definition_point_2: DxfPoint::new(0.0, 0.0, 0.0),
@@ -2278,14 +2459,22 @@ mod tests {
         );
         assert_eq!((skipped_entities, skipped_dimensions, dropped), (0, 0, 1));
 
+        // 長さ寸法（水平、寸法線の角度 0）に 53 = 30 度: 基準角を復元できないので
+        // 取り込まず計上する。
         let rotated_text = DimensionBase {
             text_rotation_angle: 30.0,
             ..aligned_base()
         };
-        let (_, _, _, dropped) = import_one(linear_dim(rotated_text, (0.0, 0.0), (10.0, 0.0)));
-        assert_eq!(dropped, 1);
+        let (geom, _, _, dropped) = import_one(linear_dim(rotated_text, (0.0, 0.0), (10.0, 0.0)));
+        let dim = linear_of(geom);
+        assert_eq!(
+            dim.annotation.text_rotation, None,
+            "基準角を復元できないので取り込まない"
+        );
+        assert_eq!(dropped, 1, "長さ寸法でも 53 は計上する");
 
-        // 52 と 53 と文字テンプレートが同時に落ちても、計上は 1 件。
+        // 52 と 53（どちらも取り込まない）と文字テンプレート（表現できる）が同時に
+        // 起きても、寸法 1 件につき最大 1 件なので合計 1 件。
         let everything = EntityType::RotatedDimension(RotatedDimension {
             dimension_base: DimensionBase {
                 text: "M10".to_string(),
@@ -2297,7 +2486,94 @@ mod tests {
             extension_line_angle: 15.0,
             ..Default::default()
         });
-        assert_eq!(import_one(everything).3, 1, "寸法ごとに 1 件だけ数える");
+        assert_eq!(
+            import_one(everything).3,
+            1,
+            "52・53 のどちらも捨てるが計上は寸法ごとに最大 1（文字テンプレートは表現できる）"
+        );
+    }
+
+    /// 半径・直径寸法でも group 53 は基準角（DIMSTYLE 依存）を復元できないため
+    /// 取り込まず計上する（[`dimension_annotation`] の doc）。
+    #[test]
+    fn radial_and_diameter_text_rotation_is_dropped_and_counted() {
+        // 半径寸法: 引出方向は中心 (0,0) → 円周点 (5,0)、角度 0。53 = 90 度。
+        let radial = EntityType::RadialDimension(RadialDimension {
+            dimension_base: DimensionBase {
+                text_rotation_angle: 90.0,
+                ..Default::default()
+            },
+            definition_point_2: DxfPoint::new(5.0, 0.0, 0.0),
+            ..Default::default()
+        });
+        let (geom, _, _, dropped) = import_one(radial);
+        let dim = match geom {
+            Some(EntityGeom::DimRadial(d)) => d,
+            other => panic!("半径寸法として取り込まれていない: {other:?}"),
+        };
+        assert_eq!(dim.annotation.text_rotation, None);
+        assert_eq!(dropped, 1);
+
+        // 直径寸法: 直径線は (-5,0) → (5,0)、角度 0。53 = 45 度。
+        let diameter = EntityType::DiameterDimension(DiameterDimension {
+            dimension_base: DimensionBase {
+                text_rotation_angle: 45.0,
+                definition_point_1: DxfPoint::new(-5.0, 0.0, 0.0),
+                ..Default::default()
+            },
+            definition_point_2: DxfPoint::new(5.0, 0.0, 0.0),
+            ..Default::default()
+        });
+        let (geom, _, _, dropped) = import_one(diameter);
+        let dim = match geom {
+            Some(EntityGeom::DimDiameter(d)) => d,
+            other => panic!("直径寸法として取り込まれていない: {other:?}"),
+        };
+        assert_eq!(dim.annotation.text_rotation, None);
+        assert_eq!(dropped, 1);
+    }
+
+    /// 角度・座標寸法でも group 53 は基準角を復元できないため取り込まず計上する。
+    /// 整列/回転・半径・直径と扱いは同じ（[`dimension_annotation`] の doc）。
+    #[test]
+    fn angular_and_ordinate_text_rotation_is_dropped_and_counted() {
+        let angular = EntityType::AngularThreePointDimension(AngularThreePointDimension {
+            dimension_base: DimensionBase {
+                dimension_type: DimensionType::AngularThreePoint,
+                text_rotation_angle: 30.0,
+                definition_point_1: DxfPoint::new(4.0, 0.0, 0.0),
+                ..Default::default()
+            },
+            definition_point_2: DxfPoint::new(10.0, 0.0, 0.0),
+            definition_point_3: DxfPoint::new(0.0, 10.0, 0.0),
+            definition_point_4: DxfPoint::new(0.0, 0.0, 0.0),
+            ..Default::default()
+        });
+        let (geom, _, _, dropped) = import_one(angular);
+        let dim = match geom {
+            Some(EntityGeom::DimAngular(d)) => d,
+            other => panic!("角度寸法として取り込まれていない: {other:?}"),
+        };
+        assert_eq!(dim.annotation.text_rotation, None);
+        assert_eq!(dropped, 1);
+
+        let ordinate = EntityType::OrdinateDimension(OrdinateDimension {
+            dimension_base: DimensionBase {
+                dimension_type: DimensionType::Ordinate,
+                text_rotation_angle: 30.0,
+                definition_point_1: DxfPoint::new(0.0, 0.0, 0.0),
+                ..Default::default()
+            },
+            definition_point_2: DxfPoint::new(3.0, 0.0, 0.0),
+            definition_point_3: DxfPoint::new(3.0, 2.0, 0.0),
+        });
+        let (geom, _, _, dropped) = import_one(ordinate);
+        let dim = match geom {
+            Some(EntityGeom::DimOrdinate(d)) => d,
+            other => panic!("座標寸法として取り込まれていない: {other:?}"),
+        };
+        assert_eq!(dim.annotation.text_rotation, None);
+        assert_eq!(dropped, 1);
     }
 
     /// 実測値（group 42）は「書いた CAD が表示していた値」。mcad は座標から再計算した

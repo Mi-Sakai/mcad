@@ -1180,6 +1180,32 @@ DXF import して確認した項目は、寸法が 4 件(整列・鉛直・半�
   3 件)を implement-sonnet が引き継いだ。中断時点で core のモデル・展開・pick・v7・app 追従は
   完了しており、ビルドとテストは通っていた。
 
+#### タスク70 の実装時追記(2026-09-20)
+
+- **`text_rotation` はワールドの絶対角**(`Some(0.0)` が水平固定)。`rotated` は `θ + angle`、
+  `mirrored` は `2α − θ` で追従する(`DimDirection::Rotated` と同じ式)。DXF の group 53(寸法文字の回転)は
+  **取り込まない**(2026-09-20 の Codex adversarial review [high] 指摘を反映)。当初は「寸法線・引出線の
+  角度 = DXF の既定の向き」と仮定して `base_angle + 53.to_radians()` へ変換していたが、group 53 の基準は
+  DIMSTYLE(文字を寸法線に沿わせるか水平にするか)依存で、DIMSTYLE を取り込まない mcad(M9 設計判断)では
+  基準角を復元できない。誤った向きで黙って取り込むより、`dropped_dimension_details` へ計上して落とす
+  (M11 の一貫した方針)。`text_rotation` フィールド自体は mcad 側から水平固定にする用途(タスク73 以降)で残す。
+- **DXF の寸法文字テンプレート(group 1)は解釈できる部分集合だけを取り込む**(同 Codex review [high] 指摘)。
+  `\X` / `\U+XXXX` / `%%c` 等の書式コードや制御文字を含む文字列、`<>` を 2 個以上含む文字列は
+  一部だけ解釈すると意味が変わるため取り込まず、`dropped_dimension_details` へ計上して無注記にする
+  (`dimension_text_has_format_codes` が `\` / `%%` / 制御文字の有無で保守的に判定)。
+- **組版の並びは prefix → 記号 → 値 → suffix → 公差**。規定 5-2 4)「寸法補助記号は数値の左」を
+  満たしつつ、接頭辞はその外側。`Reference` は記号〜suffix を丸括弧で囲み(公差は括弧の外)、
+  `TheoreticallyExact` は同じ範囲を矩形枠で囲む(`DimLabel::frame` を `underline` と同じ流儀で追加)。
+- **`prefix` / `suffix` の上限は 32 文字**(`MAX_DIM_AFFIX_LEN`)。空文字列は `None` で表すべきなので拒否。
+- **負債: `clippy::large_enum_variant` を `#[allow]` で抑制した**(`tool.rs` の `ToolResult` /
+  `PlacementOutcome` / `OffsetOutcome`)。`DimAnnotation` に文字列 3 つが加わって `Command` が
+  大きくなったため。`Command` の `Box` 化は 55 箇所のネストしたパターンマッチの書き換えを要し、
+  リント解消だけを理由に踏み込む変更ではないと判断した(理由はコードの doc にも記載)。
+  **サイズが問題になったら Box 化する**(M12 以降の残債候補)。
+- **規定に無い事項(要追記)**: 「理論的に正確な寸法」の**矩形枠**は `製図規定.md` に記述が無い
+  (参考寸法の丸括弧は JIS B 0001:2019 11.1 / JIS Z 8317-1:2008 7.11 の裏付けあり)。
+  角度寸法・座標寸法の記入方法とあわせて、規定整備の対象とする。
+
 #### 設計判断
 
 1. **展開の純関数を `mcad-core` へ移す**(タスク71)。現状 `crates/mcad-app/src/dimension.rs` と

@@ -172,6 +172,15 @@ pub enum InputEvent {
 }
 
 /// [`Tool::on_input`] の結果。
+///
+/// `Command` を直接持つ（`Box` 化しない）ため、他バリアントとのサイズ差について
+/// `clippy::large_enum_variant` が警告する。M11 タスク70 で `DimAnnotation` に
+/// `text_rotation`/`value_style`/`prefix`/`suffix` を追加したことで `Command` が
+/// 176→232 バイトへ広がり、閾値を超えた。`Command` を `Box` 化すると 55 箇所の
+/// パターンマッチ（`ToolResult::Commit(Command::AddEntity(..))` のようなネストした
+/// マッチを含む）を書き換える必要があり、このリントの解消だけを理由に踏み込む
+/// 変更ではないため抑制する。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolResult {
     /// まだ確定しない。ツールは内部状態を進めただけ。
@@ -2255,6 +2264,10 @@ struct Placement {
 
 /// [`SelectTool::placement_click`] の結果。呼び出し側（`McadApp`）はこれを見て
 /// ステータス表示・`Document::apply`・選択更新を行う。
+///
+/// `ToolResult` と同じ理由（M11 タスク70 の `DimAnnotation` 拡張で `Command` が
+/// 拡大した）で `clippy::large_enum_variant` を抑制する。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlacementOutcome {
     /// まだ確定しない（基準点を確定した等）。呼び出し側は何もしない。
@@ -2343,6 +2356,10 @@ struct OffsetState {
 }
 
 /// [`SelectTool::offset_click`] の結果。呼び出し側（`McadApp`）が確定・キャンセルを処理する。
+///
+/// `ToolResult` と同じ理由（M11 タスク70 の `DimAnnotation` 拡張で `Command` が
+/// 拡大した）で `clippy::large_enum_variant` を抑制する。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum OffsetOutcome {
     /// 退化入力でモードをキャンセルした。ASCII メッセージを表示する（undo 履歴は作らない）。

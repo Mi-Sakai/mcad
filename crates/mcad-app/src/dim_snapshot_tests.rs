@@ -310,6 +310,59 @@ fn annotation_text_anchor_manual_snapshot() {
     assert_snapshot("annotation_text_anchor_manual", &document);
 }
 
+/// 参考寸法（丸括弧。M11 タスク70）。JIS B 0001:2019 11.1 / JIS Z 8317-1:2008 7.11。
+#[test]
+fn annotation_value_style_reference_snapshot() {
+    let document = linear_with_annotation(DimAnnotation {
+        value_style: mcad_core::ValueStyle::Reference,
+        ..DimAnnotation::default()
+    });
+    assert_snapshot("annotation_value_style_reference", &document);
+}
+
+/// 理論的に正確な寸法（矩形の枠。M11 タスク70）。`製図規定.md` に本文が無いため
+/// JIS の慣行に倣う（[`mcad_core::ValueStyle::TheoreticallyExact`] の doc 参照）。
+#[test]
+fn annotation_value_style_theoretically_exact_snapshot() {
+    let document = linear_with_annotation(DimAnnotation {
+        value_style: mcad_core::ValueStyle::TheoreticallyExact,
+        ..DimAnnotation::default()
+    });
+    assert_snapshot("annotation_value_style_theoretically_exact", &document);
+}
+
+/// 接頭辞・接尾辞（M11 タスク70。`2×φ10` の `2×`、`4-M6` の `-M6` に相当）。
+#[test]
+fn annotation_prefix_and_suffix_snapshot() {
+    let document = linear_with_annotation(DimAnnotation {
+        prefix: Some("2×".to_string()),
+        suffix: Some("-M6".to_string()),
+        ..DimAnnotation::default()
+    });
+    assert_snapshot("annotation_prefix_and_suffix", &document);
+}
+
+/// 文字回転（水平固定。M11 タスク70）。斜めの計測 2 点で通常は文字も斜めになるが、
+/// `text_rotation: Some(0.0)` で水平に固定する。
+#[test]
+fn annotation_text_rotation_horizontal_on_a_diagonal_dimension_snapshot() {
+    let mut document = document_1_1();
+    add(
+        &mut document,
+        EntityGeom::DimLinear(DimLinear {
+            p1: Point2::ORIGIN,
+            p2: Point2::new(40.0, 30.0),
+            offset: 10.0,
+            direction: DimDirection::Aligned,
+            annotation: DimAnnotation {
+                text_rotation: Some(0.0),
+                ..DimAnnotation::default()
+            },
+        }),
+    );
+    assert_snapshot("annotation_text_rotation_horizontal", &document);
+}
+
 // ---------------------------------------------------------------------
 // 4: 尺度 1:2 の長さ寸法（紙基準の拡縮）
 // ---------------------------------------------------------------------

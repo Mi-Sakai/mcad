@@ -1921,6 +1921,10 @@ mod tests {
                     text_anchor: None,
                     arrow_placement: ArrowPlacement::Outside,
                     value_override: None,
+                    text_rotation: None,
+                    value_style: mcad_core::ValueStyle::Plain,
+                    prefix: None,
+                    suffix: None,
                 },
             })
         );
@@ -1948,6 +1952,10 @@ mod tests {
                 text_anchor: Some(Point2::new(2.0, 3.0)),
                 arrow_placement: ArrowPlacement::Outside,
                 value_override: Some("5-10".to_string()),
+                text_rotation: Some(0.3),
+                value_style: mcad_core::ValueStyle::Reference,
+                prefix: Some("2×".to_string()),
+                suffix: Some("-M6".to_string()),
             },
         });
         doc.apply(Command::AddEntity(Entity::new(
@@ -2529,6 +2537,96 @@ mod tests {
                 EntityGeom::DimOrdinate(d) => d,
                 _ => unreachable!(),
             }
+        });
+        assert!(matches!(
+            import_document(&file),
+            Err(IoError::InvalidGeometry { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // v7（M11 タスク70）: 注記の拡張（text_rotation・value_style・prefix・suffix）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn v7_round_trip_is_lossless_for_the_task70_annotation_fields() {
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        let geom = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(10.0, 0.0),
+            offset: 2.0,
+            direction: DimDirection::Aligned,
+            annotation: DimAnnotation {
+                text_rotation: Some(0.4),
+                value_style: mcad_core::ValueStyle::Reference,
+                prefix: Some("2×".to_string()),
+                suffix: Some("-M6".to_string()),
+                ..DimAnnotation::default()
+            },
+        });
+        doc.apply(Command::AddEntity(Entity::new(
+            geom.clone(),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let json = to_json(&doc).unwrap();
+        let loaded = load(&json).unwrap();
+        assert_eq!(
+            export_document(&loaded),
+            export_document(&doc),
+            "M11 タスク70 の新フィールドを含む v7 往復は無損失であるべき"
+        );
+        let (_, entity) = loaded.entities().next().unwrap();
+        assert_eq!(entity.geom, geom);
+    }
+
+    #[test]
+    fn v7_rejects_invalid_task70_annotation_fields_at_the_read_boundary() {
+        // 非有限は JSON で書けないので `import_document`（DTO を直接受ける公開 API）
+        // の境界で、JSON で書ける不正値（空文字列の prefix）は `from_json` の境界で
+        // 拒否されることを確かめる（v7 の他フィールドと同じ流儀）。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Shape(Shape::Point(Point2::ORIGIN)),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        let base = export_document(&doc);
+
+        // (a) 非有限な text_rotation。
+        let mut file = base.clone();
+        file.entities[0].geom = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 1.5,
+            direction: DimDirection::Aligned,
+            annotation: DimAnnotation {
+                text_rotation: Some(f64::NAN),
+                ..DimAnnotation::default()
+            },
+        });
+        assert!(matches!(
+            import_document(&file),
+            Err(IoError::InvalidGeometry { .. })
+        ));
+
+        // (b) 空文字列の prefix（空文字列は None で表すべき、という value_override と
+        // 同じ思想での拒否）。
+        let mut file = base;
+        file.entities[0].geom = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 1.5,
+            direction: DimDirection::Aligned,
+            annotation: DimAnnotation {
+                prefix: Some(String::new()),
+                ..DimAnnotation::default()
+            },
         });
         assert!(matches!(
             import_document(&file),

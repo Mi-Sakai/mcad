@@ -383,7 +383,25 @@ fn arrows_point_outward(
 /// 「寸法線から text_gap だけ離す」が正しく保たれる。
 ///
 /// 非比例寸法の下線は [`DimExpansion::segments`] へ入れる（型の doc 参照）。
-fn place_label(label: &DimLabel, center: Point2, along: Vec2, out: &mut DimExpansion) {
+///
+/// # 文字姿勢の手動固定（[`DimAnnotation::text_rotation`]、M11 タスク70）
+///
+/// `annotation.text_rotation` が `Some(theta)` なら、文字・下線・枠の姿勢を絶対角
+/// `theta` に固定する（`along` から決まる読み方向を無視する）。**ラベルの位置
+/// （`center`）は変えない** — `to_world` が使う回転の基底（`along` / `up`）だけを、
+/// `theta` から作った単位ベクトルとその `perp()` へ差し替える。`None` は現行どおり
+/// `along` から決める。
+fn place_label(
+    label: &DimLabel,
+    center: Point2,
+    along: Vec2,
+    annotation: &DimAnnotation,
+    out: &mut DimExpansion,
+) {
+    let along = match annotation.text_rotation {
+        Some(theta) => Vec2::new(1.0, 0.0).rotated(theta),
+        None => along,
+    };
     let angle = along.angle();
     let up = along.perp();
     let local_center = label.bounds.center();
@@ -407,6 +425,17 @@ fn place_label(label: &DimLabel, center: Point2, along: Vec2, out: &mut DimExpan
     );
     if let Some([a, b]) = label.underline {
         out.segments.push([to_world(a), to_world(b)]);
+    }
+    // 理論的に正確な寸法の枠（M11 タスク70）。4 辺を線分として足す（下線と同じ扱い）。
+    if let Some([p0, p1, p2, p3]) = label.frame {
+        let w0 = to_world(p0);
+        let w1 = to_world(p1);
+        let w2 = to_world(p2);
+        let w3 = to_world(p3);
+        out.segments.push([w0, w1]);
+        out.segments.push([w1, w2]);
+        out.segments.push([w2, w3]);
+        out.segments.push([w3, w0]);
     }
     let bounds = label.bounds;
     out.label_box = Some([
@@ -472,7 +501,7 @@ fn expand_straight(
         let gap = render.paper_mm_to_world(render.style.text_gap_mm);
         d1.midpoint(d2) + along.perp() * (gap + label.height() * 0.5)
     });
-    place_label(&label, center, along, &mut ex);
+    place_label(&label, center, along, annotation, &mut ex);
     ex
 }
 
@@ -700,7 +729,13 @@ pub fn expand_radial(dim: &DimRadial, render: DimRender<'_>) -> DimExpansion {
         let side = if dir.x >= 0.0 { 1.0 } else { -1.0 };
         Point2::new(near.x + side * label.width() * 0.5, near.y)
     });
-    place_label(&label, center, Vec2::new(1.0, 0.0), &mut ex);
+    place_label(
+        &label,
+        center,
+        Vec2::new(1.0, 0.0),
+        &dim.annotation,
+        &mut ex,
+    );
     ex
 }
 
@@ -1010,7 +1045,13 @@ pub fn expand_angular(dim: &DimAngular, render: DimRender<'_>) -> DimExpansion {
         let text_gap = render.paper_mm_to_world(render.style.text_gap_mm);
         mid + out_dir * (text_gap + label.height() * 0.5)
     });
-    place_label(&label, center, reading_direction(out_dir.perp()), &mut ex);
+    place_label(
+        &label,
+        center,
+        reading_direction(out_dir.perp()),
+        &dim.annotation,
+        &mut ex,
+    );
     ex
 }
 
@@ -1084,7 +1125,13 @@ pub fn expand_ordinate(dim: &DimOrdinate, render: DimRender<'_>) -> DimExpansion
         let gap = render.paper_mm_to_world(render.style.text_gap_mm);
         dim.leader_end + dir * (gap + label.width() * 0.5)
     });
-    place_label(&label, center, reading_direction(dir), &mut ex);
+    place_label(
+        &label,
+        center,
+        reading_direction(dir),
+        &dim.annotation,
+        &mut ex,
+    );
     ex
 }
 
@@ -1162,7 +1209,7 @@ fn degenerate_label_only(
         render.text_height_world,
     );
     let center = annotation.text_anchor.unwrap_or(at);
-    place_label(&label, center, Vec2::new(1.0, 0.0), &mut ex);
+    place_label(&label, center, Vec2::new(1.0, 0.0), annotation, &mut ex);
     ex
 }
 
@@ -1170,7 +1217,7 @@ fn degenerate_label_only(
 mod tests {
     use super::*;
     use crate::expand::dim_label::{ASCII_CHAR_WIDTH_RATIO, DimLabel, TextRun, layout_dim_label};
-    use crate::{DimAnnotation, DimKind, DimStyle, FitClass, SizeTolerance};
+    use crate::{DimAnnotation, DimKind, DimStyle, FitClass, SizeTolerance, ValueStyle};
     use mcad_geom::{Aabb, DimSymbol, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -1548,6 +1595,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// [`crate::DimAnnotation::text_rotation`]（M11 タスク70）が `Some` なら、寸法線が
+    /// 斜めでも文字姿勢はその絶対角へ固定される（`along` から決まる読み方向を無視する）。
+    /// ラベルの位置（中心）は `text_rotation` の有無で変わらない。
+    #[test]
+    fn text_rotation_overrides_the_reading_direction_but_not_the_label_center() {
+        let p1 = Point2::new(0.0, 0.0);
+        let p2 = Point2::new(3.0, 4.0);
+        let diagonal = plain_linear(p1, p2, 1.0);
+        let horizontal = DimLinear {
+            annotation: DimAnnotation {
+                text_rotation: Some(0.0),
+                ..DimAnnotation::default()
+            },
+            ..plain_linear(p1, p2, 1.0)
+        };
+
+        let ex_diagonal = expand_linear(&diagonal, render(0.5, 1.0));
+        let ex_horizontal = expand_linear(&horizontal, render(0.5, 1.0));
+
+        // 上書きなしは斜め（前のテストで固定した規則どおり）。
+        assert!(ex_diagonal.texts[0].angle > 0.0 && ex_diagonal.texts[0].angle < FRAC_PI_2);
+        // `Some(0.0)` は水平固定。
+        assert!(ex_horizontal.texts[0].angle.abs() < T);
+
+        // ラベル中心（外形の中心）は変わらない — `place_label` は位置を変えず姿勢だけ
+        // 差し替える。文字ランは 1 つだけなので、その `anchor` から外形中心を逆算して
+        // 比較するのではなく、`label_box`（外形 4 頂点）の重心で比較する。
+        let center_of = |corners: [Point2; 4]| {
+            let sum = corners
+                .iter()
+                .fold(Vec2::new(0.0, 0.0), |acc, p| acc + Vec2::new(p.x, p.y));
+            Point2::ORIGIN + sum * 0.25
+        };
+        let c_diagonal = center_of(ex_diagonal.label_box.unwrap());
+        let c_horizontal = center_of(ex_horizontal.label_box.unwrap());
+        assert!(
+            approx(c_diagonal, c_horizontal),
+            "label center moved: {c_diagonal:?} vs {c_horizontal:?}"
+        );
     }
 
     #[test]
@@ -2142,6 +2230,11 @@ mod tests {
         if let Some([a, b]) = label.underline {
             assert!(bounds.contains_point(a) && bounds.contains_point(b));
         }
+        if let Some(corners) = label.frame {
+            for p in corners {
+                assert!(bounds.contains_point(p), "frame corner {p:?} is outside");
+            }
+        }
         assert!((label.width() - label.bounds.width()).abs() < T);
         assert!((label.height() - label.bounds.height()).abs() < T);
     }
@@ -2394,6 +2487,76 @@ mod tests {
         // 公差にも掛からない。
         assert!((b.x - (value.origin.x + 2.0 * CW)).abs() < T);
         assert!(b.x < label.bounds.max.x);
+        assert_bounds_cover_content(&label);
+    }
+
+    /// 接頭辞・接尾辞（M11 タスク70）は `prefix → 記号 → 値 → suffix → 公差` の順で並ぶ。
+    #[test]
+    fn label_prefix_and_suffix_surround_the_symbol_value_and_bracket_the_tolerance() {
+        let annotation = DimAnnotation {
+            symbol: Some(DimSymbol::Radius),
+            prefix: Some("2×".to_string()),
+            suffix: Some("-M6".to_string()),
+            tolerance: Some(SizeTolerance::Symmetric(0.5)),
+            ..DimAnnotation::default()
+        };
+        let label = layout(10.0, &annotation);
+        assert_eq!(contents(&label), ["2×", "R", "10", "-M6", "± 0.5"]);
+        assert_bounds_cover_content(&label);
+    }
+
+    /// [`crate::ValueStyle::Reference`]（参考寸法）は記号・値・接尾辞を丸括弧で囲む。
+    /// `prefix` と公差は括弧の外。
+    #[test]
+    fn label_reference_value_style_wraps_symbol_value_and_suffix_in_parens() {
+        let annotation = DimAnnotation {
+            symbol: Some(DimSymbol::Radius),
+            prefix: Some("2×".to_string()),
+            suffix: Some("-M6".to_string()),
+            tolerance: Some(SizeTolerance::Symmetric(0.5)),
+            value_style: ValueStyle::Reference,
+            ..DimAnnotation::default()
+        };
+        let label = layout(10.0, &annotation);
+        assert_eq!(
+            contents(&label),
+            ["2×", "(", "R", "10", "-M6", ")", "± 0.5"]
+        );
+        assert!(label.frame.is_none());
+        assert_bounds_cover_content(&label);
+
+        // 括弧なし（`Plain`）と比べて全体の幅が括弧 2 文字ぶん広い。
+        let plain = DimAnnotation {
+            value_style: ValueStyle::Plain,
+            ..annotation.clone()
+        };
+        let plain_label = layout(10.0, &plain);
+        assert!((label.width() - plain_label.width() - 2.0 * CW).abs() < T);
+    }
+
+    /// [`crate::ValueStyle::TheoreticallyExact`]（理論的に正確な寸法）は記号・値・接尾辞を
+    /// 矩形の枠で囲む。文字ランは増えず、[`DimLabel::frame`] に 4 頂点が入る。
+    #[test]
+    fn label_theoretically_exact_value_style_frames_symbol_value_and_suffix() {
+        let annotation = DimAnnotation {
+            symbol: Some(DimSymbol::Radius),
+            prefix: Some("2×".to_string()),
+            suffix: Some("-M6".to_string()),
+            value_style: ValueStyle::TheoreticallyExact,
+            ..DimAnnotation::default()
+        };
+        let label = layout(10.0, &annotation);
+        // 枠は記号・値・接尾辞だけを囲む文字ランのまま（"(" ")" のような追加ランは無い）。
+        assert_eq!(contents(&label), ["2×", "R", "10", "-M6"]);
+        let corners = label.frame.expect("理論的に正確な寸法には枠が付く");
+        // 4 頂点は反時計回りの矩形（左下→右下→右上→左上）。
+        assert!((corners[0].y - corners[1].y).abs() < T, "下辺は水平");
+        assert!((corners[1].x - corners[2].x).abs() < T, "右辺は垂直");
+        assert!((corners[2].y - corners[3].y).abs() < T, "上辺は水平");
+        assert!((corners[3].x - corners[0].x).abs() < T, "左辺は垂直");
+        // 記号「R」を囲むので枠の左端は接頭辞「2×」の右（記号の手前）にある。
+        let prefix_run = &label.runs[0];
+        assert!(corners[0].x > prefix_run.origin.x, "枠は接頭辞を含まない");
         assert_bounds_cover_content(&label);
     }
 

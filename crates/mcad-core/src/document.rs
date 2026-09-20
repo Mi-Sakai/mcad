@@ -807,7 +807,7 @@ mod tests {
         ArrowPlacement, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimStyle, FitClass,
         Linetype, MAX_DIM_DECIMALS, MAX_SCALE_TERM, MAX_TABLE_MM, MAX_TABLE_ROWS, Orientation,
         PaperSize, ProjectionMethod, Scale, SizeTolerance, Style, TableGeom, TitleBlockFields,
-        TitleBlockKind, TitleBlockTemplate, Unit, WidthMm,
+        TitleBlockKind, TitleBlockTemplate, Unit, ValueStyle, WidthMm,
     };
     use mcad_geom::{ArrowKind, DimSymbol, LineSeg, Point2, Shape};
 
@@ -2079,6 +2079,10 @@ mod tests {
             text_anchor: Some(Point2::new(1.0, 2.0)),
             arrow_placement: ArrowPlacement::Outside,
             value_override: Some("5-10".to_string()),
+            text_rotation: Some(0.4),
+            value_style: ValueStyle::TheoreticallyExact,
+            prefix: Some("2×".to_string()),
+            suffix: Some("-M6".to_string()),
         };
         let geom = annotated_linear(annotation);
         let layer = doc.current_layer();

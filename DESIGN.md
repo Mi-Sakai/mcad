@@ -1224,6 +1224,23 @@ DXF import して確認した項目は、寸法が 4 件(整列・鉛直・半�
    見える。(c) 表(M10)と同じ流儀で一貫する。**非対称往復**(読み戻しても寸法エンティティには
    戻らない)であることを README・AGENTS.md・import summary の doc に明記する。
    `.mcad` が正本であるという既存の位置づけ(DXF は交換用)は変えない。
+   - **実装時の設計方針追記(2026-09-21、采配役判断、タスク72)**: 分解先のうち**矢先の
+     塗りは DXF `SOLID`** とする(`dxf` 0.6.1 に `HATCH` に相当する型が無いため実測で確認)。
+     `fill_polygon_to_dxf_solids` が凸多角形を頂点 v0 を要とする三角形扇へ分割し、
+     `third_corner == fourth_corner` の三角形 `SOLID` 1 枚ずつへ写す(`ArrowKind::ClosedFilled`
+     は矢1個につき1枚、`Dot`(16角形近似)は14枚)。輪郭ポリラインにしないのは、塗りが無いと
+     ビューアによっては黒塗り矢先が中抜きに見えるため。**代償として非対称の度合いが表より
+     強い**: `SOLID` は `dxf_entity_to_geom` が対応しないため、re-import で
+     `ImportSummary::skipped_entities` へ計上される(`LINE` / `ARC` / `TEXT` は通常どおり
+     Shape / Text として取り込まれる)。回帰テストは
+     `reimporting_exported_dimension_skips_only_the_solid_arrow_fills`。
+   - **実装時の設計方針追記(2026-09-21、采配役判断、タスク72)**: 寸法由来のエンティティは
+     **常に `CONTINUOUS`**(画面・SVG/PDF と同じく、寸法は製図慣行として常に実線で描く)。
+     `Style::linetype` による線種上書きは適用せず、色・線幅は他のエンティティと同じ経路で
+     適用する(`export_dxf` の `force_continuous`)。また `DimExpansion::texts` の `height` は
+     **既にワールド長**(`TextGeom` 本来の紙 mm 契約とは逆)なので、`text_to_dxf_entity` の
+     `height * k` を通さず共通ヘルパー `text_geom_to_dxf_text` へワールド長のまま渡す
+     (二重換算の防止)。`DimRender` の組み方は SVG/PDF 出力(`plot::plot_page`)と同一。
 3. **空間インデックスは計測してから決める**(タスク66 → 76)。現状の実測が無いまま導入すると、
    効果の無い複雑さを core へ持ち込む。数千エンティティの図面で描画・pick・矩形選択・
    ズームフィットの時間を測り、**閾値(例: 1 フレーム 16ms を超える規模)が実在することを
@@ -1251,7 +1268,7 @@ M11-0(契約固定)は本章の上記で完了。以下は M11-1(64〜72)・M11-
 | 69 | core+io: 角度寸法・座標寸法 **(完了 2026-09-20)** | `DimAngular`/`DimOrdinate` バリアント新設(validate・aabb・変換)、展開(角度は弧+2本の補助線、座標は引出線+値)・pick・plot、v7 へ相乗り、3点角度と Ordinate の import | implement-opus | 68 |
 | 70 | core+io: 注記の拡張 **(完了 2026-09-20)** | `DimAnnotation` へ `text_rotation` / `value_style` / `prefix` / `suffix` を追加、組版(括弧・枠・接頭辞/接尾辞)、v7 へ相乗り、DXF group 1 のテンプレート(`<>`)を prefix/suffix/value_override へ分解する写像 | implement-sonnet | 68 |
 | 71 | core: 展開の純関数を core へ移設 **(完了 2026-09-13)** | `mcad-app` の `dimension.rs`(展開部)と `table.rs` を `mcad-core` へ移し、app・plot・io が同じ実装を使う。**M10 の組版二重化(io 側の表の再実装)もここで解消**。app 側は呼び出しのみ残す。移設で描画が変わらないことをタスク64 のスナップショットで保証。**依存を 69・70 から 64 のみへ変更(2026-09-13)**: 移設はモデル拡張の前に行う方が、68〜70 の拡張作業が core の一箇所で済み、72(分解 export)にも早く着手できる | implement-opus | 64 |
-| 72 | io: 寸法・表の分解 export | 移設した展開を使い、寸法と表を `LINE` / 塗り / `TEXT` へ分解して DXF へ書く(設計判断2)。非対称往復を README・AGENTS.md・モジュール doc へ明記。スキップ件数から寸法を外す | implement-sonnet | 71 |
+| 72 | io: 寸法・表の分解 export **(完了 2026-09-21)** | 移設した展開を使い、寸法と表を `LINE` / 塗り / `TEXT` へ分解して DXF へ書く(設計判断2)。非対称往復を README・AGENTS.md・モジュール doc へ明記。スキップ件数から寸法を外す | implement-sonnet | 71 |
 | 73 | app: 回転寸法ツールと向き UI | 長さ寸法ツールに向き(整列/水平/鉛直/任意角)の切替を足す(キー割当・切替 UX はタスク内で確定)。直交モード時の向き自動判定。右パネル「寸法」で既存寸法の向きを変更 | implement-sonnet | 68 |
 | 74 | app: 角度寸法・座標寸法ツール | 角度寸法(3点クリック)・座標寸法(原点→計測点→引出線端)のツール、未使用キーの確認、右パネルの種別対応(角度寸法に記号コンボを出さない等) | implement-sonnet | 69 |
 | 75 | app: グリップ編集と連続/並列寸法 | 選択中の寸法の端点・寸法線位置をドラッグで編集(M9 の文字位置ドラッグと同じ別経路)、連続/並列寸法の連続入力、注記上書きの一括解除 | implement-sonnet | 73 |

@@ -10,10 +10,12 @@
 //! （タスク25b。当初 M9 予定だったが 2026-07-25 のユーザー判断で M6 へ前倒し）の
 //! 双方に対応した。
 //!
-//! 寸法は **import のみ M11 タスク67 で対応**した（下の「DIMENSION の import」）。
-//! **export は未対応**で、[`ExportSummary::skipped_entities`] に計上される
-//! （M11 タスク72 で「寸法線・補助線・矢先・文字へ分解して `LINE`/`TEXT` として
-//! 書く」方式になる予定。DESIGN.md M11 設計判断2。表と同じ非対称往復になる）。
+//! 寸法は import が M11 タスク67 で対応した（下の「DIMENSION の import」）のに続き、
+//! export もタスク72 で対応した（下の「DIMENSION の分解 export」）。**export は
+//! 分解（非対称往復）**: 寸法線・補助線・矢先・文字を `LINE` / `SOLID` / `ARC` /
+//! `TEXT` へ分解して書くため、mcad が書いた寸法を re-import しても
+//! [`mcad_core::EntityGeom`] の `DimLinear` 等へは戻らない（表と同じ非対称往復。
+//! DESIGN.md M11 設計判断2）。
 //!
 //! 表（[`mcad_core::EntityGeom::Table`]、M10）は**非対称往復**の best-effort で
 //! 対応する（DESIGN.md M10 設計方針6・詳細設計8、タスク61）:
@@ -35,16 +37,23 @@
 //!   （SPLINE・ELLIPSE 等、`EntityType` にバリアントはあるが `dxf_entity_to_geom`
 //!   が変換しないものは通常どおり計上される、という既存の区別と異なる）。
 //!
-//! **寸法の非対称は表と向きが逆**で、現状は import だけができる（M11 タスク67）。
-//! タスク72 で分解 export が入ると表と同じ向きの非対称（書けるが読み戻せない）にも
-//! なるため、そのときは「mcad が書いた寸法は読み戻せないが、他 CAD が書いた
-//! `DIMENSION` は読める」という二重の非対称になる。
+//! **寸法の非対称は表と向きが逆**: タスク72 で分解 export が入った結果、表と同じ向き
+//! の非対称（書けるが読み戻せない）になった。そのため「mcad が書いた寸法は
+//! 読み戻せないが、他 CAD が書いた `DIMENSION` は読める」という**二重の非対称**に
+//! なる。
+//!
+//! **表との違い**: 表の分解（罫線 `LINE`・セル文字 `TEXT`）は import 側の
+//! `skipped_entities` を増やさない（`LINE`/`TEXT` 自体は対応エンティティなので）。
+//! 寸法の分解が使う矢先の `SOLID`（下記「DIMENSION の分解 export」設計判断1）は
+//! `dxf_entity_to_geom` が対応しない `EntityType` のため、**re-import 時に
+//! [`ImportSummary::skipped_entities`] へ計上される**（`LINE`/`ARC`/`TEXT` 側は
+//! 通常どおり Shape/Text として取り込まれる）。
 //!
 //! # DIMENSION の import（M11 タスク67・タスク69）
 //!
 //! 他 CAD が書いた寸法を [`mcad_core::EntityGeom`] の `DimLinear` / `DimRadial` /
-//! `DimDiameter` / `DimAngular` / `DimOrdinate` へ写す（**export は未対応**。
-//! 上記「設計方針」参照）。対応表は次のとおりで、
+//! `DimDiameter` / `DimAngular` / `DimOrdinate` へ写す（**export は「DIMENSION の
+//! 分解 export」節を参照。この節は import のみを扱う**）。対応表は次のとおりで、
 //! 「クレートの型」は `dxf` 0.6.1 が group 100 のサブクラス名で選ぶ `EntityType`。
 //!
 //! | DXF 種別（group 70 の整数部） | クレートの型 | mcad | 備考 |
@@ -139,6 +148,57 @@
 //!
 //! 関連付け（DIMASSOC）はクレートの公開フィールドに無いため、**すべて静的寸法として
 //! 取り込む**（M9 設計判断どおり非関連。図形を動かしても寸法値は追従しない）。
+//!
+//! # DIMENSION の分解 export（M11 タスク72）
+//!
+//! [`dim_to_dxf_entities`] が `DimLinear` / `DimRadial` / `DimDiameter` /
+//! `DimAngular` / `DimOrdinate` の 5 種すべてを DXF の `LINE` / `SOLID` / `ARC` /
+//! `TEXT` へ**分解**して書く。DXF の `DIMENSION` は見た目を anonymous block への
+//! 参照として持ち、それを書かないビューアには何も表示されない（DESIGN.md M11
+//! 設計判断2 (a)）ため、[`table_to_dxf_entities`]（表、M10 タスク61）と同じ
+//! 「見た目を直接プリミティブへ分解する」方式を採る。
+//!
+//! ## 組版は `mcad-core` の [`mcad_core::expand_dim`] が唯一の出所
+//!
+//! 表と同じく、画面（`mcad-app`）・SVG/PDF（`mcad-app::plot`）・DXF export が
+//! [`mcad_core::expand_dim`] の同じ結果を分けて描くだけなので、値が乖離しても
+//! 検出できない二重化は起きない（M11 設計判断1・タスク71）。渡す
+//! [`mcad_core::DimRender`] は SVG/PDF 出力（`plot::plot_page`）とまったく同じ
+//! 組み方（`crates/mcad-app/src/plot/mod.rs` 参照）で、出力は常に紙基準
+//! （紙 mm × 文書尺度 `Scale::world_mm_per_paper_mm()`）になる。
+//!
+//! ## 矢先の塗りは `SOLID`（ポリライン輪郭にしない）
+//!
+//! [`mcad_geom::ArrowGlyph::fills`]（塗る凸多角形）は [`fill_polygon_to_dxf_solids`]
+//! が頂点 v0 を要とする三角形扇へ分割し、`SOLID`（`third_corner == fourth_corner`
+//! で三角形にする）1 枚ずつへ変換する。塗りを `LINE` の輪郭だけで表すと、ビューア
+//! によっては黒塗り矢先が中抜き（輪郭線だけで塗りがない）に見えるため、確実に
+//! 塗りつぶされる `SOLID` を選んだ。**表と違い、寸法由来のエンティティは
+//! `dxf_entity_to_geom` が対応しない `EntityType::Solid` を含むため、非対称往復の
+//! 度合いが表より強い**（`SOLID` を re-import すると [`ImportSummary::skipped_entities`]
+//! に計上される。上記「設計方針」節「表との違い」参照）。
+//!
+//! ## 寸法由来のエンティティは常に実線
+//!
+//! 画面・SVG/PDF は寸法を製図慣行として常に実線で描く。DXF でも
+//! [`export_dxf`] が寸法から生成したすべてのエンティティへ `CONTINUOUS` を明示し、
+//! `Style::linetype` による線種上書きを適用しない（Shape・Text・表の罫線は従来どおり
+//! `Style::linetype` を適用する）。色（`Style::color`）と線幅（`Style::width_mm`）は
+//! 他のエンティティと同じ経路で適用する。
+//!
+//! ## 文字高さは二重換算しない
+//!
+//! [`mcad_core::DimExpansion::texts`] の `height` は**既にワールド長**（`TextGeom`
+//! 本来の「紙 mm」契約とは逆。[`mcad_core::DimExpansion`] の doc 参照）。
+//! [`text_to_dxf_entity`] が行う `height * k` をここでは行わず、共通ヘルパー
+//! [`text_geom_to_dxf_text`] へワールド長のまま渡す。
+//!
+//! ## 退化への耐性
+//!
+//! [`mcad_core::expand_dim`] が `None` を返す、または展開結果が空になる退化した
+//! 寸法は、何も書かず [`ExportSummary::skipped_entities`] も増やさない（表の
+//! 「空セルは出さない」と同じ流儀。存在自体は正しいエンティティなので「対応済みだが
+//! 描くものが無かった」扱いにする）。
 //!
 //! # 文字列は UTF-8 で書く（ヘッダバージョン R2007）
 //!
@@ -377,7 +437,7 @@ use std::path::Path;
 use dxf::entities::{
     AngularThreePointDimension, Arc as DxfArc, Circle as DxfCircle, DiameterDimension,
     DimensionBase, Entity as DxfEntity, EntityType, Line as DxfLine, LwPolyline, ModelPoint,
-    OrdinateDimension, RadialDimension, RotatedDimension, Text as DxfText,
+    OrdinateDimension, RadialDimension, RotatedDimension, Solid as DxfSolid, Text as DxfText,
 };
 use dxf::enums::{
     DimensionType, HorizontalTextJustification, Units as DxfUnits, VerticalTextJustification,
@@ -387,8 +447,8 @@ use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
 use mcad_core::{
     Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimOrdinate,
-    DimRadial, Document, Entity, EntityGeom, Layer, LayerId, Linetype, OrdinateAxis, Rgb, Style,
-    TableGeom, TextGeom, WidthMm, expand_table,
+    DimRadial, DimRender, Document, Entity, EntityGeom, Layer, LayerId, Linetype, OrdinateAxis,
+    Rgb, Style, TableGeom, TextGeom, WidthMm, expand_dim, expand_table,
 };
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
@@ -498,19 +558,24 @@ pub struct ImportSummary {
 
 /// DXF export の結果。
 ///
-/// M6 で `Entity.geom` が [`mcad_core::EntityGeom`] 化され、Text・寸法（非 Shape
+/// M6 で `Entity.geom` が [`mcad_core::EntityGeom`] 化され、Text・寸法・表（非 Shape
 /// バリアント）を持てるようになった。Text（[`EntityGeom::Text`]）はタスク25で
-/// DXF `TEXT` エンティティとして export されるが、寸法（`DimLinear` / `DimRadial`）は
-/// DXF に対応するプリミティブがなく export 時にスキップされる。黙って消えると
-/// 呼び出し側がデータロスに気づけないため、[`ImportSummary`] と対称に、スキップ件数を
-/// 返してステータス表示できるようにする。
+/// DXF `TEXT` エンティティとして export され、表（[`EntityGeom::Table`]、M10）は
+/// タスク61で、寸法（`DimLinear`/`DimRadial`/`DimDiameter`/`DimAngular`/
+/// `DimOrdinate`）はタスク72で、それぞれ `LINE`/`SOLID`/`ARC`/`TEXT` へ分解して
+/// export される（モジュール doc「DIMENSION の分解 export」）。`skipped_entities`
+/// に計上されるのは、現状は将来 core へ追加される未知の [`EntityGeom`] バリアント
+/// （`#[non_exhaustive]`）だけである。黙って消えると呼び出し側がデータロスに
+/// 気づけないため、[`ImportSummary`] と対称に、スキップ件数を返してステータス
+/// 表示できるようにする。
 ///
 /// `dxf::Drawing` は `Debug` を導出しているが、対称性と将来の拡張余地のためこの構造体は
 /// `Debug` を導出しない（[`ImportSummary`] と同じ扱い）。
 pub struct ExportSummary {
     /// 生成した図面。
     pub drawing: Drawing,
-    /// DXF 非対応でスキップしたエンティティ数（寸法。Text はタスク25で export 対応済み）。
+    /// DXF 非対応でスキップしたエンティティ数（現状は `EntityGeom` の未知バリアントの
+    /// みが対象。Text・表・寸法はいずれも分解 export に対応済みで、ここには含まれない）。
     pub skipped_entities: usize,
 }
 
@@ -1421,9 +1486,22 @@ fn dxf_entity_to_geom(specific: &EntityType) -> Result<ImportedGeom, DxfImportSk
 /// 「TEXT 高さの尺度契約」参照）。逆写像（import 側は 1:1 とみなす非対称な写像）は
 /// [`dxf_entity_to_geom`]。
 fn text_to_dxf_entity(text: &TextGeom, world_mm_per_paper_mm: f64) -> DxfEntity {
+    text_geom_to_dxf_text(text, text.height * world_mm_per_paper_mm)
+}
+
+/// [`TextGeom`] を DXF `TEXT` エンティティへ変換する共通ヘルパー。`height_world` は
+/// **ワールド長としてそのまま書く**（換算はしない）。
+///
+/// 呼び出し側の契約が違う 2 経路がこれを共有する（M11 タスク72）:
+///
+/// - [`text_to_dxf_entity`]（`TextGeom::height` は紙 mm契約）は `height * k` を渡す。
+/// - [`dim_to_dxf_entities`]（[`mcad_core::DimExpansion::texts`] の `height` は
+///   既にワールド長）は `height` をそのまま渡す（`× k` すると二重換算になる。
+///   モジュール doc「DIMENSION の分解 export」の「文字高さは二重換算しない」参照）。
+fn text_geom_to_dxf_text(text: &TextGeom, height_world: f64) -> DxfEntity {
     let specific = EntityType::Text(DxfText {
         location: to_dxf_point(text.anchor),
-        text_height: text.height * world_mm_per_paper_mm,
+        text_height: height_world,
         value: text.content.clone(),
         rotation: text.angle.to_degrees(),
         ..Default::default()
@@ -1482,12 +1560,107 @@ fn table_to_dxf_entities(table: &TableGeom, world_mm_per_paper_mm: f64) -> Vec<D
     lines.chain(texts).collect()
 }
 
+/// 矢先の塗り（凸多角形、[`mcad_geom::ArrowGlyph::fills`]）を DXF `SOLID` へ**三角形扇**
+/// へ分割して分解する（M11 タスク72、DESIGN.md M11 設計判断2）。
+///
+/// 頂点 `poly[0]` を扇の要とし、`(poly[0], poly[i], poly[i+1])`（`i = 1..len-1`）の
+/// 三角形 1 枚ずつを `SOLID`（`third_corner == fourth_corner` で三角形にする）で書く。
+/// 例: [`mcad_geom::ArrowKind::ClosedFilled`]（3 頂点）は三角形 1 枚、
+/// [`mcad_geom::ArrowKind::Dot`]（16 角形近似）は三角形 14 枚になる。
+///
+/// **ポリライン輪郭にしない**: 黒塗り矢先を `LINE` の輪郭だけで表すと、ビューアに
+/// よっては塗りがなく中抜きに見える。`SOLID` を選べば確実に塗りつぶされる
+/// （モジュール doc「DIMENSION の分解 export」参照）。
+///
+/// 頂点が 3 未満の多角形は空（描くものが無い）として扱う。
+fn fill_polygon_to_dxf_solids(poly: &[Point2]) -> Vec<DxfEntity> {
+    if poly.len() < 3 {
+        return Vec::new();
+    }
+    let v0 = to_dxf_point(poly[0]);
+    poly[1..]
+        .windows(2)
+        .map(|pair| {
+            let vi = to_dxf_point(pair[0]);
+            let vi1 = to_dxf_point(pair[1]);
+            DxfEntity::new(EntityType::Solid(DxfSolid {
+                first_corner: v0.clone(),
+                second_corner: vi,
+                third_corner: vi1.clone(),
+                fourth_corner: vi1,
+                ..Default::default()
+            }))
+        })
+        .collect()
+}
+
+/// 寸法（[`EntityGeom`] の `DimLinear` / `DimRadial` / `DimDiameter` / `DimAngular` /
+/// `DimOrdinate`）を DXF の `LINE` / `SOLID` / `ARC` / `TEXT` へ**分解**する
+/// （M11 タスク72。詳細はモジュール doc「DIMENSION の分解 export」）。
+///
+/// 組版は [`expand_dim`]（`mcad-core`、画面・SVG/PDF と同じ唯一の出所）に一任し、
+/// この関数は結果を DXF エンティティへ写すだけ。描く順序は画面・SVG/PDF の
+/// `push_dim`（`crates/mcad-app/src/plot/mod.rs`）と揃える: `segments` →
+/// `arrows`（`fills` → `strokes`）→ `symbol_strokes` → `texts`。
+///
+/// - `segments` は `LINE`。
+/// - `arrows` の `fills` は [`fill_polygon_to_dxf_solids`] で `SOLID` へ、`strokes` は
+///   `LINE` へ。
+/// - `symbol_strokes`（φ・□等の記号、角度寸法の弧 [`Shape::Arc`]）は
+///   [`shape_to_dxf_entity`] をそのまま再利用する。
+/// - `texts` は [`text_geom_to_dxf_text`] へ**ワールド長のまま**渡す（`× k` しない。
+///   [`mcad_core::DimExpansion::texts`] の doc、モジュール doc「文字高さは二重換算
+///   しない」参照）。
+/// - `label_box` は pick 用の当たり判定形状であり、描画対象ではないので出力しない。
+///
+/// [`expand_dim`] が `None` を返す（退化した寸法）ときは空を返す。呼び出し側
+/// （[`export_dxf`]）はこの結果が空でも `skipped_entities` を増やさない（表の
+/// 「空セルは出さない」と同じ流儀）。
+fn dim_to_dxf_entities(geom: &EntityGeom, render: DimRender<'_>) -> Vec<DxfEntity> {
+    let Some(expansion) = expand_dim(geom, render) else {
+        return Vec::new();
+    };
+
+    let mut entities = Vec::new();
+    for seg in &expansion.segments {
+        entities.push(DxfEntity::new(EntityType::Line(DxfLine {
+            p1: to_dxf_point(seg[0]),
+            p2: to_dxf_point(seg[1]),
+            ..Default::default()
+        })));
+    }
+    for glyph in &expansion.arrows {
+        for poly in &glyph.fills {
+            entities.extend(fill_polygon_to_dxf_solids(poly));
+        }
+        for [a, b] in &glyph.strokes {
+            entities.push(DxfEntity::new(EntityType::Line(DxfLine {
+                p1: to_dxf_point(*a),
+                p2: to_dxf_point(*b),
+                ..Default::default()
+            })));
+        }
+    }
+    for shape in &expansion.symbol_strokes {
+        entities.push(shape_to_dxf_entity(shape));
+    }
+    for text in &expansion.texts {
+        // `DimExpansion::texts` の height はワールド長（TextGeom 本来の「紙 mm」契約
+        // とは逆）なので `× k` しない。
+        entities.push(text_geom_to_dxf_text(text, text.height));
+    }
+    entities
+}
+
 /// `Document` を `dxf::Drawing` へ変換する。
 ///
 /// 生存中のレイヤー・エンティティのみを列挙する（undo/redo 履歴は含めない）。
 /// Text（[`EntityGeom::Text`]）は DXF `TEXT` エンティティとして export する
-/// （タスク25）。寸法（[`EntityGeom`] の `DimLinear` / `DimRadial`）は DXF に
-/// 対応するプリミティブがなくスキップし、その件数を
+/// （タスク25）。表（[`EntityGeom::Table`]）と寸法（[`EntityGeom`] の `DimLinear` 等
+/// 5 種）は DXF に対応するプリミティブがないため分解して export する
+/// （[`table_to_dxf_entities`]・[`dim_to_dxf_entities`]、モジュール doc「DIMENSION
+/// の分解 export」）。将来 core へ追加される未知の [`EntityGeom`] バリアントのみを
+/// スキップし、その件数を
 /// [`ExportSummary::skipped_entities`] に積む。
 #[must_use]
 pub fn export_dxf(doc: &Document) -> ExportSummary {
@@ -1595,6 +1768,17 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
     // TEXT 高さの尺度契約（DESIGN.md M8 設計判断4a）: `height * k` を書く。
     let world_mm_per_paper_mm = doc.sheet().scale.world_mm_per_paper_mm();
 
+    // 寸法の展開パラメータ。出力は常に紙基準なので、注記の長さはスタイルの紙 mm × `k`
+    // （SVG/PDF の `plot::plot_page` が組む `DimRender` とまったく同じ組み方。
+    // モジュール doc「DIMENSION の分解 export」参照）。
+    let dim_style = doc.dim_style();
+    let dim_render = DimRender {
+        style: dim_style,
+        scale_world_per_paper_mm: world_mm_per_paper_mm,
+        arrow_len_world: dim_style.arrow_len_mm * world_mm_per_paper_mm,
+        text_height_world: dim_style.text_height_mm * world_mm_per_paper_mm,
+    };
+
     let mut skipped_entities = 0usize;
     for (_, entity) in doc.entities() {
         let layer_name = layer_names
@@ -1602,15 +1786,29 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
             .expect("Document invariant: entity's layer must be alive")
             .clone();
         // M6: Shape・Text は DXF エンティティへ変換する（タスク25で Text も対応）。
-        // 表（M10 タスク61）は複数の LINE/TEXT へ分解する（[`table_to_dxf_entities`]）。
-        // 寸法（DimLinear/DimRadial）は DXF に対応するプリミティブがないためスキップし
+        // 表（M10 タスク61）・寸法（M11 タスク72）は複数の LINE/SOLID/ARC/TEXT へ
+        // 分解する（[`table_to_dxf_entities`]・[`dim_to_dxf_entities`]）。将来 core へ
+        // 追加される未知の幾何（`EntityGeom` は `#[non_exhaustive]`）だけをスキップし
         // 件数を数える。件数は呼び出し側がステータス表示し、無警告のデータロスを防ぐ。
-        let dxf_entities: Vec<DxfEntity> = match &entity.geom {
-            EntityGeom::Shape(shape) => vec![shape_to_dxf_entity(shape)],
-            EntityGeom::Text(text) => vec![text_to_dxf_entity(text, world_mm_per_paper_mm)],
-            EntityGeom::Table(table) => table_to_dxf_entities(table, world_mm_per_paper_mm),
-            // 寸法（DimLinear/DimRadial）と、将来 core へ追加される未知の幾何
-            // （`EntityGeom` は `#[non_exhaustive]`）はまとめてスキップ側に回す。
+        //
+        // `force_continuous` は寸法由来のエンティティにだけ立てる: 寸法は画面・
+        // SVG/PDF とも製図慣行として常に実線で描くため、DXF でも `Style::linetype`
+        // による線種上書きを適用せず `CONTINUOUS` を明示する（モジュール doc
+        // 「寸法由来のエンティティは常に実線」参照。表・Shape・Text は従来どおり
+        // `Style::linetype` を適用する）。
+        let (dxf_entities, force_continuous): (Vec<DxfEntity>, bool) = match &entity.geom {
+            EntityGeom::Shape(shape) => (vec![shape_to_dxf_entity(shape)], false),
+            EntityGeom::Text(text) => {
+                (vec![text_to_dxf_entity(text, world_mm_per_paper_mm)], false)
+            }
+            EntityGeom::Table(table) => {
+                (table_to_dxf_entities(table, world_mm_per_paper_mm), false)
+            }
+            EntityGeom::DimLinear(_)
+            | EntityGeom::DimRadial(_)
+            | EntityGeom::DimDiameter(_)
+            | EntityGeom::DimAngular(_)
+            | EntityGeom::DimOrdinate(_) => (dim_to_dxf_entities(&entity.geom, dim_render), true),
             _ => {
                 skipped_entities += 1;
                 continue;
@@ -1623,7 +1821,10 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
             // 既定（`line_type_name = "BYLAYER"`）のままにする。線幅の既定
             // （`lineweight_enum_value = 0`）は「明示的に 0」を意味してしまうため、
             // ByLayer を表す `-1`（group code 370 の慣例）を明示的に書く必要がある。
-            if let Some(linetype) = entity.style.linetype {
+            if force_continuous {
+                dxf_entity.common.line_type_name =
+                    linetype_to_dxf_name(Linetype::Continuous).to_string();
+            } else if let Some(linetype) = entity.style.linetype {
                 dxf_entity.common.line_type_name = linetype_to_dxf_name(linetype).to_string();
             }
             dxf_entity.common.lineweight_enum_value = entity
@@ -2900,13 +3101,15 @@ mod tests {
         approx_point(text.anchor, Point2::new(1.0, 2.0));
     }
 
-    /// タスク25: Text は DXF `TEXT` エンティティとして export され、長さ寸法・半径寸法は
-    /// DXF に対応するプリミティブがなくスキップされる（DESIGN.md M6 設計判断5・
-    /// タスク分割表#25）。ここは export 側のフィールドマッピングのみを見る
-    /// （往復は `round_trip_preserves_cjk_and_ascii_text`）。
+    /// タスク25: Text は DXF `TEXT` エンティティとして export される（DESIGN.md M6
+    /// 設計判断5・タスク分割表#25）。ここは export 側のフィールドマッピングのみを見る
+    /// （往復は `round_trip_preserves_cjk_and_ascii_text`）。寸法の分解 export は
+    /// 下の「DIMENSION の分解 export」テスト群が担当する（M11 タスク72 で、寸法は
+    /// スキップされずに `LINE`/`SOLID`/`ARC`/`TEXT` へ分解されるようになったため、
+    /// このテストは寸法を含まない）。
     #[test]
-    fn export_writes_text_entity_and_skips_dimensions() {
-        use mcad_core::{DimAnnotation, DimDiameter, DimLinear, DimRadial, EntityGeom, TextGeom};
+    fn export_writes_text_entity() {
+        use mcad_core::{EntityGeom, TextGeom};
 
         let mut doc = Document::new();
         let layer = doc.current_layer();
@@ -2929,46 +3132,9 @@ mod tests {
             Style::inherited(),
         )))
         .unwrap();
-        // 長さ寸法・半径寸法・直径寸法は DXF 非対応でスキップされる（直径寸法は
-        // M9 タスク47-2 の新設バリアント。ワイルドカード腕でスキップ側へ乗る）。
-        doc.apply(Command::AddEntity(Entity::new(
-            EntityGeom::DimLinear(DimLinear {
-                p1: Point2::new(0.0, 0.0),
-                p2: Point2::new(2.0, 0.0),
-                offset: 1.0,
-                direction: DimDirection::Aligned,
-                annotation: DimAnnotation::default(),
-            }),
-            layer,
-            Style::inherited(),
-        )))
-        .unwrap();
-        doc.apply(Command::AddEntity(Entity::new(
-            EntityGeom::DimRadial(DimRadial {
-                center: Point2::new(0.0, 0.0),
-                radius: 2.0,
-                leader_angle: 0.0,
-                annotation: DimAnnotation::default(),
-            }),
-            layer,
-            Style::inherited(),
-        )))
-        .unwrap();
-        doc.apply(Command::AddEntity(Entity::new(
-            EntityGeom::DimDiameter(DimDiameter {
-                center: Point2::new(0.0, 0.0),
-                radius: 2.0,
-                angle: 0.0,
-                annotation: DimAnnotation::default(),
-            }),
-            layer,
-            Style::inherited(),
-        )))
-        .unwrap();
 
         let export = export_dxf(&doc);
-        // 3 件（長さ・半径・直径寸法）がスキップされ、Shape 1 件 + TEXT 1 件が図面へ入る。
-        assert_eq!(export.skipped_entities, 3);
+        assert_eq!(export.skipped_entities, 0);
         assert_eq!(export.drawing.entities().count(), 2);
 
         let text_entity = export
@@ -2983,6 +3149,432 @@ mod tests {
         assert!((text_entity.text_height - 2.5).abs() < EPS);
         assert!((text_entity.rotation - 90.0).abs() < ANGLE_EPS);
         assert_eq!(text_entity.value, "hi");
+    }
+
+    // ---------------------------------------------------------------------
+    // タスク72: DIMENSION の分解 export
+    // ---------------------------------------------------------------------
+
+    /// 5 種の寸法を 1 つずつ持つドキュメントを作る（テスト用、`DimStyle` は既定・
+    /// 尺度 1:1）。各寸法は `EntityGeom::validate` を満たす非退化な値。
+    fn dim_sample_doc() -> Document {
+        use mcad_core::{
+            DimAngular, DimAnnotation, DimDiameter, DimLinear, DimOrdinate, DimRadial, EntityGeom,
+            OrdinateAxis,
+        };
+
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::new(0.0, 0.0),
+                p2: Point2::new(10.0, 0.0),
+                offset: 5.0,
+                direction: DimDirection::Aligned,
+                annotation: DimAnnotation::default(),
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimRadial(DimRadial {
+                center: Point2::new(0.0, 0.0),
+                radius: 5.0,
+                leader_angle: 0.3,
+                annotation: DimAnnotation::default(),
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimDiameter(DimDiameter {
+                center: Point2::new(0.0, 0.0),
+                radius: 5.0,
+                angle: 0.3,
+                annotation: DimAnnotation::default(),
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimAngular(DimAngular {
+                vertex: Point2::new(0.0, 0.0),
+                p1: Point2::new(10.0, 0.0),
+                p2: Point2::new(0.0, 10.0),
+                arc_radius: 5.0,
+                annotation: DimAnnotation::default(),
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimOrdinate(DimOrdinate {
+                origin: Point2::new(0.0, 0.0),
+                feature: Point2::new(10.0, 5.0),
+                leader_end: Point2::new(15.0, 5.0),
+                axis: OrdinateAxis::X,
+                annotation: DimAnnotation::default(),
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc
+    }
+
+    /// 5 種の寸法すべてが分解され、少なくとも `LINE`（寸法線・補助線）と `TEXT`
+    /// （値）を出す。角度寸法は弧（`ARC`、[`DimAngular`] 側の記号ストローク）も出す。
+    #[test]
+    fn export_decomposes_all_dimension_kinds_into_line_arc_text() {
+        use mcad_core::EntityGeom;
+
+        let doc = dim_sample_doc();
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 0);
+
+        // 種別ごとに、その寸法だけを持つドキュメントで LINE/ARC/TEXT の有無を確認する。
+        for (_, entity) in doc.entities() {
+            let mut single = Document::new();
+            let layer = single.current_layer();
+            single
+                .apply(Command::AddEntity(Entity::new(
+                    entity.geom.clone(),
+                    layer,
+                    Style::inherited(),
+                )))
+                .unwrap();
+            let export = export_dxf(&single);
+            assert_eq!(export.skipped_entities, 0);
+            let has_line = export
+                .drawing
+                .entities()
+                .any(|e| matches!(e.specific, EntityType::Line(_)));
+            let has_text = export
+                .drawing
+                .entities()
+                .any(|e| matches!(e.specific, EntityType::Text(_)));
+            assert!(has_line, "{:?} must produce at least one LINE", entity.geom);
+            assert!(has_text, "{:?} must produce at least one TEXT", entity.geom);
+            if matches!(entity.geom, EntityGeom::DimAngular(_)) {
+                let has_arc = export
+                    .drawing
+                    .entities()
+                    .any(|e| matches!(e.specific, EntityType::Arc(_)));
+                assert!(has_arc, "angular dimension must produce an ARC");
+            }
+        }
+    }
+
+    /// 寸法だけの文書を export しても `skipped_entities` は増えない（5 種すべて
+    /// 分解できるため）。
+    #[test]
+    fn export_dimension_only_document_has_no_skipped_entities() {
+        let doc = dim_sample_doc();
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 0);
+        assert!(export.drawing.entities().count() > 0);
+    }
+
+    /// 分解した座標は [`expand_dim`] を直接呼んだ結果と一致する（画面描画の入力と
+    /// まったく同じ `DimExpansion` から座標を取っていることの固定。
+    /// `crates/mcad-app/src/plot/mod.rs` のスナップショットテストと同じ考え方）。
+    #[test]
+    fn export_dimension_coordinates_match_expand_dim_directly() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let dim = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(10.0, 0.0),
+            offset: 5.0,
+            direction: DimDirection::Aligned,
+            annotation: DimAnnotation::default(),
+        });
+        doc.apply(Command::AddEntity(Entity::new(
+            dim.clone(),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let dim_style = doc.dim_style();
+        let k = doc.sheet().scale.world_mm_per_paper_mm();
+        let render = DimRender {
+            style: dim_style,
+            scale_world_per_paper_mm: k,
+            arrow_len_world: dim_style.arrow_len_mm * k,
+            text_height_world: dim_style.text_height_mm * k,
+        };
+        let expected = expand_dim(&dim, render).expect("linear dim must expand");
+
+        let export = export_dxf(&doc);
+        let lines: Vec<[Point2; 2]> = export
+            .drawing
+            .entities()
+            .filter_map(|e| match &e.specific {
+                EntityType::Line(l) => Some([from_dxf_point(&l.p1), from_dxf_point(&l.p2)]),
+                _ => None,
+            })
+            .collect();
+        // `expand_dim` の `segments` は必ず最初に来る（`dim_to_dxf_entities` の doc
+        // 「描く順序」参照）。矢先ストロークが後ろへ続くので `segments` の本数だけ
+        // 先頭を比較する。
+        assert!(lines.len() >= expected.segments.len());
+        for (seg, line) in expected.segments.iter().zip(lines.iter()) {
+            approx_point(seg[0], line[0]);
+            approx_point(seg[1], line[1]);
+        }
+
+        let texts: Vec<&DxfText> = export
+            .drawing
+            .entities()
+            .filter_map(|e| match &e.specific {
+                EntityType::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), expected.texts.len());
+        for (expected_text, dxf_text) in expected.texts.iter().zip(texts.iter()) {
+            approx_point(from_dxf_point(&dxf_text.location), expected_text.anchor);
+            // 文字高さは `DimExpansion::texts` の height（ワールド長）をそのまま
+            // 書く契約（二重換算しない）。
+            assert!((dxf_text.text_height - expected_text.height).abs() < EPS);
+            assert_eq!(dxf_text.value, expected_text.content);
+        }
+    }
+
+    /// 矢先の塗り（[`mcad_geom::ArrowGlyph::fills`]）は `SOLID` として出る。
+    /// `ClosedFilled`（既定）は矢1個につき三角形1枚 = `SOLID` 1件、両端で2件。
+    /// `Dot` は矢1個につき16角形近似 → 三角形14枚 = `SOLID` 14件、両端で28件。
+    #[test]
+    fn export_dimension_arrow_fills_become_solid_entities() {
+        use mcad_geom::ArrowKind;
+
+        fn solid_count_for(arrow_kind: ArrowKind) -> usize {
+            let mut doc = Document::new();
+            let mut style = *doc.dim_style();
+            style.arrow_kind = arrow_kind;
+            doc.apply(Command::SetDimStyle(style)).unwrap();
+            let layer = doc.current_layer();
+            doc.apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(0.0, 0.0),
+                    p2: Point2::new(10.0, 0.0),
+                    offset: 5.0,
+                    direction: DimDirection::Aligned,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+            let export = export_dxf(&doc);
+            export
+                .drawing
+                .entities()
+                .filter(|e| matches!(e.specific, EntityType::Solid(_)))
+                .count()
+        }
+
+        assert_eq!(solid_count_for(ArrowKind::ClosedFilled), 2);
+        assert_eq!(solid_count_for(ArrowKind::Dot), 28);
+        // 塗りを持たない矢先種（ストロークのみ）は SOLID を出さない。
+        assert_eq!(solid_count_for(ArrowKind::Open30), 0);
+    }
+
+    /// 尺度（`SheetMeta::scale`）を変えると、寸法の文字高さ・座標も尺度どおりに
+    /// スケールする（`export_table_lines_scale_by_sheet_scale` と同じ流儀）。
+    #[test]
+    fn export_dimension_text_height_and_coords_scale_by_sheet_scale() {
+        use mcad_core::Scale;
+
+        // `DimLinear` の計測点（p1/p2/offset）はワールド座標で寸法データそのものなので
+        // 尺度では動かない。尺度が動かすのは「注記の表示倍率」を通した値
+        // （突き出し・すきま・矢先長さ・文字高さ）だけ（`DimRender::annotation_scale`
+        // の doc 参照）。したがってここでは `expand_dim` を尺度ごとに直接呼んだ
+        // 期待値と export の座標・文字高さを突き合わせて、尺度がちゃんと効いている
+        // ことを固定する（`export_table_lines_scale_by_sheet_scale` と同じ
+        // 「期待値は展開そのものから取る」流儀）。
+        let dim = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(10.0, 0.0),
+            offset: 5.0,
+            direction: DimDirection::Aligned,
+            annotation: DimAnnotation::default(),
+        });
+
+        for scale in [Scale::ONE, Scale::new(1, 2).unwrap()] {
+            let mut doc = Document::new();
+            let mut sheet = doc.sheet().clone();
+            sheet.scale = scale;
+            doc.apply(Command::SetSheet(sheet)).unwrap();
+            let layer = doc.current_layer();
+            doc.apply(Command::AddEntity(Entity::new(
+                dim.clone(),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+
+            let dim_style = doc.dim_style();
+            let k = scale.world_mm_per_paper_mm();
+            let render = DimRender {
+                style: dim_style,
+                scale_world_per_paper_mm: k,
+                arrow_len_world: dim_style.arrow_len_mm * k,
+                text_height_world: dim_style.text_height_mm * k,
+            };
+            let expected = expand_dim(&dim, render).expect("linear dim must expand");
+
+            let export = export_dxf(&doc);
+
+            let text_height = export
+                .drawing
+                .entities()
+                .find_map(|e| match &e.specific {
+                    EntityType::Text(t) => Some(t.text_height),
+                    _ => None,
+                })
+                .expect("dimension TEXT must be present");
+            assert!(
+                (text_height - dim_style.text_height_mm * k).abs() < EPS,
+                "k={k} text_height={text_height}"
+            );
+            assert!((text_height - expected.texts[0].height).abs() < EPS);
+
+            // 突き出し（ext_overshoot_mm × k）ぶん寸法線より外側へ出る補助線の
+            // 最大 y 座標が、尺度どおりに動くことを確認する（寸法線自体の y = offset
+            // は尺度に依存しない）。
+            let max_y = export
+                .drawing
+                .entities()
+                .filter_map(|e| match &e.specific {
+                    EntityType::Line(l) => Some(l.p1.y.max(l.p2.y)),
+                    _ => None,
+                })
+                .fold(f64::MIN, f64::max);
+            let expected_max_y = expected
+                .segments
+                .iter()
+                .flat_map(|s| [s[0].y, s[1].y])
+                .fold(f64::MIN, f64::max);
+            assert!(
+                (max_y - expected_max_y).abs() < EPS,
+                "k={k} max_y={max_y} expected={expected_max_y}"
+            );
+        }
+    }
+
+    /// 寸法の `Style::linetype` に破線を設定しても、export された寸法由来の `LINE` は
+    /// `CONTINUOUS` になる（寸法は製図慣行として常に実線。モジュール doc「寸法由来の
+    /// エンティティは常に実線」参照）。
+    #[test]
+    fn export_dimension_lines_are_always_continuous_even_with_dashed_style() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let mut style = Style::inherited();
+        style.linetype = Some(Linetype::Dashed);
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::new(0.0, 0.0),
+                p2: Point2::new(10.0, 0.0),
+                offset: 5.0,
+                direction: DimDirection::Aligned,
+                annotation: DimAnnotation::default(),
+            }),
+            layer,
+            style,
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+        let line_entities: Vec<_> = export
+            .drawing
+            .entities()
+            .filter(|e| matches!(e.specific, EntityType::Line(_)))
+            .collect();
+        assert!(!line_entities.is_empty());
+        for entity in line_entities {
+            assert_eq!(
+                entity.common.line_type_name.to_ascii_uppercase(),
+                "CONTINUOUS"
+            );
+        }
+    }
+
+    /// M11 タスク72: 矢先の塗り（`SOLID`）は re-import 時に対応する `EntityType` が
+    /// 無いため `ImportSummary::skipped_entities` へ計上される（表の `LINE`/`TEXT`
+    /// とは違う非対称。モジュール doc「DIMENSION の分解 export」「矢先の塗りは
+    /// `SOLID`」節、AGENTS.md「非対称往復を許している経路」参照）。この doc の
+    /// 主張をコードで固定する回帰テスト: export した `SOLID` の枚数と re-import 時の
+    /// `skipped_entities` が一致し、寸法由来の `LINE`/`TEXT` は寸法エンティティへは
+    /// 戻らず通常の Shape/Text として取り込まれることを確認する。
+    #[test]
+    fn reimporting_exported_dimension_skips_only_the_solid_arrow_fills() {
+        let mut doc = Document::new();
+        let mut style = *doc.dim_style();
+        style.arrow_kind = mcad_geom::ArrowKind::ClosedFilled;
+        doc.apply(Command::SetDimStyle(style)).unwrap();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::new(0.0, 0.0),
+                p2: Point2::new(10.0, 0.0),
+                offset: 5.0,
+                direction: DimDirection::Aligned,
+                annotation: DimAnnotation::default(),
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 0);
+        let solid_count = export
+            .drawing
+            .entities()
+            .filter(|e| matches!(e.specific, EntityType::Solid(_)))
+            .count();
+        // `ClosedFilled` は矢1個につき三角形1枚（塗り1枚）。長さ寸法は両端に矢を
+        // 持つので2枚になるはず（ハードコードではなく、この事実自体も検証する）。
+        assert_eq!(solid_count, 2);
+
+        let import = import_dxf(&export.drawing).expect("re-import must succeed");
+        // ハードコードせず、export 側で数えた SOLID 数と突き合わせる。
+        assert_eq!(
+            import.skipped_entities, solid_count,
+            "SOLID の枚数だけ skipped_entities が増えるはず"
+        );
+
+        let entities: Vec<_> = import.document.entities().collect();
+        assert!(!entities.is_empty());
+        assert!(
+            entities.iter().all(|(_, e)| !matches!(
+                e.geom,
+                EntityGeom::DimLinear(_)
+                    | EntityGeom::DimRadial(_)
+                    | EntityGeom::DimDiameter(_)
+                    | EntityGeom::DimAngular(_)
+                    | EntityGeom::DimOrdinate(_)
+            )),
+            "非対称往復: 寸法エンティティへは戻らないはず"
+        );
+        assert!(
+            entities
+                .iter()
+                .any(|(_, e)| matches!(e.geom, EntityGeom::Shape(Shape::Line(_)))),
+            "寸法線・補助線は Shape::Line として取り込まれるはず"
+        );
+        assert!(
+            entities
+                .iter()
+                .any(|(_, e)| matches!(e.geom, EntityGeom::Text(_))),
+            "寸法値は Text として取り込まれるはず"
+        );
     }
 
     /// タスク61: 表（`EntityGeom::Table`、M10）の DXF 分解 export。

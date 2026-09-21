@@ -47,7 +47,7 @@ GUI に関わる変更(ダイアログ・ビューポート・パネル等)は�
 ## 外部クレートの既知の制約
 
 - **`dxf` クレート(0.6.1)**: R2007 ヘッダ固定、ACI 色のみ、レイヤーのロック・重ね順・線幅が保存できない等、**踏んではいけない制約が多数ある**。`crates/mcad-io/src/dxf_file.rs` を触る前に `dxf-constraints` skill を読むこと(実測根拠は同ファイルのモジュール doc)。
-  - **非対称往復を許している経路**: 表(`EntityGeom::Table`)は export 時に罫線 `LINE` とセル `TEXT` へ分解し、import では表に戻さない。`ACAD_TABLE` はクレートに対応する型が無くパーサ側で読み飛ばされるためスキップ件数にも出ない。寸法は export 自体を行わない(import は M11)。図面枠・表題欄は用紙メタを DXF へ載せられないため出力しない。
+  - **非対称往復を許している経路**: 表(`EntityGeom::Table`)は export 時に罫線 `LINE` とセル `TEXT` へ分解し、import では表に戻さない。`ACAD_TABLE` はクレートに対応する型が無くパーサ側で読み飛ばされるためスキップ件数にも出ない。寸法(`DimLinear`/`DimRadial`/`DimDiameter`/`DimAngular`/`DimOrdinate`)も M11 タスク72 で同じ非対称往復になった: export は寸法線・補助線・矢先・文字を `LINE`/`SOLID`/`ARC`/`TEXT` へ分解して書き、import では寸法エンティティへ戻さない。表と違い、矢先の塗りに使う `SOLID` はクレートの `EntityType::Solid` に対応するが `dxf_entity_to_geom` 側が対応しないため、re-import 時に `ImportSummary::skipped_entities` へ計上される(`LINE`/`ARC`/`TEXT` は通常の Shape/Text として取り込まれる)。他 CAD が書いた `DIMENSION` は M11 タスク67・69 で import 済みなので、「mcad が書いた寸法は読み戻せないが、他 CAD が書いた `DIMENSION` は読める」という二重の非対称になる。図面枠・表題欄は用紙メタを DXF へ載せられないため出力しない。
 - **`rfd`(ネイティブダイアログ)**: フレームコールバック内で同期(ブロッキング)呼び出し。MVP としては許容だがプラットフォーム依存の癖があるため、変更時は手動確認する。
 
 ## リポジトリ運用

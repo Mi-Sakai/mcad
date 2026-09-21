@@ -68,13 +68,27 @@ impl IsoFace {
         }
     }
 
-    /// 上部パネル表示用のラベル（ASCII）。
+    /// [`Tool::variant_options`](crate::tool::Tool::variant_options) の選択肢一覧
+    /// （`Tab` 循環の順序 = [`IsoFace::next`] の順序と一致、M11 タスク73）。
+    pub const OPTIONS: [&'static str; 3] = ["Top", "Left", "Right"];
+
+    /// [`Self::OPTIONS`] 内の現在の面の添字。
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn index(self) -> usize {
         match self {
-            IsoFace::Top => "Top",
-            IsoFace::Left => "Left",
-            IsoFace::Right => "Right",
+            IsoFace::Top => 0,
+            IsoFace::Left => 1,
+            IsoFace::Right => 2,
+        }
+    }
+
+    /// [`Self::OPTIONS`] の添字から面を作る。範囲外は `Top`（既定）に倒す。
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            1 => IsoFace::Left,
+            2 => IsoFace::Right,
+            _ => IsoFace::Top,
         }
     }
 

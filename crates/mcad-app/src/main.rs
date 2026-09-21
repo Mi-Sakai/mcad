@@ -28,12 +28,12 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
-    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimExpansion, DimKind, DimLinear,
-    DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom, EntityId, FitClass, Layer,
-    LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize, ProjectionMethod, Rgb, Scale,
-    SheetMeta, SizeTolerance, Style, TableGeom, TextGeom, TitleBlockFields, TitleBlockKind,
+    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimDirection, DimExpansion, DimKind,
+    DimLinear, DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom, EntityId, FitClass,
+    Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize, ProjectionMethod, Rgb,
+    Scale, SheetMeta, SizeTolerance, Style, TableGeom, TextGeom, TitleBlockFields, TitleBlockKind,
     WidthMm, arrow_kind_occupies_line, expand_dim, expand_table, label_box_center,
-    label_box_contains, table_world_aabb,
+    label_box_contains, linear_pick_segments, table_world_aabb,
 };
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
@@ -49,10 +49,10 @@ use frame::{frame_layout, paper_to_world, parse_scale_input};
 use plot::dash_pattern_mm;
 
 use tool::{
-    ArcTool, CircleTool, DimDiameterTool, DimLinearTool, DimRadialTool, DragPreview, ExtendTool,
-    FilletTool, InputEvent, IsoCircleTool, LineTool, OffsetOutcome, PlacementKind,
-    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TableTool,
-    TextTool, Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
+    ArcTool, CircleTool, DIM_DEGENERATE_EPSILON, DimDiameterTool, DimLinearTool, DimRadialTool,
+    DragPreview, ExtAngleInput, ExtendTool, FilletTool, InputEvent, IsoCircleTool, LineTool,
+    OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolylineTool,
+    SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -758,6 +758,14 @@ struct McadApp {
     /// 自体はセッション中保持し、同じ半径での連続フィレットに使い回せる（新規・読込では
     /// [`McadApp::reset_transient_ui_state`] でクリア）。
     fillet_radius_input: String,
+    /// 長さ寸法ツールの補助線傾き入力欄（度、M11 タスク73）。フィレット半径欄と同じ
+    /// 「上部パネルはツール選択中のみ表示・文字列はセッション中保持」の流儀。空欄は
+    /// `ExtAngleInput::Empty`（垂直）、有効な数値は度→ラジアンへ変換した
+    /// `ExtAngleInput::Value`、それ以外は `ExtAngleInput::Invalid`（[`parse_ext_angle_deg`]）。
+    /// フィレット半径欄と違い**不正値をそのまま `None` へ倒さない**（`DimLinearTool` が
+    /// 確定クリックを拒否する。[`tool::ExtAngleInput`] の doc 参照）。新規・読込では
+    /// [`McadApp::reset_transient_ui_state`] でクリアする。
+    ext_angle_input: String,
     /// Text ツールの文字列入力欄（M6 タスク23）。アンカー確定後に上部パネルへ表示し、
     /// Enter で `AddEntity` 確定。CJK（IME 入力）可。確定・キャンセルのたびにクリアする。
     text_content_input: String,
@@ -835,6 +843,21 @@ struct McadApp {
     dim_decimals_input_error: Option<String>,
     /// 表示値上書き(非比例寸法)の入力欄。
     dim_value_override_input: String,
+    /// 右パネル「寸法」の長さ寸法専用セクション（M11 タスク73）が「どの選択集合を
+    /// 対象に開いているか」。`dim_edit_target` と同じ「選択が変わったら入力欄一式を
+    /// 再同期する」流儀だが、対象が `DimLinear` のみに絞られているため別に持つ。
+    dim_linear_edit_target: Vec<EntityId>,
+    /// 向きコンボで「任意角」を選んでいる（度の入力欄+「確定」を表示中）か。
+    /// `dim_tol_editing` と同じ「明示編集フラグが選択中の共通値に優先する」流儀。
+    dim_dir_editing: bool,
+    /// 向き（任意角）の度入力欄。
+    dim_dir_angle_input: String,
+    /// 向き入力の直近の拒否理由（インライン赤字表示用）。
+    dim_dir_input_error: Option<String>,
+    /// 補助線の傾き（度）の入力欄。空欄で確定すると `ext_angle: None`（垂直）に戻す。
+    dim_ext_angle_edit_input: String,
+    /// 補助線の傾き入力の直近の拒否理由。
+    dim_ext_angle_edit_input_error: Option<String>,
     /// 寸法スタイルダイアログの作業コピー。`Some` の間はモーダルが開いている
     /// (表題欄編集ダイアログと同じ流儀。M9タスク50-3)。
     dim_style_dialog: Option<DimStyleDialogState>,
@@ -1061,6 +1084,7 @@ impl McadApp {
             pending_recent_path: None,
             offset_distance_input: String::new(),
             fillet_radius_input: String::new(),
+            ext_angle_input: String::new(),
             text_content_input: String::new(),
             text_height_input: DEFAULT_TEXT_HEIGHT.to_owned(),
             text_field_shown: false,
@@ -1081,6 +1105,12 @@ impl McadApp {
             dim_decimals_input: String::new(),
             dim_decimals_input_error: None,
             dim_value_override_input: String::new(),
+            dim_linear_edit_target: Vec::new(),
+            dim_dir_editing: false,
+            dim_dir_angle_input: String::new(),
+            dim_dir_input_error: None,
+            dim_ext_angle_edit_input: String::new(),
+            dim_ext_angle_edit_input_error: None,
             dim_style_dialog: None,
             table_dialog: None,
         };
@@ -1119,6 +1149,7 @@ impl McadApp {
         // 読込前の距離・半径入力は持ち越さない（別図面では意味が変わるため）。
         self.offset_distance_input.clear();
         self.fillet_radius_input.clear();
+        self.ext_angle_input.clear();
         // Text 入力欄も初期化する（文字列はクリア、高さは既定へ戻す）。
         self.text_content_input.clear();
         self.text_height_input = DEFAULT_TEXT_HEIGHT.to_owned();
@@ -1144,6 +1175,13 @@ impl McadApp {
         self.dim_decimals_input_error = None;
         self.dim_value_override_input.clear();
         self.dim_style_dialog = None;
+        // 長さ寸法の向き・補助線の傾き編集中状態（M11 タスク73）も別図面へ持ち越さない。
+        self.dim_linear_edit_target.clear();
+        self.dim_dir_editing = false;
+        self.dim_dir_angle_input.clear();
+        self.dim_dir_input_error = None;
+        self.dim_ext_angle_edit_input.clear();
+        self.dim_ext_angle_edit_input_error = None;
         // 表編集ダイアログも別図面へ持ち越さない。
         self.table_dialog = None;
     }
@@ -1169,6 +1207,8 @@ impl McadApp {
         // 残り、「確定」で undo を打ち消す新コマンドになる（M9 タスク50 Codex 指摘）。
         // 対象集合を空にして、次フレームの `sync_dim_edit_state` に再同期させる。
         self.dim_edit_target.clear();
+        // 長さ寸法の向き・補助線の傾き欄（M11 タスク73）も同じ理由で再同期させる。
+        self.dim_linear_edit_target.clear();
         // 表編集ダイアログの対象が undo/redo で消えた（または表以外に変わった）場合は
         // ダイアログを閉じる。開いたままだと OK 時に存在しない ID への
         // `ModifyEntity` を試みて失敗するか、無関係のエンティティを書き換えかねない。
@@ -2076,9 +2116,10 @@ impl eframe::App for McadApp {
             self.persist_config(now);
         }
 
-        // Tab で作図ツール固有の選択肢を循環する（現在はアイソメ円ツールの面
-        // Top/Left/Right。DESIGN.md 7章「アイソメ図・アクソメ図の作図補助」設計確定1・5）。
-        // 循環する選択肢を持つツール（[`Tool::variant_label`] が `Some`）がアクティブな
+        // Tab で作図ツール固有の選択肢を循環する（アイソメ円ツールの面
+        // Top/Left/Right、長さ寸法ツールの向き Aligned/Horizontal/Vertical。
+        // DESIGN.md 7章「アイソメ図・アクソメ図の作図補助」設計確定1・5、M11 タスク73）。
+        // 循環する選択肢を持つツール（[`Tool::variant_options`] が `Some`）がアクティブな
         // ときだけ Tab を横取りし、それ以外では egui 本来のフォーカス移動キーのまま残す。
         // テキスト欄フォーカス中・モーダル表示中の抑止は他のショートカットと同じゲート。
         //
@@ -2093,7 +2134,7 @@ impl eframe::App for McadApp {
             && self
                 .tool
                 .as_ref()
-                .is_some_and(|t| t.variant_label().is_some())
+                .is_some_and(|t| t.variant_options().is_some())
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab))
         {
             ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
@@ -2102,6 +2143,7 @@ impl eframe::App for McadApp {
             let ctx = ToolCtx {
                 layer: resolve_tool_layer(&self.document, self.tool_kind),
                 style: Style::inherited(),
+                ortho_enabled: self.config.ortho_enabled,
             };
             if let Some(active) = self.tool.as_mut() {
                 let _ = active.on_input(&ctx, InputEvent::Cycle);
@@ -2209,12 +2251,41 @@ impl eframe::App for McadApp {
                         );
                         ui.separator();
                     }
-                    // アイソメ円ツールの現在の面（Top/Left/Right）。ツール本体が持つ状態
-                    // なので `Tool::variant_label()` で取り出す（ツール選択中のみ表示）。
-                    // Tab キーで循環できることを併記する（凡例はツールキーのみ載せる方針で、
-                    // ツール固有のキーはこの文脈表示側で案内する）。
-                    if let Some(face) = self.tool.as_ref().and_then(|t| t.variant_label()) {
-                        ui.label(format!("Iso face: {face} (Tab)"));
+                    // 循環する選択肢を持つツールの現在値（アイソメ円ツールの面
+                    // Top/Left/Right、長さ寸法ツールの向き Aligned/Horizontal/Vertical）。
+                    // ツール本体が持つ状態なので `Tool::variant_options()` で取り出す
+                    // （ツール選択中のみ表示）。`Tab` キーで循環できることも併記し、
+                    // コンボボックスからも選べるようにする（DESIGN.md M11 タスク73）。
+                    if let Some(opts) = self.tool.as_ref().and_then(|t| t.variant_options()) {
+                        ui.label(format!("{}:", opts.heading));
+                        let mut selected = opts.current;
+                        egui::ComboBox::from_id_salt(("variant_options_combo", opts.heading))
+                            .selected_text(opts.options[opts.current])
+                            .show_ui(ui, |ui| {
+                                for (index, label) in opts.options.iter().enumerate() {
+                                    ui.selectable_value(&mut selected, index, *label);
+                                }
+                            });
+                        if selected != opts.current
+                            && let Some(active) = self.tool.as_mut()
+                        {
+                            active.set_variant(selected);
+                        }
+                        ui.label("(Tab)");
+                        ui.separator();
+                    }
+                    // 長さ寸法ツールの補助線傾き入力欄（度、M11 タスク78 の UI、
+                    // タスク73）。作図時はここ、既存寸法は右パネル「寸法」で指定する。
+                    // 空欄 = 垂直（`ext_angle: None`）。フィレット半径欄と同じ「ツール中のみ
+                    // 上部パネルへ表示・文字列はセッション中保持」の流儀。
+                    if self.tool_kind == ToolKind::DimLinear {
+                        ui.label("Ext angle:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ext_angle_input)
+                                .desired_width(48.0)
+                                .hint_text("perp"),
+                        );
+                        ui.label("deg");
                         ui.separator();
                     }
                     // Text ツールの文字列・高さ入力欄（M6 タスク23）。アンカー確定後のみ表示し、
@@ -2299,6 +2370,19 @@ impl eframe::App for McadApp {
                 &mut self.dim_decimals_input,
                 &mut self.dim_decimals_input_error,
                 &mut self.dim_value_override_input,
+                &mut self.status,
+                now,
+            );
+            dim_linear_panel(
+                ui,
+                &mut self.document,
+                self.select_tool.selection(),
+                &mut self.dim_linear_edit_target,
+                &mut self.dim_dir_editing,
+                &mut self.dim_dir_angle_input,
+                &mut self.dim_dir_input_error,
+                &mut self.dim_ext_angle_edit_input,
+                &mut self.dim_ext_angle_edit_input_error,
                 &mut self.status,
                 now,
             );
@@ -2403,6 +2487,7 @@ impl eframe::App for McadApp {
                         &mut self.status,
                         now,
                         parse_fillet_radius(&self.fillet_radius_input),
+                        parse_ext_angle_deg(&self.ext_angle_input),
                     );
                 }
             }
@@ -3049,6 +3134,7 @@ fn handle_tool_input(
     status: &mut Option<StatusMessage>,
     now: f64,
     fillet_radius: Option<f64>,
+    ext_angle_input: ExtAngleInput,
 ) {
     let Some(active) = tool.as_mut() else {
         return;
@@ -3058,6 +3144,8 @@ fn handle_tool_input(
     // ヒットテストと同時に確定するため、確定判断を行うツール側が値を持っている必要がある
     // （[`Tool::set_radius_input`] の doc 参照）。他ツールでは既定実装の no-op。
     active.set_radius_input(fillet_radius);
+    // 長さ寸法ツールの補助線傾き欄（M11 タスク73）。他ツールでは既定実装の no-op。
+    active.set_ext_angle_input(ext_angle_input);
 
     // ピック許容量（ワールド）。半径寸法ツールの円/円弧ヒットテスト（画面上のピック =
     // ズーム依存）が選択のピック許容量と揃うようにする。寸法の退化判定はこれとは別に
@@ -3067,6 +3155,7 @@ fn handle_tool_input(
     let ctx = ToolCtx {
         layer: resolve_tool_layer(document, *tool_kind),
         style: Style::inherited(),
+        ortho_enabled,
     };
 
     // スナップ用パラメータ（探索半径・グリッド間隔）。半径はピック許容量と同じ考え方で
@@ -4634,6 +4723,374 @@ fn dim_panel(
     }
 }
 
+// ---------------------------------------------------------------------
+// 右パネル「寸法」: 長さ寸法（DimLinear）の向き・補助線の傾き（M11 タスク73）
+// ---------------------------------------------------------------------
+
+/// 長さ寸法の向きの分類（右パネル「寸法」の向きコンボ表示用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinearDirKindUi {
+    Aligned,
+    Horizontal,
+    Vertical,
+    Oblique,
+}
+
+/// [`LinearDirKindUi`] 分類の許容値（ラジアン）。度の入力欄を経由した往復
+/// （度→ラジアン→度）で生じる浮動小数点誤差を吸収できれば十分な小ささにする。
+/// [`DimDirection::Rotated`] の θ は正規化しない値なので、判定は
+/// `θ mod π` を 0（水平）・π/2（鉛直）の 2 点と比較する（[`classify_linear_direction`]）。
+const LINEAR_DIR_CLASSIFY_EPS: f64 = 1e-9;
+
+/// [`DimLinear::direction`] を右パネルのコンボ4択（整列/水平/鉛直/任意角）へ分類する。
+///
+/// `Rotated(θ)` は `θ mod π` が 0 に近ければ水平、π/2 に近ければ鉛直、それ以外は
+/// 任意角（許容値は [`LINEAR_DIR_CLASSIFY_EPS`]）。`DimLinearTool` が作る水平・鉛直
+/// （`Rotated(0.0)` / `Rotated(FRAC_PI_2)`）はもちろん、右パネルで打った任意角が
+/// たまたま 0°/90° と一致した場合も同じ扱いになる（データとしては区別しない。
+/// [`DimDirection::Rotated`] の doc が言う「絶対角なので正規化しない」の帰結）。
+fn classify_linear_direction(direction: DimDirection) -> LinearDirKindUi {
+    match direction {
+        DimDirection::Aligned => LinearDirKindUi::Aligned,
+        DimDirection::Rotated(theta) => {
+            let m = theta.rem_euclid(std::f64::consts::PI);
+            let dist_to_horizontal = m.min(std::f64::consts::PI - m);
+            if dist_to_horizontal <= LINEAR_DIR_CLASSIFY_EPS {
+                LinearDirKindUi::Horizontal
+            } else if (m - std::f64::consts::FRAC_PI_2).abs() <= LINEAR_DIR_CLASSIFY_EPS {
+                LinearDirKindUi::Vertical
+            } else {
+                LinearDirKindUi::Oblique
+            }
+        }
+        // `DimDirection` は `#[non_exhaustive]`（将来の向き指定に備える設計。
+        // entity_geom.rs の doc 参照）。既知の2択（整列/回転）のどちらでもない値は
+        // コンボの4択のどれにも安全に対応しないため、コンボ操作を無効化する側
+        // （「任意角」= 数値入力を経由する編集欄）へ倒す。現状は到達しない。
+        _ => LinearDirKindUi::Oblique,
+    }
+}
+
+fn linear_dir_kind_label(kind: LinearDirKindUi) -> &'static str {
+    match kind {
+        LinearDirKindUi::Aligned => "整列",
+        LinearDirKindUi::Horizontal => "水平",
+        LinearDirKindUi::Vertical => "鉛直",
+        LinearDirKindUi::Oblique => "任意角",
+    }
+}
+
+/// 向き変更の前後で**寸法線の中点を保つ**よう `offset` を再計算する
+/// （M11 タスク73、DESIGN.md 実装時追記）。新しい向きが定まらない
+/// （[`DimDirection::unit_vector`] が `None`）、または現在の寸法線骨格が
+/// 取れない（[`linear_pick_segments`] が空、極端な退化）場合は `None`。
+fn linear_offset_preserving_midpoint(dim: &DimLinear, new_direction: DimDirection) -> Option<f64> {
+    let new_dir = new_direction.unit_vector(dim.p1, dim.p2)?;
+    let seg = linear_pick_segments(dim).into_iter().next()?;
+    let m = seg[0].midpoint(seg[1]);
+    Some((m - dim.p1).dot(new_dir.perp()))
+}
+
+/// 選択中の [`DimLinear`] 全件へ向き変更を適用する `Command::ModifyEntity` 一式を組む。
+///
+/// **投影長が退化する変更が1件でもあれば `Err` を返し、コマンドは1つも作らない**
+/// （M11 タスク73 の完了条件。既存の記号・公差編集 [`build_annotation_edit_commands`]
+/// は1件ずつスキップして残りを続行するのに対し、こちらは向きの変更が寸法の意味
+/// そのもの（`offset`・投影長）を変える操作であり、一部だけ適用すると選択内で
+/// 向きが食い違ったまま部分的に変わってしまうため、全件同じ向きへ揃うか・
+/// 何も変わらないかの二択にする）。
+fn build_linear_direction_edit_commands(
+    linear_live: &[(EntityId, DimLinear)],
+    new_direction: DimDirection,
+) -> Result<Vec<Command>, String> {
+    let mut commands = Vec::new();
+    for (id, dim) in linear_live {
+        if dim.direction == new_direction {
+            continue;
+        }
+        let Some(new_offset) = linear_offset_preserving_midpoint(dim, new_direction) else {
+            return Err("向きが定まらない寸法が含まれています".to_string());
+        };
+        let new_dim = DimLinear {
+            direction: new_direction,
+            offset: new_offset,
+            ..dim.clone()
+        };
+        if new_dim.measured_value().abs() <= DIM_DEGENERATE_EPSILON {
+            return Err("投影長がゼロになる寸法が含まれています".to_string());
+        }
+        commands.push(Command::ModifyEntity {
+            id: *id,
+            new_geom: EntityGeom::DimLinear(new_dim),
+        });
+    }
+    Ok(commands)
+}
+
+/// 選択中の [`DimLinear`] 全件へ補助線の傾き（[`DimLinear::ext_angle`]）を一括変更する
+/// `Command::ModifyEntity` 一式を組む。傾きは表示値・寸法線位置を動かさない
+/// （DESIGN.md M11 設計判断6）ため、[`build_linear_direction_edit_commands`] と違い
+/// 退化チェックは要らない。
+fn build_linear_ext_angle_edit_commands(
+    linear_live: &[(EntityId, DimLinear)],
+    new_ext_angle: Option<f64>,
+) -> Vec<Command> {
+    linear_live
+        .iter()
+        .filter(|(_, dim)| dim.ext_angle != new_ext_angle)
+        .map(|(id, dim)| {
+            let new_dim = DimLinear {
+                ext_angle: new_ext_angle,
+                ..dim.clone()
+            };
+            Command::ModifyEntity {
+                id: *id,
+                new_geom: EntityGeom::DimLinear(new_dim),
+            }
+        })
+        .collect()
+}
+
+/// 選択中の DimLinear ID 集合が変わっていたら、向き・補助線の傾きの入力欄一式を
+/// 再同期する（`sync_dim_edit_state` と同じ「選択が変わった」検知の流儀。戻り値は
+/// 再同期したか）。
+fn sync_dim_linear_edit_state(
+    edit_target: &mut Vec<EntityId>,
+    linear_live: &[(EntityId, DimLinear)],
+    dir_editing: &mut bool,
+    dir_angle_input: &mut String,
+    dir_input_error: &mut Option<String>,
+    ext_angle_input: &mut String,
+    ext_angle_input_error: &mut Option<String>,
+) -> bool {
+    let mut current_ids: Vec<EntityId> = linear_live.iter().map(|(id, _)| *id).collect();
+    current_ids.sort();
+    if *edit_target == current_ids {
+        return false;
+    }
+    *edit_target = current_ids;
+
+    *dir_editing = false;
+    dir_angle_input.clear();
+    *dir_input_error = None;
+    ext_angle_input.clear();
+    *ext_angle_input_error = None;
+
+    // 向きが全件一致し、かつ任意角なら度で編集欄を開いた状態にして埋める。
+    if let Some(DimDirection::Rotated(theta)) =
+        all_same(linear_live.iter().map(|(_, d)| d.direction))
+        && classify_linear_direction(DimDirection::Rotated(theta)) == LinearDirKindUi::Oblique
+    {
+        *dir_editing = true;
+        *dir_angle_input = format!("{}", theta.to_degrees());
+    }
+    // 補助線の傾きが全件一致すれば度で埋める（`None` 一致＝空欄のままでよい）。
+    if let Some(Some(theta)) = all_same(linear_live.iter().map(|(_, d)| d.ext_angle)) {
+        *ext_angle_input = format!("{}", theta.to_degrees());
+    }
+    true
+}
+
+/// 右パネル「寸法」内の、長さ寸法（[`DimLinear`]）専用セクション（M11 タスク73）。
+/// 選択に `DimLinear` が1件以上含まれるときだけ表示する（他種別は無視）。
+/// [`dim_panel`] と対になるが別関数にしてあるのは、向き・傾きが `DimLinear` 固有の
+/// フィールド（`DimAnnotation` の外）であり、`dim_panel` が扱う「全寸法種別に共通の
+/// 注記編集」（[`build_annotation_edit_commands`]）の型に乗らないため。
+#[allow(clippy::too_many_arguments)]
+fn dim_linear_panel(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    selection: &[EntityId],
+    edit_target: &mut Vec<EntityId>,
+    dir_editing: &mut bool,
+    dir_angle_input: &mut String,
+    dir_input_error: &mut Option<String>,
+    ext_angle_input: &mut String,
+    ext_angle_input_error: &mut Option<String>,
+    status: &mut Option<StatusMessage>,
+    now: f64,
+) {
+    let linear_live: Vec<(EntityId, DimLinear)> = selection
+        .iter()
+        .filter_map(|&id| {
+            let entity = document.entity(id)?;
+            match &entity.geom {
+                EntityGeom::DimLinear(d) => Some((id, d.clone())),
+                _ => None,
+            }
+        })
+        .collect();
+
+    sync_dim_linear_edit_state(
+        edit_target,
+        &linear_live,
+        dir_editing,
+        dir_angle_input,
+        dir_input_error,
+        ext_angle_input,
+        ext_angle_input_error,
+    );
+
+    if linear_live.is_empty() {
+        return;
+    }
+
+    // --- 向き: 整列/水平/鉛直/任意角 ---
+    let kind_common = all_same(
+        linear_live
+            .iter()
+            .map(|(_, d)| classify_linear_direction(d.direction)),
+    );
+    ui.horizontal(|ui| {
+        ui.label("向き:");
+        let selected_text = if *dir_editing {
+            linear_dir_kind_label(LinearDirKindUi::Oblique)
+        } else {
+            kind_common.map_or("(混在)", linear_dir_kind_label)
+        };
+        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_linear_direction"))
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for (kind, new_direction) in [
+                    (LinearDirKindUi::Aligned, DimDirection::Aligned),
+                    (LinearDirKindUi::Horizontal, DimDirection::Rotated(0.0)),
+                    (
+                        LinearDirKindUi::Vertical,
+                        DimDirection::Rotated(std::f64::consts::FRAC_PI_2),
+                    ),
+                ] {
+                    if ui
+                        .selectable_label(
+                            !*dir_editing && kind_common == Some(kind),
+                            linear_dir_kind_label(kind),
+                        )
+                        .clicked()
+                    {
+                        match build_linear_direction_edit_commands(&linear_live, new_direction) {
+                            Ok(cmds) => {
+                                if cmds.is_empty() {
+                                    *dir_editing = false;
+                                    *dir_input_error = None;
+                                } else if let Err(err) = document.apply(Command::Batch(cmds)) {
+                                    set_status(
+                                        status,
+                                        now,
+                                        format!("寸法の向きの変更に失敗しました: {err}"),
+                                    );
+                                } else {
+                                    *dir_editing = false;
+                                    *dir_input_error = None;
+                                }
+                            }
+                            Err(err) => {
+                                set_status(
+                                    status,
+                                    now,
+                                    format!("寸法の向きの変更に失敗しました: {err}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                if ui
+                    .selectable_label(
+                        *dir_editing || kind_common == Some(LinearDirKindUi::Oblique),
+                        linear_dir_kind_label(LinearDirKindUi::Oblique),
+                    )
+                    .clicked()
+                {
+                    *dir_editing = true;
+                    *dir_input_error = None;
+                    if dir_angle_input.is_empty()
+                        && let Some(DimDirection::Rotated(theta)) =
+                            all_same(linear_live.iter().map(|(_, d)| d.direction))
+                    {
+                        *dir_angle_input = format!("{}", theta.to_degrees());
+                    }
+                }
+            });
+    });
+    if *dir_editing {
+        ui.horizontal(|ui| {
+            ui.label("角度:");
+            ui.add(egui::TextEdit::singleline(dir_angle_input).desired_width(64.0));
+            ui.label("度");
+            if ui.button("確定").clicked() {
+                match dir_angle_input.trim().parse::<f64>() {
+                    Ok(deg) if deg.is_finite() => {
+                        let new_direction = DimDirection::Rotated(deg.to_radians());
+                        match build_linear_direction_edit_commands(&linear_live, new_direction) {
+                            Ok(cmds) if cmds.is_empty() => {
+                                *dir_input_error = None;
+                            }
+                            Ok(cmds) => match document.apply(Command::Batch(cmds)) {
+                                Ok(_) => *dir_input_error = None,
+                                Err(err) => *dir_input_error = Some(err.to_string()),
+                            },
+                            Err(err) => {
+                                *dir_input_error = Some(err);
+                            }
+                        }
+                    }
+                    _ => {
+                        *dir_input_error = Some("角度は数値で入力してください".to_string());
+                    }
+                }
+            }
+        });
+        if let Some(err) = dir_input_error {
+            ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+        }
+    }
+
+    // --- 補助線の傾き: 空欄で確定 = 垂直に戻す ---
+    let ext_common = all_same(linear_live.iter().map(|(_, d)| d.ext_angle));
+    ui.horizontal(|ui| {
+        ui.label("補助線の傾き:");
+        ui.add(
+            egui::TextEdit::singleline(ext_angle_input)
+                .desired_width(64.0)
+                .hint_text(if ext_common.is_none() { "(混在)" } else { "" }),
+        );
+        ui.label("度");
+        if ui.button("確定").clicked() {
+            let trimmed = ext_angle_input.trim();
+            if trimmed.is_empty() {
+                let cmds = build_linear_ext_angle_edit_commands(&linear_live, None);
+                if cmds.is_empty() {
+                    *ext_angle_input_error = None;
+                } else if let Err(err) = document.apply(Command::Batch(cmds)) {
+                    *ext_angle_input_error = Some(err.to_string());
+                } else {
+                    *ext_angle_input_error = None;
+                }
+            } else {
+                match trimmed.parse::<f64>() {
+                    Ok(deg) if deg.is_finite() => {
+                        let cmds = build_linear_ext_angle_edit_commands(
+                            &linear_live,
+                            Some(deg.to_radians()),
+                        );
+                        if cmds.is_empty() {
+                            *ext_angle_input_error = None;
+                        } else if let Err(err) = document.apply(Command::Batch(cmds)) {
+                            *ext_angle_input_error = Some(err.to_string());
+                        } else {
+                            *ext_angle_input_error = None;
+                        }
+                    }
+                    _ => {
+                        *ext_angle_input_error = Some("角度は数値で入力してください".to_string());
+                    }
+                }
+            }
+        }
+    });
+    if let Some(err) = ext_angle_input_error {
+        ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+    }
+}
+
 /// 用紙サイズの日本語ラベル（右パネルの用紙コンボ専用）。
 ///
 /// `frame::` 側の欄文字用ラベル（横は "A4"、縦は "A4 縦" と向きを合成する）とは
@@ -5747,6 +6204,25 @@ fn parse_text_height(text: &str) -> Option<f64> {
 /// 「Fillet: enter a radius」として拒否する（半径にはフォールバックが無い）。
 fn parse_fillet_radius(text: &str) -> Option<f64> {
     parse_positive_length(text)
+}
+
+/// 長さ寸法ツールの補助線傾き欄（度）を解析する（M11 タスク73）。フィレット半径欄の
+/// [`parse_positive_length`] と違い、空欄・有効値・不正値の 3 状態を区別する必要がある
+/// （[`ExtAngleInput`] の doc 参照 — 不正値は `None`（垂直）へ黙って倒さず確定を拒否する）。
+///
+/// **度→ラジアンの変換はこの UI 境界に閉じる。** DESIGN.md M11-0(2)「core・app は度を
+/// 一切扱わない」はデータとして保存・計算される角度（`DimLinear::ext_angle` 等）の契約で、
+/// 入力欄の文字列解析・表示側の変換はその外側（境界そのもの）にあたるためこの関数は
+/// 契約に反しない（DESIGN.md タスク73 実装時追記）。
+fn parse_ext_angle_deg(text: &str) -> ExtAngleInput {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return ExtAngleInput::Empty;
+    }
+    match trimmed.parse::<f64>() {
+        Ok(deg) if deg.is_finite() => ExtAngleInput::Value(deg.to_radians()),
+        _ => ExtAngleInput::Invalid,
+    }
 }
 
 /// 長さ系の数値入力欄（オフセット距離・テキスト高さ・フィレット半径）に共通の解析。
@@ -9700,6 +10176,196 @@ mod tests {
             panic!("expected DimLinear");
         };
         assert_eq!(dim.annotation.symbol, Some(DimSymbol::Diameter));
+    }
+
+    // -----------------------------------------------------------------
+    // 右パネル「寸法」: 長さ寸法の向き・補助線の傾き（M11 タスク73）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_linear_direction_covers_all_four_kinds() {
+        assert_eq!(
+            classify_linear_direction(DimDirection::Aligned),
+            LinearDirKindUi::Aligned
+        );
+        assert_eq!(
+            classify_linear_direction(DimDirection::Rotated(0.0)),
+            LinearDirKindUi::Horizontal
+        );
+        assert_eq!(
+            classify_linear_direction(DimDirection::Rotated(std::f64::consts::PI)),
+            LinearDirKindUi::Horizontal
+        );
+        assert_eq!(
+            classify_linear_direction(DimDirection::Rotated(std::f64::consts::FRAC_PI_2)),
+            LinearDirKindUi::Vertical
+        );
+        assert_eq!(
+            classify_linear_direction(DimDirection::Rotated(3.0 * std::f64::consts::FRAC_PI_2)),
+            LinearDirKindUi::Vertical
+        );
+        assert_eq!(
+            classify_linear_direction(DimDirection::Rotated(std::f64::consts::FRAC_PI_4)),
+            LinearDirKindUi::Oblique
+        );
+        // 度→ラジアン往復（右パネルの入力欄が経由する変換）の誤差程度は許容する。
+        assert_eq!(
+            classify_linear_direction(DimDirection::Rotated(90.0_f64.to_radians())),
+            LinearDirKindUi::Vertical
+        );
+    }
+
+    #[test]
+    fn classify_linear_direction_all_same_detects_mixed_kinds() {
+        // 混在時の表示判定（`dim_linear_panel` の「(混在)」表示が使う `all_same`）。
+        let mixed = [LinearDirKindUi::Aligned, LinearDirKindUi::Horizontal];
+        assert_eq!(all_same(mixed.into_iter()), None);
+        let same = [LinearDirKindUi::Horizontal, LinearDirKindUi::Horizontal];
+        assert_eq!(
+            all_same(same.into_iter()),
+            Some(LinearDirKindUi::Horizontal)
+        );
+    }
+
+    #[test]
+    fn linear_offset_preserving_midpoint_keeps_dimension_line_through_old_midpoint() {
+        let old = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(6.0, 8.0),
+            offset: 3.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        };
+        let seg = linear_pick_segments(&old).into_iter().next().unwrap();
+        let m = seg[0].midpoint(seg[1]);
+
+        let new_direction = DimDirection::Rotated(0.0);
+        let new_offset = linear_offset_preserving_midpoint(&old, new_direction).unwrap();
+        let new_dim = DimLinear {
+            direction: new_direction,
+            offset: new_offset,
+            ..old.clone()
+        };
+        let new_seg = linear_pick_segments(&new_dim).into_iter().next().unwrap();
+        // 新しい寸法線（直線）が旧中点 m を通ることを、m から直線への垂直距離が
+        // ほぼ 0 であることで確認する（`linear_offset_preserving_midpoint` の doc）。
+        let dir = (new_seg[1] - new_seg[0]).normalize().unwrap();
+        let normal = dir.perp();
+        let dist = (m - new_seg[0]).dot(normal);
+        assert!(dist.abs() < 1e-9, "dist={dist}");
+    }
+
+    #[test]
+    fn build_linear_direction_edit_commands_skips_when_direction_unchanged() {
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document);
+        let EntityGeom::DimLinear(dim) = document.entity(id).unwrap().geom.clone() else {
+            panic!("expected DimLinear");
+        };
+        let live = vec![(id, dim)];
+        let cmds = build_linear_direction_edit_commands(&live, DimDirection::Aligned).unwrap();
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn build_linear_direction_edit_commands_builds_modify_entity_for_valid_change() {
+        let mut document = Document::new();
+        // p1(0,0)→p2(10,0)（水平な計測線）・offset 5・整列。
+        let id = add_test_dim_linear(&mut document);
+        let EntityGeom::DimLinear(dim) = document.entity(id).unwrap().geom.clone() else {
+            panic!("expected DimLinear");
+        };
+        let live = vec![(id, dim)];
+        let cmds = build_linear_direction_edit_commands(&live, DimDirection::Rotated(0.0)).unwrap();
+        assert_eq!(cmds.len(), 1);
+        document.apply(Command::Batch(cmds)).unwrap();
+        let EntityGeom::DimLinear(new_dim) = &document.entity(id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(new_dim.direction, DimDirection::Rotated(0.0));
+        // 計測線がもともと水平（p1→p2 が x 方向のみ）なので、水平寸法線との
+        // 向きは一致し offset は変わらない。
+        assert!((new_dim.offset - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_linear_direction_edit_commands_rejects_batch_when_any_result_is_degenerate() {
+        let mut document = Document::new();
+        // p1(0,0)→p2(10,0): 鉛直向きへ変えると投影長 0（退化）。
+        let degenerate_id = add_test_dim_linear(&mut document);
+        let EntityGeom::DimLinear(degenerate_dim) =
+            document.entity(degenerate_id).unwrap().geom.clone()
+        else {
+            panic!("expected DimLinear");
+        };
+        // もう1件は鉛直向きへ変えても退化しない（計測線が鉛直）。
+        let layer = document.current_layer();
+        let ok_id = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(0.0, 0.0),
+                    p2: Point2::new(0.0, 10.0),
+                    offset: 2.0,
+                    direction: DimDirection::Aligned,
+                    ext_angle: None,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let EntityGeom::DimLinear(ok_dim) = document.entity(ok_id).unwrap().geom.clone() else {
+            panic!("expected DimLinear");
+        };
+        let live = vec![(degenerate_id, degenerate_dim), (ok_id, ok_dim)];
+
+        // 1 件でも退化するなら、退化しない側も含めて Batch は作らない
+        // （DESIGN.md M11 タスク73 実装時追記の完了条件）。
+        let result = build_linear_direction_edit_commands(
+            &live,
+            DimDirection::Rotated(std::f64::consts::FRAC_PI_2),
+        );
+        assert!(result.is_err());
+
+        // ドキュメントは触られていない。
+        let EntityGeom::DimLinear(unchanged) = &document.entity(degenerate_id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(unchanged.direction, DimDirection::Aligned);
+    }
+
+    #[test]
+    fn build_linear_ext_angle_edit_commands_skips_noop_and_builds_for_change() {
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document); // ext_angle: None
+        let EntityGeom::DimLinear(dim) = document.entity(id).unwrap().geom.clone() else {
+            panic!("expected DimLinear");
+        };
+        let live = vec![(id, dim)];
+
+        // None → None はコマンドを作らない。
+        assert!(build_linear_ext_angle_edit_commands(&live, None).is_empty());
+
+        // None → Some は 1 件の ModifyEntity。
+        let cmds = build_linear_ext_angle_edit_commands(&live, Some(0.5));
+        assert_eq!(cmds.len(), 1);
+        document.apply(Command::Batch(cmds)).unwrap();
+        let EntityGeom::DimLinear(new_dim) = &document.entity(id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(new_dim.ext_angle, Some(0.5));
+
+        // 空欄で確定（None）に戻すと再び 1 件の ModifyEntity。
+        let live = vec![(id, new_dim.clone())];
+        let cmds = build_linear_ext_angle_edit_commands(&live, None);
+        assert_eq!(cmds.len(), 1);
+        document.apply(Command::Batch(cmds)).unwrap();
+        let EntityGeom::DimLinear(reverted) = &document.entity(id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(reverted.ext_angle, None);
     }
 
     // -----------------------------------------------------------------

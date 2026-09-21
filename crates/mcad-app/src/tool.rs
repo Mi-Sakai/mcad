@@ -71,6 +71,25 @@ pub struct ToolCtx {
     pub layer: LayerId,
     /// 新規エンティティのスタイル（通常 `Style::inherited()`）。
     pub style: Style,
+    /// 直交モード（F8、`config.ortho_enabled`）が有効か（M11 タスク73）。
+    ///
+    /// [`Tool::ortho_origin`] が担う「クリック位置そのものを直前の点からの軸拘束へ
+    /// 吸着させる」既存の ortho とは別経路。[`DimLinearTool`] は**クリック位置は
+    /// 動かさず**、向きが `Aligned` のときだけ確定する `DimDirection` を計測 2 点の
+    /// 角度に近い軸（0°/90°）へ倒す（DESIGN.md タスク73 の UX 確定）ために、この
+    /// フラグを `on_input`/`draw_preview` へ渡す必要がある。
+    ///
+    /// # なぜ [`Tool::set_radius_input`] と同型の専用拡張点ではなく `ToolCtx` に置くか
+    ///
+    /// `set_radius_input` はフィレットツール 1 種類だけが使う「app 層の入力欄→ツール」
+    /// の値渡しで、`on_input` 呼び出しとは非同期（別メソッド・別フレームタイミング）に
+    /// 毎フレーム流し込む設計だった。一方 ortho は `handle_tool_input`/Tab 横取りの
+    /// どちらの経路でも `ToolCtx` を都度組み立てて `on_input` へ渡しており、
+    /// 「入力を処理するたびに常に要る値」という点で `layer`/`style` と性質が同じ
+    /// （新規エンティティの所属先・スタイルも同様に毎回同じ経路で流れる）。将来
+    /// ortho を使うツールが増えても `ToolCtx` に載せるだけで済み、専用拡張点を
+    /// ツールの数だけ増やさずに済む。
+    pub ortho_enabled: bool,
 }
 
 /// 形状・方向が数学的に成立するかを判定する、スケール非依存の幾何許容値（ワールド単位）。
@@ -81,7 +100,10 @@ pub struct ToolCtx {
 /// `AUTO_CLOSE_EPSILON` と同じ考え方）。長さ寸法の p1≈p2、半径寸法・直径寸法の
 /// 引出クリック＝中心、[`IsoCircleTool`] の半径 0 の 3 者で共有する（値も判定の意味も
 /// 同じなので、別名の定数を増やさない）。
-const DIM_DEGENERATE_EPSILON: f64 = 1e-9;
+///
+/// `pub(crate)`: 右パネル「寸法」（M11 タスク73、`main.rs` の向き変更 UI）が
+/// 既存寸法の向き変更後の投影長ゼロ判定に同じ許容値を使うため。
+pub(crate) const DIM_DEGENERATE_EPSILON: f64 = 1e-9;
 
 /// 半径寸法ツールの 1 クリック目で拾った円／円弧の採取値（中心・半径）。
 ///
@@ -376,15 +398,69 @@ pub trait Tool {
     /// 拡張点。app 層は毎フレーム呼ぶので、ツール側は最後に渡された値だけを保持すればよい。
     fn set_radius_input(&mut self, _radius: Option<f64>) {}
 
-    /// `Tab`（[`InputEvent::Cycle`]）で循環するツール固有の選択肢の現在値を、上部パネルへ
-    /// 表示するための ASCII ラベル。既定は `None`（循環する選択肢を持たない）。
+    /// app 層が持つ数値入力欄（[`DimLinearTool`] の補助線傾き欄、度→ラジアン変換済み）を
+    /// ツールへ渡す（M11 タスク73）。既定は何もしない。
     ///
-    /// [`Tool::pending_text_anchor`] と同じ「ツールの状態を app 層へ 1 点だけ見せる」
-    /// 向きの拡張点。現在の利用者は [`IsoCircleTool`] の面（`Top`/`Left`/`Right`）のみで、
-    /// app 層は `Box<dyn Tool>` からツール型を知らずに現在の面を表示できる。
-    fn variant_label(&self) -> Option<&'static str> {
+    /// [`Tool::set_radius_input`] と同型の拡張点だが、こちらは「空欄」「有効な角度」
+    /// 「不正な文字列」の 3 状態を区別する必要がある（[`ExtAngleInput`] の doc 参照）。
+    /// 空欄はそのまま `ext_angle: None` に落とせるが、不正値は `None` へ黙って倒さず
+    /// 確定クリックを拒否する（DESIGN.md M11 タスク73 実装時追記）。
+    fn set_ext_angle_input(&mut self, _input: ExtAngleInput) {}
+
+    /// `Tab`（[`InputEvent::Cycle`]）で循環するツール固有の選択肢の現在状態を、上部パネルへ
+    /// 表示するための情報。既定は `None`（循環する選択肢を持たない）。
+    ///
+    /// [`Tool::pending_text_anchor`] と同じ「ツールの状態を app 層へ見せる」向きの
+    /// 拡張点。利用者は [`IsoCircleTool`] の面（`Top`/`Left`/`Right`）と
+    /// [`DimLinearTool`] の向き（`Aligned`/`Horizontal`/`Vertical`）。app 層は
+    /// `Box<dyn Tool>` からツール型を知らずに、コンボボックスと "(Tab)" 表示を
+    /// 組み立てられる（[`VariantOptions`] の doc 参照）。
+    fn variant_options(&self) -> Option<VariantOptions> {
         None
     }
+
+    /// [`Tool::variant_options`] が返した選択肢のうち `index` 番目へ、上部パネルの
+    /// コンボボックス選択を書き戻す。既定は何もしない（循環する選択肢を持たないツール、
+    /// および `Tab` 循環のみで選ぶツールでは呼ばれない）。`index` が範囲外なら無視する。
+    fn set_variant(&mut self, _index: usize) {}
+}
+
+/// [`Tool::variant_options`] が返す、循環する選択肢を持つツールの現在状態
+/// （M11 タスク73）。
+///
+/// 上部パネルは `Box<dyn Tool>` からツールの具体型を知らないので、「見出し・選択肢の
+/// ラベル一覧・現在選ばれている添字」の 3 つだけを受け取り、ComboBox + "(Tab)" 表示を
+/// 組み立てる（[`IsoCircleTool`] の面表示 "Iso face: {face} (Tab)" を一般化したもの）。
+/// 上部パネルは英語領域（AGENTS.md 日本語化規約）なので `heading`/`options` はいずれも
+/// ASCII。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantOptions {
+    /// 上部パネルに出す見出し（例: "Iso face"、"Dim dir"）。
+    pub heading: &'static str,
+    /// 選択肢のラベル一覧（表示順 = `Tab` 循環の順序）。
+    pub options: &'static [&'static str],
+    /// 現在選ばれている `options` 内の添字。
+    pub current: usize,
+}
+
+/// 上部パネルの補助線傾き欄（度）を解析した結果（M11 タスク73）。
+///
+/// フィレット半径欄（[`Tool::set_radius_input`]、正の有限値のみ `Some`・それ以外は
+/// `None`）と違い、こちらは「空欄」と「不正な文字列」を区別する必要がある。
+/// [`DimLinear::ext_angle`](mcad_core::DimLinear::ext_angle) は「空欄 = 垂直
+/// （`None`）」という意味を持つ既定値なので、空欄をそのまま確定できる一方、
+/// 不正な文字列（非数値・非有限）を黙って空欄と同じ扱いにすると、ユーザーが打ち間違えた
+/// 値がそのまま「垂直」として確定してしまう。そこで不正値は確定クリックそのものを
+/// 拒否する（[`ToolResult::Rejected`]）ための専用状態を持つ。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum ExtAngleInput {
+    /// 空欄。確定すると `ext_angle: None`（寸法線に垂直）。
+    #[default]
+    Empty,
+    /// 有効な角度（度→ラジアン変換済み。絶対角・CCW・+x 軸基準）。
+    Value(f64),
+    /// 非数値・非有限などの不正な文字列。確定クリックは拒否する。
+    Invalid,
 }
 
 // ---------------------------------------------------------------------
@@ -942,8 +1018,16 @@ impl Tool for IsoCircleTool {
         }
     }
 
-    fn variant_label(&self) -> Option<&'static str> {
-        Some(self.face.label())
+    fn variant_options(&self) -> Option<VariantOptions> {
+        Some(VariantOptions {
+            heading: "Iso face",
+            options: &IsoFace::OPTIONS,
+            current: self.face.index(),
+        })
+    }
+
+    fn set_variant(&mut self, index: usize) {
+        self.face = IsoFace::from_index(index);
     }
 }
 
@@ -1147,11 +1231,104 @@ impl Tool for TextTool {
 // 長さ寸法（DimLinear）
 // ---------------------------------------------------------------------
 
-/// カーソル位置 `cursor` から計測線（`p1`→`p2`）への符号付きオフセットを求める
-/// （寸法線の位置決め用）。法線 `n = dir.perp()` 方向の投影量。計測 2 点がほぼ同一で
-/// 方向が定まらない場合は 0。
-fn linear_offset(p1: Point2, p2: Point2, cursor: Point2) -> f64 {
-    match (p2 - p1).normalize() {
+/// 長さ寸法ツール（`D`）の向き（M11 タスク73）。`Tab`（[`InputEvent::Cycle`]）で
+/// 整列 → 水平 → 鉛直 → 整列と循環する（DESIGN.md タスク73 の UX 確定）。
+///
+/// **任意角はここに含めない**。任意角は循環に入れず、右パネル「寸法」で既存の
+/// [`DimLinear`] の向きを変えるときだけ指定する（作図時に任意角を打つ操作は無い）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum LinearDirMode {
+    /// 整列寸法（計測 2 点を結ぶ向き。[`DimDirection::Aligned`]）。既定。直交モード
+    /// （F8）が有効なときだけ、計測 2 点の角度に近い軸へ自動で倒れる
+    /// （[`resolve_linear_direction`]）。
+    #[default]
+    Aligned,
+    /// 水平（[`DimDirection::Rotated`]`(0.0)`）。明示選択中は ortho を無視する。
+    Horizontal,
+    /// 鉛直（[`DimDirection::Rotated`]`(π/2)`）。明示選択中は ortho を無視する。
+    Vertical,
+}
+
+impl LinearDirMode {
+    /// [`Tool::variant_options`] の選択肢一覧（`Tab` 循環の順序と一致）。
+    const OPTIONS: [&'static str; 3] = ["Aligned", "Horizontal", "Vertical"];
+
+    /// `Tab` 循環の次の値（整列 → 水平 → 鉛直 → 整列）。
+    fn next(self) -> Self {
+        match self {
+            LinearDirMode::Aligned => LinearDirMode::Horizontal,
+            LinearDirMode::Horizontal => LinearDirMode::Vertical,
+            LinearDirMode::Vertical => LinearDirMode::Aligned,
+        }
+    }
+
+    /// [`Self::OPTIONS`] 内の現在の添字。
+    fn index(self) -> usize {
+        match self {
+            LinearDirMode::Aligned => 0,
+            LinearDirMode::Horizontal => 1,
+            LinearDirMode::Vertical => 2,
+        }
+    }
+
+    /// [`Self::OPTIONS`] の添字から向きを作る。範囲外は `Aligned`（既定）に倒す。
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => LinearDirMode::Horizontal,
+            2 => LinearDirMode::Vertical,
+            _ => LinearDirMode::Aligned,
+        }
+    }
+}
+
+/// 現在の向きモード・直交モード・計測 2 点から、確定する [`DimDirection`] を求める
+/// （M11 タスク73）。
+///
+/// `p2` はまだ寸法線位置クリック前（`WaitingLine` 到達後）なら確定済みの値、
+/// `WaitingP2` 中の暫定プレビューならカーソル位置を渡す想定（呼び出し側が選ぶ）。
+///
+/// - [`LinearDirMode::Horizontal`] / [`LinearDirMode::Vertical`] は ortho の有無に
+///   かかわらずそのまま確定する（明示選択は ortho より優先。DESIGN.md タスク73 の
+///   UX 確定）。
+/// - [`LinearDirMode::Aligned`] かつ `ortho_enabled` なら、`p1 → p2` の角度が近い方の
+///   軸（`|dx| >= |dy|` なら水平、それ以外は鉛直）へ倒す。グリッドがアイソメでも
+///   0°/90° のまま（等測軸へは倒さない。タスク73 の仕様どおり）。
+/// - [`LinearDirMode::Aligned`] かつ ortho 無効なら [`DimDirection::Aligned`] のまま
+///   （既存の整列寸法と完全に同じ）。
+fn resolve_linear_direction(
+    mode: LinearDirMode,
+    p1: Point2,
+    p2: Point2,
+    ortho_enabled: bool,
+) -> DimDirection {
+    match mode {
+        LinearDirMode::Horizontal => DimDirection::Rotated(0.0),
+        LinearDirMode::Vertical => DimDirection::Rotated(std::f64::consts::FRAC_PI_2),
+        LinearDirMode::Aligned => {
+            if ortho_enabled {
+                let dx = (p2.x - p1.x).abs();
+                let dy = (p2.y - p1.y).abs();
+                if dx >= dy {
+                    DimDirection::Rotated(0.0)
+                } else {
+                    DimDirection::Rotated(std::f64::consts::FRAC_PI_2)
+                }
+            } else {
+                DimDirection::Aligned
+            }
+        }
+    }
+}
+
+/// カーソル位置 `cursor` から寸法線までの符号付きオフセットを求める（寸法線の位置決め
+/// 用）。法線は `direction` が決める向き（[`DimDirection::unit_vector`]）の
+/// `perp()` 方向。向きが定まらない場合は 0。
+///
+/// M11 タスク73 で `direction` 引数を足して一般化した（従来は計測線 `(p2 − p1)`
+/// 基準に固定していた）。**[`DimDirection::Aligned`] では従来と同値**（`unit_vector`
+/// が `normalize(p2 − p1)` を返すため）。
+fn linear_offset(direction: DimDirection, p1: Point2, p2: Point2, cursor: Point2) -> f64 {
+    match direction.unit_vector(p1, p2) {
         Some(dir) => (cursor - p1).dot(dir.perp()),
         None => 0.0,
     }
@@ -1174,17 +1351,45 @@ enum DimLinearState {
 /// 3 クリック状態機械。2 クリック目以降はカーソル追従プレビュー。p1≈p2（スケール非依存の
 /// 幾何許容値 [`DIM_DEGENERATE_EPSILON`] 内）は `Rejected` で理由を返し、2 クリック目を
 /// 待ち続ける（退化したゼロ長寸法を作らない）。
+///
+/// # 向き（M11 タスク73）
+///
+/// [`LinearDirMode`] をツール本体に持ち、`spawn()` のたびに [`LinearDirMode::Aligned`]
+/// へ戻る（[`IsoCircleTool`] が `face` を持つのと同じ設計理由）。`Tab`
+/// （[`InputEvent::Cycle`]）と上部パネルのコンボ（[`Tool::set_variant`]）の両方から
+/// 変更でき、どの状態（p1/p2/寸法線位置待ち）でも受け付ける。
+///
+/// # 補助線の傾き（M11 タスク78 の UI、タスク73）
+///
+/// 上部パネルの角度欄（度）の解析結果を [`Tool::set_ext_angle_input`] で毎フレーム
+/// 受け取り、`ext_angle_input` に保持する。`ExtAngleInput::Invalid`（不正な文字列）は
+/// 確定クリックを [`ToolResult::Rejected`] にする（黙って `None` へ倒さない）。
 #[derive(Debug, Default)]
 pub struct DimLinearTool {
     state: DimLinearState,
     cursor: Option<Point2>,
+    dir_mode: LinearDirMode,
+    /// 補助線の傾き入力（上部パネル、[`Tool::set_ext_angle_input`] で毎フレーム更新）。
+    ext_angle_input: ExtAngleInput,
+    /// 直近の [`ToolCtx::ortho_enabled`]（`on_input` のたびに更新。`draw_preview` は
+    /// `ToolCtx` を受け取らないため、プレビューで向きを解決するのに必要）。
+    ortho_enabled: bool,
 }
 
 impl Tool for DimLinearTool {
     fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        // プレビュー描画（`ToolCtx` を受け取らない）が ortho 込みの向きを再現できる
+        // よう、毎フレーム最新値を保持する。
+        self.ortho_enabled = ctx.ortho_enabled;
         match ev {
             InputEvent::Move(p) => {
                 self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            // 向きの循環はどの状態でも受け付ける（p1/p2/寸法線位置待ちのいずれでも
+            // Tab で切り替えられる。DESIGN.md タスク73 の UX 確定）。
+            InputEvent::Cycle => {
+                self.dir_mode = self.dir_mode.next();
                 ToolResult::Continue
             }
             InputEvent::Click(p) => match self.state {
@@ -1204,21 +1409,37 @@ impl Tool for DimLinearTool {
                     }
                 }
                 DimLinearState::WaitingLine(p1, p2) => {
-                    let offset = linear_offset(p1, p2, p);
+                    // 不正な角度入力は黙って `None`（垂直）へ倒さず確定を拒否する
+                    // （[`ExtAngleInput`] の doc 参照）。状態は据え置き、角度欄を
+                    // 直してから再クリックできるようにする。
+                    let ext_angle = match self.ext_angle_input {
+                        ExtAngleInput::Invalid => {
+                            return ToolResult::Rejected("Linear dim: ext angle is invalid");
+                        }
+                        ExtAngleInput::Empty => None,
+                        ExtAngleInput::Value(rad) => Some(rad),
+                    };
+                    let direction =
+                        resolve_linear_direction(self.dir_mode, p1, p2, ctx.ortho_enabled);
+                    let offset = linear_offset(direction, p1, p2, p);
+                    let dim = DimLinear {
+                        p1,
+                        p2,
+                        offset,
+                        direction,
+                        ext_angle,
+                        // 作図直後は無注記（記号・公差は右パネルで後付けする）。
+                        annotation: DimAnnotation::default(),
+                    };
+                    // 投影長ゼロ（例: 水平指定で縦に並んだ 2 点）は退化した寸法になる
+                    // ため拒否する。判定はここ（寸法線位置クリック時）でよい —
+                    // それより前に Tab で向きを変えられるため、退化するかどうかは
+                    // 最終的な向きが決まるこの時点でしか判断できない。
+                    if dim.measured_value().abs() <= DIM_DEGENERATE_EPSILON {
+                        return ToolResult::Rejected("Linear dim: projected length is zero");
+                    }
                     let cmd = Command::AddEntity(Entity::new(
-                        EntityGeom::DimLinear(DimLinear {
-                            p1,
-                            p2,
-                            offset,
-                            // 長さ寸法ツールは現状**整列寸法だけ**を作る。向き
-                            // （水平/鉛直/任意角）の切替 UI は M11 タスク73。
-                            direction: DimDirection::Aligned,
-                            // 補助線は寸法線に垂直（M11 タスク78 の既定）。作図時に
-                            // 傾きを指定する UI も M11 タスク73。
-                            ext_angle: None,
-                            // 作図直後は無注記（記号・公差は右パネルで後付けする）。
-                            annotation: DimAnnotation::default(),
-                        }),
+                        EntityGeom::DimLinear(dim),
                         ctx.layer,
                         ctx.style,
                     ));
@@ -1230,7 +1451,7 @@ impl Tool for DimLinearTool {
                 self.state = DimLinearState::WaitingP1;
                 ToolResult::Cancel
             }
-            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
+            InputEvent::Confirm => ToolResult::Continue,
         }
     }
 
@@ -1255,14 +1476,20 @@ impl Tool for DimLinearTool {
                 );
             }
             // 寸法線位置待ち: カーソルで決まる offset の寸法を丸ごとプレビューする。
+            // 向き（ortho 込み）・補助線の傾きとも、確定時と同じ解決関数を通す。
             (DimLinearState::WaitingLine(p1, p2), Some(cursor)) => {
-                let offset = linear_offset(p1, p2, cursor);
+                let direction = resolve_linear_direction(self.dir_mode, p1, p2, self.ortho_enabled);
+                let offset = linear_offset(direction, p1, p2, cursor);
+                let ext_angle = match self.ext_angle_input {
+                    ExtAngleInput::Value(rad) => Some(rad),
+                    ExtAngleInput::Empty | ExtAngleInput::Invalid => None,
+                };
                 let dim = DimLinear {
                     p1,
                     p2,
                     offset,
-                    direction: DimDirection::Aligned,
-                    ext_angle: None,
+                    direction,
+                    ext_angle,
                     annotation: DimAnnotation::default(),
                 };
                 let ex = expand_linear(&dim, render);
@@ -1278,6 +1505,22 @@ impl Tool for DimLinearTool {
             DimLinearState::WaitingP2(p1) => vec![p1],
             DimLinearState::WaitingLine(p1, p2) => vec![p1, p2],
         }
+    }
+
+    fn set_ext_angle_input(&mut self, input: ExtAngleInput) {
+        self.ext_angle_input = input;
+    }
+
+    fn variant_options(&self) -> Option<VariantOptions> {
+        Some(VariantOptions {
+            heading: "Dim dir",
+            options: &LinearDirMode::OPTIONS,
+            current: self.dir_mode.index(),
+        })
+    }
+
+    fn set_variant(&mut self, index: usize) {
+        self.dir_mode = LinearDirMode::from_index(index);
     }
 }
 
@@ -3097,6 +3340,7 @@ mod tests {
         let ctx = ToolCtx {
             layer: doc.current_layer(),
             style: Style::inherited(),
+            ortho_enabled: false,
         };
         (doc, ctx)
     }
@@ -3349,6 +3593,12 @@ mod tests {
 
     // --- アイソメ円ツール（IsoCircle、v0.9.x 番号外 アイソメ-3）---
 
+    /// [`Tool::variant_options`] から現在選ばれているラベルだけを取り出す
+    /// （テスト用ヘルパー。旧 `Tool::variant_label` 相当）。
+    fn variant_label(tool: &dyn Tool) -> Option<&'static str> {
+        tool.variant_options().map(|o| o.options[o.current])
+    }
+
     /// `Commit` から 4 円弧を取り出す（`Batch(AddEntity × 4)` を前提に検証する）。
     fn iso_arcs_of(result: ToolResult, ctx: &ToolCtx) -> Vec<Arc> {
         match result {
@@ -3430,19 +3680,19 @@ mod tests {
         let (_doc, ctx) = ctx();
         let mut tool = IsoCircleTool::default();
         // 既定は Top。Tab で Top → Left → Right → Top。
-        assert_eq!(tool.variant_label(), Some("Top"));
+        assert_eq!(variant_label(&tool), Some("Top"));
         assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
-        assert_eq!(tool.variant_label(), Some("Left"));
+        assert_eq!(variant_label(&tool), Some("Left"));
         tool.on_input(&ctx, InputEvent::Cycle);
-        assert_eq!(tool.variant_label(), Some("Right"));
+        assert_eq!(variant_label(&tool), Some("Right"));
         tool.on_input(&ctx, InputEvent::Cycle);
-        assert_eq!(tool.variant_label(), Some("Top"));
+        assert_eq!(variant_label(&tool), Some("Top"));
 
         // 中心確定後（プレビュー中）の切替が確定形状に反映される。
         let center = Point2::new(-4.0, 0.5);
         tool.on_input(&ctx, InputEvent::Click(center));
         tool.on_input(&ctx, InputEvent::Cycle);
-        assert_eq!(tool.variant_label(), Some("Left"));
+        assert_eq!(variant_label(&tool), Some("Left"));
         let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(-4.0, 2.5)));
         let arcs = iso_arcs_of(result, &ctx);
         assert_eq!(arcs, iso_circle_arcs(IsoFace::Left, center, 2.0).unwrap());
@@ -3480,7 +3730,7 @@ mod tests {
         line.on_input(&ctx, InputEvent::Click(Point2::ORIGIN));
         assert_eq!(line.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
         assert_eq!(line.snap_points(), vec![Point2::ORIGIN]);
-        assert_eq!(line.variant_label(), None);
+        assert_eq!(line.variant_options(), None);
 
         let mut polyline = PolylineTool::default();
         polyline.on_input(&ctx, InputEvent::Click(Point2::ORIGIN));
@@ -5568,6 +5818,197 @@ mod tests {
         // Esc で最初の状態へ戻る（snap 候補も消える）。
         assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
         assert!(tool.snap_points().is_empty());
+    }
+
+    // --- 長さ寸法ツールの向き（M11 タスク73）---
+
+    #[test]
+    fn dim_linear_tool_cycle_works_in_every_state() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        assert_eq!(variant_label(&tool), Some("Aligned"));
+        // WaitingP1 中でも Tab を受け付ける。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+        assert_eq!(variant_label(&tool), Some("Horizontal"));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        // WaitingP2 中でも Tab を受け付ける。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+        assert_eq!(variant_label(&tool), Some("Vertical"));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        // WaitingLine 中でも Tab を受け付ける（整列 → 水平 → 鉛直 → 整列で一周）。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+        assert_eq!(variant_label(&tool), Some("Aligned"));
+    }
+
+    #[test]
+    fn dim_linear_tool_horizontal_and_vertical_confirm_rotated_direction() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 3.0)));
+        tool.on_input(&ctx, InputEvent::Cycle); // Aligned -> Horizontal
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 5.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(dim.direction, DimDirection::Rotated(0.0));
+        // Horizontal の法線は (0,1)。offset = (cursor − p1)・(0,1)。
+        assert!((dim.offset - 5.0).abs() < 1e-9);
+
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 3.0)));
+        tool.on_input(&ctx, InputEvent::Cycle); // Aligned -> Horizontal
+        tool.on_input(&ctx, InputEvent::Cycle); // Horizontal -> Vertical
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(6.0, 1.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(
+            dim.direction,
+            DimDirection::Rotated(std::f64::consts::FRAC_PI_2)
+        );
+        // Vertical の法線は (-1,0)。offset = (cursor − p1)・(-1,0) = -6。
+        assert!((dim.offset - (-6.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dim_linear_tool_aligned_offset_matches_pre_task73_formula() {
+        // Aligned は向きの一般化後も既存の計測線基準オフセットと完全に同値
+        // （`dim_linear_tool_three_clicks_commit` と同じ入力・同じ期待値）。
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(dim.direction, DimDirection::Aligned);
+        assert!((dim.offset - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dim_linear_tool_ortho_snaps_aligned_to_nearest_axis() {
+        let (_doc, mut ctx) = ctx();
+        ctx.ortho_enabled = true;
+        let mut tool = DimLinearTool::default();
+        // |dx|=4 >= |dy|=1 → 水平へ倒す。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 1.0)));
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 5.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(dim.direction, DimDirection::Rotated(0.0));
+
+        // |dx|=1 < |dy|=4 → 鉛直へ倒す。
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 4.0)));
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 1.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(
+            dim.direction,
+            DimDirection::Rotated(std::f64::consts::FRAC_PI_2)
+        );
+    }
+
+    #[test]
+    fn dim_linear_tool_ortho_disabled_keeps_aligned() {
+        let (_doc, ctx) = ctx();
+        assert!(!ctx.ortho_enabled);
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 1.0)));
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 5.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(dim.direction, DimDirection::Aligned);
+    }
+
+    #[test]
+    fn dim_linear_tool_ortho_ignored_when_direction_explicit() {
+        let (_doc, mut ctx) = ctx();
+        ctx.ortho_enabled = true;
+        let mut tool = DimLinearTool::default();
+        // p1→p2 の角度は水平に近い（ortho が Aligned なら Rotated(0.0) を選ぶ配置）が、
+        // 鉛直を明示選択しているので ortho は無視され Rotated(π/2) のまま確定する。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 1.0)));
+        tool.on_input(&ctx, InputEvent::Cycle); // Aligned -> Horizontal
+        tool.on_input(&ctx, InputEvent::Cycle); // Horizontal -> Vertical
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(6.0, 1.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(
+            dim.direction,
+            DimDirection::Rotated(std::f64::consts::FRAC_PI_2)
+        );
+    }
+
+    #[test]
+    fn dim_linear_tool_rejects_zero_projection_and_keeps_waiting_line() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 5.0)));
+        tool.on_input(&ctx, InputEvent::Cycle); // Aligned -> Horizontal
+        // 計測線が鉛直（p1→p2 は y 方向のみ）なので、水平指定では投影長が 0 になる。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(3.0, 2.0))),
+            ToolResult::Rejected("Linear dim: projected length is zero")
+        );
+        // 状態は WaitingLine のまま据え置き。向きを変えれば同じ2点でも確定できる。
+        tool.on_input(&ctx, InputEvent::Cycle); // Horizontal -> Vertical
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(3.0, 2.0))));
+        assert!(matches!(geom, EntityGeom::DimLinear(_)));
+    }
+
+    #[test]
+    fn dim_linear_tool_ext_angle_empty_and_value() {
+        let (_doc, ctx) = ctx();
+        // 未設定（既定）は空欄と同じ扱いで ext_angle: None。
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(dim.ext_angle, None);
+
+        // 有効な角度は度→ラジアン変換済みでそのまま Some へ入る。
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        tool.set_ext_angle_input(ExtAngleInput::Value(std::f64::consts::FRAC_PI_4));
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        let EntityGeom::DimLinear(dim) = geom else {
+            panic!("expected DimLinear, got {geom:?}");
+        };
+        assert_eq!(dim.ext_angle, Some(std::f64::consts::FRAC_PI_4));
+    }
+
+    #[test]
+    fn dim_linear_tool_ext_angle_invalid_rejects_commit_and_keeps_state() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        tool.set_ext_angle_input(ExtAngleInput::Invalid);
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))),
+            ToolResult::Rejected("Linear dim: ext angle is invalid")
+        );
+        // 据え置き：入力を直せば同じ2点・クリックで確定できる。
+        tool.set_ext_angle_input(ExtAngleInput::Empty);
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        assert!(matches!(geom, EntityGeom::DimLinear(_)));
     }
 
     // --- 半径寸法ツール（DimRadial）---

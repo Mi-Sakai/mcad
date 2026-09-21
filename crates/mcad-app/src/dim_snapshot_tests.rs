@@ -145,6 +145,7 @@ fn linear_dimension_snapshot_per_arrow_kind() {
                 p2: Point2::new(100.0, 0.0),
                 offset: 20.0,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             }),
         );
@@ -238,6 +239,7 @@ fn linear_with_annotation(annotation: DimAnnotation) -> Document {
             p2: Point2::new(50.0, 0.0),
             offset: 15.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation,
         }),
     );
@@ -354,6 +356,7 @@ fn annotation_text_rotation_horizontal_on_a_diagonal_dimension_snapshot() {
             p2: Point2::new(40.0, 30.0),
             offset: 10.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 text_rotation: Some(0.0),
                 ..DimAnnotation::default()
@@ -377,6 +380,7 @@ fn linear_dimension_snapshot_at_scale_1_to_2() {
             p2: Point2::new(100.0, 0.0),
             offset: 20.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         }),
     );

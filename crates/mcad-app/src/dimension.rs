@@ -77,6 +77,7 @@ mod tests {
             p2,
             offset,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         }
     }

@@ -931,6 +931,7 @@ mod tests {
                     p2: Point2::new(40.0, 0.0),
                     offset: 10.0,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation: DimAnnotation::default(),
                 }),
             );
@@ -1058,6 +1059,7 @@ mod tests {
                 p2: Point2::new(100.0, 0.0),
                 offset: 10.0,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             };
             add(&mut document, EntityGeom::DimLinear(dim.clone()));
@@ -1123,6 +1125,7 @@ mod tests {
                 p2: Point2::new(100.0, 0.0),
                 offset: 10.0,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             }),
         );
@@ -1352,6 +1355,7 @@ mod tests {
                     p2: Point2::new(40.0, 0.0),
                     offset: 10.0,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation,
                 }),
             );
@@ -1914,6 +1918,7 @@ mod tests {
                 p2: Point2::new(10.0, 0.0),
                 offset: 5.0,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             }),
         );

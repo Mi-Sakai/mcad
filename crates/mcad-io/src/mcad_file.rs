@@ -25,9 +25,9 @@
 //! | 4 | 図面メタデータ `sheet`、レイヤーの `linetype`/`width_mm`、`style` の線幅を px から紙 mm の ByLayer モデルへ（M8） | `dim_style = 既定`（`annotation` は元々 `EntityGeom` の `#[serde(default)]` で無注記に補完される） |
 //! | 5 | 寸法注記（[`mcad_core::DimAnnotation`]）・文書単位の寸法スタイル（`dim_style`）を永続化（M9 タスク48） | `arrow_kind = ClosedFilled`。表（[`EntityGeom::Table`]）は概念自体が無いため、凍結 DTO（[`EntityGeomV5`]）が `Table` タグを拒否する |
 //! | 6 | 汎用テーブル（[`EntityGeom::Table`]、M10）・[`mcad_core::DimStyle::arrow_kind`]（矢先種別。M10 タスク57で `.mcad` へ導入、形状生成は M10 タスク63）を追加 | `direction = Aligned`（凍結 DTO [`DimLinearV6`] が `direction` キーを拒否する） |
-//! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）と、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）を追加。現行 | なし |
+//! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）、長さ寸法の補助線の傾き（`DimLinear::ext_angle`。M11 タスク78）を追加。現行 | なし |
 //!
-//! **v7 は M11-1 の中で 2 度拡張した（タスク68 → 69）が、版は上げていない。**
+//! **v7 は M11-1 の中で 3 度拡張した（タスク68 → 69 → 78）が、版は上げていない。**
 //! タスク68 の v7 は未リリースで、同じマイルストーンの中で版を刻む意味がないため
 //! （DESIGN.md M11-0(3)「M11-1 で 1 回のバージョン上げにまとめる」）。v6 以前の
 //! 凍結 DTO は両方の拡張をまとめて拒否する。
@@ -40,7 +40,7 @@
 //! ```text
 //! v1 → v2 → v3 → v4 → v5 → v6 → v7(= FileDocument)
 //!      ^    ^    ^     ^    ^    ^
-//!      |    |    |     |    |    +-- DimLinearV6 → DimLinear（direction = Aligned）
+//!      |    |    |     |    |    +-- DimLinearV6 → DimLinear（direction = Aligned・ext_angle = None）
 //!      |    |    |     |    +------- EntityGeomV5 → EntityGeomV6（Table は現れない）
 //!      |    |    |     +------------ dim_style = LEGACY_DIM_STYLE
 //!      |    |    +------------------ sheet = 既定、style.width(px) → width_mm
@@ -206,6 +206,28 @@
 //! - 不正値（非有限座標・`arc_radius <= 0`・頂点と一致する角の辺）は
 //!   [`mcad_core::EntityGeom::validate`] が [`IoError::InvalidGeometry`] として
 //!   読込境界で拒否する。
+//!
+//! # 寸法補助線の傾き（v7 へ相乗り・M11 タスク78）
+//!
+//! M11 タスク78 で [`mcad_core::DimLinear`] へ `ext_angle`（補助線の傾き。絶対角・
+//! ラジアン・`None` = 寸法線に垂直）を足した。**ここも版は上げず v7 のスキーマを
+//! 広げる**（理由はタスク69 と同じ。v7 は未リリース）。
+//!
+//! - [`FileEntity::geom`] が現行の [`EntityGeom`] をそのまま serde するので追加の型は
+//!   要らない。`ext_angle` は `#[serde(default, skip_serializing_if = "Option::is_none")]`
+//!   なので、**傾き無し（既定）のファイルはキーごと出ない**。
+//!   これにより、タスク78 より前に保存された v7 ファイル（開発中のもの）も
+//!   `ext_angle` 無しでそのまま読め、書き戻しても内容が増えない
+//!   （`direction` が常に書かれるのとは扱いが違う。あちらは列挙型で `null` に
+//!   相当する状態が無く、既定値も自己記述的に書く価値があるため）。
+//! - **v6 以前は [`DimLinearV6`] の `#[serde(deny_unknown_fields)]` が
+//!   `ext_angle` キーごと拒否する**（`direction` とまったく同じ防御。v6 以前の
+//!   長さ寸法は補助線が寸法線に垂直なものしか持たない、という版数の意味を守る。
+//!   回帰は `v6_file_with_extension_line_angle_is_rejected`）。
+//! - v7 の不正値（非有限の傾き）は [`mcad_core::EntityGeom::validate`] が
+//!   [`IoError::InvalidGeometry`] として読込境界で拒否する（3 境界のうちの 1 つ。
+//!   **範囲は拒否も正規化もしない**のは core と同じ。回帰は
+//!   `v7_file_with_non_finite_extension_line_angle_is_rejected`）。
 
 use std::fs;
 use std::path::Path;
@@ -630,7 +652,8 @@ impl FileDocumentV1 {
     }
 }
 
-/// v7 で [`DimLinear::direction`] が追加される**前**の長さ寸法を表す凍結 DTO
+/// v7 で [`DimLinear::direction`]（M11 タスク68）と `ext_angle`（補助線の傾き。
+/// M11 タスク78）が追加される**前**の長さ寸法を表す凍結 DTO
 /// （後方互換読込専用、v1〜v6 が共有する）。
 ///
 /// # なぜ凍結するか
@@ -650,6 +673,12 @@ impl FileDocumentV1 {
 /// ものは黙って変形せず、拒否して知らせる」方針に揃えた
 /// （回帰は `v6_file_with_dim_direction_is_rejected`）。
 ///
+/// **`ext_angle`（補助線の傾き。M11 タスク78）もこの `deny_unknown_fields` が
+/// そのまま拒否する**（回帰は `v6_file_with_extension_line_angle_is_rejected`）。
+/// 理由は `direction` と同じで、v6 以前の長さ寸法は補助線が寸法線に垂直なものしか
+/// 持たないという版数の意味を守るため。**フィールドを足す必要は無い**ことに注意 —
+/// 拒否は既存の属性から自動的に効く。
+///
 /// フィールドの意味は [`DimLinear`] と同じ。`annotation` の
 /// `#[serde(default)]` も v5 以降の正規ファイルを読むために必要なので残す。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -664,14 +693,16 @@ struct DimLinearV6 {
 
 impl From<DimLinearV6> for DimLinear {
     /// 凍結 DTO を現行の [`DimLinear`] へ変換する（向きは
-    /// [`DimDirection::Aligned`] で補完）。**`Aligned` の展開は M10 までと完全に
-    /// 同一**なので、v6 以前の図面の見た目は変わらない。
+    /// [`DimDirection::Aligned`]、補助線の傾きは `None` = 寸法線に垂直で補完）。
+    /// **`Aligned` かつ傾き無しの展開は M10 までと完全に同一**なので、v6 以前の
+    /// 図面の見た目は変わらない。
     fn from(dim: DimLinearV6) -> Self {
         DimLinear {
             p1: dim.p1,
             p2: dim.p2,
             offset: dim.offset,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: dim.annotation,
         }
     }
@@ -1854,6 +1885,7 @@ mod tests {
                 p2: Point2::new(4.0, 0.0),
                 offset: 1.5,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             })
         );
@@ -1914,6 +1946,7 @@ mod tests {
                 p2: Point2::new(4.0, 0.0),
                 offset: 1.5,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation {
                     symbol: Some(DimSymbol::Diameter),
                     tolerance: Some(SizeTolerance::Fit(FitClass::new("H7").unwrap())),
@@ -1945,6 +1978,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 1.5,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 symbol: Some(DimSymbol::Diameter),
                 tolerance: Some(SizeTolerance::Fit(FitClass::new("H7").unwrap())),
@@ -2353,6 +2387,7 @@ mod tests {
             p2: Point2::new(120.0, 30.0),
             offset: -12.5,
             direction: DimDirection::Rotated(std::f64::consts::FRAC_PI_6),
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         });
         doc.apply(Command::AddEntity(Entity::new(
@@ -2395,6 +2430,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 1.5,
             direction: DimDirection::Rotated(f64::NAN),
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         });
         assert!(matches!(
@@ -2557,6 +2593,7 @@ mod tests {
             p2: Point2::new(10.0, 0.0),
             offset: 2.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 text_rotation: Some(0.4),
                 value_style: mcad_core::ValueStyle::Reference,
@@ -2605,6 +2642,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 1.5,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 text_rotation: Some(f64::NAN),
                 ..DimAnnotation::default()
@@ -2623,6 +2661,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 1.5,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 prefix: Some(String::new()),
                 ..DimAnnotation::default()
@@ -2632,6 +2671,150 @@ mod tests {
             import_document(&file),
             Err(IoError::InvalidGeometry { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // v7（M11 タスク78）: 寸法補助線の傾き（版は上げず v7 へ相乗り）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn v7_round_trip_is_lossless_for_the_extension_line_angle() {
+        let oblique = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(100.0, 20.0),
+            offset: 40.0,
+            direction: DimDirection::Rotated(0.0),
+            // 2π 超（正規化しないことも往復で確かめる）。
+            ext_angle: Some(7.0),
+            annotation: DimAnnotation::default(),
+        });
+        let plain = EntityGeom::DimLinear(DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(10.0, 0.0),
+            offset: 2.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        });
+
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        for geom in [oblique.clone(), plain.clone()] {
+            doc.apply(Command::AddEntity(Entity::new(
+                geom,
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        }
+
+        let exported = export_document(&doc);
+        assert_eq!(
+            exported.version, FORMAT_VERSION,
+            "版は上げない（v7 のまま）"
+        );
+
+        let json = to_json(&doc).unwrap();
+        assert!(
+            json.contains("\"ext_angle\": 7.0"),
+            "傾きの書き出し: {json}"
+        );
+        assert_eq!(
+            json.matches("ext_angle").count(),
+            1,
+            "傾き無し（既定）はキーごと出さない: {json}"
+        );
+
+        let loaded = load(&json).unwrap();
+        assert_eq!(
+            export_document(&loaded),
+            exported,
+            "v7 往復は無損失であるべき"
+        );
+        let geoms: Vec<_> = loaded.entities().map(|(_, e)| e.geom.clone()).collect();
+        assert!(geoms.contains(&oblique), "傾きが往復で変わった: {geoms:?}");
+        assert!(geoms.contains(&plain));
+    }
+
+    #[test]
+    fn v7_file_without_the_extension_line_angle_key_loads_as_none() {
+        // タスク78 より前に保存された v7 ファイル（開発中のもの）が読めること。
+        // `#[serde(default)]` なのでキーが無ければ「傾き無し」になる。
+        let default_style = serde_json::to_string(&DimStyle::default()).unwrap();
+        let json = v5_json(r#"{"num": 1, "den": 1}"#, "0.35", "null", &default_style)
+            .replacen("\"version\": 5", "\"version\": 7", 1)
+            .replace(
+                r#""geom": {"Shape": {"Point": {"x": 0.0, "y": 0.0}}}"#,
+                r#""geom": {"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 4.0, "y": 3.0},
+                    "offset": 1.5, "direction": "Aligned"}}"#,
+            );
+        let doc = load(&json).expect("ext_angle の無い v7 は読めるべき");
+        let (_, entity) = doc.entities().next().unwrap();
+        let EntityGeom::DimLinear(dim) = &entity.geom else {
+            panic!("長さ寸法のはず: {:?}", entity.geom);
+        };
+        assert_eq!(dim.ext_angle, None);
+    }
+
+    #[test]
+    fn v6_file_with_extension_line_angle_is_rejected() {
+        // v6 以前に「補助線の傾き」の概念は無い。凍結 DTO（`DimLinearV6`）の
+        // `deny_unknown_fields` が `direction` と同じようにキーごと拒否する
+        // （黙って無視すると、傾けた補助線が垂直へすり替わった図面を無警告で開く）。
+        const GEOM: &str = r#"{"DimLinear": {"p1": {"x": 0.0, "y": 0.0}, "p2": {"x": 4.0, "y": 0.0},
+            "offset": 1.5, "ext_angle": 0.7853981633974483}}"#;
+        for json in [
+            v6_json_with_dimension(GEOM),
+            v5_json_with_dimension(GEOM),
+            v4_json_with_dimension(GEOM),
+        ] {
+            assert!(
+                matches!(from_json(&json), Err(IoError::Json(_))),
+                "ext_angle を持つ旧版ファイルは拒否されるべき: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn v7_file_with_non_finite_extension_line_angle_is_rejected() {
+        // 3 境界のうち `.mcad` 読込の 1 つ。JSON は非有限を書けないので
+        // `import_document`（DTO を直接受ける公開 API）の境界で確かめる。
+        // **範囲（2π 超）は拒否しない**ことも同時に押さえる。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Shape(Shape::Point(Point2::ORIGIN)),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        let base = export_document(&doc);
+
+        let dim = |theta: f64| {
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::new(0.0, 0.0),
+                p2: Point2::new(4.0, 0.0),
+                offset: 1.5,
+                direction: DimDirection::Aligned,
+                ext_angle: Some(theta),
+                annotation: DimAnnotation::default(),
+            })
+        };
+
+        for bad in [f64::NAN, f64::INFINITY] {
+            let mut file = base.clone();
+            file.entities[0].geom = dim(bad);
+            assert!(
+                matches!(import_document(&file), Err(IoError::InvalidGeometry { .. })),
+                "非有限の傾き {bad} は読込境界で拒否されるべき"
+            );
+        }
+
+        let mut file = base;
+        file.entities[0].geom = dim(12.0);
+        let loaded = import_document(&file).expect("2π 超は正規化も拒否もしない");
+        let (_, entity) = loaded.entities().next().unwrap();
+        assert_eq!(entity.geom, dim(12.0));
     }
 
     #[test]

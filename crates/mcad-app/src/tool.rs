@@ -1213,6 +1213,9 @@ impl Tool for DimLinearTool {
                             // 長さ寸法ツールは現状**整列寸法だけ**を作る。向き
                             // （水平/鉛直/任意角）の切替 UI は M11 タスク73。
                             direction: DimDirection::Aligned,
+                            // 補助線は寸法線に垂直（M11 タスク78 の既定）。作図時に
+                            // 傾きを指定する UI も M11 タスク73。
+                            ext_angle: None,
                             // 作図直後は無注記（記号・公差は右パネルで後付けする）。
                             annotation: DimAnnotation::default(),
                         }),
@@ -1259,6 +1262,7 @@ impl Tool for DimLinearTool {
                     p2,
                     offset,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation: DimAnnotation::default(),
                 };
                 let ex = expand_linear(&dim, render);
@@ -5764,6 +5768,7 @@ mod tests {
                 p2: Point2::new(1.0, 0.0),
                 offset: 0.5,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             }),
             doc.current_layer(),
@@ -6787,6 +6792,7 @@ mod tests {
                     p2: Point2::new(4.0, 0.0),
                     offset: 2.0,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation: DimAnnotation::default(),
                 }),
                 layer,
@@ -6899,6 +6905,7 @@ mod tests {
                     p2: Point2::new(24.0, 0.0),
                     offset: 2.0,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation: DimAnnotation::default(),
                 }),
                 layer,
@@ -6951,6 +6958,7 @@ mod tests {
                     p2: Point2::new(4.0, 0.0),
                     offset: 2.0,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation: DimAnnotation::default(),
                 }),
                 layer,

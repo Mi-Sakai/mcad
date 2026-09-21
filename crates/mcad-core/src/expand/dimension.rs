@@ -17,8 +17,9 @@
 //! [`expand_linear`] / [`expand_radial`] / [`expand_diameter`] が返す [`DimExpansion`] を
 //! 描画（`mcad-app` の `draw_dim_expansion`）とプレビューが共有する。ヒットテスト
 //! （`SelectTool::pick`）は [`linear_distance`] / [`radial_distance`] /
-//! [`diameter_distance`] を使い、**保存データ（p1/p2/offset・center/radius/leader_angle・
-//! center/radius/angle）だけで決まるズーム非依存の線分**への最短距離を返す。
+//! [`diameter_distance`] を使い、**各寸法型の保存フィールドだけで決まるズーム非依存の
+//! 線分**への最短距離を返す（長さ寸法なら p1/p2/offset/direction/ext_angle。
+//! 一覧は各 `*_pick_segments` の doc に置き、ここでは繰り返さない）。
 //! これにより「tol 以内で最も近いものを拾う」という既存の pick 契約へ素直に合流する
 //! （矢印・文字の見かけの大きさに依存しない。M6 タスク23 の Text ヒットテストで得た教訓）。
 //!
@@ -509,12 +510,14 @@ fn expand_straight(
 // 長さ寸法
 // ---------------------------------------------------------------------
 
-/// 長さ寸法の寸法線の骨格（M11 タスク68）。保存データ（p1/p2/offset/direction）
-/// だけで決まり、スタイルにも表示状態にも依存しない。
+/// 長さ寸法の寸法線の骨格（M11 タスク68）。保存データ（p1/p2/offset/direction/
+/// ext_angle）だけで決まり、スタイルにも表示状態にも依存しない。
 pub(crate) struct LinearFrame {
-    /// 寸法線の端点（`p1` を寸法線へ投影した足）。
+    /// 寸法線の端点（`p1` から引いた補助線と寸法線の交点。[`DimLinear::ext_angle`] が
+    /// `None` なら垂線の足）。
     pub(crate) d1: Point2,
-    /// 寸法線の端点（`p2` を寸法線へ投影した足）。
+    /// 寸法線の端点（`p2` から引いた補助線と寸法線の交点。[`DimLinear::ext_angle`] が
+    /// `None` なら垂線の足）。
     pub(crate) d2: Point2,
     /// **描画用**の寸法線方向の単位ベクトル（`(d2 − d1)` の向きに揃えてある）。
     ///
@@ -525,8 +528,117 @@ pub(crate) struct LinearFrame {
     /// 食い違い、揃えないと矢先・寸法線の延長が反転したまま描かれる。`Aligned` は
     /// 元々 `dir ∥ (p2 − p1)` で一致しているため実質変わらない。
     pub(crate) dir: Vec2,
-    /// 表示する測定値（`|d2 − d1|`。[`DimLinear::measured_value`] と同値）。
+    /// 表示する測定値（[`DimLinear::measured_value`] と同値＝寸法線方向への投影長）。
+    ///
+    /// [`DimLinear::ext_angle`] が `None` なら `|d2 − d1|` に一致するが、**傾いた
+    /// 補助線を持つ回転寸法では一致しない**（2 本の補助線が寸法線を切る位置が
+    /// 不揃いにずれるため寸法線だけが伸び縮みする。値は動かさないのが
+    /// DESIGN.md M11 設計判断6）。
     pub(crate) value: f64,
+    /// 補助線を引くか（M11 タスク78）。`false` になるのは
+    /// [`DimLinear::ext_angle`] が `Some` で**交点を採用できなかった**ときだけで
+    /// （条件は [`oblique_feet`]）、そのとき `d1`/`d2` は垂線の足へ倒してある
+    /// （寸法線と値ラベルは描く）。`None`（既定）では常に `true`。
+    ///
+    /// 展開（[`expand_linear`]）と pick（[`linear_pick_segments`]）が同じ判断を
+    /// 共有するためにここへ持つ。
+    pub(crate) draw_ext_lines: bool,
+}
+
+/// 補助線が寸法の大きさに対して伸びてよい最大倍率（M11 タスク78、Codex adversarial
+/// review [medium] 指摘）。
+///
+/// 補助線長 `|s|` が `max(|offset|, |p2 − p1|) * MAX_EXT_LINE_SPAN_RATIO` を超えたら
+/// 交点を採用しない（[`oblique_feet`]）。
+///
+/// # なぜ平行判定（[`mcad_geom::EPS`]）だけでは足りないか
+///
+/// 交点までの距離は `s = (base − m)·n / sin(θ − φ)` で、分母が 0 でなくても
+/// **小さければ座標が発散する**。閾値直上の `sin = 1e-9` と有限な `offset = 1e10` で
+/// 座標は 1e19 に達し、`offset` がもう少し大きければ `f64` の範囲を超えて
+/// `Infinity` になる。`EntityGeom::validate` は `offset` と θ の有限性しか見ないので
+/// この組合せを弾けない。
+///
+/// # なぜ 1000 倍か
+///
+/// **補助線が寸法そのものの 1000 倍の長さになる図面は製図上あり得ない**
+/// （寸法補助線は図形の輪郭から寸法線までを結ぶ短い線である）。この倍率は
+/// 寸法線と補助線のなす角がおよそ **0.057°**（= `asin(1/1000)`）未満であることに
+/// 相当し、そこまで寝た補助線は「平行」と区別する意味がない。
+const MAX_EXT_LINE_SPAN_RATIO: f64 = 1.0e3;
+
+/// 傾けた補助線（[`DimLinear::ext_angle`]、M11 タスク78）で決まる寸法線の 2 端点。
+///
+/// `base` は寸法線が通る点（`p1 + perp(dir) * offset`）、`n` はその法線
+/// （`perp(dir)`）。
+///
+/// `None` を返すのは次のいずれかで、どれも寸法線の端点は**垂線の足**（`ext_angle` が
+/// `None` のときと同じ）へ倒し、補助線を描かない（[`LinearFrame::draw_ext_lines`]）。
+///
+/// - `ext_angle` が `None`（既定。補助線は寸法線に垂直。**この場合だけは補助線を
+///   描く**ので、呼び出し側が `ext_angle.is_none()` で区別する）
+/// - θ が非有限（[`EntityGeom::validate`](crate::EntityGeom::validate) が 3 境界で
+///   弾くが、検証を通っていない値で NaN を撒かないための防御。
+///   [`DimDirection::unit_vector`] と同じ規律）
+/// - 補助線が寸法線と**平行**（交点が出ない。[`oblique_foot`]）
+/// - 交点が遠すぎる（[`MAX_EXT_LINE_SPAN_RATIO`]）／非有限（[`oblique_foot`]）
+/// - `ext_angle` が計測線 `p1 → p2` の傾きと一致する（2 本の補助線が寸法線上の
+///   同じ点で交わり、`d1` と `d2` が一致する。寸法線の長さが 0 になって
+///   矢先 2 つとラベルが同一点に重なる、読めない描画になるため。ここは NaN や
+///   非有限が出るわけではなく（`d1`・`d2` とも有限値）、[`DimDirection::Rotated`]
+///   の投影長 0 を描かない既存の規律と同じ理由で退ける）
+///
+/// # 2 点は「両方採用」か「両方却下」か
+///
+/// 片方の足だけが規模ガードに掛かることはありうるが、その場合も**両方を却下する**。
+/// 片側だけ交点・片側だけ垂線の足にすると、寸法線の長さも向きも「傾けた図」でも
+/// 「垂直の図」でもない中間物になり、[`LinearFrame::value`] との関係も説明できなく
+/// なるため。
+fn oblique_feet(dim: &DimLinear, base: Point2, n: Vec2) -> Option<(Point2, Point2)> {
+    let theta = dim.ext_angle?;
+    if !theta.is_finite() {
+        return None;
+    }
+    let (sin, cos) = theta.sin_cos();
+    let e = Vec2::new(cos, sin);
+    // 補助線長の上限は寸法そのものの大きさを基準にする（座標系のスケールに
+    // 依存しない量にするため。絶対値の閾値だと mm 図面と m 図面で意味が変わる）。
+    let max_span = dim.offset.abs().max((dim.p2 - dim.p1).length()) * MAX_EXT_LINE_SPAN_RATIO;
+    let d1 = oblique_foot(dim.p1, e, base, n, max_span)?;
+    let d2 = oblique_foot(dim.p2, e, base, n, max_span)?;
+    // `ext_angle` が計測線 p1→p2 の傾きと一致すると、2 本の補助線は寸法線上の
+    // 同じ点で交わり d1 == d2 になる（寸法線の長さが 0）。ここは算術破綻では
+    // ない（d1/d2 とも有限）が、長さ 0 の寸法線は矢先とラベルが同一点に重なって
+    // 読めないので、Rotated の投影長 0 を描かない既存の退化経路へ合流させる。
+    if (d2 - d1).length() <= mcad_geom::EPS {
+        return None;
+    }
+    Some((d1, d2))
+}
+
+/// 計測点 `m` を通る向き `e` の直線と、`base` を通る寸法線（法線 `n = perp(dir)`）の交点。
+///
+/// `base + t·dir = m + s·e` を `n` との内積で解くと `dir · n = 0` から
+/// `s = (base − m)·n / (e · n)` になる。
+///
+/// **採用できないときは `None`**（理由は [`oblique_feet`] の doc）。
+///
+/// - 分母 `|e · n| = |sin(θ − φ)|` が [`mcad_geom::EPS`] 以下（寸法線と平行）
+/// - 補助線長 `s` が非有限（桁あふれ。`s.is_finite()` を大小比較より**先に**見るので、
+///   NaN が「比較が false ＝ 合格」へ滑り込むことはない）
+/// - 補助線長 `|s|` が `max_span` を超える（[`MAX_EXT_LINE_SPAN_RATIO`]）
+/// - 交点の座標が非有限（上の 3 つを通っても、極端な入力では桁あふれしうる）
+fn oblique_foot(m: Point2, e: Vec2, base: Point2, n: Vec2, max_span: f64) -> Option<Point2> {
+    let denom = e.dot(n);
+    if denom.abs() <= mcad_geom::EPS {
+        return None;
+    }
+    let s = (base - m).dot(n) / denom;
+    if !s.is_finite() || s.abs() > max_span {
+        return None;
+    }
+    let foot = m + e * s;
+    (foot.x.is_finite() && foot.y.is_finite()).then_some(foot)
 }
 
 /// 長さ寸法の寸法線の骨格を求める（M11 タスク68 で回転寸法へ一般化）。
@@ -545,22 +657,62 @@ pub(crate) struct LinearFrame {
 /// 最終桁が動きうるため、**M10 以前に保存された図面の描画をビット単位で保つ**ために
 /// 閉じた形のまま残す（回帰網は `mcad-app` の寸法スナップショット 29 ケース）。
 ///
+/// # 補助線の傾き（M11 タスク78）
+///
+/// [`DimLinear::ext_angle`] が `Some(θ)` なら、端点は垂線の足ではなく**「計測点を
+/// 通る角度 θ の直線」と寸法線の交点**（[`oblique_feet`]）になる。**寸法線の直線
+/// そのもの（`offset` の意味）は変わらない**し、[`LinearFrame::value`]（表示値）も
+/// 投影長のまま変わらない（DESIGN.md M11 設計判断6）。変わるのは端点だけなので、
+/// 回転寸法では寸法線の長さと表示値が一般に食い違う。
+///
+/// **`ext_angle` が `None` のときは上の閉じた形をそのまま通る**（追加の演算を 1 つも
+/// 挟まない）ので、既定の描画は M11 タスク72 までとビット単位で同一である。
+///
+/// 交点を採用できないとき（寸法線と平行・遠すぎる・非有限。条件は [`oblique_feet`]）は、
+/// 端点を垂線の足へ倒したうえで [`LinearFrame::draw_ext_lines`] を `false` にする
+/// （寸法線と値は描き、補助線だけ描かない）。**この退化はここ 1 箇所で決まる**ので、
+/// 展開・pick・AABB の 3 つは常に同じ判断を見る。
+///
 /// # `None`（描かない）になる条件
 ///
 /// - [`DimDirection::Aligned`] で計測 2 点がほぼ同一（向きが定まらない。M10 までと同じ）
 /// - [`DimDirection::Rotated`] で θ が非有限（向きが定まらない）
 /// - [`DimDirection::Rotated`] で投影長が 0（**寸法線の長さが 0**）。計測 2 点が
 ///   寸法線の法線上に並んだ場合で、値 0 の寸法を描いても読めないため引かない。
+///   **補助線が傾いていても同じ**（傾ければ端点は 1 点へ潰れないが、表示値は
+///   投影長＝0 のままで読めないため）。
 pub(crate) fn linear_frame(dim: &DimLinear) -> Option<LinearFrame> {
     let dir = dim.direction.unit_vector(dim.p1, dim.p2)?;
-    let shift = dir.perp() * dim.offset;
+    let normal = dir.perp();
+    let shift = normal * dim.offset;
+    let base = dim.p1 + shift;
+    // 傾けた補助線で決まる端点（M11 タスク78）。`None` は「傾き指定なし」と
+    // 「交点を採用できない」の両方で、どちらも端点は垂線の足（従来の計算）に
+    // なる。2 つの区別は `draw_ext_lines`（前者だけ補助線を描く）。
+    let oblique = oblique_feet(dim, base, normal);
+    let draw_ext_lines = dim.ext_angle.is_none() || oblique.is_some();
     match dim.direction {
-        DimDirection::Aligned => Some(LinearFrame {
-            d1: dim.p1 + shift,
-            d2: dim.p2 + shift,
-            dir,
-            value: (dim.p2 - dim.p1).length(),
-        }),
+        // 既定（垂直）の 2 経路は M11 タスク72 までの式をそのまま残す（`signum` の
+        // 掛け直しすら挟まない）。傾き付きの 2 経路だけが交点を使う。
+        DimDirection::Aligned => match oblique {
+            None => Some(LinearFrame {
+                d1: dim.p1 + shift,
+                d2: dim.p2 + shift,
+                dir,
+                value: (dim.p2 - dim.p1).length(),
+                draw_ext_lines,
+            }),
+            Some((d1, d2)) => Some(LinearFrame {
+                d1,
+                d2,
+                // `Aligned` は 2 本の補助線が等しくずれる（計測線が寸法線と
+                // 平行なので 2 点の寸法線までの距離が等しい）ため、傾けても
+                // 向きは `dir` のまま・長さも `|p2 − p1|` のまま。
+                dir: drawing_dir(dir, d2 - d1),
+                value: (dim.p2 - dim.p1).length(),
+                draw_ext_lines,
+            }),
+        },
         DimDirection::Rotated(_) => {
             let span = (dim.p2 - dim.p1).dot(dir);
             // 寸法線長 0（投影がつぶれた）は描かない。`Vec2::normalize` と同じ
@@ -569,18 +721,42 @@ pub(crate) fn linear_frame(dim: &DimLinear) -> Option<LinearFrame> {
             if span.abs() <= mcad_geom::EPS {
                 return None;
             }
-            let d1 = dim.p1 + shift;
-            Some(LinearFrame {
-                d1,
-                d2: d1 + dir * span,
-                // 描画用の向きは `(d2 − d1)` へ揃える（`span` が負なら `dir` の逆側）。
-                // `offset` に使った `shift` はこの前で確定済みなので位置決めには
-                // 影響しない。
-                dir: dir * span.signum(),
-                value: span.abs(),
-            })
+            match oblique {
+                None => {
+                    let d1 = dim.p1 + shift;
+                    Some(LinearFrame {
+                        d1,
+                        d2: d1 + dir * span,
+                        // 描画用の向きは `(d2 − d1)` へ揃える（`span` が負なら `dir` の
+                        // 逆側）。`offset` に使った `shift` はこの前で確定済みなので
+                        // 位置決めには影響しない。
+                        dir: dir * span.signum(),
+                        value: span.abs(),
+                        draw_ext_lines,
+                    })
+                }
+                Some((d1, d2)) => Some(LinearFrame {
+                    d1,
+                    d2,
+                    // 傾いた補助線では投影（`span`）の符号と `(d2 − d1)` の符号が
+                    // 食い違いうるので、向きは**実際の寸法線**で決める。
+                    dir: drawing_dir(dir, d2 - d1),
+                    // 表示値は投影長のまま（`|d2 − d1|` ではない）。
+                    value: span.abs(),
+                    draw_ext_lines,
+                }),
+            }
         }
     }
+}
+
+/// [`LinearFrame::dir`]（描画用の向き）を `d1 → d2` の側へ揃える。
+///
+/// `d1_to_d2` が `dir` と同じ側を向いていれば `dir` をそのまま返す
+/// （`dir * 1.0` はビット単位で `dir`）。
+#[inline]
+fn drawing_dir(dir: Vec2, d1_to_d2: Vec2) -> Vec2 {
+    dir * d1_to_d2.dot(dir).signum()
 }
 
 /// [`linear_frame`] が `None`（投影長 0 の `Rotated`、または `Aligned`/`Rotated` で
@@ -600,12 +776,17 @@ pub(crate) fn linear_degenerate_dir_and_point(dim: &DimLinear) -> Option<(Vec2, 
 }
 
 /// 長さ寸法のヒットテスト用線分（寸法線＋補助線 2 本）。矢先・文字の大きさに依らず
-/// 保存データ（p1/p2/offset/direction）だけで決まるため、ズーム非依存で pick から
-/// 使える。退化（[`linear_frame`] が `None`）時は空。
+/// 保存データ（p1/p2/offset/direction/ext_angle）だけで決まるため、ズーム非依存で
+/// pick から使える。退化（[`linear_frame`] が `None`）時は空。
+///
+/// 補助線が傾いている（[`DimLinear::ext_angle`]、M11 タスク78）ときは傾いた線分を
+/// 返し、**寸法線と平行で補助線を描かないときは寸法線だけを返す**（展開が描く線と
+/// 一致させるため。[`LinearFrame::draw_ext_lines`]）。
 #[must_use]
 pub fn linear_pick_segments(dim: &DimLinear) -> Vec<[Point2; 2]> {
     match linear_frame(dim) {
-        Some(f) => vec![[f.d1, f.d2], [dim.p1, f.d1], [dim.p2, f.d2]],
+        Some(f) if f.draw_ext_lines => vec![[f.d1, f.d2], [dim.p1, f.d1], [dim.p2, f.d2]],
+        Some(f) => vec![[f.d1, f.d2]],
         None => Vec::new(),
     }
 }
@@ -624,17 +805,20 @@ pub fn linear_distance(dim: &DimLinear, p: Point2) -> f64 {
 
 /// 長さ寸法を展開する（規定 5-2 3)・5-4 2)・5-4 4)）。
 ///
-/// - 寸法線は `d1`→`d2`（[`linear_frame`]。回転寸法では計測 2 点を投影した足）。
-///   矢は `arrows_point_outward` の判定で内外が決まり、外向きのときは寸法線を
-///   両端へ矢先長ぶん延長する。
+/// - 寸法線は `d1`→`d2`（[`linear_frame`]。回転寸法では計測 2 点を投影した足、
+///   補助線が傾いていれば補助線との交点）。矢は `arrows_point_outward` の判定で
+///   内外が決まり、外向きのときは寸法線を両端へ矢先長ぶん延長する。
 /// - 補助線は計測点から**その足まで** [`DimStyle::ext_gap_mm`] のすきまを空けて始まり、
 ///   寸法線を [`DimStyle::ext_overshoot_mm`] だけ越えて終わる（退化時の扱いは
 ///   `extension_line`）。回転寸法では補助線が計測線と直交しない（寸法線の法線方向へ
 ///   引かれる）が、これは JIS でも一般的な回転寸法の描き方である。
+///   [`DimLinear::ext_angle`]（M11 タスク78）を指定すると、補助線はその絶対角で引かれ、
+///   **寸法線と平行になる指定では補助線を描かない**（寸法線と値ラベルは描く）。
 /// - 値ラベルは寸法線の**上側**へ [`DimStyle::text_gap_mm`] のすきまで置く。
 ///   `offset` の符号では側を変えない（M9 タスク49-2 の意図した可視差）。
-/// - 表示値は**寸法線の 2 端点間の距離**（[`DimLinear::measured_value`]）。
-///   [`DimDirection::Aligned`] では `|p2 − p1|` に一致する。
+/// - 表示値は[`DimLinear::measured_value`]（寸法線方向への投影長）。
+///   [`DimDirection::Aligned`] では `|p2 − p1|` に一致する。**補助線を傾けても
+///   変わらない**（傾けた回転寸法では、寸法線の長さのほうが表示値と食い違う）。
 #[must_use]
 pub fn expand_linear(dim: &DimLinear, render: DimRender<'_>) -> DimExpansion {
     // 退化時も破綻しない骨格へ倒す（通常はツールが p1≈p2 を弾く）。
@@ -642,18 +826,23 @@ pub fn expand_linear(dim: &DimLinear, render: DimRender<'_>) -> DimExpansion {
     //   寸法線を置く。
     // - 向きも決まらない（`Aligned` で p1≈p2 / θ が非有限）: M10 までと同じく
     //   計測 2 点をそのまま使い、向きは +x へ倒す。
+    //
+    // どちらの退化でも補助線は従来どおり引く（`draw_ext_lines: true`）。長さが
+    // すきま以下へ潰れていれば `extension_line` 側が引かないと判断する。
     let frame = linear_frame(dim).unwrap_or_else(|| match linear_degenerate_dir_and_point(dim) {
         Some((dir, d)) => LinearFrame {
             d1: d,
             d2: d,
             dir,
             value: 0.0,
+            draw_ext_lines: true,
         },
         None => LinearFrame {
             d1: dim.p1,
             d2: dim.p2,
             dir: Vec2::new(1.0, 0.0),
             value: (dim.p2 - dim.p1).length(),
+            draw_ext_lines: true,
         },
     });
 
@@ -667,12 +856,14 @@ pub fn expand_linear(dim: &DimLinear, render: DimRender<'_>) -> DimExpansion {
         render,
     );
 
-    let gap = render.paper_mm_to_world(render.style.ext_gap_mm);
-    let overshoot = render.paper_mm_to_world(render.style.ext_overshoot_mm);
-    ex.segments
-        .extend(extension_line(dim.p1, frame.d1, gap, overshoot));
-    ex.segments
-        .extend(extension_line(dim.p2, frame.d2, gap, overshoot));
+    if frame.draw_ext_lines {
+        let gap = render.paper_mm_to_world(render.style.ext_gap_mm);
+        let overshoot = render.paper_mm_to_world(render.style.ext_overshoot_mm);
+        ex.segments
+            .extend(extension_line(dim.p1, frame.d1, gap, overshoot));
+        ex.segments
+            .extend(extension_line(dim.p2, frame.d2, gap, overshoot));
+    }
     ex
 }
 
@@ -1219,7 +1410,7 @@ mod tests {
     use crate::expand::dim_label::{ASCII_CHAR_WIDTH_RATIO, DimLabel, TextRun, layout_dim_label};
     use crate::{DimAnnotation, DimKind, DimStyle, FitClass, SizeTolerance, ValueStyle};
     use mcad_geom::{Aabb, DimSymbol, dim_symbol_glyph};
-    use std::f64::consts::{FRAC_PI_2, PI};
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
     const T: f64 = 1e-9;
 
@@ -1277,6 +1468,7 @@ mod tests {
             p2,
             offset,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         }
     }
@@ -1488,6 +1680,302 @@ mod tests {
         }
     }
 
+    // --- 補助線の傾き（M11 タスク78）---
+
+    /// [`plain_linear`]（整列寸法）に補助線の傾き `ext`（絶対角・ラジアン）を足したもの。
+    fn oblique_linear(p1: Point2, p2: Point2, offset: f64, ext: f64) -> DimLinear {
+        DimLinear {
+            ext_angle: Some(ext),
+            ..plain_linear(p1, p2, offset)
+        }
+    }
+
+    /// 斜辺 (0,0)-(100,20) に付けた**水平**寸法（θ = 0、offset +40 → 寸法線は y = 40）に
+    /// 45 度の補助線を付けたもの。足は「計測点から 45 度に上がって y = 40 に当たる点」
+    /// なので手計算で決まる:
+    ///
+    /// - p1 (0,0) → Δy = 40 なので Δx = 40 → **(40, 40)**
+    /// - p2 (100,20) → Δy = 20 なので Δx = 20 → **(120, 40)**
+    fn oblique_case() -> DimLinear {
+        DimLinear {
+            ext_angle: Some(FRAC_PI_4),
+            ..rotated_linear(Point2::new(0.0, 0.0), Point2::new(100.0, 20.0), 40.0, 0.0)
+        }
+    }
+
+    #[test]
+    fn oblique_extension_lines_put_the_dimension_line_ends_on_the_intersections() {
+        let dim = oblique_case();
+        let segs = linear_pick_segments(&dim);
+        assert_eq!(segs.len(), 3);
+        // 寸法線は 2 つの交点を結ぶ（長さ 80。offset が指す直線 y = 40 は動かない）。
+        assert!(approx(segs[0][0], Point2::new(40.0, 40.0)), "{:?}", segs[0]);
+        assert!(
+            approx(segs[0][1], Point2::new(120.0, 40.0)),
+            "{:?}",
+            segs[0]
+        );
+        // 補助線は計測点から足まで（傾いた線分）。
+        assert!(approx(segs[1][0], Point2::new(0.0, 0.0)));
+        assert!(approx(segs[1][1], Point2::new(40.0, 40.0)));
+        assert!(approx(segs[2][0], Point2::new(100.0, 20.0)));
+        assert!(approx(segs[2][1], Point2::new(120.0, 40.0)));
+        // 表示値は**投影長 100 のまま**（寸法線の長さ 80 ではない）。
+        assert!((dim.measured_value() - 100.0).abs() < T);
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        assert_eq!(contents_of(&ex), vec!["100"]);
+    }
+
+    #[test]
+    fn oblique_expansion_and_pick_share_the_same_frame() {
+        // 展開（描画）と pick が同じ骨格から作られていること。展開の補助線は
+        // すきま・突き出しを足すが、pick の線分と**同一直線上**にある。
+        let dim = oblique_case();
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        let segs = linear_pick_segments(&dim);
+        assert_eq!(
+            ex.segments.len(),
+            3,
+            "寸法線 + 補助線 2 本: {:?}",
+            ex.segments
+        );
+        // 矢は内向き（寸法線長 80 に対してラベルは十分小さい）なので寸法線は骨格そのもの。
+        assert!(approx(ex.segments[0][0], segs[0][0]));
+        assert!(approx(ex.segments[0][1], segs[0][1]));
+        let ext_dir = Vec2::new(FRAC_PI_4.cos(), FRAC_PI_4.sin());
+        for seg in &ex.segments[1..] {
+            let d = (seg[1] - seg[0]).normalize().expect("補助線は退化しない");
+            assert!(
+                d.dot(ext_dir).abs() > 1.0 - 1e-9,
+                "補助線が 45 度を向いていない: {seg:?}"
+            );
+        }
+        // 矢先は寸法線の両端（交点）に立つ。
+        let tips: Vec<Point2> = ex.arrows.iter().map(arrow_tip).collect();
+        assert!(tips.iter().any(|t| approx(*t, Point2::new(40.0, 40.0))));
+        assert!(tips.iter().any(|t| approx(*t, Point2::new(120.0, 40.0))));
+    }
+
+    #[test]
+    fn oblique_aligned_dimension_slides_the_whole_dimension_line() {
+        // 整列寸法は計測線が寸法線と平行 → 2 本の補助線が等しくずれるので、
+        // 寸法線は長さも向きも変えずに丸ごと平行移動する。
+        // (0,0)-(60,0)・offset +30（寸法線 y = 30）に 45 度 → (30,30)-(90,30)。
+        let dim = oblique_linear(
+            Point2::new(0.0, 0.0),
+            Point2::new(60.0, 0.0),
+            30.0,
+            FRAC_PI_4,
+        );
+        let segs = linear_pick_segments(&dim);
+        assert_eq!(segs.len(), 3);
+        assert!(approx(segs[0][0], Point2::new(30.0, 30.0)), "{:?}", segs[0]);
+        assert!(approx(segs[0][1], Point2::new(90.0, 30.0)), "{:?}", segs[0]);
+        assert!((dim.measured_value() - 60.0).abs() < T);
+    }
+
+    #[test]
+    fn extension_lines_parallel_to_the_dimension_line_are_not_drawn() {
+        let p1 = Point2::new(0.0, 0.0);
+        let p2 = Point2::new(60.0, 0.0);
+        // 水平な寸法線に平行な補助線（0 / π / 2π / 非有限）。交点が出ないので
+        // 補助線は描かず、端点は垂線の足（`ext_angle = None` と同じ）へ倒れる。
+        for theta in [0.0, PI, -PI, 2.0 * PI, f64::NAN, f64::INFINITY] {
+            let dim = oblique_linear(p1, p2, 20.0, theta);
+            let segs = linear_pick_segments(&dim);
+            assert_eq!(segs.len(), 1, "θ = {theta} で補助線が出ている: {segs:?}");
+            assert!(approx(segs[0][0], Point2::new(0.0, 20.0)), "θ = {theta}");
+            assert!(approx(segs[0][1], Point2::new(60.0, 20.0)), "θ = {theta}");
+        }
+
+        // 展開は寸法線と値ラベル・矢を描き、**補助線 2 本だけ**が消える。
+        let render = render(0.5, 1.0);
+        let plain = expand_linear(&plain_linear(p1, p2, 20.0), render);
+        let parallel = expand_linear(&oblique_linear(p1, p2, 20.0, 0.0), render);
+        assert_eq!(plain.segments.len(), 3);
+        assert_eq!(parallel.segments.len(), 1);
+        assert!(approx(parallel.segments[0][0], plain.segments[0][0]));
+        assert!(approx(parallel.segments[0][1], plain.segments[0][1]));
+        assert_eq!(contents_of(&parallel), contents_of(&plain));
+        assert_eq!(parallel.arrows.len(), plain.arrows.len());
+        // 非有限でも NaN を撒かない。
+        let nan = expand_linear(&oblique_linear(p1, p2, 20.0, f64::NAN), render);
+        assert!(nan.segments.iter().flatten().all(|p| p.x.is_finite()));
+    }
+
+    /// 平行判定（[`mcad_geom::EPS`]）だけでは防げない「交点が遠すぎる／発散する」
+    /// 入力を規模ガード（[`MAX_EXT_LINE_SPAN_RATIO`]）が退化へ落とすこと
+    /// （Codex adversarial review [medium] 指摘）。
+    #[test]
+    fn nearly_parallel_extension_lines_fall_back_instead_of_exploding() {
+        let p1 = Point2::new(0.0, 0.0);
+        let p2 = Point2::new(100.0, 20.0);
+        // (a) 平行判定の閾値**直上**（sin(θ − φ) ≈ 2e-9 > EPS = 1e-9）。素直に交点を
+        //     採ると s = 40 / 2e-9 = 2e10 で、寸法の大きさ（約 102）の 1000 倍を
+        //     はるかに超える。
+        let dim = DimLinear {
+            ext_angle: Some(2.0e-9),
+            ..rotated_linear(p1, p2, 40.0, 0.0)
+        };
+        let segs = linear_pick_segments(&dim);
+        assert_eq!(segs.len(), 1, "補助線を引いてしまっている: {segs:?}");
+        // 端点は垂線の足（`ext_angle = None` と同じ）へ倒れる。
+        assert!(approx(segs[0][0], Point2::new(0.0, 40.0)), "{:?}", segs[0]);
+        assert!(
+            approx(segs[0][1], Point2::new(100.0, 40.0)),
+            "{:?}",
+            segs[0]
+        );
+
+        // (b) 有限だが巨大な offset（交点は f64 の範囲を超えて Infinity になる）。
+        //     展開・pick・AABB のどこにも非有限が出ないこと。
+        for offset in [1.0e10, 1.0e300] {
+            let dim = DimLinear {
+                ext_angle: Some(2.0e-9),
+                ..rotated_linear(p1, p2, offset, 0.0)
+            };
+            let segs = linear_pick_segments(&dim);
+            assert_eq!(segs.len(), 1, "offset = {offset} で補助線が出ている");
+            assert!(
+                segs.iter()
+                    .flatten()
+                    .all(|p| p.x.is_finite() && p.y.is_finite()),
+                "offset = {offset} で pick に非有限が出た: {segs:?}"
+            );
+            let ex = expand_linear(&dim, render(0.5, 1.0));
+            assert!(
+                ex.segments
+                    .iter()
+                    .flatten()
+                    .all(|p| p.x.is_finite() && p.y.is_finite()),
+                "offset = {offset} で展開に非有限が出た"
+            );
+            let bb = crate::EntityGeom::DimLinear(dim).aabb();
+            assert!(
+                bb.min.x.is_finite()
+                    && bb.min.y.is_finite()
+                    && bb.max.x.is_finite()
+                    && bb.max.y.is_finite(),
+                "offset = {offset} で AABB に非有限が出た: {bb:?}"
+            );
+        }
+
+        // (c) 実用的な角度は巻き込まない。45 度（[`oblique_case`] と同じ）はもちろん、
+        //     補助線が寸法の 100 倍まで伸びる寝た角度（sin = 1e-2）も交点を採る
+        //     （ガードが効くのは 1000 倍を超えてからで、これは約 0.057 度に相当する）。
+        assert_eq!(linear_pick_segments(&oblique_case()).len(), 3);
+        let shallow = DimLinear {
+            ext_angle: Some(1.0e-2_f64.asin()),
+            ..rotated_linear(Point2::new(0.0, 0.0), Point2::new(100.0, 0.0), 100.0, 0.0)
+        };
+        let segs = linear_pick_segments(&shallow);
+        assert_eq!(segs.len(), 3, "100 倍はまだ引くべき: {segs:?}");
+        // s = 100 / 1e-2 = 1e4。足は p1 から x 方向へ約 1e4 進んだ位置。
+        assert!(
+            (segs[1][1].x - 10_000.0).abs() < 1.0,
+            "交点が使われていない: {:?}",
+            segs[1]
+        );
+    }
+
+    /// 補助線の傾き（[`DimLinear::ext_angle`]）が計測線 `p1 → p2` の傾きと一致すると
+    /// 2 本の補助線が寸法線上の同じ点で交わり `d1 == d2` になる（Codex adversarial
+    /// review 指摘）。長さ 0 の寸法線を描いてしまわず、既存の「平行で交点が出ない」
+    /// 退化経路（端点は垂線の足、補助線を描かない）へ合流すること。
+    #[test]
+    fn extension_line_angle_matching_the_measured_line_falls_back_instead_of_collapsing() {
+        let p1 = Point2::new(0.0, 0.0);
+        let p2 = Point2::new(100.0, 20.0);
+        // (p2 - p1) の傾きと同じ角度。
+        let dim = DimLinear {
+            ext_angle: Some(0.2_f64.atan()),
+            ..rotated_linear(p1, p2, 40.0, 0.0)
+        };
+
+        let segs = linear_pick_segments(&dim);
+        assert_eq!(segs.len(), 1, "補助線を引いてしまっている: {segs:?}");
+        assert!(approx(segs[0][0], Point2::new(0.0, 40.0)), "{:?}", segs[0]);
+        assert!(
+            approx(segs[0][1], Point2::new(100.0, 40.0)),
+            "{:?}",
+            segs[0]
+        );
+        assert!(
+            segs.iter()
+                .flatten()
+                .all(|p| p.x.is_finite() && p.y.is_finite())
+        );
+
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        assert!(
+            ex.segments
+                .iter()
+                .flatten()
+                .all(|p| p.x.is_finite() && p.y.is_finite())
+        );
+
+        let bb = crate::EntityGeom::DimLinear(dim.clone()).aabb();
+        assert!(
+            bb.min.x.is_finite()
+                && bb.min.y.is_finite()
+                && bb.max.x.is_finite()
+                && bb.max.y.is_finite(),
+            "AABB に非有限が出た: {bb:?}"
+        );
+
+        assert!(
+            (dim.measured_value() - 100.0).abs() < T,
+            "投影長が変わった: {}",
+            dim.measured_value()
+        );
+    }
+
+    #[test]
+    fn oblique_extension_lines_do_not_change_the_measured_value() {
+        let p1 = Point2::new(0.0, 0.0);
+        let p2 = Point2::new(100.0, 20.0);
+        let aligned = plain_linear(p1, p2, 40.0).measured_value();
+        // 12.0 rad は 2π 超（正規化しない設計。[`DimLinear::ext_angle`] の doc）。
+        for theta in [0.3, FRAC_PI_4, 2.0, -1.0, 12.0] {
+            let a = DimLinear {
+                ext_angle: Some(theta),
+                ..plain_linear(p1, p2, 40.0)
+            };
+            assert!(
+                (a.measured_value() - aligned).abs() < T,
+                "整列寸法の実距離が θ = {theta} で動いた"
+            );
+            let r = DimLinear {
+                ext_angle: Some(theta),
+                ..rotated_linear(p1, p2, 40.0, 0.0)
+            };
+            assert!(
+                (r.measured_value() - 100.0).abs() < T,
+                "回転寸法の投影長が θ = {theta} で動いた"
+            );
+        }
+    }
+
+    #[test]
+    fn oblique_does_not_change_the_default_drawing() {
+        // 既定（`ext_angle: None`）の展開・pick は M11 タスク72 までと同一であること。
+        // スナップショット（`mcad-app` の dim_snapshot_tests）の代理として、
+        // 骨格の同一性をここでも押さえる。
+        let p1 = Point2::new(0.0, 0.0);
+        let p2 = Point2::new(100.0, 20.0);
+        for dim in [
+            plain_linear(p1, p2, 40.0),
+            rotated_linear(p1, p2, 40.0, 0.0),
+            rotated_linear(p1, p2, -15.0, FRAC_PI_2),
+        ] {
+            let f = linear_frame(&dim).expect("退化しない");
+            assert!(f.draw_ext_lines, "既定では補助線を引く");
+            let dir = dim.direction.unit_vector(p1, p2).unwrap();
+            let d1 = p1 + dir.perp() * dim.offset;
+            assert!(approx(f.d1, d1), "{:?}", f.d1);
+        }
+    }
+
     #[test]
     fn linear_distance_is_zero_on_dimension_line() {
         let dim = plain_linear(Point2::new(0.0, 0.0), Point2::new(4.0, 0.0), 2.0);
@@ -1682,6 +2170,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 value_override: Some("50".to_string()),
                 ..DimAnnotation::default()
@@ -1706,6 +2195,7 @@ mod tests {
             p2: Point2::new(40.0, 0.0),
             offset: 2.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 tolerance: Some(SizeTolerance::Deviations {
                     upper: 0.2,
@@ -1740,6 +2230,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: annotation.clone(),
         };
         let ex = expand_linear(&dim, render(0.5, 1.0));
@@ -1786,6 +2277,7 @@ mod tests {
             p2: Point2::new(p2x, 0.0),
             offset: 2.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 arrow_placement: placement,
                 ..DimAnnotation::default()
@@ -2077,6 +2569,7 @@ mod tests {
                     p2: Point2::new(5.0, 0.0),
                     offset: 2.0,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation: DimAnnotation {
                         arrow_placement: placement,
                         ..DimAnnotation::default()
@@ -2698,6 +3191,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 2.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 text_anchor: Some(anchor),
                 ..DimAnnotation::default()

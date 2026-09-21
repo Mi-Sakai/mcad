@@ -1971,6 +1971,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 1.5,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation,
         })
     }
@@ -2619,6 +2620,7 @@ mod tests {
             p2: Point2::new(10.0, 0.0),
             offset: 5.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 decimals_override: None,
                 ..DimAnnotation::default()
@@ -2629,6 +2631,7 @@ mod tests {
             p2: Point2::new(20.0, 0.0),
             offset: 5.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation {
                 decimals_override: Some(1),
                 ..DimAnnotation::default()

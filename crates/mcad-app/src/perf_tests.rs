@@ -121,6 +121,7 @@ fn build_document(n: usize) -> Document {
                 p2: pt(&mut rng),
                 offset: rng.next_f64(5.0, 30.0),
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::unannotated(),
             })
         };

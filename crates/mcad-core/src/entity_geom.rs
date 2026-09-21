@@ -127,6 +127,46 @@ pub struct DimLinear {
     /// v6 以前の `.mcad` はこの値で補完される。
     #[serde(default)]
     pub direction: DimDirection,
+    /// **寸法補助線の傾き**（絶対角・**ラジアン**・CCW・+x 軸基準。M11 タスク78、
+    /// DESIGN.md M11 設計判断6）。`None`（既定）は**寸法線に垂直**で、描画は
+    /// M11 タスク72 までと完全に同一。
+    ///
+    /// `Some(θ)` のとき、寸法線の 2 端点は「計測点を通る角度 θ の直線」と寸法線の
+    /// **交点**になる（[`crate::expand_linear`]）。寸法線の直線そのもの（[`offset`] の
+    /// 意味）は変わらない。製図規定 5-4 2) a)「寸法補助線は図形の輪郭線に垂直に引く」を
+    /// 回転寸法でも満たすための指定で、mcad の寸法は非関連（図形への参照を持たない）
+    /// ため輪郭線の向きはユーザーが与えるしかない。
+    ///
+    /// **DXF の group 52（`extension_line_angle`）とは往復しない。** 52 は基準角
+    /// （絶対角か group 50 への加算か）を一次資料から確定できないため import では
+    /// 取り込まず捨てて計上する（理由は `mcad-io` の
+    /// `ImportSummary::dropped_dimension_details` の doc）。export は寸法を線へ分解して
+    /// 書くので、ここで傾けた補助線は傾いたまま DXF へ出る。
+    ///
+    /// **表示値（[`DimLinear::measured_value`]）は傾きで変わらない**（寸法線方向への
+    /// 投影長のまま。AutoCAD の oblique dimension と同じ）。そのため
+    /// [`DimDirection::Rotated`] に傾いた補助線を付けると、寸法線の長さ `|d2 − d1|` と
+    /// 表示値は一般に一致しない（[`DimDirection::Aligned`] では 2 本の補助線が
+    /// 等しくずれるので一致したまま）。
+    ///
+    /// # 角度の範囲は正規化も拒否もしない
+    ///
+    /// 絶対角なので `2π` を超えても `−π` 未満でも向きの意味は一意に決まる
+    /// （`sin_cos` が同じ単位ベクトルを返す）。範囲へ丸めると回転・鏡映のたびに値が
+    /// 跳ね、`.mcad` の往復で保存値が書き換わる。[`DimDirection::Rotated`] と同じ規則で、
+    /// **3 境界（[`EntityGeom::validate`] / `.mcad` 読込 / DXF import）が拒否するのは
+    /// 非有限の θ だけ**。
+    ///
+    /// # 寸法線と平行なら補助線を引かない
+    ///
+    /// θ が寸法線と平行（交点が出ない）なら**補助線を描かず**、寸法線の端点は `None`
+    /// と同じ垂線の足へ倒す（寸法線と値ラベルは描く）。退化を黙って別物へ倒さない
+    /// 既存流儀に合わせたもので、判定は `crate::expand::linear_frame` 1 箇所
+    /// （展開・pick・AABB が同じ骨格を共有する）。
+    ///
+    /// [`offset`]: DimLinear::offset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext_angle: Option<f64>,
     /// 寸法補助記号・公差などの注記（M9 設計判断2）。既定は無注記で、そのときの描画は
     /// M8 までと完全に同じ。許容記号は φ/Sφ/□/C/t（[`DimKind::Linear`]）。
     #[serde(default, skip_serializing_if = "DimAnnotation::is_unannotated")]
@@ -145,6 +185,10 @@ impl DimLinear {
     /// `(p2 − p1)・dir` を通さない）。数学的には同値だが、正規化と内積を経由すると
     /// 最終桁が動きうるため、M10 以前に保存された図面の描画を**ビット単位で**
     /// 保つほうを優先した（回帰網は `mcad-app` の寸法スナップショット 29 ケース）。
+    ///
+    /// **[`DimLinear::ext_angle`]（補助線の傾き、M11 タスク78）はこの値を動かさない。**
+    /// 傾きが変えるのは寸法線の端点だけで、表示値は寸法線方向への投影長のままである
+    /// （AutoCAD の oblique dimension と同じ。DESIGN.md M11 設計判断6）。
     #[must_use]
     pub fn measured_value(&self) -> f64 {
         match self.direction {
@@ -644,8 +688,10 @@ impl EntityGeom {
                 p1: dim.p1 + delta,
                 p2: dim.p2 + delta,
                 offset: dim.offset,
-                // 平行移動では向きは変わらない（絶対角のまま）。
+                // 平行移動では向きは変わらない（絶対角のまま）。補助線の傾き
+                // （M11 タスク78）も同じ理由でそのまま。
                 direction: dim.direction,
+                ext_angle: dim.ext_angle,
                 annotation: transform_annotation(&dim.annotation, |p| p + delta),
             }),
             EntityGeom::DimRadial(dim) => EntityGeom::DimRadial(DimRadial {
@@ -711,6 +757,10 @@ impl EntityGeom {
                     DimDirection::Aligned => DimDirection::Aligned,
                     DimDirection::Rotated(theta) => DimDirection::Rotated(theta + angle),
                 },
+                // 補助線の傾き（M11 タスク78）も絶対角なので、寸法線の向きと同じく
+                // 回転量を加算する（加算しないと図形だけが回って補助線の傾きが
+                // 取り残される）。
+                ext_angle: dim.ext_angle.map(|theta| theta + angle),
                 // 文字姿勢の手動固定（[`DimAnnotation::text_rotation`]、M11 タスク70）も
                 // 絶対角なので、寸法線の向きと同じく回転量を加算する。
                 annotation: transform_annotation_rotation(
@@ -826,6 +876,11 @@ impl EntityGeom {
                         })
                     }
                 },
+                // 補助線の傾き（M11 タスク78）も絶対角なので、寸法線の向きと同じ
+                // 鏡映式（`2·alpha − theta`）で写す。
+                ext_angle: dim
+                    .ext_angle
+                    .map(|theta| mirror_angle(axis_a, axis_b, theta)),
                 // 文字姿勢の手動固定（M11 タスク70）も絶対角なので、寸法線の向きと
                 // 同じ鏡映式（`2·alpha − theta`）で写す。
                 annotation: transform_annotation_rotation(
@@ -961,6 +1016,14 @@ impl EntityGeom {
                     && !theta.is_finite()
                 {
                     return Err("non-finite linear dimension direction angle".into());
+                }
+                // 補助線の傾きの絶対角（M11 タスク78）。**拒否するのは非有限だけ**で、
+                // 範囲（2π 超・負）は正規化も拒否もしない（[`DimLinear::ext_angle`] の
+                // doc）。非有限だと交点が NaN になり、展開・pick・AABB が壊れる。
+                if let Some(theta) = dim.ext_angle
+                    && !theta.is_finite()
+                {
+                    return Err("non-finite linear dimension extension line angle".into());
                 }
                 check_annotation(&dim.annotation, DimKind::Linear)
             }
@@ -1387,6 +1450,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset: 1.5,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         };
         let g = EntityGeom::DimLinear(dim);
@@ -1413,6 +1477,7 @@ mod tests {
             p2: Point2::new(1.0, 0.0),
             offset: 0.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         });
         assert!(ok.validate().is_ok());
@@ -1421,6 +1486,7 @@ mod tests {
             p2: Point2::new(1.0, 0.0),
             offset: f64::INFINITY,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         });
         assert!(bad.validate().is_err());
@@ -1437,6 +1503,7 @@ mod tests {
             p2: Point2::new(120.0, 30.0),
             offset: 0.0,
             direction: DimDirection::Rotated(theta),
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         }
     }
@@ -1571,6 +1638,7 @@ mod tests {
             p2: Point2::new(50.0, 0.0),
             offset: 100.0,
             direction: DimDirection::Rotated(FRAC_PI_2),
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         };
         assert!(
@@ -1609,6 +1677,89 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // M11 タスク78: 補助線の傾き（`DimLinear::ext_angle`）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dim_linear_validate_rejects_only_a_non_finite_extension_line_angle() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let dim = DimLinear {
+                ext_angle: Some(bad),
+                ..rotated_linear(0.0)
+            };
+            assert!(
+                EntityGeom::DimLinear(dim).validate().is_err(),
+                "補助線の傾き {bad} は拒否されるべき"
+            );
+        }
+        // **範囲は拒否も正規化もしない**（絶対角なので 2π 超・負でも意味は決まる）。
+        for ok in [0.0, FRAC_PI_2, -3.0, 12.0, 1.0e6] {
+            let dim = DimLinear {
+                ext_angle: Some(ok),
+                ..rotated_linear(0.0)
+            };
+            assert!(
+                EntityGeom::DimLinear(dim.clone()).validate().is_ok(),
+                "補助線の傾き {ok} は受理されるべき"
+            );
+            // 保存値はそのまま（正規化していない）。
+            assert_eq!(dim.ext_angle, Some(ok));
+        }
+    }
+
+    #[test]
+    fn dim_linear_extension_line_angle_follows_rotation_and_mirroring() {
+        let dim = DimLinear {
+            ext_angle: Some(FRAC_PI_2),
+            ..rotated_linear(0.0)
+        };
+        let g = EntityGeom::DimLinear(dim);
+
+        // 平行移動では絶対角は変わらない。
+        let EntityGeom::DimLinear(t) = g.translated(Vec2::new(3.0, -1.0)) else {
+            panic!();
+        };
+        assert_eq!(t.ext_angle, Some(FRAC_PI_2));
+
+        // 回転は回転量を加算（寸法線の向きと同じ規則）。
+        let EntityGeom::DimLinear(r) = g.rotated(Point2::ORIGIN, FRAC_PI_2) else {
+            panic!();
+        };
+        assert!((r.ext_angle.unwrap() - PI).abs() < T);
+
+        // x 軸鏡映（alpha = 0）は `2·0 − θ = −θ`。
+        let EntityGeom::DimLinear(m) = g.mirrored(Point2::ORIGIN, Point2::new(1.0, 0.0)) else {
+            panic!();
+        };
+        assert!((m.ext_angle.unwrap() + FRAC_PI_2).abs() < T);
+
+        // 傾き無しは変換しても無しのまま。
+        let plain = EntityGeom::DimLinear(rotated_linear(0.0));
+        let EntityGeom::DimLinear(r) = plain.rotated(Point2::ORIGIN, 1.0) else {
+            panic!();
+        };
+        assert_eq!(r.ext_angle, None);
+    }
+
+    #[test]
+    fn dim_linear_aabb_covers_the_oblique_dimension_line_ends() {
+        // 展開・pick と同じ骨格（`expand::linear_frame`）を使うので、傾けて外へ出た
+        // 寸法線の端点も AABB に入る。(0,0)-(100,20) の水平寸法・offset 40
+        // （寸法線 y = 40）に 45 度の補助線 → 端点は (40,40) と (120,40)。
+        let dim = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(100.0, 20.0),
+            offset: 40.0,
+            direction: DimDirection::Rotated(0.0),
+            ext_angle: Some(std::f64::consts::FRAC_PI_4),
+            annotation: DimAnnotation::default(),
+        };
+        let bb = EntityGeom::DimLinear(dim).aabb();
+        assert!(approx(bb.min, Point2::new(0.0, 0.0)), "{bb:?}");
+        assert!(approx(bb.max, Point2::new(120.0, 40.0)), "{bb:?}");
+    }
+
     #[test]
     fn dim_radial_rotate_and_validate() {
         let dim = DimRadial {
@@ -1643,6 +1794,7 @@ mod tests {
             p2: Point2::new(4.0, 0.0),
             offset,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         }
     }

@@ -9304,6 +9304,7 @@ mod tests {
             p2: Point2::new(200.0, 0.0),
             offset: 20.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: mcad_core::DimAnnotation::default(),
         };
 
@@ -9645,6 +9646,7 @@ mod tests {
                     p2: Point2::new(10.0, 0.0),
                     offset: 5.0,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation: DimAnnotation::default(),
                 }),
                 layer,

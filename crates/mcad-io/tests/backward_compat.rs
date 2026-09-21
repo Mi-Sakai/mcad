@@ -403,6 +403,17 @@ fn v7_fixture_loads_with_expected_content() {
         "実距離: {measured:?}"
     );
 
+    // この fixture は M11 タスク78（補助線の傾き）より前に保存した v7 なので
+    // `ext_angle` キーを持たない。`#[serde(default)]` で「傾き無し」に補完され、
+    // **既に v7 で保存されたファイルがそのまま読める**ことの回帰になる。
+    assert!(
+        doc.entities().all(|(_, e)| match &e.geom {
+            EntityGeom::DimLinear(d) => d.ext_angle.is_none(),
+            _ => true,
+        }),
+        "ext_angle を持たない v7 は傾き無しとして読むべき"
+    );
+
     let exported = export_document(&doc);
     assert_eq!(exported.version, FORMAT_VERSION);
     let reloaded = from_json(&mcad_io::to_json(&doc).unwrap())

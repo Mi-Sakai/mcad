@@ -537,7 +537,9 @@ pub struct ImportSummary {
     /// - 文字テンプレート（group 1）に書式コード・制御文字が含まれる、または
     ///   `<>` を 2 個以上含む（[`dimension_text_has_format_codes`] が保守的に判定する。
     ///   Codex adversarial review [high] 指摘・M11 タスク70 で追加）
-    /// - 補助線の傾き（group 52 `extension_line_angle`）が 0 でない
+    /// - 補助線の傾き（group 52 `extension_line_angle`）が 0 でない（非有限を含む）。
+    ///   **M11 タスク78 で [`mcad_core::DimLinear::ext_angle`] を足したとき、一度は
+    ///   取り込む実装を入れたが撤回した**（下記「group 52 を取り込まない理由」）
     /// - 寸法文字の回転（group 53 `text_rotation_angle`）が 0 でない。**M11 タスク70 で
     ///   一度は寸法線・引出線の角度からの変換を試みたが、DXF の group 53 は
     ///   DIMSTYLE 依存の基準角からの相対値であり、DIMSTYLE を読まない mcad では
@@ -553,6 +555,38 @@ pub struct ImportSummary {
     /// **数えない**（全寸法で常に落ちる情報で、計上するとノイズにしかならない。
     /// 色の ACI 近似・未知線種の `Continuous` フォールバックと同じ扱い。モジュール
     /// doc 参照）。
+    ///
+    /// # group 52 を取り込まない理由（M11 タスク78 で一度実装して撤回。蒸し返さないこと）
+    ///
+    /// mcad には M11 タスク78 で [`mcad_core::DimLinear::ext_angle`]（補助線の傾き。
+    /// **+x 軸からの絶対角**）が入ったので、group 52 を写せるように見える。実際に
+    /// 「52（度）をラジアンの絶対角として取り込む」実装をいったん入れたが、
+    /// **Codex adversarial review [high] 指摘 → 一次資料の確認で撤回した**。
+    /// 撤回の根拠は次の 3 つ:
+    ///
+    /// 1. **一次資料が自己矛盾する。** Autodesk DXF Reference（Linear and Rotated
+    ///    Dimension Group Codes）の 52 の説明は "When added to the rotation angle of
+    ///    the linear dimension (group code 50), it gives the angle of the extension
+    ///    lines"、すなわち **50 への加算**（相対角）と読める。ところがそのとおりに
+    ///    読むと **52 = 0 で「補助線は寸法線と平行」**になり、実際の既定（ezdxf の
+    ///    `0 = orthogonal to dimension line`、AutoCAD ユーザーガイドの "Extension
+    ///    lines are created perpendicular to the dimension line"）と食い違う。
+    ///    絶対角・相対角のどちらで読んでも整合する説明が見つからない。
+    /// 2. **整列寸法では基準を確かめる足場すら無い。** `AcDbAlignedDimension` の
+    ///    group code 表に 50・52 は載っていない。
+    /// 3. **52 を書いた実ファイルで検証できていない**（`tests/fixtures/` の
+    ///    `synthetic_dimensions.dxf` には 52 が 1 つも無い）。
+    ///
+    /// 基準を取り違えれば**補助線が別の向きで描かれた図面を無警告で開く**ことになり、
+    /// M11 の「値や位置が黙って変わる取り込みはしない」方針に反する。これは group 53
+    /// （寸法文字の回転）を M11 タスク70 で一度実装してから撤回したのとまったく同じ
+    /// 構造であり、同じ結論（**取り込まず、捨てて計上する**）に揃えた。
+    ///
+    /// **復活させるなら、実ファイル（AutoCAD / LibreCAD が DIMEDIT の傾斜で書いた
+    /// DXF）で基準を確かめてからにすること。** 回帰は
+    /// `oblique_extension_lines_and_text_rotation_are_dropped_and_counted`。
+    /// なお **export は影響を受けない**（寸法は分解して線で書くので、mcad 側で
+    /// 傾けた補助線はそのまま `LINE` として出る）。
     pub dropped_dimension_details: usize,
 }
 
@@ -1110,6 +1144,25 @@ fn actual_measurement_mismatches(base: &DimensionBase, expected: f64) -> bool {
 /// ようになったため、斜辺に付けた水平寸法（かつて `skipped_dimensions` に計上して
 /// 捨てていた形）も本来の向きのまま取り込める。
 ///
+/// # 補助線の傾き（group 52）は取り込まない（M11 タスク78 で検討し、撤回した）
+///
+/// mcad 側には [`mcad_core::DimLinear::ext_angle`]（補助線の傾き。絶対角）があるが、
+/// **group 52 はそこへ写さず、非ゼロなら捨てて
+/// [`ImportSummary::dropped_dimension_details`] へ計上する**（タスク67 からの挙動を
+/// 維持する）。理由は**基準角を一次資料から確定できない**ことで、詳細は
+/// [`ImportSummary::dropped_dimension_details`] の doc に書いた。要点だけ再掲すると:
+///
+/// - DXF Reference の原文は「group 50（寸法線の回転角）に**加算**すると補助線の
+///   角度になる」と読めるが、そのとおりに読むと 52 = 0 が「補助線は寸法線と平行」に
+///   なり、実際の既定（寸法線に**垂直**）と矛盾する。
+/// - 整列寸法（`AcDbAlignedDimension`）の group code 表には 50・52 が無く、基準を
+///   確かめる足場がない。
+/// - 52 を書いた実ファイルで検証できていない。
+///
+/// group 53（寸法文字の回転）を M11 タスク70 で一度実装してから撤回したのと同じ
+/// 構造の判断である（基準が復元できない角度は取り込まない）。**mcad 側で傾けた
+/// 補助線は分解 export でそのまま線として DXF へ出る**ので、export は影響を受けない。
+///
 /// # 拒否条件
 ///
 /// - `horizontal_direction_angle`（group 51）が 0 でない回転寸法。51 は寸法の
@@ -1119,7 +1172,8 @@ fn actual_measurement_mismatches(base: &DimensionBase, expected: f64) -> bool {
 /// - 計測 2 点がほぼ同一（整列寸法の向きが決まらない。回転寸法でも補助線の足が
 ///   1 点へ潰れるので同じ扱いにする）。
 /// - group 50 が非有限（向きが決まらない。[`mcad_core::EntityGeom::validate`] も
-///   同じ値を拒否する）。
+///   同じ値を拒否する）。**group 52 は値を使わないので、非有限でも拒否しない**
+///   （他の属性は読めるため、捨てて計上するだけにする）。
 /// - 押し出し法線が +Z でない（[`is_dimension_plane_supported`]）。
 /// - `dimension_type` が整列でも回転でもない（クレートは group 100 のサブクラス名で
 ///   型を決めるため、group 70 と食い違う DXF はここへ来うる）。
@@ -1158,12 +1212,18 @@ fn linear_dimension_to_geom(
         p2,
         offset,
         direction,
+        // 補助線の傾き（group 52）は**取り込まない**（基準角を確定できないため。
+        // 上の doc と `ImportSummary::dropped_dimension_details` の doc を参照）。
+        // mcad の既定＝寸法線に垂直で読む。
+        ext_angle: None,
         annotation: DimAnnotation::unannotated(),
     };
     // 値の検査は注記より先（食い違って捨てるなら `dropped_detail` を立てない）。
     if actual_measurement_mismatches(base, geom.measured_value()) {
         return None;
     }
+    // 非ゼロの 52 は「取り込めなかった属性」として計上する（非有限もここに入る。
+    // 値を使わないので向きが決まらなくなることはない）。
     if dim.extension_line_angle != 0.0 {
         *dropped_detail = true;
     }
@@ -2639,11 +2699,13 @@ mod tests {
         }
     }
 
-    /// 補助線の傾き（group 52）は mcad に概念が無いので捨てて計上する。
-    /// 寸法文字の回転（group 53）は DIMSTYLE 依存の基準角を復元できないため
-    /// 常に取り込まず計上する（Codex adversarial review [high] 指摘で撤回。
-    /// [`dimension_annotation`] の doc）。**計上は寸法 1 件につき最大 1**
-    /// （属性ごとに増やさない）。
+    /// 補助線の傾き（group 52）は**取り込まず、捨てて計上する**。
+    ///
+    /// mcad 側には [`DimLinear::ext_angle`]（M11 タスク78）があるが、DXF の 52 は
+    /// 基準角（絶対角か group 50 への加算か）を一次資料から確定できないため写さない
+    /// （M11 タスク78 で一度取り込む実装を入れ、Codex adversarial review [high] 指摘で
+    /// 撤回した。理由の全文は [`ImportSummary::dropped_dimension_details`] の doc）。
+    /// **この方針を変えるときは、52 を書いた実ファイルで基準を確かめてからにすること。**
     #[test]
     fn oblique_extension_lines_and_text_rotation_are_dropped_and_counted() {
         let oblique = EntityType::RotatedDimension(RotatedDimension {
@@ -2654,12 +2716,42 @@ mod tests {
             ..Default::default()
         });
         let (geom, skipped_entities, skipped_dimensions, dropped) = import_one(oblique);
-        assert!(
-            geom.is_some(),
+        let dim = linear_of(geom);
+        assert_eq!(
+            dim.ext_angle, None,
+            "52 は mcad の傾きへ写さない（基準角が確定できない）"
+        );
+        assert_eq!(
+            (skipped_entities, skipped_dimensions, dropped),
+            (0, 0, 1),
             "52 付きの寸法は取り込む（捨てるのは 52 だけ）"
         );
+
+        // 非有限の 52 も同じ扱い（値を使わないので寸法ごと捨てる必要はない）。
+        let bad = EntityType::RotatedDimension(RotatedDimension {
+            dimension_base: aligned_base(),
+            definition_point_2: DxfPoint::new(0.0, 0.0, 0.0),
+            definition_point_3: DxfPoint::new(10.0, 0.0, 0.0),
+            extension_line_angle: f64::NAN,
+            ..Default::default()
+        });
+        let (geom, skipped_entities, skipped_dimensions, dropped) = import_one(bad);
+        let dim = linear_of(geom);
+        assert_eq!(dim.ext_angle, None);
         assert_eq!((skipped_entities, skipped_dimensions, dropped), (0, 0, 1));
 
+        // 52 = 0（省略と区別できない DXF の既定値）は落ちる情報が無いので計上しない。
+        let (geom, _, _, dropped) = import_one(linear_dim(aligned_base(), (0.0, 0.0), (10.0, 0.0)));
+        assert_eq!(linear_of(geom).ext_angle, None);
+        assert_eq!(dropped, 0, "52 = 0 は捨てる情報が無い");
+    }
+
+    /// 寸法文字の回転（group 53）は DIMSTYLE 依存の基準角を復元できないため
+    /// 常に取り込まず計上する（Codex adversarial review [high] 指摘で撤回。
+    /// [`dimension_annotation`] の doc）。**計上は寸法 1 件につき最大 1**
+    /// （属性ごとに増やさない）。
+    #[test]
+    fn text_rotation_is_dropped_and_counted_once_per_dimension() {
         // 長さ寸法（水平、寸法線の角度 0）に 53 = 30 度: 基準角を復元できないので
         // 取り込まず計上する。
         let rotated_text = DimensionBase {
@@ -2674,7 +2766,7 @@ mod tests {
         );
         assert_eq!(dropped, 1, "長さ寸法でも 53 は計上する");
 
-        // 52 と 53（どちらも取り込まない）と文字テンプレート（表現できる）が同時に
+        // 52・53（どちらも取り込まない）と文字テンプレート（表現できる）が同時に
         // 起きても、寸法 1 件につき最大 1 件なので合計 1 件。
         let everything = EntityType::RotatedDimension(RotatedDimension {
             dimension_base: DimensionBase {
@@ -3171,6 +3263,7 @@ mod tests {
                 p2: Point2::new(10.0, 0.0),
                 offset: 5.0,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             }),
             layer,
@@ -3291,6 +3384,7 @@ mod tests {
             p2: Point2::new(10.0, 0.0),
             offset: 5.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         });
         doc.apply(Command::AddEntity(Entity::new(
@@ -3365,6 +3459,7 @@ mod tests {
                     p2: Point2::new(10.0, 0.0),
                     offset: 5.0,
                     direction: DimDirection::Aligned,
+                    ext_angle: None,
                     annotation: DimAnnotation::default(),
                 }),
                 layer,
@@ -3403,6 +3498,7 @@ mod tests {
             p2: Point2::new(10.0, 0.0),
             offset: 5.0,
             direction: DimDirection::Aligned,
+            ext_angle: None,
             annotation: DimAnnotation::default(),
         });
 
@@ -3483,6 +3579,7 @@ mod tests {
                 p2: Point2::new(10.0, 0.0),
                 offset: 5.0,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             }),
             layer,
@@ -3525,6 +3622,7 @@ mod tests {
                 p2: Point2::new(10.0, 0.0),
                 offset: 5.0,
                 direction: DimDirection::Aligned,
+                ext_angle: None,
                 annotation: DimAnnotation::default(),
             }),
             layer,

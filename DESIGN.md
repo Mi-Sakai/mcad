@@ -1287,6 +1287,103 @@ DXF import して確認した項目は、寸法が 4 件(整列・鉛直・半�
   (11) 上部パネル・右パネルのレイアウト崩れなし。
 - **Codex adversarial review(2026-09-21)**: 指摘なしで approve。
 
+#### タスク74 の実装時追記(2026-09-21)
+
+角度寸法・座標寸法ツール（`DimAngularTool`/`DimOrdinateTool`、`crates/mcad-app/src/tool.rs`）を
+タスク表の UX 確定どおり実装した。`DimLinearTool`（タスク73）の状態機械・`VariantOptions`/
+`set_variant`・`ToolCtx::ortho_enabled` の各流儀をそのまま踏襲し、新しい拡張点は追加していない。
+
+- **角度寸法の拒否条件は4段階**: (1) p1 が頂点とほぼ一致（`DIM_DEGENERATE_EPSILON`）
+  (2) p2 が頂点とほぼ一致 (3) p1 方向と p2 方向のなす角が 0 に近い（同方向）または
+  π に近い（反平行） (4) 弧位置クリックが頂点とほぼ一致（半径 0）。(3) は core の
+  `EntityGeom::validate`（タスク69）が使う反平行の閾値 **1e-6 ラジアン**を使う（core が
+  `pub const DIM_ANGULAR_ANTIPARALLEL_EPS`（`crates/mcad-core/src/entity_geom.rs`）として
+  公開し、`lib.rs` から再公開、ツール側は `mcad_core::DIM_ANGULAR_ANTIPARALLEL_EPS` を
+  import して使う。当初は値をツール側にリテラルで複製していたが、Codex adversarial
+  review（2026-09-21）の指摘を受けて共有した）。2 辺目のクリック時点（弧位置クリック
+  より前）で先回りして拒否することで、後で core の `validate()` が同じ理由で弾く無駄な
+  クリックを避けている。各拒否は状態据え置き（`ToolResult::Rejected`）で、理由文字列は
+  「同方向」「反平行」を区別した。
+- **座標寸法は原点保持**: `DimOrdinateState::WaitingFeature(origin)` へ確定後も戻ることで、
+  `Esc` を挟まなければ計測点 → 引出線端の2クリックで連続して置ける。`feature == origin`
+  （計測点が原点と一致）は拒否しない（core も拒否しない。値 0 として正当）。引出線長ゼロ
+  （`leader_end` が `feature` とほぼ一致）だけを拒否する。
+- **座標寸法の X/Y は `OrdAxisMode { Auto, X, Y }`**（`LinearDirMode` と同型。`Tab` はどの状態でも
+  受け付け、`spawn()` のたびに `Auto` へ戻る）。自動判定は引出線 `feature → leader_end` の
+  `|dy| >= |dx|`（縦に引く）なら X、`|dx| > |dy|`（横に引く）なら Y。X/Y の明示選択は自動判定より
+  常に優先する（`DimLinearTool` の `Horizontal`/`Vertical` が ortho より優先されるのと同じ設計）。
+- **原点マーカーはスクリーン固定 6px の十字**（`ORIGIN_MARKER_PX`、`draw_origin_marker`）。
+  `viewport.world_to_screen` で変換してから固定 px で描くため、ズームレベルに関わらず同じ
+  見た目になる。計測点待ち・引出線端待ちの両方で常時表示する（引出線端待ち中は寸法プレビュー
+  にも重ねて描く）。
+- **公差種別の除外は行わなかった**。依頼時の指摘どおり `SizeTolerance::validate` と
+  `DimAnnotation::validate(kind)`（`crates/mcad-core/src/dim.rs`）を確認したところ、
+  公差の種類（対称/上下偏差/はめあい記号）を `DimKind` で絞り込む処理は無く、はめあい記号を
+  含むどの公差も `DimKind::Angular`/`DimKind::Ordinate` へ付けられる。右パネル「寸法」の
+  公差セクションはそのまま出し、種別ごとの除外ロジックは追加していない
+  （`build_annotation_edit_commands_accepts_fit_tolerance_for_angular_and_ordinate` で固定）。
+  一方、記号（φ・□等）は `DimKind::Angular | DimKind::Ordinate => &[]` で core が既に空集合を
+  返すため、右パネルの記号行を `any_kind_allows_symbols`（選択中の全種別の
+  `allowed_symbols` がすべて空なら行自体を出さない）でガードした。
+- **`Esc`（`InputEvent::Cancel`）の実際の挙動を確認した**: `main.rs` の `handle_tool_input` は
+  `ToolResult::Cancel` を受けると `*tool_kind = ToolKind::Select; *tool = None;` でツール本体を
+  丸ごと選択ツールへ差し替える（`crates/mcad-app/src/main.rs` の `ToolResult::Cancel` アーム）。
+  つまり `Tool::on_input` 内で行う内部状態のリセット（`DimOrdinateTool` の「原点ごと破棄して
+  `WaitingOrigin` へ」を含む）は、app 層が `*tool = None` で `Tool` インスタンスごと捨てるため
+  **実際には観測されない**（次に同じツールを起動し直すと `spawn()` で新しいデフォルト状態から
+  始まる。これは `DimLinearTool`/`DimRadialTool`/`DimDiameterTool` など既存の全寸法ツールの
+  Cancel リセットにも同様に当てはまる既存の性質で、タスク74 固有の問題ではない）。
+  今回はタスク仕様どおり内部リセットのロジックは実装した（`Tool` 単体のユニットテストでは
+  意味のある違いを検証できる。`dim_ordinate_tool_cancel_discards_origin` 参照）が、GUI 経由の
+  実際の `Esc` はいずれにせよツール全体を選択ツールへ戻すため、両者は同じ結果になる。
+- **public API の変更は無い**: `Tool` トレイト・`InputEvent`・`ToolResult`・`VariantOptions` は
+  変更していない。`tool.rs` へ `pub struct DimAngularTool`/`DimOrdinateTool` を追加し、
+  `main.rs` の `use tool::{...}` へ加えた（`DimDiameterTool` 等と同じ、crate 内部 API）。
+- **`clippy::enum_variant_names` を `DimOrdinateState` へ `#[allow]`**: 3 変異体
+  （`WaitingOrigin`/`WaitingFeature`/`WaitingLeaderEnd`）が揃って `Waiting` 接頭辞を持つため
+  誤検出する。他の寸法ツール状態と同じ「次に待つ入力」を明示する命名を優先し、抑制した。
+- **実装時の設計方針追記（2026-09-21、Codex adversarial review 指摘3件への対応）**:
+  1. **反平行閾値の複製をやめて core と共有した**: 上記「角度寸法の拒否条件」段落が
+     元々「core 側の定数は非公開で再利用できず、値だけを複製する」としていたのは実態と
+     異なる — core が `pub const` を公開していなかっただけで、公開すれば共有できた。
+     `crates/mcad-core/src/entity_geom.rs` に `pub const DIM_ANGULAR_ANTIPARALLEL_EPS: f64`
+     を追加し（`DimAngular` struct のすぐ上）、`EntityGeom::validate` のリテラル `1e-6` を
+     置き換え、旧コメントの理由書きを定数の doc へ移した。`lib.rs` から再公開し、
+     `crates/mcad-app/src/tool.rs` は複製していた `DIM_ANGULAR_ANTIPARALLEL_EPSILON` を削除
+     して `mcad_core::DIM_ANGULAR_ANTIPARALLEL_EPS` を import して使う。core は
+     `~/tcad` から path 依存されているが、`pub const` の追加は既存の公開 API を変えない
+     非破壊変更。回帰テスト `dim_angular_tool_antiparallel_threshold_matches_core_validate`
+     （`tool.rs`）で、閾値のすぐ内側・外側の両方でツールの拒否/通過と core の `validate()`
+     が一致することを固定した。
+  2. **座標寸法の確定失敗で原点を失わないようにした**: `DimOrdinate` を
+     `ToolKind::keeps_state_on_commit_failure`（`main.rs`）の対象に加えた。従来は
+     Trim/Extend/Fillet/Split の4ツールのみで、`DimOrdinateTool` は確定成功時のみ自分で
+     `WaitingFeature(origin)` へ戻る一方、`Document::apply` がレイヤーロック等で失敗すると
+     app 側が `spawn()` で作り直してしまい、原点・X/Y モードが失われて「Esc までは原点を
+     保持」という UX 確定（タスク74）が破られていた。`DimOrdinateTool` は
+     `Tool::on_commit_failed` で片付けが要るフラグを持たないため、既定の no-op のままで
+     良い。回帰テスト `dim_ordinate_tool_keeps_origin_after_locked_layer_commit_failure`
+     （`main.rs`）で、ロックレイヤーへの確定失敗後も原点を保持したまま計測点・引出線端の
+     再選択だけで再確定できることを固定した。
+  3. **引出線長ゼロの拒否は維持し、理由コメントを訂正した**（high 指摘だが拒否は維持と
+     判断）。`tool.rs` の元コメント「値ラベルの位置が定まらない」は誤りで、core の
+     `expand_ordinate` は引出線長 0 でも引出線を引かずにラベルだけを置ける（値は
+     `feature − origin` だけで決まる）。実際の理由は、作図でこの長さ 0 が起こるのは
+     ほぼ二重クリックの誤操作であり、かつ `resolve_ordinate_axis` の X/Y 自動判定は
+     引出線の向きに依存するため、向きが無いと軸が定まらないこと。`DimLinearTool` が
+     `p1≈p2` を拒否するのと同じ「UI は core より厳しくてよい」方針として、コメントを
+     この理由へ訂正した（拒否条件・挙動そのものは変更していない）。
+- スモークテストで判明した割当漏れを修正(寸法線レイヤーへの自動割当に角度・座標を追加)。
+- **スモークテスト記録(2026-09-21、ユーザー実機、release ビルド)**: 11 項目すべて問題なし。
+  (1) `Shift+G`/`Shift+V` の割当と `G` 単押し・`V` 単押し (2) 角度寸法の 4 クリックとプレビュー
+  (3) 同方向・180° の拒否 (4) 座標寸法の原点保持と連続配置(ロックしたレイヤーでの確定失敗後も
+  原点が残る) (5) X/Y の自動判定と負の値 (6) `Tab`・コンボでの X/Y 固定 (7) `Esc` で選択ツールへ戻り
+  原点からやり直し (8) 記号行の非表示判定 (9) 角度寸法への公差・桁数の反映 (10) 選択内訳の
+  表示崩れなし (11) 保存・再読込と SVG/PDF 出力。**同テストで角度・座標寸法が「寸法線」レイヤーへ
+  入らない割当漏れが見つかり修正した**(上記)。修正後の確認(同日、ユーザー実機): 角度・座標寸法とも「寸法線」レイヤーへ入ることを確認
+- **Codex adversarial review(2026-09-21)**: 1 回目 needs-attention(3 件、対応は上記)、
+  対応後の 2 回目は指摘なしで approve。
+
 #### 設計判断
 
 1. **展開の純関数を `mcad-core` へ移す**(タスク71)。現状 `crates/mcad-app/src/dimension.rs` と
@@ -1408,7 +1505,7 @@ M11-0(契約固定)は本章の上記で完了。以下は M11-1(64〜72)・M11-
 | 72 | io: 寸法・表の分解 export **(完了 2026-09-21)** | 移設した展開を使い、寸法と表を `LINE` / 塗り / `TEXT` へ分解して DXF へ書く(設計判断2)。非対称往復を README・AGENTS.md・モジュール doc へ明記。スキップ件数から寸法を外す | implement-sonnet | 71 |
 | 78 | core+io: 寸法補助線の傾き(**2026-09-21 新設**) | `DimLinear` へ `ext_angle: Option<f64>` を追加(設計判断6)。`linear_frame` の端点を交点で決め、展開・pick・AABB を追従。`validate` の 3 境界、`.mcad` v7 へ相乗り。**DXF group 52 の import は見送り**(2026-09-21、設計判断6「(b) の撤回」。基準角が確定できないため従来どおり計上する)。既定 `None` の描画がタスク64 のスナップショットと一致することを保証 | implement-opus | 68 |
 | 73 | app: 回転寸法ツールと向き UI **(完了 2026-09-21)** | 長さ寸法ツールに向き(整列/水平/鉛直/任意角)の切替を足す(キー割当・切替 UX はタスク内で確定)。直交モード時の向き自動判定。右パネル「寸法」で既存寸法の向きを変更。**UX 確定(2026-09-21 ユーザー選択)**: 作図時の向きは `Tab` 循環(整列→水平→鉛直)と上部パネルのコンボを**併用**し、現在値は `Tool::variant_label()` で上部パネルへ出す(`IsoCircleTool` と同じ流儀。**実装では `variant_options()` + `set_variant()` へ置き換えた** — タスク73 の実装時追記)。**任意角は循環に入れず**、右パネル「寸法」で既存寸法の向きを変えるときだけ指定する。直交モード(F8)が有効なときは、**向きが「整列」のときだけ**計測 2 点の角度に近い軸(0°/90°)へ自動で倒す(明示選択した向きは尊重する)。タスク78 の補助線の傾きも、作図時は上部パネルの角度欄(度)、既存寸法は右パネルで指定する | implement-sonnet | 78 |
-| 74 | app: 角度寸法・座標寸法ツール | 角度寸法(3点クリック)・座標寸法(原点→計測点→引出線端)のツール、未使用キーの確認、右パネルの種別対応(角度寸法に記号コンボを出さない等) | implement-sonnet | 69 |
+| 74 | app: 角度寸法・座標寸法ツール **(完了 2026-09-21)** | 角度寸法(3点クリック)・座標寸法(原点→計測点→引出線端)のツール、未使用キーの確認、右パネルの種別対応(角度寸法に記号コンボを出さない等)。**UX 確定(2026-09-21 ユーザー選択)**: キーは**角度寸法 = `Shift+G`・座標寸法 = `Shift+V`**(単押しの空き H/J/N/Q/U/V/W/Y は温存。長さ `D`/半径 `Shift+D` と同じ Shift 併用の流儀)。角度寸法は**4 クリック**(頂点 → 1 辺目の点 → 2 辺目の点 → 弧の位置 = 半径)。座標寸法は**原点を保持**し(最初に原点を 1 回クリックすれば、`Esc` までは計測点 → 引出線端の 2 クリックで続けて置ける)、**X/Y は引出線の向きで自動判定**(縦に引けば X 座標、横に引けば Y 座標)、`Tab` で 自動/X/Y を切り替える | implement-sonnet | 69 |
 | 75 | app: グリップ編集と連続/並列寸法 | 選択中の寸法の端点・寸法線位置をドラッグで編集(M9 の文字位置ドラッグと同じ別経路)、連続/並列寸法の連続入力、注記上書きの一括解除 | implement-sonnet | 73 |
 | 76 | geom/core: 空間インデックス | **見送りで確定(2026-09-13)**。タスク66 の実測で pick・矩形選択・カリングが 20,000 エンティティでも 3ms 台と判明し、索引が削れるのは最大でその数 ms。16ms を超えた `plot_page`・保存・読込は全件処理の単発操作で索引では速くならない(上記「実測」節)。**実装しない。**残るのは実ウィンドウでの描画体感の確認のみで、重い場合の対策は描画側(別課題) | — | 66 |
 | 77 | ドキュメント整合・v0.11.0 リリース | README・AGENTS.md(v7・寸法種別・DXF の非対称往復)・CHANGELOG・DESIGN.md 本章の反映と `docs/design/M11.md` への移設・リリース。**CHANGELOG は采配役が書く**(M9・M10 で haiku の草案に事実誤りがあったため) | implement-sonnet + 采配役 | 64-76 |

@@ -28,12 +28,12 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
-    ArrowPlacement, Command, DimAnnotation, DimDiameter, DimDirection, DimExpansion, DimKind,
-    DimLinear, DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom, EntityId, FitClass,
-    Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize, ProjectionMethod, Rgb,
-    Scale, SheetMeta, SizeTolerance, Style, TableGeom, TextGeom, TitleBlockFields, TitleBlockKind,
-    WidthMm, arrow_kind_occupies_line, expand_dim, expand_table, label_box_center,
-    label_box_contains, linear_pick_segments, table_world_aabb,
+    ArrowPlacement, Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimExpansion,
+    DimKind, DimLinear, DimOrdinate, DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom,
+    EntityId, FitClass, Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize,
+    ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style, TableGeom, TextGeom,
+    TitleBlockFields, TitleBlockKind, WidthMm, arrow_kind_occupies_line, expand_dim, expand_table,
+    label_box_center, label_box_contains, linear_pick_segments, table_world_aabb,
 };
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
@@ -49,10 +49,11 @@ use frame::{frame_layout, paper_to_world, parse_scale_input};
 use plot::dash_pattern_mm;
 
 use tool::{
-    ArcTool, CircleTool, DIM_DEGENERATE_EPSILON, DimDiameterTool, DimLinearTool, DimRadialTool,
-    DragPreview, ExtAngleInput, ExtendTool, FilletTool, InputEvent, IsoCircleTool, LineTool,
-    OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolylineTool,
-    SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
+    ArcTool, CircleTool, DIM_DEGENERATE_EPSILON, DimAngularTool, DimDiameterTool, DimLinearTool,
+    DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput, ExtendTool, FilletTool, InputEvent,
+    IsoCircleTool, LineTool, OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview,
+    PointTool, PolylineTool, SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult,
+    TrimTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -587,6 +588,8 @@ enum ToolKind {
     DimLinear,
     DimRadial,
     DimDiameter,
+    DimAngular,
+    DimOrdinate,
     Trim,
     Extend,
     Fillet,
@@ -611,6 +614,8 @@ impl ToolKind {
             ToolKind::DimLinear => Some(Box::new(DimLinearTool::default())),
             ToolKind::DimRadial => Some(Box::new(DimRadialTool::default())),
             ToolKind::DimDiameter => Some(Box::new(DimDiameterTool::default())),
+            ToolKind::DimAngular => Some(Box::new(DimAngularTool::default())),
+            ToolKind::DimOrdinate => Some(Box::new(DimOrdinateTool::default())),
             ToolKind::Trim => Some(Box::new(TrimTool::default())),
             ToolKind::Extend => Some(Box::new(ExtendTool::default())),
             ToolKind::Fillet => Some(Box::new(FilletTool::default())),
@@ -641,10 +646,21 @@ impl ToolKind {
     /// `WaitingSecondLine` が失われ、この規約が崩れる（Codex adversarial review
     /// 2026-07-26 指摘）。作り直さない代わりに、選択集合の載せ替えフラグを次の確定へ
     /// 誤って持ち越さないよう [`Tool::on_commit_failed`] でクリアする必要がある。
+    ///
+    /// `DimOrdinate`（座標寸法）も同じ理由で含む: DESIGN.md タスク74 の UX 確定「Esc までは
+    /// 原点を保持」は、`DimOrdinateTool` が確定成功時に自分で `WaitingFeature(origin)` へ
+    /// 戻ることに加え、**確定失敗時も** 同じ状態を保つことを要求する。`spawn()` で作り直すと
+    /// レイヤーロック等で確定に失敗するたびに原点・X/Y モードが失われ、ユーザーは原点から
+    /// クリックし直す羽目になる（Codex adversarial review 2026-09-21 指摘）。`DimOrdinateTool`
+    /// は `on_commit_failed` で片付けが要るフラグを持たないため、既定の no-op 実装のままでよい。
     fn keeps_state_on_commit_failure(self) -> bool {
         matches!(
             self,
-            ToolKind::Trim | ToolKind::Extend | ToolKind::Fillet | ToolKind::Split
+            ToolKind::Trim
+                | ToolKind::Extend
+                | ToolKind::Fillet
+                | ToolKind::Split
+                | ToolKind::DimOrdinate
         )
     }
 
@@ -663,6 +679,8 @@ impl ToolKind {
             ToolKind::DimLinear => "Linear Dim",
             ToolKind::DimRadial => "Radial Dim",
             ToolKind::DimDiameter => "Diameter Dim",
+            ToolKind::DimAngular => "Angular Dim",
+            ToolKind::DimOrdinate => "Ordinate Dim",
             ToolKind::Trim => "Trim",
             ToolKind::Extend => "Extend",
             ToolKind::Fillet => "Fillet",
@@ -2998,7 +3016,8 @@ impl eframe::App for McadApp {
 /// キーボードショートカットでアクティブツールを切り替える（DESIGN.md 3.4 のツール群）。
 ///
 /// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `I`=Iso Circle, `P`=Polyline, `T`=Text,
-/// `K`=Table, `D`/`Shift+D`=Linear/Radial Dim, `G`=Diameter Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
+/// `K`=Table, `D`/`Shift+D`=Linear/Radial Dim, `G`/`Shift+G`=Diameter/Angular Dim,
+/// `Shift+V`=Ordinate Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
 /// 作図ツールへ切り替えるときは、描画中に古い選択ハイライトが残らないよう選択をクリアする。
 fn handle_tool_shortcut_keys(
@@ -3048,8 +3067,22 @@ fn handle_tool_shortcut_keys(
             requested = Some(ToolKind::Table);
         } else if i.key_pressed(Key::G) {
             // 未使用キー（G/H/I/J/K/N/Q/U/V/W のうち G を採用。2026-09-04、
-            // main.rs/tool.rs をともに `grep -n "Key::G"` して未使用を確認済み）。
-            requested = Some(ToolKind::DimDiameter);
+            // main.rs/tool.rs をともに `grep -n "Key::G"` して未使用を確認済み）。単押しは
+            // 直径寸法のまま、Shift 併用で角度寸法（M11 タスク74、DESIGN.md タスク74 の
+            // UX 確定: `D`/`Shift+D` の長さ/半径寸法と同じ Shift 併用の流儀）。
+            requested = Some(if i.modifiers.shift {
+                ToolKind::DimAngular
+            } else {
+                ToolKind::DimDiameter
+            });
+        } else if i.key_pressed(Key::V) {
+            // 未使用キー（H/J/N/Q/U/V/W のうち V を採用。2026-09-21、main.rs/tool.rs を
+            // ともに `grep -n "Key::V"` して未使用を確認済み）。単押しの V は未割当のまま
+            // 温存し、Shift 併用のみ座標寸法として受理する（DESIGN.md タスク74 の
+            // UX 確定）。
+            if i.modifiers.shift {
+                requested = Some(ToolKind::DimOrdinate);
+            }
         } else if i.key_pressed(Key::X) {
             requested = Some(ToolKind::Trim);
         } else if i.key_pressed(Key::E) {
@@ -3080,8 +3113,8 @@ fn handle_tool_shortcut_keys(
 /// 新規エンティティを追加する先のレイヤーを、作図ツールの種類から解決する
 /// （M9 タスク53: 標準レイヤー構成と自動割当）。
 ///
-/// 寸法ツール（`DimLinear`/`DimRadial`/`DimDiameter`）は [`DIM_LAYER_NAME`]
-/// （`寸法線`）、文字ツール（[`ToolKind::Text`]）は [`TEXT_LAYER_NAME`]（`文字`）が
+/// 寸法ツール（`DimLinear`/`DimRadial`/`DimDiameter`/`DimAngular`/`DimOrdinate`）は
+/// [`DIM_LAYER_NAME`]（`寸法線`）、文字ツール（[`ToolKind::Text`]）は [`TEXT_LAYER_NAME`]（`文字`）が
 /// 文書に存在すればそこへ、無ければ [`Document::current_layer`] へフォールバックする。
 /// それ以外のツールは常にカレントレイヤーを使う。**該当名のレイヤーが無い文書へ
 /// 新しくレイヤーを作ることはしない**（読込図面でレイヤーが勝手に増えないための
@@ -3090,7 +3123,11 @@ fn handle_tool_shortcut_keys(
 /// 表示される（ここではフォールバックしない — ユーザーがロックした意図を尊重する）。
 fn resolve_tool_layer(document: &Document, tool_kind: ToolKind) -> LayerId {
     match tool_kind {
-        ToolKind::DimLinear | ToolKind::DimRadial | ToolKind::DimDiameter => {
+        ToolKind::DimLinear
+        | ToolKind::DimRadial
+        | ToolKind::DimDiameter
+        | ToolKind::DimAngular
+        | ToolKind::DimOrdinate => {
             layer_named(document, DIM_LAYER_NAME).unwrap_or_else(|| document.current_layer())
         }
         // 表・部品表も文字レイヤーへ(ユーザー指示 2026-09-06。表は罫線と文字の複合だが、
@@ -4059,6 +4096,8 @@ fn dim_kind_and_annotation(geom: &EntityGeom) -> Option<(DimKind, &DimAnnotation
         EntityGeom::DimLinear(d) => Some((DimKind::Linear, &d.annotation)),
         EntityGeom::DimRadial(d) => Some((DimKind::Radial, &d.annotation)),
         EntityGeom::DimDiameter(d) => Some((DimKind::Diameter, &d.annotation)),
+        EntityGeom::DimAngular(d) => Some((DimKind::Angular, &d.annotation)),
+        EntityGeom::DimOrdinate(d) => Some((DimKind::Ordinate, &d.annotation)),
         _ => None,
     }
 }
@@ -4075,6 +4114,14 @@ fn dim_geom_with_annotation(geom: &EntityGeom, annotation: DimAnnotation) -> Opt
             ..d.clone()
         })),
         EntityGeom::DimDiameter(d) => Some(EntityGeom::DimDiameter(DimDiameter {
+            annotation,
+            ..d.clone()
+        })),
+        EntityGeom::DimAngular(d) => Some(EntityGeom::DimAngular(DimAngular {
+            annotation,
+            ..d.clone()
+        })),
+        EntityGeom::DimOrdinate(d) => Some(EntityGeom::DimOrdinate(DimOrdinate {
             annotation,
             ..d.clone()
         })),
@@ -4109,6 +4156,14 @@ fn common_allowed_symbols(kinds: impl Iterator<Item = DimKind>) -> Vec<DimSymbol
     acc.unwrap_or_default()
 }
 
+/// `kinds` のうち 1 種類でも [`DimKind::allowed_symbols`] が空でない（記号を持てる）なら
+/// `true`（M11 タスク74）。角度寸法・座標寸法はどちらも記号を持てない
+/// （`DimKind::allowed_symbols` が `&[]` を返す）ため、選択が角度・座標のみのときは
+/// 記号行そのものを出さない。`kinds` が空なら `false`。
+fn any_kind_allows_symbols(mut kinds: impl Iterator<Item = DimKind>) -> bool {
+    kinds.any(|k| !k.allowed_symbols().is_empty())
+}
+
 /// 桁数「スタイルに従う」チェックボックスの表示状態（チェック済み＝スタイルに従う）を、
 /// 永続的な編集フラグ `decimals_editing` と現在の注記から算出した `all_follow_style`
 /// から導出する（Codex adversarial review 2026-09-04 差し戻し対応A）。
@@ -4137,20 +4192,20 @@ fn dim_selection_summary(live: &[(EntityId, DimKind, DimAnnotation)]) -> String 
     let mut linear = 0usize;
     let mut radial = 0usize;
     let mut diameter = 0usize;
+    let mut angular = 0usize;
+    let mut ordinate = 0usize;
     for (_, kind, _) in live {
         match kind {
             DimKind::Linear => linear += 1,
             DimKind::Radial => radial += 1,
             DimKind::Diameter => diameter += 1,
-            // 角度寸法・座標寸法（M11 タスク69）は**まだこの経路へ来ない**。
-            // `live` を組む `dim_kind_and_annotation` が両者に `None` を返すため、
-            // 右パネルの「寸法」セクション自体が対象にしていない。種別対応と
-            // この内訳文言の追加はタスク74 の範囲。
-            DimKind::Angular | DimKind::Ordinate => {}
+            // M11 タスク74 で角度・座標も `dim_kind_and_annotation` の対象になった。
+            DimKind::Angular => angular += 1,
+            DimKind::Ordinate => ordinate += 1,
         }
     }
     format!(
-        "選択中: {} 件(長さ {linear}・半径 {radial}・直径 {diameter})",
+        "選択中: {} 件(長さ {linear}・半径 {radial}・直径 {diameter}・角度 {angular}・座標 {ordinate})",
         live.len()
     )
 }
@@ -4357,43 +4412,48 @@ fn dim_panel(
     };
 
     // --- 記号: 全種別の allowed_symbols の共通部分だけを選択肢にする ---
-    let allowed_symbols = common_allowed_symbols(live.iter().map(|(_, kind, _)| *kind));
-    let symbol_common = all_same(live.iter().map(|(_, _, a)| a.symbol));
-    ui.horizontal(|ui| {
-        ui.label("記号:");
-        let selected_text = match symbol_common {
-            Some(Some(sym)) => dim_symbol_ui_label(sym),
-            Some(None) => "なし",
-            None => "(混在)",
-        };
-        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_symbol"))
-            .height(DIM_COMBO_MAX_HEIGHT)
-            .selected_text(selected_text)
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(symbol_common == Some(None), "なし")
-                    .clicked()
-                {
-                    let (cmds, errs) =
-                        build_annotation_edit_commands(document, &live, |a| a.symbol = None);
-                    apply(cmds, errs);
-                }
-                for &sym in &allowed_symbols {
+    // 選択中の全種別が記号を持てない（角度・座標のみ。DimKind::allowed_symbols が
+    // 空）場合は行そのものを出さない（M11 タスク74）。
+    if any_kind_allows_symbols(live.iter().map(|(_, kind, _)| *kind)) {
+        let allowed_symbols = common_allowed_symbols(live.iter().map(|(_, kind, _)| *kind));
+        let symbol_common = all_same(live.iter().map(|(_, _, a)| a.symbol));
+        ui.horizontal(|ui| {
+            ui.label("記号:");
+            let selected_text = match symbol_common {
+                Some(Some(sym)) => dim_symbol_ui_label(sym),
+                Some(None) => "なし",
+                None => "(混在)",
+            };
+            egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_symbol"))
+                .height(DIM_COMBO_MAX_HEIGHT)
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
                     if ui
-                        .selectable_label(
-                            symbol_common == Some(Some(sym)),
-                            dim_symbol_ui_label(sym),
-                        )
+                        .selectable_label(symbol_common == Some(None), "なし")
                         .clicked()
                     {
-                        let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
-                            a.symbol = Some(sym);
-                        });
+                        let (cmds, errs) =
+                            build_annotation_edit_commands(document, &live, |a| a.symbol = None);
                         apply(cmds, errs);
                     }
-                }
-            });
-    });
+                    for &sym in &allowed_symbols {
+                        if ui
+                            .selectable_label(
+                                symbol_common == Some(Some(sym)),
+                                dim_symbol_ui_label(sym),
+                            )
+                            .clicked()
+                        {
+                            let (cmds, errs) =
+                                build_annotation_edit_commands(document, &live, |a| {
+                                    a.symbol = Some(sym);
+                                });
+                            apply(cmds, errs);
+                        }
+                    }
+                });
+        });
+    }
 
     // --- 公差: 種別コンボ（なし/±対称/上下偏差/はめあい記号）+ 値入力 ---
     let tol_kind_common = all_same(live.iter().map(|(_, _, a)| dim_tol_kind_ui(&a.tolerance)));
@@ -7542,7 +7602,7 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::dimension::dim_sizes;
-    use mcad_core::{DimDirection, Entity, expand_linear};
+    use mcad_core::{DimDirection, Entity, OrdinateAxis, expand_linear};
     use mcad_geom::{Circle, LineSeg};
     // 紙 mm のダッシュパターン定数は `plot` が持つ（タスク39）。画面側の px 換算
     // （[`dash_pattern_px`]）の回帰テストが元の値と突き合わせるために参照する。
@@ -8930,6 +8990,69 @@ mod tests {
     }
 
     #[test]
+    fn dim_ordinate_tool_keeps_origin_after_locked_layer_commit_failure() {
+        // 回帰(タスク74 Codex adversarial review 2026-09-21 指摘): DimOrdinate は
+        // `ToolKind::keeps_state_on_commit_failure` に含まれていなかったため、確定失敗
+        // （レイヤーロック等）のたびに `*tool = tool_kind.spawn()` で作り直され、DESIGN.md
+        // タスク74 の UX 確定「Esc までは原点を保持」が破られていた。
+        let mut document = Document::new();
+        let layer = lock_current_layer(&mut document);
+        let entity_count_before = document.entity_count();
+        let tool_ctx = tool::ToolCtx {
+            layer,
+            style: Style::inherited(),
+            ortho_enabled: false,
+        };
+
+        let mut tool = ToolKind::DimOrdinate
+            .spawn()
+            .expect("DimOrdinate always spawns a tool");
+        let origin = Point2::new(0.0, 0.0);
+        assert_eq!(
+            tool.on_input(&tool_ctx, InputEvent::Click(origin)),
+            ToolResult::Continue,
+            "1クリック目は原点を確定するだけ"
+        );
+        let feature = Point2::new(3.0, 0.0);
+        assert_eq!(
+            tool.on_input(&tool_ctx, InputEvent::Click(feature)),
+            ToolResult::Continue,
+            "2クリック目は計測点を確定するだけ"
+        );
+        let leader_end = Point2::new(3.0, 2.0);
+        let ToolResult::Commit(cmd) = tool.on_input(&tool_ctx, InputEvent::Click(leader_end))
+        else {
+            panic!("expected Commit");
+        };
+        assert!(
+            document.apply(cmd).is_err(),
+            "ロックレイヤーなので確定は失敗する"
+        );
+        assert_eq!(document.entity_count(), entity_count_before, "文書は不変");
+
+        // 本来の handle_tool_input の Err 分岐と同じ処理: 作り直さず後始末フックだけ呼ぶ。
+        assert!(ToolKind::DimOrdinate.keeps_state_on_commit_failure());
+        tool.on_commit_failed();
+
+        // 原点を保持していれば、次のクリックは「原点の選び直し」（Continue のまま
+        // WaitingOrigin）ではなく「計測点の確定」として進む。それを、続く1クリックで
+        // もう一度確定できることで確認する（原点を選び直す必要があれば、あと2クリック
+        // 要る＝leader_end のクリックだけでは Commit にならない）。
+        let feature2 = Point2::new(3.0, 5.0);
+        assert_eq!(
+            tool.on_input(&tool_ctx, InputEvent::Click(feature2)),
+            ToolResult::Continue,
+            "原点を保持していれば、この1クリックは計測点の確定で進むはず"
+        );
+        let leader_end2 = Point2::new(3.0, 6.0);
+        let retry = tool.on_input(&tool_ctx, InputEvent::Click(leader_end2));
+        assert!(
+            matches!(retry, ToolResult::Commit(_)),
+            "原点を保持したまま計測点・引出線端だけ選び直して再確定できるはず、got {retry:?}"
+        );
+    }
+
+    #[test]
     fn trim_tool_commit_failure_does_not_leak_stale_selection_flag() {
         // 回帰(A-3): 2断片トリムの確定がロックで失敗しても、選択集合の載せ替えフラグ
         // （`select_new_entities`）が立ったまま残ってはいけない。残ると、次に成功した
@@ -9111,6 +9234,14 @@ mod tests {
             document.current_layer()
         );
         assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimAngular),
+            document.current_layer()
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimOrdinate),
+            document.current_layer()
+        );
+        assert_eq!(
             resolve_tool_layer(&document, ToolKind::Text),
             document.current_layer()
         );
@@ -9135,6 +9266,14 @@ mod tests {
         );
         assert_eq!(
             resolve_tool_layer(&document, ToolKind::DimDiameter),
+            dim_layer
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimAngular),
+            dim_layer
+        );
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::DimOrdinate),
             dim_layer
         );
 
@@ -10926,14 +11065,45 @@ mod tests {
             .unwrap()
             .entities[0];
 
+        let angular = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimAngular(DimAngular {
+                    vertex: Point2::ORIGIN,
+                    p1: Point2::new(4.0, 0.0),
+                    p2: Point2::new(0.0, 4.0),
+                    arc_radius: 2.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let ordinate = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimOrdinate(DimOrdinate {
+                    origin: Point2::ORIGIN,
+                    feature: Point2::new(10.0, 3.0),
+                    leader_end: Point2::new(14.0, 3.0),
+                    axis: OrdinateAxis::Y,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
         let live = vec![
             (linear, DimKind::Linear, DimAnnotation::default()),
             (radial, DimKind::Radial, DimAnnotation::default()),
             (diameter, DimKind::Diameter, DimAnnotation::default()),
+            (angular, DimKind::Angular, DimAnnotation::default()),
+            (ordinate, DimKind::Ordinate, DimAnnotation::default()),
         ];
         assert_eq!(
             dim_selection_summary(&live),
-            "選択中: 3 件(長さ 1・半径 1・直径 1)"
+            "選択中: 5 件(長さ 1・半径 1・直径 1・角度 1・座標 1)"
         );
 
         // 単一種別のみ（長さ寸法だけを選び直したはずが、累積選択で直径寸法が
@@ -10944,7 +11114,68 @@ mod tests {
         ];
         assert_eq!(
             dim_selection_summary(&mixed),
-            "選択中: 2 件(長さ 1・半径 0・直径 1)"
+            "選択中: 2 件(長さ 1・半径 0・直径 1・角度 0・座標 0)"
         );
+    }
+
+    #[test]
+    fn any_kind_allows_symbols_true_when_linear_mixed_in() {
+        // 角度・座標のみ → 記号を持てる種別が無いので false。
+        assert!(!any_kind_allows_symbols(
+            [DimKind::Angular, DimKind::Ordinate].into_iter()
+        ));
+        // 長さ寸法が混ざれば true（DimKind::Linear::allowed_symbols は非空）。
+        assert!(any_kind_allows_symbols(
+            [DimKind::Angular, DimKind::Linear].into_iter()
+        ));
+        // 空なら false。
+        assert!(!any_kind_allows_symbols(std::iter::empty()));
+    }
+
+    #[test]
+    fn build_annotation_edit_commands_accepts_fit_tolerance_for_angular_and_ordinate() {
+        // core（`SizeTolerance::validate` / `DimAnnotation::validate`）は公差の種類を
+        // 寸法種別で絞り込んでいない（はめあい記号を含むどの公差も Angular/Ordinate へ
+        // 付けられる）。DESIGN.md タスク74 実装時追記の確認結果を固定するテスト。
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        let angular = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimAngular(DimAngular {
+                    vertex: Point2::ORIGIN,
+                    p1: Point2::new(4.0, 0.0),
+                    p2: Point2::new(0.0, 4.0),
+                    arc_radius: 2.0,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let ordinate = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimOrdinate(DimOrdinate {
+                    origin: Point2::ORIGIN,
+                    feature: Point2::new(10.0, 3.0),
+                    leader_end: Point2::new(14.0, 3.0),
+                    axis: OrdinateAxis::Y,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let live = vec![
+            (angular, DimKind::Angular, DimAnnotation::default()),
+            (ordinate, DimKind::Ordinate, DimAnnotation::default()),
+        ];
+        let fit = SizeTolerance::Fit(FitClass::new("H7").unwrap());
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |a| {
+            a.tolerance = Some(fit.clone());
+        });
+        assert!(errs.is_empty(), "errors: {errs:?}");
+        assert_eq!(cmds.len(), 2, "角度・座標の両方へ適用できる");
     }
 }

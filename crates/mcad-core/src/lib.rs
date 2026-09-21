@@ -68,9 +68,9 @@ pub use dim::{
 pub use document::{Document, NewIds};
 pub use entity::Entity;
 pub use entity_geom::{
-    DimAngular, DimDiameter, DimDirection, DimLinear, DimOrdinate, DimRadial, EntityGeom,
-    MAX_TABLE_COLS, MAX_TABLE_MM, MAX_TABLE_ROWS, OrdinateAxis, TableGeom, TextGeom,
-    approx_text_width,
+    DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimDiameter, DimDirection, DimLinear, DimOrdinate,
+    DimRadial, EntityGeom, MAX_TABLE_COLS, MAX_TABLE_MM, MAX_TABLE_ROWS, OrdinateAxis, TableGeom,
+    TextGeom, approx_text_width,
 };
 pub use error::CoreError;
 pub use expand::{

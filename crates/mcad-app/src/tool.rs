@@ -41,9 +41,10 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimRender, Document,
-    Entity, EntityGeom, EntityId, LayerId, Linetype, NewIds, Style, TableGeom, dim_distance,
-    expand_diameter, expand_linear, expand_radial, table_world_aabb,
+    Command, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation, DimDiameter, DimDirection,
+    DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom, EntityId, LayerId,
+    Linetype, NewIds, OrdinateAxis, Style, TableGeom, dim_distance, expand_angular,
+    expand_diameter, expand_linear, expand_ordinate, expand_radial, table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -1739,6 +1740,436 @@ impl Tool for DimDiameterTool {
                 radius: hit.radius,
             };
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 角度寸法（DimAngular、M11 タスク74）
+// ---------------------------------------------------------------------
+
+/// 角度寸法ツール（`Shift+G`）の状態。頂点 → 1 辺目の点（p1） → 2 辺目の点（p2） →
+/// 弧の位置（半径）の 4 クリック（DESIGN.md タスク74 の UX 確定）。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum DimAngularState {
+    /// 頂点待ち。
+    #[default]
+    WaitingVertex,
+    /// 1 辺目の点（p1）待ち。頂点は確定済み。
+    WaitingP1(Point2),
+    /// 2 辺目の点（p2）待ち。頂点・p1 は確定済み。
+    WaitingP2(Point2, Point2),
+    /// 弧の位置（半径）のクリック待ち。頂点・p1・p2 は確定済み。
+    WaitingArc(Point2, Point2, Point2),
+}
+
+/// 角度寸法ツール（`Shift+G`）。頂点 → 1 辺目の点 → 2 辺目の点 → 弧の位置の 4 クリックで
+/// [`EntityGeom::DimAngular`] を確定する（DESIGN.md M11 タスク74）。優角（180°超）は
+/// 扱わない・反平行（180°ちょうど）は core が拒否するが、このツールは弧の位置クリックへ
+/// 進む前（2 辺目のクリック時点）に同じ基準で先回りして拒否する（無駄なクリックを
+/// 減らすため）。
+#[derive(Debug, Default)]
+pub struct DimAngularTool {
+    state: DimAngularState,
+    cursor: Option<Point2>,
+}
+
+impl Tool for DimAngularTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                DimAngularState::WaitingVertex => {
+                    self.state = DimAngularState::WaitingP1(p);
+                    ToolResult::Continue
+                }
+                DimAngularState::WaitingP1(vertex) => {
+                    // p1 が頂点とほぼ一致すると辺の向きが定まらない。
+                    if vertex.distance(p) <= DIM_DEGENERATE_EPSILON {
+                        ToolResult::Rejected("Angular dim: leg point coincides with vertex")
+                    } else {
+                        self.state = DimAngularState::WaitingP2(vertex, p);
+                        ToolResult::Continue
+                    }
+                }
+                DimAngularState::WaitingP2(vertex, p1) => {
+                    if vertex.distance(p) <= DIM_DEGENERATE_EPSILON {
+                        return ToolResult::Rejected(
+                            "Angular dim: leg point coincides with vertex",
+                        );
+                    }
+                    let (Some(u1), Some(u2)) =
+                        ((p1 - vertex).normalize(), (p - vertex).normalize())
+                    else {
+                        // 距離チェックを通過していれば正規化は必ず成功するはずだが、
+                        // 念のための防御（core の `directions()` と同じ形）。
+                        return ToolResult::Rejected(
+                            "Angular dim: leg point coincides with vertex",
+                        );
+                    };
+                    // `DIM_ANGULAR_ANTIPARALLEL_EPS`（core, `crates/mcad-core/src/entity_geom.rs`）を
+                    // 同方向・反平行の両方の判定に使う。`WaitingP2` のクリック時点（弧の位置
+                    // クリックより前）で先回りして拒否することで、core の `validate()` が同じ
+                    // 理由で弾く無駄なクリックを避ける（同方向の拒否は core には無い UI 独自の
+                    // 方針。core は 0° も受け付けるが、作図で 0° になるのは誤クリックとみなす）。
+                    let angle = u1.dot(u2).clamp(-1.0, 1.0).acos();
+                    if angle <= DIM_ANGULAR_ANTIPARALLEL_EPS {
+                        return ToolResult::Rejected("Angular dim: legs point the same direction");
+                    }
+                    if (std::f64::consts::PI - angle).abs() < DIM_ANGULAR_ANTIPARALLEL_EPS {
+                        return ToolResult::Rejected("Angular dim: legs are antiparallel");
+                    }
+                    self.state = DimAngularState::WaitingArc(vertex, p1, p);
+                    ToolResult::Continue
+                }
+                DimAngularState::WaitingArc(vertex, p1, p2) => {
+                    // 弧位置のクリックが頂点とほぼ一致すると半径 0 になる
+                    // （半径寸法・直径寸法の中心クリックと同じ退化条件）。
+                    if vertex.distance(p) <= DIM_DEGENERATE_EPSILON {
+                        return ToolResult::Rejected("Angular dim: arc radius is zero");
+                    }
+                    let arc_radius = vertex.distance(p);
+                    let cmd = Command::AddEntity(Entity::new(
+                        EntityGeom::DimAngular(DimAngular {
+                            vertex,
+                            p1,
+                            p2,
+                            arc_radius,
+                            // 作図直後は無注記（角度寸法に記号は無い。DimKind::Angular::allowed_symbols）。
+                            annotation: DimAnnotation::default(),
+                        }),
+                        ctx.layer,
+                        ctx.style,
+                    ));
+                    self.state = DimAngularState::WaitingVertex;
+                    ToolResult::Commit(cmd)
+                }
+            },
+            InputEvent::Cancel => {
+                self.state = DimAngularState::WaitingVertex;
+                ToolResult::Cancel
+            }
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        render: DimRender<'_>,
+    ) {
+        match (self.state, self.cursor) {
+            // p1 待ち: 頂点→カーソルの暫定辺を細線で示す。
+            (DimAngularState::WaitingP1(vertex), Some(cursor)) => {
+                draw_shape(
+                    painter,
+                    rect,
+                    viewport,
+                    &Shape::Line(LineSeg::new(vertex, cursor)),
+                    preview_stroke(),
+                    Linetype::Continuous,
+                    1.0,
+                );
+            }
+            // p2 待ち: 確定済みの 1 辺目（頂点→p1）と、暫定の 2 辺目（頂点→カーソル）の
+            // 2 本を示す。
+            (DimAngularState::WaitingP2(vertex, p1), Some(cursor)) => {
+                draw_shape(
+                    painter,
+                    rect,
+                    viewport,
+                    &Shape::Line(LineSeg::new(vertex, p1)),
+                    preview_stroke(),
+                    Linetype::Continuous,
+                    1.0,
+                );
+                draw_shape(
+                    painter,
+                    rect,
+                    viewport,
+                    &Shape::Line(LineSeg::new(vertex, cursor)),
+                    preview_stroke(),
+                    Linetype::Continuous,
+                    1.0,
+                );
+            }
+            // 弧位置待ち: カーソルまでの距離を半径として、寸法を丸ごとプレビューする。
+            (DimAngularState::WaitingArc(vertex, p1, p2), Some(cursor)) => {
+                let arc_radius = vertex.distance(cursor);
+                if arc_radius > DIM_DEGENERATE_EPSILON {
+                    let dim = DimAngular {
+                        vertex,
+                        p1,
+                        p2,
+                        arc_radius,
+                        annotation: DimAnnotation::default(),
+                    };
+                    let ex = expand_angular(&dim, render);
+                    crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            DimAngularState::WaitingVertex => Vec::new(),
+            DimAngularState::WaitingP1(vertex) => vec![vertex],
+            DimAngularState::WaitingP2(vertex, p1) => vec![vertex, p1],
+            DimAngularState::WaitingArc(vertex, p1, p2) => vec![vertex, p1, p2],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 座標寸法（DimOrdinate、M11 タスク74）
+// ---------------------------------------------------------------------
+
+/// 座標寸法ツール（`Shift+V`）の X/Y 判定モード（[`LinearDirMode`] と同型）。`Tab`
+/// （[`InputEvent::Cycle`]）で 自動 → X → Y → 自動と循環する（DESIGN.md タスク74 の
+/// UX 確定）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum OrdAxisMode {
+    /// 引出線の向きから自動判定する（[`resolve_ordinate_axis`]）。既定。
+    #[default]
+    Auto,
+    /// X 座標に固定。
+    X,
+    /// Y 座標に固定。
+    Y,
+}
+
+impl OrdAxisMode {
+    /// [`Tool::variant_options`] の選択肢一覧（`Tab` 循環の順序と一致）。
+    const OPTIONS: [&'static str; 3] = ["Auto", "X", "Y"];
+
+    /// `Tab` 循環の次の値（自動 → X → Y → 自動）。
+    fn next(self) -> Self {
+        match self {
+            OrdAxisMode::Auto => OrdAxisMode::X,
+            OrdAxisMode::X => OrdAxisMode::Y,
+            OrdAxisMode::Y => OrdAxisMode::Auto,
+        }
+    }
+
+    /// [`Self::OPTIONS`] 内の現在の添字。
+    fn index(self) -> usize {
+        match self {
+            OrdAxisMode::Auto => 0,
+            OrdAxisMode::X => 1,
+            OrdAxisMode::Y => 2,
+        }
+    }
+
+    /// [`Self::OPTIONS`] の添字からモードを作る。範囲外は `Auto`（既定）に倒す。
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => OrdAxisMode::X,
+            2 => OrdAxisMode::Y,
+            _ => OrdAxisMode::Auto,
+        }
+    }
+}
+
+/// 現在のモード・引出線（`feature → leader_end`）から、確定する [`OrdinateAxis`] を
+/// 求める（M11 タスク74）。
+///
+/// `Auto` は「引出線の向きで自動判定」（DESIGN.md タスク74 の UX 確定）:
+/// `|dy| >= |dx|`（縦に引く）なら X 座標、それ以外（横に引く）なら Y 座標。
+/// 一見逆に見えるが、「縦の引出線は水平方向の位置（X）を示す」という座標寸法の
+/// 通例に合わせた対応で、これが仕様どおり正しい。
+fn resolve_ordinate_axis(mode: OrdAxisMode, feature: Point2, leader_end: Point2) -> OrdinateAxis {
+    match mode {
+        OrdAxisMode::X => OrdinateAxis::X,
+        OrdAxisMode::Y => OrdinateAxis::Y,
+        OrdAxisMode::Auto => {
+            let dx = (leader_end.x - feature.x).abs();
+            let dy = (leader_end.y - feature.y).abs();
+            if dy >= dx {
+                OrdinateAxis::X
+            } else {
+                OrdinateAxis::Y
+            }
+        }
+    }
+}
+
+/// 座標寸法ツール（`Shift+V`）の状態。原点を保持し、計測点 → 引出線端の 2 クリックで
+/// 連続して置ける（DESIGN.md タスク74 の UX 確定）。
+///
+/// 3 変異体が揃って `Waiting` 接頭辞を持つため `clippy::enum_variant_names` が
+/// 誤検出するが、他の寸法ツール状態（[`DimLinearState`]・[`DimAngularState`] 等）と
+/// 「次に待つ入力」を明示するための一貫した命名なので抑制する。
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum DimOrdinateState {
+    /// 原点待ち。
+    #[default]
+    WaitingOrigin,
+    /// 計測点（feature）待ち。原点は確定済み。
+    WaitingFeature(Point2),
+    /// 引出線端（leader_end）のクリック待ち。原点・計測点は確定済み。
+    WaitingLeaderEnd(Point2, Point2),
+}
+
+/// 座標寸法ツール（`Shift+V`）。原点 → 計測点 → 引出線端の3クリックで
+/// [`EntityGeom::DimOrdinate`] を確定する（DESIGN.md M11 タスク74）。確定後は
+/// `WaitingFeature`（原点保持）へ戻るため、`Esc` を挟まなければ計測点 → 引出線端の
+/// 2 クリックで続けて置ける。
+///
+/// # X/Y（[`OrdAxisMode`]）
+///
+/// [`DimLinearTool`] の [`LinearDirMode`] と同じ設計。`spawn()` のたびに
+/// [`OrdAxisMode::Auto`] へ戻り、`Tab`（[`InputEvent::Cycle`]）はどの状態でも
+/// 受け付ける。
+#[derive(Debug, Default)]
+pub struct DimOrdinateTool {
+    state: DimOrdinateState,
+    cursor: Option<Point2>,
+    axis_mode: OrdAxisMode,
+}
+
+/// 原点マーカーの固定表示サイズ（スクリーンピクセル、ワールド座標非依存）。
+const ORIGIN_MARKER_PX: f32 = 6.0;
+
+/// 原点にスクリーン固定サイズの十字マーカーを描く（[`DimOrdinateTool`] のプレビュー）。
+/// ワールド座標をズームに関わらず同じ見た目で示すため、`world_to_screen` で
+/// スクリーン座標へ変換してから固定 px 長で描く。
+fn draw_origin_marker(painter: &Painter, rect: Rect, viewport: &Viewport, origin: Point2) {
+    let center = viewport.world_to_screen(rect, origin);
+    let half = ORIGIN_MARKER_PX / 2.0;
+    let stroke = preview_stroke();
+    painter.line_segment(
+        [
+            egui::Pos2::new(center.x - half, center.y),
+            egui::Pos2::new(center.x + half, center.y),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::Pos2::new(center.x, center.y - half),
+            egui::Pos2::new(center.x, center.y + half),
+        ],
+        stroke,
+    );
+}
+
+impl Tool for DimOrdinateTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            // X/Y の循環はどの状態でも受け付ける（DimLinearTool の向き循環と同じ扱い）。
+            InputEvent::Cycle => {
+                self.axis_mode = self.axis_mode.next();
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                DimOrdinateState::WaitingOrigin => {
+                    self.state = DimOrdinateState::WaitingFeature(p);
+                    ToolResult::Continue
+                }
+                // 計測点が原点と一致しても値 0 として正当なので拒否しない
+                // （core の `EntityGeom::validate` も `feature == origin` を拒否しない）。
+                DimOrdinateState::WaitingFeature(origin) => {
+                    self.state = DimOrdinateState::WaitingLeaderEnd(origin, p);
+                    ToolResult::Continue
+                }
+                DimOrdinateState::WaitingLeaderEnd(origin, feature) => {
+                    // core（`EntityGeom::validate`）は引出線長 0（`feature == leader_end`）を
+                    // 拒否しない。`expand_ordinate` は引出線を引かずにラベルだけを置けるため、
+                    // DXF import 等で経路上こういう値が来ても値は破綻しない。だがこのツールで
+                    // 長さ 0 になるのは大半が二重クリックの誤操作で、しかも X/Y の自動判定
+                    // （`resolve_ordinate_axis`）は引出線の向きから決めるため、向きが無いと
+                    // どちらの軸か定まらない。`DimLinearTool` が p1≈p2 を拒否するのと同じ
+                    // 「UI は core より厳しくてよい」方針で、ここは拒否する（Codex adversarial
+                    // review 2026-09-21: high 指摘だが、この理由で拒否を維持すると判断した）。
+                    if feature.distance(p) <= DIM_DEGENERATE_EPSILON {
+                        return ToolResult::Rejected("Ordinate dim: leader length is zero");
+                    }
+                    let axis = resolve_ordinate_axis(self.axis_mode, feature, p);
+                    let cmd = Command::AddEntity(Entity::new(
+                        EntityGeom::DimOrdinate(DimOrdinate {
+                            origin,
+                            feature,
+                            leader_end: p,
+                            axis,
+                            // 作図直後は無注記（座標寸法に記号は無い。DimKind::Ordinate::allowed_symbols）。
+                            annotation: DimAnnotation::default(),
+                        }),
+                        ctx.layer,
+                        ctx.style,
+                    ));
+                    // 原点は保持し、計測点待ちへ戻る（Esc までは連続して置ける）。
+                    self.state = DimOrdinateState::WaitingFeature(origin);
+                    ToolResult::Commit(cmd)
+                }
+            },
+            InputEvent::Cancel => {
+                // 原点ごと破棄する（DESIGN.md タスク74 の UX 確定）。
+                self.state = DimOrdinateState::WaitingOrigin;
+                ToolResult::Cancel
+            }
+            InputEvent::Confirm => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        render: DimRender<'_>,
+    ) {
+        match self.state {
+            DimOrdinateState::WaitingOrigin => {}
+            DimOrdinateState::WaitingFeature(origin) => {
+                draw_origin_marker(painter, rect, viewport, origin);
+            }
+            DimOrdinateState::WaitingLeaderEnd(origin, feature) => {
+                draw_origin_marker(painter, rect, viewport, origin);
+                if let Some(cursor) = self.cursor {
+                    let axis = resolve_ordinate_axis(self.axis_mode, feature, cursor);
+                    let dim = DimOrdinate {
+                        origin,
+                        feature,
+                        leader_end: cursor,
+                        axis,
+                        annotation: DimAnnotation::default(),
+                    };
+                    let ex = expand_ordinate(&dim, render);
+                    crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
+                }
+            }
+        }
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            DimOrdinateState::WaitingOrigin => Vec::new(),
+            DimOrdinateState::WaitingFeature(origin) => vec![origin],
+            DimOrdinateState::WaitingLeaderEnd(origin, feature) => vec![origin, feature],
+        }
+    }
+
+    fn variant_options(&self) -> Option<VariantOptions> {
+        Some(VariantOptions {
+            heading: "Ord axis",
+            options: &OrdAxisMode::OPTIONS,
+            current: self.axis_mode.index(),
+        })
+    }
+
+    fn set_variant(&mut self, index: usize) {
+        self.axis_mode = OrdAxisMode::from_index(index);
     }
 }
 
@@ -6130,6 +6561,337 @@ mod tests {
             ToolResult::Continue
         );
         assert!(tool.wants_circle_pick());
+    }
+
+    // --- 角度寸法ツール（M11 タスク74）---
+
+    #[test]
+    fn dim_angular_tool_four_clicks_commit() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0))),
+            ToolResult::Continue
+        );
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0))),
+            ToolResult::Continue
+        );
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 4.0))),
+            ToolResult::Continue
+        );
+        // 弧の位置（半径 2）で確定。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 0.0))));
+        let EntityGeom::DimAngular(dim) = geom else {
+            panic!("expected DimAngular, got {geom:?}");
+        };
+        assert!(dim.vertex.distance(Point2::ORIGIN) < 1e-9);
+        assert!(dim.p1.distance(Point2::new(4.0, 0.0)) < 1e-9);
+        assert!(dim.p2.distance(Point2::new(0.0, 4.0)) < 1e-9);
+        assert!((dim.arc_radius - 2.0).abs() < 1e-9);
+        // 確定後は頂点待ちへ戻る。
+        assert!(tool.snap_points().is_empty());
+    }
+
+    #[test]
+    fn dim_angular_tool_rejects_p1_coincident_with_vertex() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0)));
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0))),
+            ToolResult::Rejected("Angular dim: leg point coincides with vertex")
+        );
+        // 状態据え置き = まだ p1 待ちなので、離れた点なら受理する。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 1.0))),
+            ToolResult::Continue
+        );
+    }
+
+    #[test]
+    fn dim_angular_tool_rejects_p2_coincident_with_vertex() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0))),
+            ToolResult::Rejected("Angular dim: leg point coincides with vertex")
+        );
+        // 状態据え置き = まだ p2 待ちなので、離れた点なら受理して弧待ちへ進む。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 4.0))),
+            ToolResult::Continue
+        );
+    }
+
+    #[test]
+    fn dim_angular_tool_rejects_same_direction_legs() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        // p2 も +x 方向（同方向）。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 0.0))),
+            ToolResult::Rejected("Angular dim: legs point the same direction")
+        );
+        // 状態据え置き。反平行でない有効な点なら受理する。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 4.0))),
+            ToolResult::Continue
+        );
+    }
+
+    #[test]
+    fn dim_angular_tool_rejects_antiparallel_legs() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        // p2 は反対方向（-x）= 反平行（180°ちょうど）。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(-4.0, 0.0))),
+            ToolResult::Rejected("Angular dim: legs are antiparallel")
+        );
+        // 状態据え置き。180°未満の有効な点なら受理する。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 4.0))),
+            ToolResult::Continue
+        );
+    }
+
+    #[test]
+    fn dim_angular_tool_antiparallel_threshold_matches_core_validate() {
+        // ツール側の反平行拒否（`DIM_ANGULAR_ANTIPARALLEL_EPS` を使う判定）が、core の
+        // `EntityGeom::validate`（同じ定数を使う）と同じ境界で一致することを固定する
+        // （Codex adversarial review 2026-09-21 指摘: 定数の複製をやめて共有した後も
+        // 閾値そのものが変わっていないことの回帰）。
+        let vertex = Point2::new(0.0, 0.0);
+        let p1 = Point2::new(1.0, 0.0);
+
+        // 閾値のすぐ内側（反平行寄り）: PI - angle < EPS なので両者とも拒否する。
+        let offset_inside = DIM_ANGULAR_ANTIPARALLEL_EPS * 0.5;
+        let angle_inside = std::f64::consts::PI - offset_inside;
+        let p2_inside = Point2::new(angle_inside.cos(), angle_inside.sin());
+
+        let (_doc, tool_ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.on_input(&tool_ctx, InputEvent::Click(vertex));
+        tool.on_input(&tool_ctx, InputEvent::Click(p1));
+        assert_eq!(
+            tool.on_input(&tool_ctx, InputEvent::Click(p2_inside)),
+            ToolResult::Rejected("Angular dim: legs are antiparallel"),
+            "閾値の内側はツールも拒否するはず"
+        );
+        let core_result_inside = EntityGeom::DimAngular(DimAngular {
+            vertex,
+            p1,
+            p2: p2_inside,
+            arc_radius: 1.0,
+            annotation: DimAnnotation::default(),
+        })
+        .validate();
+        assert!(
+            core_result_inside.is_err(),
+            "core の validate も閾値の内側は拒否するはず"
+        );
+
+        // 閾値のすぐ外側: PI - angle > EPS なので両者とも通す。
+        let offset_outside = DIM_ANGULAR_ANTIPARALLEL_EPS * 2.0;
+        let angle_outside = std::f64::consts::PI - offset_outside;
+        let p2_outside = Point2::new(angle_outside.cos(), angle_outside.sin());
+
+        let (_doc, tool_ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.on_input(&tool_ctx, InputEvent::Click(vertex));
+        tool.on_input(&tool_ctx, InputEvent::Click(p1));
+        assert_eq!(
+            tool.on_input(&tool_ctx, InputEvent::Click(p2_outside)),
+            ToolResult::Continue,
+            "閾値の外側はツールも通すはず"
+        );
+        let core_result_outside = EntityGeom::DimAngular(DimAngular {
+            vertex,
+            p1,
+            p2: p2_outside,
+            arc_radius: 1.0,
+            annotation: DimAnnotation::default(),
+        })
+        .validate();
+        assert!(
+            core_result_outside.is_ok(),
+            "core の validate も閾値の外側は通すはず, got {core_result_outside:?}"
+        );
+    }
+
+    #[test]
+    fn dim_angular_tool_rejects_zero_arc_radius() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        let vertex = Point2::new(0.0, 0.0);
+        tool.on_input(&ctx, InputEvent::Click(vertex));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 4.0)));
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(vertex)),
+            ToolResult::Rejected("Angular dim: arc radius is zero")
+        );
+        // 状態据え置き。離れた点なら受理して確定できる。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0))));
+        assert!(matches!(geom, EntityGeom::DimAngular(_)));
+    }
+
+    #[test]
+    fn dim_angular_tool_cancel_resets_and_snap_points() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        assert!(tool.snap_points().is_empty());
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        assert_eq!(tool.snap_points().len(), 2);
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+        assert!(tool.snap_points().is_empty());
+    }
+
+    // --- 座標寸法ツール（M11 タスク74）---
+
+    #[test]
+    fn dim_ordinate_tool_three_clicks_commit_then_repeats_with_origin_kept() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimOrdinateTool::default();
+
+        // 原点。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0))),
+            ToolResult::Continue
+        );
+        // 計測点。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(10.0, 3.0))),
+            ToolResult::Continue
+        );
+        // 引出線端（横に引く → 自動判定で Y）。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(14.0, 3.0))));
+        let EntityGeom::DimOrdinate(dim) = geom else {
+            panic!("expected DimOrdinate, got {geom:?}");
+        };
+        assert!(dim.origin.distance(Point2::ORIGIN) < 1e-9);
+        assert!(dim.feature.distance(Point2::new(10.0, 3.0)) < 1e-9);
+        assert_eq!(dim.axis, OrdinateAxis::Y);
+
+        // 原点は保持され、計測点 → 引出線端の 2 クリックで続けて置ける。
+        assert_eq!(tool.snap_points(), vec![Point2::new(0.0, 0.0)]);
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 5.0)));
+        let geom2 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 9.0))));
+        let EntityGeom::DimOrdinate(dim2) = geom2 else {
+            panic!("expected DimOrdinate, got {geom2:?}");
+        };
+        assert!(dim2.origin.distance(Point2::ORIGIN) < 1e-9);
+        assert!(dim2.feature.distance(Point2::new(2.0, 5.0)) < 1e-9);
+    }
+
+    #[test]
+    fn dim_ordinate_tool_allows_feature_equal_to_origin() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimOrdinateTool::default();
+        let origin = Point2::new(1.0, 1.0);
+        tool.on_input(&ctx, InputEvent::Click(origin));
+        // feature == origin は退化として拒否しない（値 0 として正当）。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(origin)),
+            ToolResult::Continue
+        );
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 5.0))));
+        let EntityGeom::DimOrdinate(dim) = geom else {
+            panic!("expected DimOrdinate, got {geom:?}");
+        };
+        assert!((dim.feature - dim.origin).length() < 1e-9);
+    }
+
+    #[test]
+    fn dim_ordinate_tool_rejects_zero_leader_length() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimOrdinateTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        let feature = Point2::new(5.0, 5.0);
+        tool.on_input(&ctx, InputEvent::Click(feature));
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(feature)),
+            ToolResult::Rejected("Ordinate dim: leader length is zero")
+        );
+        // 状態据え置き。離れた点なら受理して確定できる。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 9.0))));
+        assert!(matches!(geom, EntityGeom::DimOrdinate(_)));
+    }
+
+    #[test]
+    fn dim_ordinate_tool_cancel_discards_origin() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimOrdinateTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        assert_eq!(tool.snap_points(), vec![Point2::new(0.0, 0.0)]);
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+        // 原点ごと破棄されているので snap_points が空（原点待ちへ戻った）。
+        assert!(tool.snap_points().is_empty());
+    }
+
+    #[test]
+    fn dim_ordinate_tool_auto_axis_picks_x_for_vertical_leader_and_y_for_horizontal() {
+        let (_doc, ctx) = ctx();
+        // 縦に引く（|dy| >= |dx|）→ X。
+        let mut tool = DimOrdinateTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(3.0, 0.0)));
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(3.0, 10.0))));
+        let EntityGeom::DimOrdinate(dim) = geom else {
+            panic!("expected DimOrdinate, got {geom:?}");
+        };
+        assert_eq!(dim.axis, OrdinateAxis::X);
+
+        // 横に引く（|dx| > |dy|）→ Y。
+        let mut tool = DimOrdinateTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 3.0)));
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(10.0, 3.0))));
+        let EntityGeom::DimOrdinate(dim) = geom else {
+            panic!("expected DimOrdinate, got {geom:?}");
+        };
+        assert_eq!(dim.axis, OrdinateAxis::Y);
+    }
+
+    #[test]
+    fn dim_ordinate_tool_explicit_axis_overrides_auto_detection() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimOrdinateTool::default();
+        assert_eq!(variant_label(&tool), Some("Auto"));
+        // Tab で Auto -> X。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+        assert_eq!(variant_label(&tool), Some("X"));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        // 横に引く（自動判定なら Y になるはずの向き）でも X 固定が優先される。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(10.0, 0.0))));
+        let EntityGeom::DimOrdinate(dim) = geom else {
+            panic!("expected DimOrdinate, got {geom:?}");
+        };
+        assert_eq!(dim.axis, OrdinateAxis::X);
+
+        // set_variant でも同様に固定できる（コンボ経由の経路）。
+        let mut tool2 = DimOrdinateTool::default();
+        tool2.set_variant(2); // Y
+        assert_eq!(variant_label(&tool2), Some("Y"));
+        tool2.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool2.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        // 縦に引く（自動判定なら X になるはずの向き）でも Y 固定が優先される。
+        let geom2 = committed_geom(tool2.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 10.0))));
+        let EntityGeom::DimOrdinate(dim2) = geom2 else {
+            panic!("expected DimOrdinate, got {geom2:?}");
+        };
+        assert_eq!(dim2.axis, OrdinateAxis::Y);
     }
 
     // --- pick_circle_or_arc（app 層ヒットテスト）---

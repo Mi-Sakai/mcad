@@ -283,6 +283,19 @@ impl OrdinateAxis {
     }
 }
 
+/// 角度寸法の反平行判定に使う閾値（ラジアン）。
+///
+/// [`EntityGeom::validate`]（`DimAngular`）が、`p1` 方向と `p2` 方向のなす角と π の差が
+/// この値未満なら反平行（180 度ちょうど）として拒否する。境界は「意図して 180 度ちょうどを
+/// 作った場合だけを弾き、179.99 度のような通常の角度は通す」ために選んだ。f64 の `acos` は
+/// 1e-8 程度の丸め誤差を持ちうるので、それより十分大きく、かつ通常の作図で意図せず踏むには
+/// 小さすぎる値として `1e-6` を取った（M11 タスク69）。
+///
+/// `crates/mcad-app/src/tool.rs` の `DimAngularTool` も、弧位置クリックより前（2 辺目の
+/// クリック時点）で同じ基準を先回りして使うため、この定数を経由して共有する
+/// （Codex adversarial review 2026-09-21 指摘、M11 タスク74: 以前は値をリテラルで複製していた）。
+pub const DIM_ANGULAR_ANTIPARALLEL_EPS: f64 = 1e-6;
+
 /// 角度寸法（非関連の静的寸法。M11 タスク69 で新設）。
 ///
 /// 頂点 [`DimAngular::vertex`] と、そこから見た 2 方向を決める点
@@ -1072,13 +1085,10 @@ impl EntityGeom {
                 // （`p1`/`p2` を入れ替えると弧が反対側へ飛ぶ。[`DimAngular`] の doc
                 // 「反平行（180 度ちょうど）は拒否する」参照）。
                 //
-                // 閾値 1e-6 ラジアン（≒ 0.00006 度）は「意図して 180 度ちょうどを
-                // 作った場合だけを弾き、179.99 度のような通常の角度は通す」ために
-                // 選んだ。f64 の acos は 1e-8 程度の丸め誤差を持ちうるので、それより
-                // 十分大きく、かつ通常の作図で意図せず踏むには小さすぎる値として
-                // 1e-6 を取った。
+                // 閾値の理由は [`DIM_ANGULAR_ANTIPARALLEL_EPS`] の doc を参照
+                // （メッセージの二重管理をしない）。
                 let angle = u1.dot(u2).clamp(-1.0, 1.0).acos();
-                if (std::f64::consts::PI - angle).abs() < 1e-6 {
+                if (std::f64::consts::PI - angle).abs() < DIM_ANGULAR_ANTIPARALLEL_EPS {
                     return Err(
                         "angular dimension legs must not be antiparallel (arc side is ambiguous at 180°)"
                             .into(),

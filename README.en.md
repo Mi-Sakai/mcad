@@ -2,7 +2,7 @@
 
 *[日本語版 README](./README.md)*
 
-A 2D CAD application built with Rust and egui. Current version: **v0.10.0**.
+A 2D CAD application built with Rust and egui. Current version: **v0.11.0**.
 
 > **Note on language.** The project's design documents (`DESIGN.md`, `AGENTS.md`,
 > `CHANGELOG.md`) are written in Japanese, and the application UI is being migrated
@@ -23,8 +23,8 @@ for the design and [`AGENTS.md`](./AGENTS.md) for the development conventions
 
 ## Features
 
-- **Drawing**: points, line segments, circles, arcs (three-point: start / through / end), polylines, text (CJK supported), **dimensions** (linear, radial and diameter; auxiliary symbols φ/Sφ/□/R/SR/CR/C/t; tolerance support; style editing; seven arrowhead styles; drag text position)
-- **Editing**: selection (click, rubber band, additive), move, duplicate, rotate, mirror, offset, **trim, extend, fillet, split**, delete
+- **Drawing**: points, line segments, circles, arcs (three-point: start / through / end), polylines, text (CJK supported), **dimensions** (linear, radial, diameter, angular and ordinate; linear dimensions support aligned/horizontal/vertical/oblique direction; angular dimensions can be defined by three points or by two lines — including lines meeting at a corner cut by a fillet or chamfer; ordinate dimensions auto-detect X/Y; auxiliary symbols φ/Sφ/□/R/SR/CR/C/t; tolerance support; annotation value style (reference/theoretically-exact), prefix/suffix and text rotation (auto/horizontal/oblique); style editing; seven arrowhead styles; drag text position; chained/parallel continuous input)
+- **Editing**: selection (click, rubber band, additive), move, duplicate, rotate, mirror, offset, **trim, extend, fillet, split**, dimension grip editing (drag endpoints or the dimension line position; a right-panel button clears appearance overrides in bulk), delete
 - **Isometric drawing aids**: isometric grid (`F5`), isometric axes for orthogonal mode, and an isometric circle tool (`I`, four-centre method). No Z axis or true ellipse; everything stays 2D arcs
 - **Snapping**: endpoint, intersection, midpoint, center and grid candidates chosen by priority, with a distinct marker per kind
 - **Tables and parts lists**: a general table entity (`K`, with cells, column widths and row heights edited in a dedicated dialog) and a parts-list preset from the drafting standard (item no. / name / quantity / material / remarks, placed right above the title block). Entries are typed by hand; nothing is aggregated from the drawing automatically
@@ -69,9 +69,11 @@ For everyday use, a release build is recommended: `cargo run --release -p mcad-a
 | `1` | Point tool |
 | `L` / `C` / `A` / `P` | Line / circle / arc / polyline |
 | `T` | Text (click the anchor, type the string and height in the top panel, `Enter` to commit, `Esc` to cancel) |
-| `D` | Linear dimension (three clicks: two measured points, then the dimension line position; preview follows the cursor) |
+| `D` | Linear dimension (three clicks: two measured points, then the dimension line position; preview follows the cursor). Direction (aligned/horizontal/vertical) cycles with `Tab` or the top-panel combo; with orthogonal mode (`F8`) on and direction set to aligned, it snaps to the nearest axis of the two measured points. The top-panel angle field (degrees) sets an extension-line angle. Oblique direction and changing an existing dimension's direction are done from the right panel "寸法" (dimensions) section. The top-panel combo (single/series/parallel) switches to continuous input: series chains the next dimension's first point to the previous one's second point and keeps the dimension line collinear; parallel keeps the first dimension's first point fixed and only asks for a new dimension-line position each time |
 | `Shift+D` | Radial dimension (two clicks: a circle or arc, then the leader direction) |
 | `G` | Diameter dimension (two clicks: a circle or arc, then the direction of the dimension line) |
+| `Shift+G` | Angular dimension. The top-panel combo or `Tab` switches between "3 points" and "2 lines". 3 points: four clicks — vertex, a point on each leg, then the arc position (parallel, same-direction or degenerate legs are rejected). 2 lines: three clicks — line 1, line 2, then the arc position; the vertex is the two lines' intersection (possibly on an extension), and the angle measured is the one on the side where the arc was placed (parallel lines are rejected) |
+| `Shift+V` | Ordinate dimension (three clicks: origin, measured point, leader end; after `Esc` the origin stays fixed and further dimensions only need the two remaining clicks). X/Y is auto-detected from the leader direction; `Tab` or the top-panel combo switches auto/X/Y |
 | `I` | Isometric circle (click the centre, then a point at the radius; drawn as four arcs by the four-centre method. `Tab` during the preview cycles the face Top/Left/Right) |
 | `K` | Table (one click places an empty 3 × 3 table; edit cells, column widths, row heights, text height and the number of rows/columns from the 表を編集… (edit table) button in the right panel) |
 | `Enter` | Commit a polyline (two or more points, left open; clicking the start point closes and commits it) |
@@ -94,7 +96,7 @@ a settings file and restored on the next launch (see "Settings" below).
 
 ## File formats
 
-- **`.mcad`**: the native JSON format. As of v0.10.0 the schema is v6; v1 through v5 files still load (backward compatible: v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era)
+- **`.mcad`**: the native JSON format. As of v0.11.0 the schema is v7; v1 through v6 files still load (backward compatible: v6 files get the dimension types and annotation fields added in v7 filled in with defaults, v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era). v7 added linear dimension direction (aligned/horizontal/vertical/oblique, `DimLinear.direction`) and extension-line angle (`DimLinear.ext_angle`), angular (`DimAngular`) and ordinate (`DimOrdinate`) dimensions, and the annotation extensions (text rotation, reference/theoretically-exact value style, prefix/suffix)
 - **New drawings** start with `"0"` plus five layers matching the drafting standard's line table (centre line, hidden line, outline, dimension line, text, with their linetypes and widths), and the current layer is the outline layer. Dimensions and text are placed automatically on layers named `寸法線` (dimension line) and `文字` (text) when those exist (in a loaded drawing without them, the current layer is used). The standard layers can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
 
 ## Settings
@@ -122,8 +124,8 @@ format — the original DXF file is never overwritten. Be aware of the following
 - **Line width**: per-entity line width round-trips, but a layer's default line width is not preserved and falls back to the default (0.35mm) — a limitation of the `dxf` crate 0.6.1
 - **Linetype**: continuous / dashed / dash-dot / dash-dot-dot round-trips for both layers and entities. Unknown linetype names fall back to continuous
 - **TEXT**: position, height and rotation are mapped. Height is converted against the drawing's scale, in paper mm. Strings containing CJK are written and restored as UTF-8 (the DXF header is R2007). TEXT with a non-standard justification — anything other than horizontal Left plus vertical Baseline — is skipped
-- **DIMENSION**: mcad dimensions are not exported to DXF, as there is no corresponding primitive; the number of skipped entities is shown in the status bar. They are saved normally in `.mcad`. Importing DXF DIMENSION is planned for M11
-- **Tables**: a table is exported decomposed into its rules (`LINE`) and non-empty cell texts (`TEXT`). This is a **one-way trip** — reimporting does not rebuild the table entity, and the distinction between the outer border and the inner rules is lost. `ACAD_TABLE` written by other software is skipped, since the `dxf` crate 0.6.1 has no type for it (it is not even counted as skipped)
+- **DIMENSION**: since DXF has no primitive that corresponds to an mcad dimension, dimensions are exported decomposed into their dimension line, extension lines, arrowheads and text, written as `LINE`/`SOLID`/`ARC`/`TEXT` (the same **one-way round trip** as tables — reimporting does not rebuild the dimension entity; the `SOLID` used for the filled arrowhead is counted in the skipped-entity total on reimport). They are saved normally in `.mcad`. Importing DXF `DIMENSION` written by other CAD software is supported (aligned, rotated, radial, diameter, three-point angular and ordinate dimensions; two-line angular and arc-length dimensions are not)
+- **Tables**: a table is exported decomposed into its rules (`LINE`) and cell texts (`TEXT`). This is a **one-way trip** — reimporting does not rebuild the table entity (the distinction in rule thickness is also lost). `ACAD_TABLE` written by other software is skipped, since the `dxf` crate 0.6.1 has no type for it (it is not even counted as skipped)
 - **Drawing frame and title block**: these are not exported to DXF, because DXF has nowhere to carry the sheet metadata. A reimported drawing draws its frame from the default paper and scale, so the frame no longer lines up with the geometry the way it did in the original
 - **CJK text in other applications**: CJK written by mcad may appear garbled in other CAD software (confirmed with LibreCAD). DXF cannot embed the font itself, so rendering depends on the fonts installed on the receiving side
 
@@ -156,7 +158,7 @@ Key design decisions:
 - **f64 world coordinates**: coordinate precision matters in CAD. f32 accumulates error on large drawings, so the conversion to f32 happens only at the egui drawing boundary
 - **Command-pattern undo**: cheaper in memory than snapshots and viable for large drawings. Every change goes through `Document::apply(Command)`
 - **Keeping geom GUI-independent**: geometry stays testable as pure functions, which also makes a future constraint solver easier to add
-- **No spatial index**: a full scan with AABB culling is adequate up to a few thousand entities
+- **No spatial index**: a full scan with AABB culling is used (measured in v0.11.0: picking, box selection and culling stay around 3 ms even at 20,000 entities)
 
 ## Development
 

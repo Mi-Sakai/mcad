@@ -4,6 +4,90 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-22 — 性能と互換性
+
+他 CAD が書いた DXF の寸法(DIMENSION)を読めるようにし、寸法の種類を回転寸法・角度寸法・座標寸法へ広げた。
+寸法は DXF へ分解して書き出す。あわせて寸法・表の展開を `mcad-core` へ移し、画面・SVG/PDF・DXF が同じ実装を
+使うようにした(M11 タスク64〜80)。`.mcad` スキーマを v6 → v7 へ更新。空間インデックスは実測のうえ見送った。
+
+### 追加
+
+- **DXF DIMENSION の import**(`crates/mcad-io/src/dxf_file.rs`、タスク67・69): 整列・回転・半径・直径・3 点角度・
+  座標の 6 種を `DimLinear`/`DimRadial`/`DimDiameter`/`DimAngular`/`DimOrdinate` へ写す。定義点(10/13/14/15)の意味は
+  Autodesk DXF Reference と LibreCAD(libdxfrw 0.6.3)の実ファイルで確認した。DXF の角度(度)とラジアンの変換は
+  io 境界に閉じる。**値や位置が変わってしまう寸法は取り込まない**: 計測 2 点が group 50 の方向と平行でない回転寸法、
+  押し出し法線が +Z でない寸法、実測値(group 42)が座標からの再計算と食い違う寸法(DIMLFAC 等)は
+  新設の `ImportSummary::skipped_dimensions` へ計上してスキップする(判定は `actual_measurement_mismatches` 等)。
+  取り込むが属性を捨てたもの(解釈できない文字テンプレート・group 52 の補助線の傾き・group 53 の文字回転)は
+  新設の `ImportSummary::dropped_dimension_details` へ計上する。DIMSTYLE は読まず、anonymous block(`*D1` 等)も
+  無視するので見た目の線が二重に入ることはない。2 直線角度寸法・弧長寸法は `dxf` クレートが読めないため
+  読み飛ばされ、件数にも出ない。回帰用の合成 fixture は `crates/mcad-io/tests/fixtures/synthetic_dimensions.dxf`
+- **回転寸法**(タスク68): `DimDirection { Aligned, Rotated(θ) }`(`crates/mcad-core/src/entity_geom.rs`)と
+  `DimLinear::direction`。水平・鉛直は `Rotated(0)`・`Rotated(π/2)` で表す。計測 2 点を寸法線の向きへ投影して
+  寸法線の端点を決め、`rotated`/`mirrored` は向きも変換する。`Aligned` の描画は従来とビット単位で同一
+- **角度寸法 `DimAngular`**(頂点・2 辺の点・弧の半径)と**座標寸法 `DimOrdinate`**(原点・計測点・引出線端・
+  `OrdinateAxis { X, Y }`)(タスク69)。角度寸法は弧と頂点からの補助線で描き、値に `°` を付ける。優角(180° 超)は
+  扱わず、反平行(180° ちょうど)は拒否する
+- **注記の拡張**(`DimAnnotation`、タスク70): `text_rotation`(文字の向き、ワールドの絶対角)・`value_style`
+  (`ValueStyle { Plain, Reference, TheoreticallyExact }`。参考寸法は丸括弧、理論的に正確な寸法は矩形枠)・
+  `prefix`/`suffix`(`2×`・`-M6` 等。上限 `MAX_DIM_AFFIX_LEN` = 32 文字)。組版の並びは
+  接頭辞 → 記号 → 値 → 接尾辞 → 公差で、括弧・枠は記号〜接尾辞を囲む(公差は外)。DXF の文字テンプレート(`<>`)は
+  前後を接頭辞・接尾辞へ分解して取り込む
+- **寸法補助線の傾き** `DimLinear::ext_angle`(タスク78): `None` は寸法線に垂直(従来どおり)。`Some(θ)` のとき
+  寸法線の端点は補助線との交点で決まり、表示値(投影長)は変わらない。補助線が寸法線とほぼ平行で交点が遠くへ
+  飛ぶ場合は補助線を描かない(`MAX_EXT_LINE_SPAN_RATIO`、`crates/mcad-core/src/expand/dimension.rs`)
+- **寸法の分解 DXF export**(タスク72): 寸法線・補助線・矢先・文字を `LINE`/`SOLID`/`ARC`/`TEXT` へ分解して書く。
+  矢先の塗りは凸多角形を三角形扇の `SOLID` へ分割する(`fill_polygon_to_dxf_solids`)。寸法由来の線は常に
+  `CONTINUOUS`。表と同じ**非対称往復**で、読み戻しても寸法には戻らず、`SOLID` は再取込時にスキップ件数へ計上される
+- **長さ寸法ツールの向き**(`D`、タスク73): 整列/水平/鉛直を `Tab` 循環と上部パネルのコンボで切り替える。直交モード
+  (`F8`)では整列のまま近い軸へ自動で倒れる。上部パネルの角度欄(度)で補助線の傾きを指定する。右パネル「寸法」で
+  既存の長さ寸法の向き(任意角を含む)と補助線の傾きを変更でき、向きを変えても寸法線の位置は保たれる
+  (`linear_offset_preserving_midpoint`)。これに合わせ `Tool::variant_label()` を `Tool::variant_options()` +
+  `Tool::set_variant()` へ置き換え、`ToolCtx` に `ortho_enabled` を足した
+- **角度寸法ツール**(`Shift+G`)と**座標寸法ツール**(`Shift+V`)(タスク74・80): 角度寸法は「3 points」(頂点 → 1 辺目 →
+  2 辺目 → 弧の位置の 4 クリック)と「2 lines」(線分またはポリラインの辺を 2 本選び、交点を頂点にして、弧の位置を
+  置いた側の角を測る。交点は延長上でもよく、フィレットで欠けた角にも付けられる)を `Tab`・コンボで切り替える。
+  座標寸法は原点 → 計測点 → 引出線端の 3 クリックで、`Esc` まで原点を保持し、X/Y は引出線の向きで自動判定
+  (`Tab`・コンボで自動/X/Y)。同方向・反平行・平行・半径ゼロ等の退化は理由を出して拒否する
+- **寸法のグリップ編集**(タスク75): 選択中の寸法の計測点・寸法線位置・頂点・弧の位置等にグリップ(`DimGripKind`、
+  `dim_grips`)を出し、スナップを効かせてドラッグで編集する。確定規則は `apply_dim_grip` 1 箇所で、プレビューと
+  確定が食い違わない。undo 1 回で戻る
+- **直列寸法・並列寸法の連続入力**(`D` の上部パネル「連続」コンボ、`ChainMode`、タスク75): 直列は 1 本目の寸法線と
+  同一直線上に次の計測点 1 クリックで続け、並列は 1 本目の始点を共有して計測点 → 寸法線位置の 2 クリックで積む。
+  `Tool::chain_options()`/`set_chain_variant()` を新設
+- **右パネル「寸法」の注記入力**(タスク75・79): 「表記」(通常/参考寸法/理論的に正確な寸法)・「接頭辞」「接尾辞」
+  (確定/解除)・「文字の向き」(自動/水平/任意角)と、「見た目の上書きを一括解除」ボタン(桁数・文字位置・文字の向き・
+  表示値上書き・矢の配置を戻す。記号・公差・表記・接頭辞/接尾辞は残す)。複数選択では選択中の全寸法へ
+  undo 1 回で適用する
+- `.mcad` v7(`crates/mcad-io/src/mcad_file.rs`): 上記の向き・角度寸法・座標寸法・注記の拡張・補助線の傾きを永続化。
+  v6 以前の DTO は凍結し、v6 以前と自称するファイルの長さ寸法に `direction`・`ext_angle` が混ざっていれば
+  整列寸法へすり替えずに読込ごと拒否する(`DimLinearV6` の `deny_unknown_fields`)
+
+### 変更
+
+- **寸法・表の展開(罫線・文字・矢先の座標を組む純関数)を `mcad-app` から `mcad-core` の `expand` モジュールへ移した**
+  (`crates/mcad-core/src/expand/`、タスク71)。画面・SVG/PDF・DXF export が同じ実装を使い、M10 で DXF の表 export が
+  組版を io 側へ再実装していた二重化を解消した。描画は変わらない(タスク64 のスナップショットで確認)
+- **ファイルダイアログにタイトルを付け、メインウィンドウの子として開くようにした**(「MCAD開く」「MCAD保存」「DXFインポート」
+  「DXF保存」「SVG保存」「PDF保存」。日本語で始まるタイトルは MATE で描かれないため英字で始める)。従来はタイトルが空で、DXF 保存のダイアログがメインウィンドウの
+  前面に出ないことがあった
+- 回転寸法の補助線は寸法線に垂直に引く(輪郭線に合わせたいときは補助線の傾きで指定する)
+- `clippy::large_enum_variant` を `ToolResult`/`PlacementOutcome`/`OffsetOutcome` 等で抑制した(`DimAnnotation` の拡張で
+  `Command` が大きくなったため。`Command` の `Box` 化は見送り)
+
+### 見送り
+
+- **空間インデックス**(タスク76): 1k/5k/20k エンティティの実測(タスク66、`crates/mcad-app/src/perf_tests.rs`)で、
+  pick・矩形選択・カリングは 20,000 エンティティでも 3ms 台だった。16ms を超えた SVG/PDF 出力・保存・読込は
+  全件を処理する単発操作で、索引では速くならない。20,000 エンティティの実ウィンドウでも操作は重くなかった
+
+### テスト
+
+- 971本 → 1167本(うち ignored 2本)
+- 寸法描画の SVG スナップショット 36 ケース(`crates/mcad-app/src/dim_snapshot_tests.rs`、fixture は
+  `crates/mcad-app/tests/snapshots/`、更新は `UPDATE_SNAPSHOTS=1`)と、`.mcad` v1〜v7 の実ファイル fixture
+  (`crates/mcad-io/tests/fixtures/`)を追加
+
 ## [0.10.0] - 2026-09-13 — 表・部品表
 
 汎用テーブルエンティティと部品表プリセットを実装し、あわせて寸法矢先をブロック化して7種から

@@ -1413,23 +1413,23 @@ impl McadApp {
     }
 
     /// Ctrl+O: 未保存の変更があれば確認モーダルを出し、なければ即座にファイル選択へ進む。
-    fn request_open_document(&mut self, now: f64) {
+    fn request_open_document(&mut self, frame: Option<&eframe::Frame>, now: f64) {
         self.cancel_placement_for_file_op();
         if self.is_dirty() {
             self.confirm_state = ConfirmState::ConfirmingOpen;
         } else {
-            self.open_document(now);
+            self.open_document(frame, now);
         }
     }
 
     /// Ctrl+Shift+O: 未保存の変更があれば確認モーダルを出し、なければ即座に
     /// DXF ファイル選択へ進む。
-    fn request_open_dxf(&mut self, now: f64) {
+    fn request_open_dxf(&mut self, frame: Option<&eframe::Frame>, now: f64) {
         self.cancel_placement_for_file_op();
         if self.is_dirty() {
             self.confirm_state = ConfirmState::ConfirmingOpenDxf;
         } else {
-            self.open_dxf(now);
+            self.open_dxf(frame, now);
         }
     }
 
@@ -1557,8 +1557,8 @@ impl McadApp {
     /// 未保存の変更があるかどうかは確認しない。呼び出し側（[`McadApp::request_open_document`]
     /// または確認モーダルの「破棄して続行」選択）が確認済みであることを前提とする。
     /// 読込失敗時は現在のドキュメントを一切変更せず、理由をステータスバーへ表示する。
-    fn open_document(&mut self, now: f64) {
-        let mut dialog = rfd::FileDialog::new().add_filter("mcad", &[MCAD_EXTENSION]);
+    fn open_document(&mut self, frame: Option<&eframe::Frame>, now: f64) {
+        let mut dialog = new_file_dialog("MCAD開く", frame).add_filter("mcad", &[MCAD_EXTENSION]);
         if let Some(dir) = self.dialog_start_dir() {
             dialog = dialog.set_directory(dir);
         }
@@ -1613,8 +1613,9 @@ impl McadApp {
     /// へ設定して必ず dirty=true にする（doc 参照）。これにより直後の Ctrl+S は
     /// `save_document` → `save_document_as` 経由で「名前を付けて`.mcad`保存」ダイアログへ
     /// 誘導され、元の DXF ファイルは上書きされない。
-    fn open_dxf(&mut self, now: f64) {
-        let mut dialog = rfd::FileDialog::new().add_filter("dxf", &[DXF_EXTENSION]);
+    fn open_dxf(&mut self, frame: Option<&eframe::Frame>, now: f64) {
+        let mut dialog =
+            new_file_dialog("DXFインポート", frame).add_filter("dxf", &[DXF_EXTENSION]);
         if let Some(dir) = self.dialog_start_dir() {
             dialog = dialog.set_directory(dir);
         }
@@ -1685,7 +1686,7 @@ impl McadApp {
     /// 変更があっても確認モーダルは出さない。成功しても `current_path`・
     /// `saved_generation` は一切変更しない（DESIGN.md 6章 設計判断1: DXFは交換用
     /// 形式であり「保存」とは別物として扱う。dirty 状態は変わらない）。
-    fn export_dxf_file(&mut self, now: f64) {
+    fn export_dxf_file(&mut self, frame: Option<&eframe::Frame>, now: f64) {
         self.cancel_placement_for_file_op();
         let default_name = self
             .current_path
@@ -1696,7 +1697,7 @@ impl McadApp {
                 || DEFAULT_DXF_FILE_NAME.to_string(),
                 |stem| format!("{stem}.{DXF_EXTENSION}"),
             );
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = new_file_dialog("DXF保存", frame)
             .add_filter("dxf", &[DXF_EXTENSION])
             .set_file_name(&default_name);
         if let Some(dir) = self.dialog_start_dir() {
@@ -1736,7 +1737,7 @@ impl McadApp {
     /// DXF エクスポートと同じく読み取り専用操作なので、未保存の変更があっても確認
     /// モーダルは出さず、成功しても `current_path`・`saved_generation` は変更しない
     /// （M8 タスク39-3。SVG は plot IR の直列化であって「保存」ではない）。
-    fn export_svg_file(&mut self, now: f64) {
+    fn export_svg_file(&mut self, frame: Option<&eframe::Frame>, now: f64) {
         self.cancel_placement_for_file_op();
         let default_name = self
             .current_path
@@ -1747,7 +1748,7 @@ impl McadApp {
                 || DEFAULT_SVG_FILE_NAME.to_string(),
                 |stem| format!("{stem}.{SVG_EXTENSION}"),
             );
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = new_file_dialog("SVG保存", frame)
             .add_filter("svg", &[SVG_EXTENSION])
             .set_file_name(&default_name);
         if let Some(dir) = self.dialog_start_dir() {
@@ -1776,7 +1777,7 @@ impl McadApp {
     /// DXF/SVG エクスポートと同じく読み取り専用操作なので、未保存の変更があっても
     /// 確認モーダルは出さず、成功しても `current_path`・`saved_generation` は変更
     /// しない（M8 タスク40。PDF は plot IR の直列化であって「保存」ではない）。
-    fn export_pdf_file(&mut self, now: f64) {
+    fn export_pdf_file(&mut self, frame: Option<&eframe::Frame>, now: f64) {
         self.cancel_placement_for_file_op();
         let default_name = self
             .current_path
@@ -1787,7 +1788,7 @@ impl McadApp {
                 || DEFAULT_PDF_FILE_NAME.to_string(),
                 |stem| format!("{stem}.{PDF_EXTENSION}"),
             );
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = new_file_dialog("PDF保存", frame)
             .add_filter("pdf", &[PDF_EXTENSION])
             .set_file_name(&default_name);
         if let Some(dir) = self.dialog_start_dir() {
@@ -1812,10 +1813,10 @@ impl McadApp {
 
     /// Ctrl+S: 開いているファイルパスへ上書き保存する。パスが未定なら
     /// 「名前を付けて保存」（[`McadApp::save_document_as`]）と同じ扱いにする。
-    fn save_document(&mut self, now: f64) {
+    fn save_document(&mut self, frame: Option<&eframe::Frame>, now: f64) {
         self.cancel_placement_for_file_op();
         let Some(path) = self.current_path.clone() else {
-            self.save_document_as(now);
+            self.save_document_as(frame, now);
             return;
         };
         self.save_to(&path, now);
@@ -1823,7 +1824,7 @@ impl McadApp {
 
     /// Ctrl+Shift+S: 常にネイティブの保存ダイアログを表示し、選んだ先へ保存する。
     /// 成功時は「現在開いているファイルパス」を選んだ先に更新する。
-    fn save_document_as(&mut self, now: f64) {
+    fn save_document_as(&mut self, frame: Option<&eframe::Frame>, now: f64) {
         self.cancel_placement_for_file_op();
         let default_name = self
             .current_path
@@ -1831,7 +1832,7 @@ impl McadApp {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or(DEFAULT_FILE_NAME);
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = new_file_dialog("MCAD保存", frame)
             .add_filter("mcad", &[MCAD_EXTENSION])
             .set_file_name(default_name);
         if let Some(dir) = self.dialog_start_dir() {
@@ -1912,6 +1913,28 @@ fn ensure_pdf_extension(path: PathBuf) -> PathBuf {
     ensure_extension(path, PDF_EXTENSION)
 }
 
+/// ネイティブファイルダイアログ（`rfd::FileDialog`）の共通の組み立てを担う
+/// ヘルパー。タイトルと親ウィンドウを設定する（フィルタ・既定ファイル名・
+/// 開始ディレクトリは呼び出し側がそれぞれ付け足す）。
+///
+/// `title` は OS ネイティブのダイアログに表示される文字列であり、egui の UI
+/// 領域ではないため AGENTS.md の「日本語化は領域単位で」の対象外（日本語を渡してよい）。
+/// ただし**英字で始めること**: 開発機の MATE（xdg-desktop-portal-gtk）では、日本語で
+/// 始まるタイトルがタイトルバーに描かれない（ウィンドウ名自体は設定される。
+/// 2026-09-22 に「図面を開く」は描かれず「DXF図面を開く」は描かれることを実測）。
+///
+/// `frame` が `Some` のとき、Linux（xdg-desktop-portal バックエンド）で
+/// ダイアログをメインウィンドウの子として親付けし、前面に出さない不具合を防ぐ
+/// （[`rfd::FileDialog::set_parent`]）。ネイティブダイアログを開かない headless
+/// テストでは `eframe::Frame` を用意できないため `None` を渡す。
+fn new_file_dialog(title: &str, frame: Option<&eframe::Frame>) -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new().set_title(title);
+    match frame {
+        Some(frame) => dialog.set_parent(frame),
+        None => dialog,
+    }
+}
+
 /// ドキュメント中の全エンティティを包む AABB。エンティティが1つもなければ `None`
 /// （M4タスク13: ズームフィット対象の算出。[`Viewport::fit_to_aabb`] に渡す）。
 ///
@@ -1977,7 +2000,7 @@ fn select_canvas_key_shortcuts_enabled(text_focused: bool) -> bool {
 }
 
 impl eframe::App for McadApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let now = ui.input(|i| i.time);
 
         // テキスト入力欄（オフセット距離入力欄など）にフォーカスがあるか。egui のフォーカスは
@@ -2047,25 +2070,25 @@ impl eframe::App for McadApp {
                 self.request_new_document(now);
             }
             if open_pressed {
-                self.request_open_document(now);
+                self.request_open_document(Some(frame), now);
             }
             if save_pressed {
-                self.save_document(now);
+                self.save_document(Some(frame), now);
             }
             if save_as_pressed {
-                self.save_document_as(now);
+                self.save_document_as(Some(frame), now);
             }
             if open_dxf_pressed {
-                self.request_open_dxf(now);
+                self.request_open_dxf(Some(frame), now);
             }
             if export_dxf_pressed {
-                self.export_dxf_file(now);
+                self.export_dxf_file(Some(frame), now);
             }
             if export_svg_pressed {
-                self.export_svg_file(now);
+                self.export_svg_file(Some(frame), now);
             }
             if export_pdf_pressed {
-                self.export_pdf_file(now);
+                self.export_pdf_file(Some(frame), now);
             }
             if duplicate_pressed {
                 self.request_duplicate(now);
@@ -2722,11 +2745,11 @@ impl eframe::App for McadApp {
                                 }
                                 ConfirmState::ConfirmingOpen => {
                                     self.confirm_state = ConfirmState::Idle;
-                                    self.open_document(now);
+                                    self.open_document(Some(frame), now);
                                 }
                                 ConfirmState::ConfirmingOpenDxf => {
                                     self.confirm_state = ConfirmState::Idle;
-                                    self.open_dxf(now);
+                                    self.open_dxf(Some(frame), now);
                                 }
                                 ConfirmState::ConfirmingOpenRecent => {
                                     self.confirm_state = ConfirmState::Idle;
@@ -8422,7 +8445,7 @@ mod tests {
             .unwrap();
         assert!(app.is_dirty());
 
-        app.request_open_document(0.0);
+        app.request_open_document(None, 0.0);
 
         assert_eq!(app.confirm_state, ConfirmState::ConfirmingOpen);
     }
@@ -8748,7 +8771,7 @@ mod tests {
             .unwrap();
         assert!(app.is_dirty());
 
-        app.request_open_dxf(0.0);
+        app.request_open_dxf(None, 0.0);
 
         assert_eq!(app.confirm_state, ConfirmState::ConfirmingOpenDxf);
     }

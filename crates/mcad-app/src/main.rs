@@ -50,10 +50,10 @@ use plot::dash_pattern_mm;
 
 use tool::{
     ArcTool, CircleTool, DIM_DEGENERATE_EPSILON, DimAngularTool, DimDiameterTool, DimLinearTool,
-    DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput, ExtendTool, FilletTool, InputEvent,
-    IsoCircleTool, LineTool, OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview,
-    PointTool, PolylineTool, SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult,
-    TrimTool, layer_visible,
+    DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput, ExtendTool, FilletTool,
+    GripDragOutcome, InputEvent, IsoCircleTool, LineTool, OffsetOutcome, PlacementKind,
+    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TableTool,
+    TextTool, Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -492,6 +492,16 @@ const RECT_OUTLINE_COLOR: Color32 = Color32::from_rgb(80, 160, 255);
 /// 選択ハイライト（寒色）と区別しやすい。オフセット中は元＝ハイライト、結果＝この色）。
 const OFFSET_PREVIEW_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 
+/// 寸法グリップ（M11 タスク75）のスクリーン固定表示サイズ（1辺、px）。ズームに関わらず
+/// 同じ見た目にする（座標寸法の原点マーカー [`tool::ORIGIN_MARKER_PX`] と同じ流儀）。
+const GRIP_SIZE_PX: f32 = 8.0;
+/// グリップのヒット許容量（px）。四角の1辺と同じにして、見えている範囲だけを掴めるようにする。
+const GRIP_HIT_PX: f32 = GRIP_SIZE_PX;
+/// 通常時のグリップ色（選択ハイライトと同系統の寒色）。
+const GRIP_COLOR: Color32 = SELECTION_COLOR;
+/// ドラッグ中のグリップ色（オフセットゴーストと同じ暖色。掴んでいるものだけ強調する）。
+const GRIP_DRAG_COLOR: Color32 = OFFSET_PREVIEW_COLOR;
+
 /// Text ツールの入力中プレビュー色（作図プレビューと同系統の暖色）。
 const TEXT_PREVIEW_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 
@@ -653,6 +663,12 @@ impl ToolKind {
     /// レイヤーロック等で確定に失敗するたびに原点・X/Y モードが失われ、ユーザーは原点から
     /// クリックし直す羽目になる（Codex adversarial review 2026-09-21 指摘）。`DimOrdinateTool`
     /// は `on_commit_failed` で片付けが要るフラグを持たないため、既定の no-op 実装のままでよい。
+    ///
+    /// `DimLinear`（長さ寸法）も同じ理由で含む（M11 タスク75）: 直列/並列モードで
+    /// 1本目確定後に続く系列（[`tool::DimLinearTool`] の `ChainSeries`/`ChainParallelP2`/
+    /// `ChainParallelLine`）は、`spawn()` で作り直すとレイヤーロック等の確定失敗のたびに
+    /// 失われる。単発（1本だけの確定）でも同じ理由で失敗時に2点を失わせない
+    /// （`DimLinearTool::on_commit_failed` が確定直前の状態へ巻き戻す）。
     fn keeps_state_on_commit_failure(self) -> bool {
         matches!(
             self,
@@ -661,6 +677,7 @@ impl ToolKind {
                 | ToolKind::Fillet
                 | ToolKind::Split
                 | ToolKind::DimOrdinate
+                | ToolKind::DimLinear
         )
     }
 
@@ -1164,6 +1181,7 @@ impl McadApp {
         self.select_tool.cancel_placement();
         self.select_tool.cancel_offset();
         self.select_tool.cancel_text_drag();
+        self.select_tool.cancel_grip_drag();
         // 読込前の距離・半径入力は持ち越さない（別図面では意味が変わるため）。
         self.offset_distance_input.clear();
         self.fillet_radius_input.clear();
@@ -1219,6 +1237,7 @@ impl McadApp {
         // 宙ぶらりんのオフセットを残さない。設計判断2 と同じ思想）。
         self.select_tool.cancel_offset();
         self.select_tool.cancel_text_drag();
+        self.select_tool.cancel_grip_drag();
         self.snap_marker = None;
         // 右パネル「寸法」の入力バッファは選択 ID 集合を鮮度キーにしているが、undo/redo は
         // 選択を変えずに注記の中身だけを変える。そのままだと undo で戻した値がバッファに
@@ -1253,6 +1272,7 @@ impl McadApp {
         self.select_tool.cancel_placement();
         self.select_tool.cancel_offset();
         self.select_tool.cancel_text_drag();
+        self.select_tool.cancel_grip_drag();
         self.reset_picked_shape_tool();
         self.snap_marker = None;
     }
@@ -2014,10 +2034,14 @@ impl eframe::App for McadApp {
         // Ctrl+N/Ctrl+O 等でモーダルを開いたのがこのフレームでも、上のショートカット処理で
         // `confirm_state` が更新済みなので同フレームで確実に解除できる。
         if self.modal_open() {
-            if self.select_tool.is_placing() || self.select_tool.is_offsetting() {
+            if self.select_tool.is_placing()
+                || self.select_tool.is_offsetting()
+                || self.select_tool.is_grip_dragging()
+            {
                 self.select_tool.cancel_placement();
                 self.select_tool.cancel_offset();
                 self.select_tool.cancel_text_drag();
+                self.select_tool.cancel_grip_drag();
                 self.snap_marker = None;
             }
             // トリム・延長の途中状態（採取済みの境界）もモーダル表示で畳む
@@ -2292,6 +2316,27 @@ impl eframe::App for McadApp {
                         ui.label("(Tab)");
                         ui.separator();
                     }
+                    // 2つ目のコンボ（連続入力: 単発/直列/並列）。`Tab` は向きの循環に
+                    // 使用中なので割り当てず、コンボ操作のみで選ぶ（M11 タスク75、
+                    // DESIGN.md「タスク75の着手時設計」(2)）。`Tool::variant_options` と
+                    // 同型の別拡張点（`Tool::chain_options`）で取り出す。
+                    if let Some(opts) = self.tool.as_ref().and_then(|t| t.chain_options()) {
+                        ui.label(format!("{}:", opts.heading));
+                        let mut selected = opts.current;
+                        egui::ComboBox::from_id_salt(("chain_options_combo", opts.heading))
+                            .selected_text(opts.options[opts.current])
+                            .show_ui(ui, |ui| {
+                                for (index, label) in opts.options.iter().enumerate() {
+                                    ui.selectable_value(&mut selected, index, *label);
+                                }
+                            });
+                        if selected != opts.current
+                            && let Some(active) = self.tool.as_mut()
+                        {
+                            active.set_chain_variant(selected);
+                        }
+                        ui.separator();
+                    }
                     // 長さ寸法ツールの補助線傾き入力欄（度、M11 タスク78 の UI、
                     // タスク73）。作図時はここ、既存寸法は右パネル「寸法」で指定する。
                     // 空欄 = 垂直（`ext_angle: None`）。フィレット半径欄と同じ「ツール中のみ
@@ -2549,6 +2594,15 @@ impl eframe::App for McadApp {
                 offset_distance,
                 self.config.paper_display_enabled,
                 k,
+            );
+            // 選択中の寸法のグリップ（M11 タスク75）。選択ハイライトの後・作図プレビューの
+            // 前に描く（グリップは既存寸法の編集起点であり、進行中の作図とは独立）。
+            draw_dim_grips(
+                &painter,
+                rect,
+                &self.document,
+                &self.viewport,
+                &self.select_tool,
             );
             if let Some(tool) = &self.tool {
                 tool.draw_preview(
@@ -3103,6 +3157,7 @@ fn handle_tool_shortcut_keys(
         select_tool.cancel_placement();
         select_tool.cancel_offset();
         select_tool.cancel_text_drag();
+        select_tool.cancel_grip_drag();
         // 作図ツールへ移るときは選択を解除する（Select のままなら選択は保持）。
         if kind != ToolKind::Select {
             select_tool.clear_selection();
@@ -4769,6 +4824,38 @@ fn dim_panel(
         }
     });
 
+    // --- 見た目の上書きの一括解除（M11 タスク75、DESIGN.md「タスク75の着手時設計」(3)）---
+    // 対象は表示上の上書きだけ（`decimals_override`・`text_anchor`・`text_rotation`・
+    // `value_override` を `None`、`arrow_placement` を `Auto` へ戻す）。記号・公差・
+    // `value_style`・接頭辞/接尾辞は寸法の意味そのものなので対象外。向き・補助線の傾き
+    // （`DimLinear` のフィールドで注記ではない）も対象外（`dim_linear_panel` の管轄）。
+    // 対象が1件も上書きを持たなければボタン自体を出さない。
+    let has_display_override = live.iter().any(|(_, _, a)| {
+        a.decimals_override.is_some()
+            || a.text_anchor.is_some()
+            || a.text_rotation.is_some()
+            || a.value_override.is_some()
+            || a.arrow_placement != ArrowPlacement::Auto
+    });
+    if has_display_override {
+        ui.horizontal(|ui| {
+            if ui.button("見た目の上書きを一括解除").clicked() {
+                let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                    a.decimals_override = None;
+                    a.text_anchor = None;
+                    a.text_rotation = None;
+                    a.value_override = None;
+                    a.arrow_placement = ArrowPlacement::Auto;
+                });
+                apply(cmds, errs);
+                decimals_input.clear();
+                *decimals_input_error = None;
+                *decimals_editing = false;
+                value_override_input.clear();
+            }
+        });
+    }
+
     if !pending.is_empty()
         && let Err(err) = document.apply(Command::Batch(pending))
     {
@@ -6087,34 +6174,84 @@ fn handle_select_input(
         select_tool.on_cancel();
     }
 
-    // Space 押下中の左ドラッグはパン。選択操作とは扱わない。
+    // Space 押下中の左ドラッグはパン。選択操作とは扱わない。ドラッグの途中で Space を
+    // 押した場合は、その解放がここへ届かず確定されないまま状態が残るため、進行中の
+    // ドラッグ（グリップ・文字・矩形）を破棄する（M11 タスク75、Codex review 指摘）。
     if ui.input(|i| i.key_down(Key::Space)) {
+        if select_tool.cancel_drags() {
+            *snap_marker = None;
+        }
         return;
     }
+
+    // グリップドラッグ用のスナップパラメータ（作図・配置ツールと同じ換算。M11 タスク75）。
+    let snap_radius = SNAP_RADIUS_PX / viewport.zoom;
+    let grid_step = viewport::nice_grid_step(viewport.zoom, GRID_TARGET_PX);
+    let grid = snap::GridSpec::new(grid_step, grid_mode);
 
     let world_at = |pos| viewport.screen_to_world(rect, pos);
     let pointer = response.interact_pointer_pos();
     if let Some(pos) = pointer {
         let world = world_at(pos);
         if response.drag_started_by(egui::PointerButton::Primary) {
-            // ドラッグ開始点が、選択済み寸法の文字ブロックに入っていれば文字ドラッグへ
-            // 分岐する（M9 タスク51、設計判断7）。それ以外は従来どおり矩形選択。
-            let render = dim_render(
-                document.dim_style(),
-                paper_display,
-                dim_scale_k,
-                viewport.zoom,
-            );
-            match dim_label_hit(document, select_tool.selection(), world, render) {
-                Some((id, label_center)) => {
-                    select_tool.start_text_drag(id, label_center, world);
+            // ドラッグ開始点の掴む優先順（DESIGN.md タスク75）: グリップ（スクリーン座標
+            // ヒット）> 選択済み寸法の文字ブロック（M9 タスク51、設計判断7）> 矩形選択。
+            // 当たり判定・掴んだ点・矩形の始点はすべて押下点で決める。`drag_started_by` の
+            // 時点の `pos` は egui のドラッグ閾値ぶん動いた後の位置で、判定ごとに基準点が
+            // 違うと小さなグリップや文字ブロックの端で優先順が崩れるため。
+            let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+            let press_world = world_at(press);
+            match dim_grip_hit(document, select_tool.selection(), rect, viewport, press) {
+                Some((id, kind, origin)) => {
+                    select_tool.start_grip_drag(id, kind, origin);
                 }
-                None => select_tool.on_drag_start(world),
+                None => {
+                    let render = dim_render(
+                        document.dim_style(),
+                        paper_display,
+                        dim_scale_k,
+                        viewport.zoom,
+                    );
+                    match dim_label_hit(document, select_tool.selection(), press_world, render) {
+                        Some((id, label_center)) => {
+                            select_tool.start_text_drag(id, label_center, press_world);
+                        }
+                        None => select_tool.on_drag_start(press_world),
+                    }
+                }
             }
         } else if response.dragged_by(egui::PointerButton::Primary) {
-            select_tool.on_drag(world);
+            if select_tool.is_grip_dragging() {
+                // グリップドラッグはスナップを効かせる（DESIGN.md タスク75「ドラッグ中」）。
+                // 直交モード（F8）は基準点が定まらないので効かせない（既存の作図ツールの
+                // ortho とは別経路であり、ここでは合成しない）。
+                let (snapped, marker) =
+                    apply_snap(document, snap_enabled, world, snap_radius, grid, &[]);
+                *snap_marker = marker;
+                select_tool.on_grip_drag(snapped);
+            } else {
+                select_tool.on_drag(world);
+            }
         } else if response.drag_stopped_by(egui::PointerButton::Primary) {
-            if select_tool.is_text_dragging() {
+            if select_tool.is_grip_dragging() {
+                // 最後の移動と解放が同じフレームに届くと `dragged_by` 分岐を通らないため、
+                // 解放位置にもスナップを掛けてから確定する（直前フレームの位置で確定しない）。
+                let (snapped, _) =
+                    apply_snap(document, snap_enabled, world, snap_radius, grid, &[]);
+                select_tool.on_grip_drag(snapped);
+                *snap_marker = None;
+                match select_tool.end_grip_drag(document, tol) {
+                    GripDragOutcome::None => {}
+                    GripDragOutcome::Commit(cmd) => {
+                        if let Err(err) = document.apply(cmd) {
+                            set_status(status, now, format!("グリップ編集に失敗しました: {err}"));
+                        }
+                    }
+                    GripDragOutcome::Rejected(reason) => {
+                        set_status(status, now, reason);
+                    }
+                }
+            } else if select_tool.is_text_dragging() {
                 // 文字ドラッグの確定（M9 タスク51）。移動量が tol 未満なら
                 // `end_text_drag` が `None` を返し、履歴を汚さない。
                 if let Some(cmd) = select_tool.end_text_drag(document, world, tol)
@@ -6329,6 +6466,7 @@ fn handle_offset_input(
     if !typing && ui.input(|i| i.key_pressed(Key::Escape)) {
         select_tool.cancel_offset();
         select_tool.cancel_text_drag();
+        select_tool.cancel_grip_drag();
         *snap_marker = None;
         return;
     }
@@ -6869,6 +7007,37 @@ fn draw_entities(
     }
 }
 
+/// スクリーン座標 `pointer_screen` が、**選択集合に含まれる**寸法いずれかのグリップの
+/// ヒット範囲（[`GRIP_HIT_PX`] 以内）に入っていれば `(EntityId, グリップ種別, グリップの
+/// ワールド座標)` を返す（M11 タスク75、DESIGN.md「タスク75の着手時設計」(1)「掴む優先順」）。
+///
+/// グリップはスクリーン固定サイズなのでヒット判定もスクリーン座標で行う（`dim_label_hit`
+/// のワールド座標 `label_box` とは異なる）。選択順→[`tool::dim_grips`] の定義順で最初に
+/// ヒットしたものを返す（重なったときのタイブレーク、設計どおり）。
+fn dim_grip_hit(
+    document: &Document,
+    selection: &[EntityId],
+    rect: Rect,
+    viewport: &Viewport,
+    pointer_screen: Pos2,
+) -> Option<(EntityId, tool::DimGripKind, Point2)> {
+    for &id in selection {
+        let Some(entity) = document.entity(id) else {
+            continue;
+        };
+        if !layer_visible(document, entity) {
+            continue;
+        }
+        for (kind, point) in tool::dim_grips(&entity.geom) {
+            let screen = viewport.world_to_screen(rect, point);
+            if screen.distance(pointer_screen) <= GRIP_HIT_PX {
+                return Some((id, kind, point));
+            }
+        }
+    }
+    None
+}
+
 /// `world` が、**選択集合に含まれる**寸法いずれかの文字ブロック（表示サイズ依存の
 /// `label_box`）に入っていれば、その `(EntityId, 現在のラベル中心)` を返す（M9 タスク51）。
 ///
@@ -7172,6 +7341,28 @@ fn draw_selection(
                 }
             }
         }
+        Some(DragPreview::Grip { id, kind, point }) => {
+            // グリップドラッグ中（M11 タスク75）: 現在の選択はそのまま強調表示し、
+            // ドラッグ対象の寸法だけ `apply_dim_grip` を通した一時コピーを重ねて
+            // 仮表示する（`DimText` と同じゴースト流儀）。退化して作れない
+            // （`Err`）ときは何も描かない（グリップ自体は `draw_dim_grips` が
+            // 強調色でドラッグ中の位置に描いている）。
+            draw_selected(
+                painter,
+                rect,
+                document,
+                viewport,
+                select_tool,
+                highlight,
+                paper_display,
+                k,
+            );
+            if let Some(entity) = document.entity(id)
+                && let Ok(new_geom) = tool::apply_dim_grip(&entity.geom, kind, point)
+            {
+                draw_dim_geom(painter, rect, viewport, &new_geom, highlight, render);
+            }
+        }
         None => draw_selected(
             painter,
             rect,
@@ -7343,6 +7534,62 @@ fn draw_snap_marker(
             seg(c + egui::vec2(0.0, -s), c + egui::vec2(0.0, s));
         }
     }
+}
+
+/// 選択中の寸法のグリップ（スクリーン固定サイズの正方形）を描く（M11 タスク75、
+/// DESIGN.md「タスク75の着手時設計」(1)）。可視レイヤーの寸法にのみ描く（非表示
+/// レイヤーは描画・ヒットテストの対象外という既存規約と同じ）。ロック中のレイヤーの
+/// 寸法にも出す（確定時の `Err` はステータスバーへ出す方針、文字位置ドラッグと同じ）。
+///
+/// グリップドラッグ中（[`DragPreview::Grip`]）は、掴んでいるグリップだけをドラッグ中の
+/// 位置・強調色で描き、それ以外は元位置のまま描く。
+fn draw_dim_grips(
+    painter: &egui::Painter,
+    rect: Rect,
+    document: &Document,
+    viewport: &Viewport,
+    select_tool: &SelectTool,
+) {
+    let dragging = match select_tool.drag_preview() {
+        Some(DragPreview::Grip { id, kind, point }) => Some((id, kind, point)),
+        _ => None,
+    };
+    for &id in select_tool.selection() {
+        let Some(entity) = document.entity(id) else {
+            continue;
+        };
+        if !layer_visible(document, entity) {
+            continue;
+        }
+        for (kind, point) in tool::dim_grips(&entity.geom) {
+            let (point, color) = match dragging {
+                Some((drag_id, drag_kind, drag_point)) if drag_id == id && drag_kind == kind => {
+                    (drag_point, GRIP_DRAG_COLOR)
+                }
+                _ => (point, GRIP_COLOR),
+            };
+            draw_grip_square(painter, rect, viewport, point, color);
+        }
+    }
+}
+
+/// グリップ1個をスクリーン固定サイズの正方形で描く（塗り + 黒枠。スナップマーカーの
+/// 端点□と同じ骨格だが、塗りつぶして「掴める場所」だと視覚的に区別する）。
+fn draw_grip_square(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    world: Point2,
+    color: Color32,
+) {
+    let c = viewport.world_to_screen(rect, world);
+    let r = Rect::from_center_size(c, egui::vec2(GRIP_SIZE_PX, GRIP_SIZE_PX));
+    painter.rect_filled(r, 0.0, color);
+    let outline = Stroke::new(1.0, Color32::BLACK);
+    painter.line_segment([r.left_top(), r.right_top()], outline);
+    painter.line_segment([r.right_top(), r.right_bottom()], outline);
+    painter.line_segment([r.right_bottom(), r.left_bottom()], outline);
+    painter.line_segment([r.left_bottom(), r.left_top()], outline);
 }
 
 /// [`Rgb`] を egui の [`Color32`] へ変換する。
@@ -9032,6 +9279,10 @@ mod tests {
 
         // 本来の handle_tool_input の Err 分岐と同じ処理: 作り直さず後始末フックだけ呼ぶ。
         assert!(ToolKind::DimOrdinate.keeps_state_on_commit_failure());
+        // 長さ寸法も同じ理由で対象に加えた（M11 タスク75。単体の巻き戻し検証は
+        // `tool.rs` の `dim_linear_tool_single_commit_failure_rolls_back_to_waiting_line`・
+        // `dim_linear_tool_series_commit_failure_rolls_back_and_keeps_series` を参照）。
+        assert!(ToolKind::DimLinear.keeps_state_on_commit_failure());
         tool.on_commit_failed();
 
         // 原点を保持していれば、次のクリックは「原点の選び直し」（Continue のまま
@@ -10294,6 +10545,96 @@ mod tests {
         });
         assert!(cmds.is_empty(), "invalid symbol must not produce a command");
         assert_eq!(errs.len(), 1);
+    }
+
+    /// [`add_test_dim_linear`] と同じ寸法を、`annotation` を指定して追加する
+    /// （M11 タスク75 の一括解除テスト用）。
+    fn add_test_dim_linear_with_annotation(
+        document: &mut Document,
+        annotation: DimAnnotation,
+    ) -> EntityId {
+        let layer = document.current_layer();
+        let ids = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(0.0, 0.0),
+                    p2: Point2::new(10.0, 0.0),
+                    offset: 5.0,
+                    direction: DimDirection::Aligned,
+                    ext_angle: None,
+                    annotation,
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        ids.entities[0]
+    }
+
+    #[test]
+    fn batch_clear_display_overrides_resets_only_the_five_fields_and_skips_dims_without_overrides()
+    {
+        // dim_panel の「見た目の上書きを一括解除」ボタンが使う mutate 内容
+        // （decimals_override・text_anchor・text_rotation・value_override を None、
+        // arrow_placement を Auto へ）が、対象5項目だけを戻し他を残すことを固定する
+        // （DESIGN.md「タスク75の着手時設計」(3)）。
+        let mut document = Document::new();
+        let full_annotation = DimAnnotation {
+            symbol: Some(DimSymbol::Diameter),
+            tolerance: Some(SizeTolerance::Symmetric(0.1)),
+            decimals_override: Some(2),
+            text_anchor: Some(Point2::new(1.0, 1.0)),
+            arrow_placement: ArrowPlacement::Inside,
+            value_override: Some("X".to_string()),
+            text_rotation: Some(0.3),
+            value_style: mcad_core::ValueStyle::Reference,
+            prefix: Some("2x".to_string()),
+            suffix: Some("-M6".to_string()),
+        };
+        let overridden_id =
+            add_test_dim_linear_with_annotation(&mut document, full_annotation.clone());
+        // 上書きを何も持たない寸法（既定注記）も選択へ混ぜる。
+        let plain_id = add_test_dim_linear(&mut document);
+
+        let live = vec![
+            (overridden_id, DimKind::Linear, full_annotation.clone()),
+            (plain_id, DimKind::Linear, DimAnnotation::default()),
+        ];
+
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |a| {
+            a.decimals_override = None;
+            a.text_anchor = None;
+            a.text_rotation = None;
+            a.value_override = None;
+            a.arrow_placement = ArrowPlacement::Auto;
+        });
+        assert!(errs.is_empty());
+        // 上書きを持つ1件だけコマンドが作られる（無変化はスキップする既存規約どおり）。
+        assert_eq!(cmds.len(), 1);
+        assert!(document.apply(Command::Batch(cmds)).is_ok());
+
+        let EntityGeom::DimLinear(dim) = &document.entity(overridden_id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        let a = &dim.annotation;
+        // 対象5項目は戻る。
+        assert_eq!(a.decimals_override, None);
+        assert_eq!(a.text_anchor, None);
+        assert_eq!(a.text_rotation, None);
+        assert_eq!(a.value_override, None);
+        assert_eq!(a.arrow_placement, ArrowPlacement::Auto);
+        // それ以外（記号・公差・表記方式・接頭辞・接尾辞）は保たれる。
+        assert_eq!(a.symbol, Some(DimSymbol::Diameter));
+        assert_eq!(a.tolerance, Some(SizeTolerance::Symmetric(0.1)));
+        assert_eq!(a.value_style, mcad_core::ValueStyle::Reference);
+        assert_eq!(a.prefix, Some("2x".to_string()));
+        assert_eq!(a.suffix, Some("-M6".to_string()));
+
+        // 上書きを持たなかった側は無変化。
+        let EntityGeom::DimLinear(plain) = &document.entity(plain_id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(plain.annotation, DimAnnotation::default());
     }
 
     #[test]

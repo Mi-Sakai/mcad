@@ -43,8 +43,9 @@ use egui::{Color32, Painter, Rect, Stroke};
 use mcad_core::{
     Command, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation, DimDiameter, DimDirection,
     DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom, EntityId, LayerId,
-    Linetype, NewIds, OrdinateAxis, Style, TableGeom, dim_distance, expand_angular,
-    expand_diameter, expand_linear, expand_ordinate, expand_radial, table_world_aabb,
+    Linetype, NewIds, OrdinateAxis, Style, TableGeom, diameter_pick_segments, dim_distance,
+    expand_angular, expand_diameter, expand_linear, expand_ordinate, expand_radial,
+    linear_pick_segments, radial_pick_segments, table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -424,6 +425,20 @@ pub trait Tool {
     /// コンボボックス選択を書き戻す。既定は何もしない（循環する選択肢を持たないツール、
     /// および `Tab` 循環のみで選ぶツールでは呼ばれない）。`index` が範囲外なら無視する。
     fn set_variant(&mut self, _index: usize) {}
+
+    /// [`Tool::variant_options`]（向きのコンボ）とは別の、2つ目のコンボボックスの現在状態
+    /// （M11 タスク75）。既定は `None`（2つ目のコンボを持たない）。利用者は
+    /// [`DimLinearTool`] の連続入力モード（単発/直列/並列）のみ。`Tab` は向きの循環に
+    /// 使用中のため、こちらはコンボ操作のみで選ぶ（キー割当を増やさない。DESIGN.md
+    /// タスク75「着手時設計」(2)）。既存の1つ目のコンボと同型の拡張点にすることで、
+    /// 上部パネルは `Box<dyn Tool>` からツール型を知らずに2つ目のコンボも組み立てられる。
+    fn chain_options(&self) -> Option<VariantOptions> {
+        None
+    }
+
+    /// [`Tool::chain_options`] が返した選択肢のうち `index` 番目へ、上部パネルの
+    /// 2つ目のコンボボックス選択を書き戻す。既定は何もしない。`index` が範囲外なら無視する。
+    fn set_chain_variant(&mut self, _index: usize) {}
 }
 
 /// [`Tool::variant_options`] が返す、循環する選択肢を持つツールの現在状態
@@ -1335,7 +1350,61 @@ fn linear_offset(direction: DimDirection, p1: Point2, p2: Point2, cursor: Point2
     }
 }
 
-/// 長さ寸法ツール（`D`）の状態。3 クリック（計測点 p1 → p2 → 寸法線位置）。
+/// 連続入力モード（単発/直列/並列。M11 タスク75、DESIGN.md「タスク75の着手時設計」(2)）。
+/// `spawn()` のたびに [`ChainMode::Single`] へ戻る。`Tab` は向きの循環に使用中のため、
+/// こちらは上部パネルの2つ目のコンボ（[`Tool::chain_options`]）だけで選ぶ。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ChainMode {
+    /// 単発（既定）。1本ごとに3クリックで完結し、系列は作らない。
+    #[default]
+    Single,
+    /// 直列。前の寸法の `p2` が次の `p1` になり、寸法線は1本目と同一直線上に揃える。
+    Series,
+    /// 並列。1本目の `p1` を基準に固定し、寸法線位置は毎回クリックで決める。
+    Parallel,
+}
+
+impl ChainMode {
+    /// [`Tool::chain_options`] の選択肢一覧。
+    const OPTIONS: [&'static str; 3] = ["Single", "Series", "Parallel"];
+
+    /// [`Self::OPTIONS`] 内の現在の添字。
+    fn index(self) -> usize {
+        match self {
+            ChainMode::Single => 0,
+            ChainMode::Series => 1,
+            ChainMode::Parallel => 2,
+        }
+    }
+
+    /// [`Self::OPTIONS`] の添字からモードを作る。範囲外は `Single`（既定）に倒す。
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => ChainMode::Series,
+            2 => ChainMode::Parallel,
+            _ => ChainMode::Single,
+        }
+    }
+}
+
+/// 直列/並列の「系列の基準」（M11 タスク75）。1本目確定時に作り、以降の寸法はこれを
+/// 使って向き・寸法線位置を求める。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ChainAnchor {
+    /// 1本目確定時に解決した向き（ortho 自動判定を含む）を、以降固定の絶対角として
+    /// 保存したもの（常に [`DimDirection::Rotated`]）。1本目自身が
+    /// [`DimDirection::Aligned`] で確定しても、2本目以降は同じ角度の `Rotated` で
+    /// 作る（DESIGN.md「1本目が整列でも、2本目以降は寸法線を同一直線上/平行に揃える
+    /// ため Rotated で保存する」）。
+    direction: DimDirection,
+    /// 直列専用: 1本目の寸法線が通る点（寸法線骨格の1点。並列では使わない）。
+    line_ref: Point2,
+    /// 並列専用: 1本目の `p1`（常にこれを使う。直列では使わない）。
+    first_p1: Point2,
+}
+
+/// 長さ寸法ツール（`D`）の状態。3 クリック（計測点 p1 → p2 → 寸法線位置）に加え、
+/// 直列/並列モード（[`ChainMode`]）で1本目確定後に続く系列状態を持つ（M11 タスク75）。
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 enum DimLinearState {
     /// 計測点 1（p1）待ち。
@@ -1345,6 +1414,15 @@ enum DimLinearState {
     WaitingP2(Point2),
     /// 寸法線位置（offset）のクリック待ち。`p1`・`p2` 確定済み。
     WaitingLine(Point2, Point2),
+    /// 直列: 次の計測点待ち（1クリックで確定）。前の寸法の `p2` が `next_p1`。
+    ChainSeries {
+        anchor: ChainAnchor,
+        next_p1: Point2,
+    },
+    /// 並列: 次の計測点待ち（1クリック目）。`p1` は `anchor.first_p1` に固定。
+    ChainParallelP2 { anchor: ChainAnchor },
+    /// 並列: 寸法線位置待ち（2クリック目）。次の計測点 `p2` は確定済み。
+    ChainParallelLine { anchor: ChainAnchor, p2: Point2 },
 }
 
 /// 長さ寸法ツール（`D`）。計測点 p1 → p2 → 寸法線位置の 3 クリックで
@@ -1365,16 +1443,51 @@ enum DimLinearState {
 /// 上部パネルの角度欄（度）の解析結果を [`Tool::set_ext_angle_input`] で毎フレーム
 /// 受け取り、`ext_angle_input` に保持する。`ExtAngleInput::Invalid`（不正な文字列）は
 /// 確定クリックを [`ToolResult::Rejected`] にする（黙って `None` へ倒さない）。
+/// 直列/並列でも1本ごとに確定時点の値を使う（1本目と同じ扱い）。
+///
+/// # 直列/並列（M11 タスク75）
+///
+/// [`ChainMode`] を持ち、`spawn()` のたびに [`ChainMode::Single`] へ戻る。1本目は
+/// 単発と同じ3クリックで確定し、`Single` 以外なら確定時に [`ChainAnchor`] を作って
+/// [`DimLinearState::ChainSeries`]/[`DimLinearState::ChainParallelP2`] へ進む。向き
+/// （[`LinearDirMode`]・`Tab`/コンボ）や連続モード自体を系列の途中で変えると、系列を
+/// 破棄して `WaitingP1` へ戻る（[`Self::break_chain`]）。
+///
+/// 確定失敗（レイヤーロック等）でも系列を失わない: [`crate::ToolKind::DimLinear`] を
+/// `keeps_state_on_commit_failure` の対象に加えてあり（`main.rs`）、`Commit` を返す
+/// 直前の状態を `rollback` へ保存して [`Tool::on_commit_failed`] で復元する（タスク74の
+/// 座標寸法と同じ「失敗したクリックの前進を巻き戻す」扱い。1本目の単発確定にも同様に効く）。
 #[derive(Debug, Default)]
 pub struct DimLinearTool {
     state: DimLinearState,
     cursor: Option<Point2>,
     dir_mode: LinearDirMode,
+    /// 連続入力モード（単発/直列/並列。M11 タスク75）。
+    chain_mode: ChainMode,
+    /// 直前に `ToolResult::Commit` を返す直前の状態（確定失敗時の巻き戻し用）。
+    /// 成功時は使われず、次の確定のたびに上書きされる。
+    rollback: Option<DimLinearState>,
     /// 補助線の傾き入力（上部パネル、[`Tool::set_ext_angle_input`] で毎フレーム更新）。
     ext_angle_input: ExtAngleInput,
     /// 直近の [`ToolCtx::ortho_enabled`]（`on_input` のたびに更新。`draw_preview` は
     /// `ToolCtx` を受け取らないため、プレビューで向きを解決するのに必要）。
     ortho_enabled: bool,
+}
+
+impl DimLinearTool {
+    /// 直列/並列の系列が進行中なら破棄して `WaitingP1` へ戻す（DESIGN.md「向き・連続
+    /// モードを変えたら系列を破棄してp1待ちへ戻る」）。1本目の3クリック途中
+    /// （`WaitingP2`/`WaitingLine`）はここでは触らない（その2点はまだ系列に属さない）。
+    fn break_chain(&mut self) {
+        if matches!(
+            self.state,
+            DimLinearState::ChainSeries { .. }
+                | DimLinearState::ChainParallelP2 { .. }
+                | DimLinearState::ChainParallelLine { .. }
+        ) {
+            self.state = DimLinearState::WaitingP1;
+        }
+    }
 }
 
 impl Tool for DimLinearTool {
@@ -1388,9 +1501,11 @@ impl Tool for DimLinearTool {
                 ToolResult::Continue
             }
             // 向きの循環はどの状態でも受け付ける（p1/p2/寸法線位置待ちのいずれでも
-            // Tab で切り替えられる。DESIGN.md タスク73 の UX 確定）。
+            // Tab で切り替えられる。DESIGN.md タスク73 の UX 確定）。系列進行中なら
+            // 破棄する（タスク75: 向きを変えたら系列を打ち切る）。
             InputEvent::Cycle => {
                 self.dir_mode = self.dir_mode.next();
+                self.break_chain();
                 ToolResult::Continue
             }
             InputEvent::Click(p) => match self.state {
@@ -1444,7 +1559,104 @@ impl Tool for DimLinearTool {
                         ctx.layer,
                         ctx.style,
                     ));
-                    self.state = DimLinearState::WaitingP1;
+                    let old_state = self.state;
+                    self.state = match self.chain_mode {
+                        ChainMode::Single => DimLinearState::WaitingP1,
+                        ChainMode::Series | ChainMode::Parallel => {
+                            // 1本目が Aligned でも、以降は解決済みの角度を Rotated として
+                            // 固定する（DESIGN.md「1本目が整列でも、2本目以降は…Rotated で
+                            // 保存する」）。dir はここまで退化していれば早期 return 済みなので必ず Some。
+                            let dir = direction.unit_vector(p1, p2).unwrap_or(Vec2::new(1.0, 0.0));
+                            let anchor = ChainAnchor {
+                                direction: DimDirection::Rotated(dir.angle()),
+                                line_ref: p1 + dir.perp() * offset,
+                                first_p1: p1,
+                            };
+                            match self.chain_mode {
+                                ChainMode::Series => DimLinearState::ChainSeries {
+                                    anchor,
+                                    next_p1: p2,
+                                },
+                                _ => DimLinearState::ChainParallelP2 { anchor },
+                            }
+                        }
+                    };
+                    self.rollback = Some(old_state);
+                    ToolResult::Commit(cmd)
+                }
+                DimLinearState::ChainSeries { anchor, next_p1 } => {
+                    // 直列: 1クリック(次の計測点)で確定する。p1 は前回の p2。
+                    if next_p1.distance(p) <= DIM_DEGENERATE_EPSILON {
+                        return ToolResult::Rejected("Linear dim: measure points coincide");
+                    }
+                    let ext_angle = match self.ext_angle_input {
+                        ExtAngleInput::Invalid => {
+                            return ToolResult::Rejected("Linear dim: ext angle is invalid");
+                        }
+                        ExtAngleInput::Empty => None,
+                        ExtAngleInput::Value(rad) => Some(rad),
+                    };
+                    // 寸法線は1本目と同一直線上（offset は1本目の寸法線が通る点から求める）。
+                    let offset = linear_offset(anchor.direction, next_p1, p, anchor.line_ref);
+                    let dim = DimLinear {
+                        p1: next_p1,
+                        p2: p,
+                        offset,
+                        direction: anchor.direction,
+                        ext_angle,
+                        annotation: DimAnnotation::default(),
+                    };
+                    if dim.measured_value().abs() <= DIM_DEGENERATE_EPSILON {
+                        return ToolResult::Rejected("Linear dim: projected length is zero");
+                    }
+                    let cmd = Command::AddEntity(Entity::new(
+                        EntityGeom::DimLinear(dim),
+                        ctx.layer,
+                        ctx.style,
+                    ));
+                    let old_state = self.state;
+                    self.state = DimLinearState::ChainSeries { anchor, next_p1: p };
+                    self.rollback = Some(old_state);
+                    ToolResult::Commit(cmd)
+                }
+                DimLinearState::ChainParallelP2 { anchor } => {
+                    // 並列: 1クリック目(次の計測点)。p1 は1本目の p1 に固定。
+                    if anchor.first_p1.distance(p) <= DIM_DEGENERATE_EPSILON {
+                        ToolResult::Rejected("Linear dim: measure points coincide")
+                    } else {
+                        self.state = DimLinearState::ChainParallelLine { anchor, p2: p };
+                        ToolResult::Continue
+                    }
+                }
+                DimLinearState::ChainParallelLine { anchor, p2 } => {
+                    // 並列: 2クリック目(寸法線位置)。毎回クリックで offset を決める。
+                    let ext_angle = match self.ext_angle_input {
+                        ExtAngleInput::Invalid => {
+                            return ToolResult::Rejected("Linear dim: ext angle is invalid");
+                        }
+                        ExtAngleInput::Empty => None,
+                        ExtAngleInput::Value(rad) => Some(rad),
+                    };
+                    let offset = linear_offset(anchor.direction, anchor.first_p1, p2, p);
+                    let dim = DimLinear {
+                        p1: anchor.first_p1,
+                        p2,
+                        offset,
+                        direction: anchor.direction,
+                        ext_angle,
+                        annotation: DimAnnotation::default(),
+                    };
+                    if dim.measured_value().abs() <= DIM_DEGENERATE_EPSILON {
+                        return ToolResult::Rejected("Linear dim: projected length is zero");
+                    }
+                    let cmd = Command::AddEntity(Entity::new(
+                        EntityGeom::DimLinear(dim),
+                        ctx.layer,
+                        ctx.style,
+                    ));
+                    let old_state = self.state;
+                    self.state = DimLinearState::ChainParallelP2 { anchor };
+                    self.rollback = Some(old_state);
                     ToolResult::Commit(cmd)
                 }
             },
@@ -1463,6 +1675,10 @@ impl Tool for DimLinearTool {
         viewport: &Viewport,
         render: DimRender<'_>,
     ) {
+        let ext_angle = match self.ext_angle_input {
+            ExtAngleInput::Value(rad) => Some(rad),
+            ExtAngleInput::Empty | ExtAngleInput::Invalid => None,
+        };
         match (self.state, self.cursor) {
             // p2 待ち: 計測線の暫定（p1→カーソル）を細線で示す。
             (DimLinearState::WaitingP2(p1), Some(cursor)) => {
@@ -1481,15 +1697,51 @@ impl Tool for DimLinearTool {
             (DimLinearState::WaitingLine(p1, p2), Some(cursor)) => {
                 let direction = resolve_linear_direction(self.dir_mode, p1, p2, self.ortho_enabled);
                 let offset = linear_offset(direction, p1, p2, cursor);
-                let ext_angle = match self.ext_angle_input {
-                    ExtAngleInput::Value(rad) => Some(rad),
-                    ExtAngleInput::Empty | ExtAngleInput::Invalid => None,
-                };
                 let dim = DimLinear {
                     p1,
                     p2,
                     offset,
                     direction,
+                    ext_angle,
+                    annotation: DimAnnotation::default(),
+                };
+                let ex = expand_linear(&dim, render);
+                crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
+            }
+            // 直列の次計測点待ち: 1クリックで確定する寸法をカーソル位置で丸ごとプレビュー。
+            (DimLinearState::ChainSeries { anchor, next_p1 }, Some(cursor)) => {
+                let offset = linear_offset(anchor.direction, next_p1, cursor, anchor.line_ref);
+                let dim = DimLinear {
+                    p1: next_p1,
+                    p2: cursor,
+                    offset,
+                    direction: anchor.direction,
+                    ext_angle,
+                    annotation: DimAnnotation::default(),
+                };
+                let ex = expand_linear(&dim, render);
+                crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
+            }
+            // 並列の次計測点待ち: 暫定の計測線（1本目の p1→カーソル）を細線で示す。
+            (DimLinearState::ChainParallelP2 { anchor }, Some(cursor)) => {
+                draw_shape(
+                    painter,
+                    rect,
+                    viewport,
+                    &Shape::Line(LineSeg::new(anchor.first_p1, cursor)),
+                    preview_stroke(),
+                    Linetype::Continuous,
+                    1.0,
+                );
+            }
+            // 並列の寸法線位置待ち: カーソルで決まる offset の寸法を丸ごとプレビューする。
+            (DimLinearState::ChainParallelLine { anchor, p2 }, Some(cursor)) => {
+                let offset = linear_offset(anchor.direction, anchor.first_p1, p2, cursor);
+                let dim = DimLinear {
+                    p1: anchor.first_p1,
+                    p2,
+                    offset,
+                    direction: anchor.direction,
                     ext_angle,
                     annotation: DimAnnotation::default(),
                 };
@@ -1505,6 +1757,9 @@ impl Tool for DimLinearTool {
             DimLinearState::WaitingP1 => Vec::new(),
             DimLinearState::WaitingP2(p1) => vec![p1],
             DimLinearState::WaitingLine(p1, p2) => vec![p1, p2],
+            DimLinearState::ChainSeries { next_p1, .. } => vec![next_p1],
+            DimLinearState::ChainParallelP2 { anchor } => vec![anchor.first_p1],
+            DimLinearState::ChainParallelLine { anchor, p2 } => vec![anchor.first_p1, p2],
         }
     }
 
@@ -1522,6 +1777,26 @@ impl Tool for DimLinearTool {
 
     fn set_variant(&mut self, index: usize) {
         self.dir_mode = LinearDirMode::from_index(index);
+        self.break_chain();
+    }
+
+    fn chain_options(&self) -> Option<VariantOptions> {
+        Some(VariantOptions {
+            heading: "Dim chain",
+            options: &ChainMode::OPTIONS,
+            current: self.chain_mode.index(),
+        })
+    }
+
+    fn set_chain_variant(&mut self, index: usize) {
+        self.chain_mode = ChainMode::from_index(index);
+        self.break_chain();
+    }
+
+    fn on_commit_failed(&mut self) {
+        if let Some(prev) = self.rollback.take() {
+            self.state = prev;
+        }
     }
 }
 
@@ -2777,6 +3052,288 @@ impl Tool for SplitTool {
 // Select / 編集（単一選択・矩形選択・移動・削除）
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// グリップ編集（M11 タスク75）
+// ---------------------------------------------------------------------
+
+/// 寸法1件が持つグリップの識別子（DESIGN.md「タスク75の着手時設計」(1)の表）。
+///
+/// ドラッグで変わるフィールドは種別ごとに1つだけ（他のフィールドは変えない）。
+/// 列挙順は「グリップどうしが重なったときのタイブレーク」の定義順として使う
+/// （[`dim_grips`] の doc、[`dim_grip_hit`](crate::dim_grip_hit) 参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimGripKind {
+    /// [`DimLinear::p1`]。
+    LinearP1,
+    /// [`DimLinear::p2`]。
+    LinearP2,
+    /// 寸法線の中点。ドラッグで動くのは [`DimLinear::offset`] のみ。
+    LinearMid,
+    /// [`DimAngular::vertex`]。
+    AngularVertex,
+    /// [`DimAngular::p1`]。
+    AngularP1,
+    /// [`DimAngular::p2`]。
+    AngularP2,
+    /// 弧の中点。ドラッグで動くのは [`DimAngular::arc_radius`] のみ。
+    AngularArcMid,
+    /// [`DimOrdinate::feature`]。
+    OrdinateFeature,
+    /// [`DimOrdinate::leader_end`]。
+    OrdinateLeaderEnd,
+    /// 引出線と円周の交点。ドラッグで動くのは [`DimRadial::leader_angle`] のみ
+    /// （中心・半径は円の事実なので動かさない）。
+    RadialPoint,
+    /// 寸法線と円周の交点。ドラッグで動くのは [`DimDiameter::angle`] のみ
+    /// （中心・半径は円の事実なので動かさない）。
+    DiameterPoint,
+}
+
+/// `geom` が寸法なら、そのグリップ一覧（種別＋現在のワールド座標）を返す。寸法以外・
+/// 退化していて向きが定まらない場合は空（描く/掴むグリップが無いだけで、エンティティ
+/// 自体は選択・削除できる。既存の pick と同じ「描けるものだけ描く」方針）。
+///
+/// 各点は展開（`expand_linear` 等）と同じ pick 用公開関数（[`linear_pick_segments`] /
+/// [`radial_pick_segments`] / [`diameter_pick_segments`]）またはフィールドから直接求め、
+/// 独自の幾何を重複実装しない。寸法線の中点・弧の中点はそれぞれの寸法線の**実際の**
+/// 位置（展開結果と同じ骨格）から取るため、描画されているグリップの位置と一致する。
+#[must_use]
+pub fn dim_grips(geom: &EntityGeom) -> Vec<(DimGripKind, Point2)> {
+    match geom {
+        EntityGeom::DimLinear(d) => {
+            let mut grips = vec![(DimGripKind::LinearP1, d.p1), (DimGripKind::LinearP2, d.p2)];
+            if let Some(seg) = linear_pick_segments(d).into_iter().next() {
+                grips.push((DimGripKind::LinearMid, seg[0].midpoint(seg[1])));
+            }
+            grips
+        }
+        EntityGeom::DimAngular(d) => {
+            let mut grips = vec![
+                (DimGripKind::AngularVertex, d.vertex),
+                (DimGripKind::AngularP1, d.p1),
+                (DimGripKind::AngularP2, d.p2),
+            ];
+            // 弧の中点は 2 辺の単位方向の和を正規化した二等分方向（なす角は検証済みの
+            // 短い側、0 < angle < π）。核の `angular_frame`（非公開）を複製せず、公開
+            // フィールドだけから求まる同値の式を使う。
+            if let Some((u1, u2)) = d.directions()
+                && let Some(bisector) = (u1 + u2).normalize()
+            {
+                grips.push((
+                    DimGripKind::AngularArcMid,
+                    d.vertex + bisector * d.arc_radius,
+                ));
+            }
+            grips
+        }
+        EntityGeom::DimOrdinate(d) => vec![
+            (DimGripKind::OrdinateFeature, d.feature),
+            (DimGripKind::OrdinateLeaderEnd, d.leader_end),
+        ],
+        EntityGeom::DimRadial(d) => radial_pick_segments(d)
+            .into_iter()
+            .next()
+            .map(|seg| vec![(DimGripKind::RadialPoint, seg[1])])
+            .unwrap_or_default(),
+        EntityGeom::DimDiameter(d) => diameter_pick_segments(d)
+            .into_iter()
+            .next()
+            .map(|seg| vec![(DimGripKind::DiameterPoint, seg[1])])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// [`DimLinear`] の p1/p2 グリップドラッグ後、寸法線が**旧寸法線の中点**を通ったまま
+/// 保たれるよう新しい `offset` を求める（タスク73 の `linear_offset_preserving_midpoint`
+/// と同じ考え方だが、こちらは移動後の新しい p1/p2 を基準に使う点が異なる ──
+/// 向き変更（p1/p2 不変）ではなく点そのものの移動なので、法線の基準点も新しい方を使う
+/// 必要がある）。新しい向きが定まらない、または旧寸法線骨格が取れない（極端な退化）
+/// 場合は `None`。
+fn linear_offset_for_moved_point(old: &DimLinear, new_p1: Point2, new_p2: Point2) -> Option<f64> {
+    let seg = linear_pick_segments(old).into_iter().next()?;
+    let m = seg[0].midpoint(seg[1]);
+    let new_dir = old.direction.unit_vector(new_p1, new_p2)?;
+    Some((m - new_p1).dot(new_dir.perp()))
+}
+
+/// 角度寸法の退化を `DimAngularTool` の4段階の拒否条件（頂点一致・同方向・反平行・
+/// 半径ゼロ）と同じ基準で確かめる。グリップドラッグの確定判定（[`apply_dim_grip`]）と
+/// 作図ツールの確定判定が同じ理由を別々に持たないよう、判定式を1箇所に共有する。
+fn check_angular_degenerate(d: &DimAngular) -> Result<(), &'static str> {
+    if d.vertex.distance(d.p1) <= DIM_DEGENERATE_EPSILON
+        || d.vertex.distance(d.p2) <= DIM_DEGENERATE_EPSILON
+    {
+        return Err("Angular dim: leg point coincides with vertex");
+    }
+    let (Some(u1), Some(u2)) = ((d.p1 - d.vertex).normalize(), (d.p2 - d.vertex).normalize())
+    else {
+        return Err("Angular dim: leg point coincides with vertex");
+    };
+    let angle = u1.dot(u2).clamp(-1.0, 1.0).acos();
+    if angle <= DIM_ANGULAR_ANTIPARALLEL_EPS {
+        return Err("Angular dim: legs point the same direction");
+    }
+    if (std::f64::consts::PI - angle).abs() < DIM_ANGULAR_ANTIPARALLEL_EPS {
+        return Err("Angular dim: legs are antiparallel");
+    }
+    if d.arc_radius <= DIM_DEGENERATE_EPSILON {
+        return Err("Angular dim: arc radius is zero");
+    }
+    Ok(())
+}
+
+/// グリップ `kind` を `world`（スナップ適用済み）へ動かした結果の新しい幾何を作る
+/// （DESIGN.md タスク75「グリップ編集」の確定規則）。`geom` が寸法でない、または
+/// `kind` がその種別のグリップでない組合せは呼ばれない前提（[`SelectTool::end_grip_drag`]
+/// が `dim_grips` から得た組合せしか渡さない）だが、防御的に理由付きで拒否する。
+///
+/// 判定は「作図ツールが同種のクリックで課す UI 側の追加拒否」（p1≈p2・頂点一致・
+/// 同方向・反平行・半径ゼロ・引出線長ゼロ・円中心一致）を先にかけたうえで、最後に
+/// [`EntityGeom::validate`] を通す（非有限値など、UI 側チェックが拾わない残りを core が
+/// 弾く。「UI は core より厳しく拒否してよい」方針はタスク74 と同じ）。
+pub(crate) fn apply_dim_grip(
+    geom: &EntityGeom,
+    kind: DimGripKind,
+    world: Point2,
+) -> Result<EntityGeom, String> {
+    let new_geom = match (geom, kind) {
+        (EntityGeom::DimLinear(d), DimGripKind::LinearP1 | DimGripKind::LinearP2) => {
+            let (new_p1, new_p2) = if kind == DimGripKind::LinearP1 {
+                (world, d.p2)
+            } else {
+                (d.p1, world)
+            };
+            if new_p1.distance(new_p2) <= DIM_DEGENERATE_EPSILON {
+                return Err("Linear dim: measure points coincide".to_string());
+            }
+            let Some(new_offset) = linear_offset_for_moved_point(d, new_p1, new_p2) else {
+                return Err("Linear dim: direction is undefined".to_string());
+            };
+            let new_dim = DimLinear {
+                p1: new_p1,
+                p2: new_p2,
+                offset: new_offset,
+                ..d.clone()
+            };
+            if new_dim.measured_value().abs() <= DIM_DEGENERATE_EPSILON {
+                return Err("Linear dim: projected length is zero".to_string());
+            }
+            EntityGeom::DimLinear(new_dim)
+        }
+        (EntityGeom::DimLinear(d), DimGripKind::LinearMid) => {
+            let offset = linear_offset(d.direction, d.p1, d.p2, world);
+            EntityGeom::DimLinear(DimLinear {
+                offset,
+                ..d.clone()
+            })
+        }
+        (EntityGeom::DimAngular(d), DimGripKind::AngularVertex) => {
+            let new_dim = DimAngular {
+                vertex: world,
+                ..d.clone()
+            };
+            check_angular_degenerate(&new_dim)?;
+            EntityGeom::DimAngular(new_dim)
+        }
+        (EntityGeom::DimAngular(d), DimGripKind::AngularP1) => {
+            let new_dim = DimAngular {
+                p1: world,
+                ..d.clone()
+            };
+            check_angular_degenerate(&new_dim)?;
+            EntityGeom::DimAngular(new_dim)
+        }
+        (EntityGeom::DimAngular(d), DimGripKind::AngularP2) => {
+            let new_dim = DimAngular {
+                p2: world,
+                ..d.clone()
+            };
+            check_angular_degenerate(&new_dim)?;
+            EntityGeom::DimAngular(new_dim)
+        }
+        (EntityGeom::DimAngular(d), DimGripKind::AngularArcMid) => {
+            let arc_radius = d.vertex.distance(world);
+            let new_dim = DimAngular {
+                arc_radius,
+                ..d.clone()
+            };
+            check_angular_degenerate(&new_dim)?;
+            EntityGeom::DimAngular(new_dim)
+        }
+        (EntityGeom::DimOrdinate(d), DimGripKind::OrdinateFeature) => {
+            if world.distance(d.leader_end) <= DIM_DEGENERATE_EPSILON {
+                return Err("Ordinate dim: leader length is zero".to_string());
+            }
+            EntityGeom::DimOrdinate(DimOrdinate {
+                feature: world,
+                ..d.clone()
+            })
+        }
+        (EntityGeom::DimOrdinate(d), DimGripKind::OrdinateLeaderEnd) => {
+            if d.feature.distance(world) <= DIM_DEGENERATE_EPSILON {
+                return Err("Ordinate dim: leader length is zero".to_string());
+            }
+            EntityGeom::DimOrdinate(DimOrdinate {
+                leader_end: world,
+                ..d.clone()
+            })
+        }
+        (EntityGeom::DimRadial(d), DimGripKind::RadialPoint) => {
+            if world.distance(d.center) <= DIM_DEGENERATE_EPSILON {
+                return Err("Radial dim: leader direction undefined at center".to_string());
+            }
+            EntityGeom::DimRadial(DimRadial {
+                leader_angle: (world - d.center).angle(),
+                ..d.clone()
+            })
+        }
+        (EntityGeom::DimDiameter(d), DimGripKind::DiameterPoint) => {
+            if world.distance(d.center) <= DIM_DEGENERATE_EPSILON {
+                return Err(
+                    "Diameter dim: dimension line direction undefined at center".to_string()
+                );
+            }
+            EntityGeom::DimDiameter(DimDiameter {
+                angle: (world - d.center).angle(),
+                ..d.clone()
+            })
+        }
+        _ => return Err("Unsupported grip".to_string()),
+    };
+    new_geom.validate().map_err(|e| e.to_string())?;
+    Ok(new_geom)
+}
+
+/// 進行中の寸法グリップドラッグ（M11 タスク75）。ドラッグ対象は「ドラッグ開始点で
+/// ヒットしたグリップ」1つに固定し、確定時に [`apply_dim_grip`] へ渡す。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GripDragState {
+    id: EntityId,
+    kind: DimGripKind,
+    /// ドラッグ開始時のグリップ位置（移動量判定の基準。[`SelectTool::end_grip_drag`]）。
+    origin: Point2,
+    /// カーソル追従用の現在位置（スナップ適用済み。`main.rs` 側で毎フレーム更新する）。
+    current: Point2,
+}
+
+/// [`SelectTool::end_grip_drag`] の結果。呼び出し側（`McadApp`）が確定・拒否表示を処理する。
+///
+/// `ToolResult`/`PlacementOutcome`/`OffsetOutcome` と同じ理由（`Command` が232バイトへ
+/// 広がっている）で `clippy::large_enum_variant` を抑制する。
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum GripDragOutcome {
+    /// 移動量がピック許容量未満、ドラッグ対象が消えている、またはドラッグ中でない。
+    /// 呼び出し側は何もしない（履歴を汚さない）。
+    None,
+    /// 確定コマンド。呼び出し側が `Document::apply` する。
+    Commit(Command),
+    /// 退化などで確定を拒否した。理由は呼び出し側がステータスバーへ表示する
+    /// （[`ToolResult::Rejected`] と同じ「無反応に見せない」ための結果）。
+    Rejected(String),
+}
+
 /// 選択エンティティのピック許容量以外に、[`SelectTool`] が扱う操作の設計判断。
 ///
 /// # なぜ [`Tool`] トレイト（[`InputEvent`]）に載せないのか
@@ -2848,6 +3405,14 @@ pub enum DragPreview {
     /// 寸法の文字ブロックドラッグのプレビュー（M9 タスク51）。`id` の寸法を
     /// `text_anchor = Some(anchor)` に差し替えた一時コピーで描く（`main.rs` 側の責務）。
     DimText { id: EntityId, anchor: Point2 },
+    /// 寸法のグリップドラッグのプレビュー（M11 タスク75）。`id` の寸法へ
+    /// [`apply_dim_grip`] を通した一時コピーで描く（`main.rs` 側の責務。退化して
+    /// 作れない場合は `main.rs` が何も描かない）。
+    Grip {
+        id: EntityId,
+        kind: DimGripKind,
+        point: Point2,
+    },
 }
 
 /// 進行中の寸法文字ブロックドラッグ（M9 タスク51、設計判断7）。
@@ -3110,6 +3675,11 @@ pub struct SelectTool {
     /// 進行中の寸法文字ブロックドラッグ（M9 タスク51）。無ければ `None`。矩形選択ドラッグ
     /// とは排他（[`SelectTool::start_text_drag`] が `drag` を破棄する）。
     text_drag: Option<TextDragState>,
+    /// 進行中の寸法グリップドラッグ（M11 タスク75）。無ければ `None`。矩形選択・文字
+    /// ブロックドラッグとは排他（[`SelectTool::start_grip_drag`] が両方を破棄する）。
+    /// 掴む優先順はグリップ > 文字ブロック > 矩形選択（DESIGN.md タスク75）なので、
+    /// ヒット判定自体は呼び出し側（`main.rs`）がグリップを最初に試す。
+    grip_drag: Option<GripDragState>,
 }
 
 /// エンティティの所属レイヤーが可視か（非表示レイヤーは描画・ヒットテスト対象外）。
@@ -3139,10 +3709,21 @@ impl SelectTool {
         self.selection.retain(|&id| document.entity(id).is_some());
     }
 
-    /// ドラッグ中のプレビュー情報（矩形選択枠、または文字ブロックドラッグ）。
-    /// どちらもドラッグしていなければ `None`。
+    /// ドラッグ中のプレビュー情報（矩形選択枠・文字ブロックドラッグ・グリップドラッグ）。
+    /// どれもドラッグしていなければ `None`。優先順はグリップ > 文字ブロック > 矩形選択
+    /// （排他なので高々1つしか `Some` を持たない。DESIGN.md タスク75）。
     #[must_use]
     pub fn drag_preview(&self) -> Option<DragPreview> {
+        if let Some(GripDragState {
+            id, kind, current, ..
+        }) = self.grip_drag
+        {
+            return Some(DragPreview::Grip {
+                id,
+                kind,
+                point: current,
+            });
+        }
         if let Some(TextDragState {
             id,
             label_center,
@@ -3295,6 +3876,73 @@ impl SelectTool {
         Some(Command::ModifyEntity { id, new_geom })
     }
 
+    /// 寸法のグリップドラッグを開始する（M11 タスク75）。`origin` はドラッグ開始時点の
+    /// グリップ位置（[`dim_grips`] が返すワールド座標。ヒット判定は `main.rs` の
+    /// `dim_grip_hit` が担う）。矩形選択・文字ブロックドラッグとは排他なので、
+    /// 進行中の `drag`/`text_drag` は破棄する（掴む優先順1位。DESIGN.md タスク75）。
+    pub fn start_grip_drag(&mut self, id: EntityId, kind: DimGripKind, origin: Point2) {
+        self.drag = None;
+        self.text_drag = None;
+        self.grip_drag = Some(GripDragState {
+            id,
+            kind,
+            origin,
+            current: origin,
+        });
+    }
+
+    /// 進行中のグリップドラッグか。
+    #[must_use]
+    pub fn is_grip_dragging(&self) -> bool {
+        self.grip_drag.is_some()
+    }
+
+    /// グリップドラッグ中のカーソル追従位置を更新する（スナップ適用済みの座標を渡す。
+    /// `main.rs` 側がドラッグ中のみスナップを計算して渡す）。ドラッグ中でなければ何もしない。
+    pub fn on_grip_drag(&mut self, world: Point2) {
+        if let Some(state) = &mut self.grip_drag {
+            state.current = world;
+        }
+    }
+
+    /// 進行中のグリップドラッグを破棄する（Esc・ツール切替・ファイル操作・モーダル表示・
+    /// undo/redo から呼ぶ。[`SelectTool::cancel_text_drag`] と同じ理由で、確定
+    /// （[`SelectTool::end_grip_drag`]）を経ない限り Document は変更しないが、
+    /// 確定すれば変更しうるドラッグなので必ず破棄する）。選択集合は変えない。
+    pub fn cancel_grip_drag(&mut self) {
+        self.grip_drag = None;
+    }
+
+    /// グリップドラッグを確定する。移動量（`origin` から `current` までの距離）が
+    /// `tol`（ワールド単位、ピック許容量）未満、対象エンティティが消えている
+    /// （undo/redo 等）、またはドラッグ中でない場合は [`GripDragOutcome::None`]
+    /// （履歴を汚さない）。[`apply_dim_grip`] が退化で拒否した場合は
+    /// [`GripDragOutcome::Rejected`]、成功すれば `Command::ModifyEntity` を包んだ
+    /// [`GripDragOutcome::Commit`] を返す（呼び出し側が `Document::apply` する）。
+    /// いずれの場合もドラッグ状態は解除する。
+    #[must_use]
+    pub fn end_grip_drag(&mut self, document: &Document, tol: f64) -> GripDragOutcome {
+        let Some(GripDragState {
+            id,
+            kind,
+            origin,
+            current,
+        }) = self.grip_drag.take()
+        else {
+            return GripDragOutcome::None;
+        };
+        if origin.distance(current) < tol {
+            return GripDragOutcome::None;
+        }
+        let Some(entity) = document.entity(id) else {
+            return GripDragOutcome::None;
+        };
+        match apply_dim_grip(&entity.geom, kind, current) {
+            Ok(new_geom) => GripDragOutcome::Commit(Command::ModifyEntity { id, new_geom }),
+            Err(reason) => GripDragOutcome::Rejected(reason),
+        }
+    }
+
     /// 矩形選択ドラッグの確定。ドラッグ矩形に **完全内包** される可視エンティティを
     /// 新しい選択集合にする（内包判定の理由は [`DragState`] の doc を参照）。ドラッグ中で
     /// なければ何もしない。矩形選択は選択集合を書き換えるだけで Document は変更しない。
@@ -3322,8 +3970,23 @@ impl SelectTool {
     /// 何もしていない状態の Esc は「選択を諦める」操作として自然に使われるため。
     /// 配置モード（複製・移動）中の Esc は呼び出し側で別経路として先に処理され、
     /// ここには来ない。
+    /// 進行中のドラッグ（グリップ・文字ブロック・矩形選択）をすべて破棄する。選択集合は
+    /// 変えない。ドラッグ中に Space（パン）へ切り替えたときに使う（M11 タスク75）:
+    /// パン中はボタン解放が選択入力へ届かず、確定されないドラッグ状態が残るため。
+    /// 破棄したドラッグがあれば `true`。
+    pub fn cancel_drags(&mut self) -> bool {
+        let had = self.grip_drag.is_some() || self.text_drag.is_some() || self.drag.is_some();
+        self.grip_drag = None;
+        self.text_drag = None;
+        self.drag = None;
+        had
+    }
+
     pub fn on_cancel(&mut self) {
-        if self.text_drag.is_some() {
+        if self.grip_drag.is_some() {
+            // グリップドラッグ中の Esc はそれだけを破棄する（文字ドラッグと同じ扱い）。
+            self.grip_drag = None;
+        } else if self.text_drag.is_some() {
             // 文字ドラッグ中の Esc はそれだけを破棄する（矩形選択の中断と同じ扱い）。
             self.text_drag = None;
         } else if self.drag.is_some() {
@@ -8236,5 +8899,812 @@ mod tests {
         tool.cancel_text_drag();
         assert!(!tool.is_text_dragging());
         assert_eq!(tool.selection(), &[id]);
+    }
+
+    // --- グリップ編集（M11 タスク75）: グリップ位置の算出 ---
+
+    #[test]
+    fn dim_grips_linear_returns_p1_p2_and_dimension_line_midpoint() {
+        let dim = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 2.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        };
+        let grips = dim_grips(&EntityGeom::DimLinear(dim));
+        assert_eq!(
+            grips,
+            vec![
+                (DimGripKind::LinearP1, Point2::new(0.0, 0.0)),
+                (DimGripKind::LinearP2, Point2::new(4.0, 0.0)),
+                // 寸法線は d1=(0,2)〜d2=(4,2) なので中点は (2,2)。
+                (DimGripKind::LinearMid, Point2::new(2.0, 2.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn dim_grips_angular_returns_vertex_p1_p2_and_arc_midpoint() {
+        let dim = DimAngular {
+            vertex: Point2::new(0.0, 0.0),
+            p1: Point2::new(2.0, 0.0),
+            p2: Point2::new(0.0, 2.0),
+            arc_radius: 3.0,
+            annotation: DimAnnotation::default(),
+        };
+        let grips = dim_grips(&EntityGeom::DimAngular(dim));
+        assert_eq!(grips.len(), 4);
+        assert_eq!(
+            grips[0],
+            (DimGripKind::AngularVertex, Point2::new(0.0, 0.0))
+        );
+        assert_eq!(grips[1], (DimGripKind::AngularP1, Point2::new(2.0, 0.0)));
+        assert_eq!(grips[2], (DimGripKind::AngularP2, Point2::new(0.0, 2.0)));
+        // 2辺(角度0°・90°)の二等分方向は45°。半径3なので (3/√2, 3/√2)。
+        let (kind, point) = grips[3];
+        assert_eq!(kind, DimGripKind::AngularArcMid);
+        let expected = Point2::new(
+            3.0 * std::f64::consts::FRAC_1_SQRT_2,
+            3.0 * std::f64::consts::FRAC_1_SQRT_2,
+        );
+        assert!(point.distance(expected) < 1e-9, "point={point:?}");
+    }
+
+    #[test]
+    fn dim_grips_ordinate_returns_feature_and_leader_end_but_not_origin() {
+        let dim = DimOrdinate {
+            origin: Point2::new(0.0, 0.0),
+            feature: Point2::new(3.0, 0.0),
+            leader_end: Point2::new(3.0, 5.0),
+            axis: OrdinateAxis::X,
+            annotation: DimAnnotation::default(),
+        };
+        let grips = dim_grips(&EntityGeom::DimOrdinate(dim));
+        assert_eq!(
+            grips,
+            vec![
+                (DimGripKind::OrdinateFeature, Point2::new(3.0, 0.0)),
+                (DimGripKind::OrdinateLeaderEnd, Point2::new(3.0, 5.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn dim_grips_radial_returns_the_circle_point_the_leader_touches() {
+        let dim = DimRadial {
+            center: Point2::new(0.0, 0.0),
+            radius: 5.0,
+            leader_angle: 0.0,
+            annotation: DimAnnotation::default(),
+        };
+        let grips = dim_grips(&EntityGeom::DimRadial(dim));
+        assert_eq!(
+            grips,
+            vec![(DimGripKind::RadialPoint, Point2::new(5.0, 0.0))]
+        );
+    }
+
+    #[test]
+    fn dim_grips_diameter_returns_the_circle_point_the_dimension_line_touches() {
+        let dim = DimDiameter {
+            center: Point2::new(0.0, 0.0),
+            radius: 5.0,
+            angle: std::f64::consts::FRAC_PI_2,
+            annotation: DimAnnotation::default(),
+        };
+        let grips = dim_grips(&EntityGeom::DimDiameter(dim));
+        assert_eq!(grips.len(), 1);
+        let (kind, point) = grips[0];
+        assert_eq!(kind, DimGripKind::DiameterPoint);
+        // cos(π/2) は浮動小数点では厳密な 0 にならないため許容誤差付きで比較する。
+        assert!(
+            point.distance(Point2::new(0.0, 5.0)) < 1e-9,
+            "point={point:?}"
+        );
+    }
+
+    #[test]
+    fn dim_grips_returns_empty_for_non_dimension_geom() {
+        let geom = EntityGeom::Shape(Shape::Point(Point2::new(1.0, 1.0)));
+        assert!(dim_grips(&geom).is_empty());
+    }
+
+    // --- グリップ編集: 各グリップのドラッグ結果の geom ---
+
+    #[test]
+    fn apply_dim_grip_linear_p1_keeps_dimension_line_through_old_midpoint() {
+        let old = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(6.0, 8.0),
+            offset: 3.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        };
+        let old_seg = linear_pick_segments(&old).into_iter().next().unwrap();
+        let m = old_seg[0].midpoint(old_seg[1]);
+
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimLinear(old),
+            DimGripKind::LinearP1,
+            Point2::new(-3.0, -1.0),
+        )
+        .expect("非退化な移動は成功する");
+        let EntityGeom::DimLinear(new_dim) = new_geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(new_dim.p1, Point2::new(-3.0, -1.0));
+        assert_eq!(new_dim.p2, Point2::new(6.0, 8.0));
+
+        let new_seg = linear_pick_segments(&new_dim).into_iter().next().unwrap();
+        let dir = (new_seg[1] - new_seg[0]).normalize().unwrap();
+        let dist = (m - new_seg[0]).dot(dir.perp());
+        assert!(dist.abs() < 1e-9, "dist={dist}");
+    }
+
+    #[test]
+    fn apply_dim_grip_linear_p2_keeps_dimension_line_through_old_midpoint() {
+        let old = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(6.0, 8.0),
+            offset: 3.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        };
+        let old_seg = linear_pick_segments(&old).into_iter().next().unwrap();
+        let m = old_seg[0].midpoint(old_seg[1]);
+
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimLinear(old),
+            DimGripKind::LinearP2,
+            Point2::new(10.0, 2.0),
+        )
+        .expect("非退化な移動は成功する");
+        let EntityGeom::DimLinear(new_dim) = new_geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(new_dim.p1, Point2::new(0.0, 0.0));
+        assert_eq!(new_dim.p2, Point2::new(10.0, 2.0));
+
+        let new_seg = linear_pick_segments(&new_dim).into_iter().next().unwrap();
+        let dir = (new_seg[1] - new_seg[0]).normalize().unwrap();
+        let dist = (m - new_seg[0]).dot(dir.perp());
+        assert!(dist.abs() < 1e-9, "dist={dist}");
+    }
+
+    #[test]
+    fn apply_dim_grip_linear_mid_changes_offset_only() {
+        let old = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 2.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        };
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimLinear(old),
+            DimGripKind::LinearMid,
+            Point2::new(2.0, 5.0),
+        )
+        .unwrap();
+        let EntityGeom::DimLinear(new_dim) = new_geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(new_dim.p1, Point2::new(0.0, 0.0));
+        assert_eq!(new_dim.p2, Point2::new(4.0, 0.0));
+        assert!((new_dim.offset - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_dim_grip_angular_vertex_moves_vertex_only() {
+        let old = DimAngular {
+            vertex: Point2::new(0.0, 0.0),
+            p1: Point2::new(2.0, 0.0),
+            p2: Point2::new(0.0, 2.0),
+            arc_radius: 3.0,
+            annotation: DimAnnotation::default(),
+        };
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimAngular(old),
+            DimGripKind::AngularVertex,
+            Point2::new(0.1, 0.1),
+        )
+        .unwrap();
+        let EntityGeom::DimAngular(new_dim) = new_geom else {
+            panic!("expected DimAngular");
+        };
+        assert_eq!(new_dim.vertex, Point2::new(0.1, 0.1));
+        assert_eq!(new_dim.p1, Point2::new(2.0, 0.0));
+        assert_eq!(new_dim.p2, Point2::new(0.0, 2.0));
+        assert_eq!(new_dim.arc_radius, 3.0);
+    }
+
+    #[test]
+    fn apply_dim_grip_angular_arc_mid_changes_radius_only() {
+        let old = DimAngular {
+            vertex: Point2::new(0.0, 0.0),
+            p1: Point2::new(2.0, 0.0),
+            p2: Point2::new(0.0, 2.0),
+            arc_radius: 3.0,
+            annotation: DimAnnotation::default(),
+        };
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimAngular(old),
+            DimGripKind::AngularArcMid,
+            Point2::new(0.0, 5.0),
+        )
+        .unwrap();
+        let EntityGeom::DimAngular(new_dim) = new_geom else {
+            panic!("expected DimAngular");
+        };
+        assert_eq!(new_dim.vertex, Point2::new(0.0, 0.0));
+        assert_eq!(new_dim.p1, Point2::new(2.0, 0.0));
+        assert_eq!(new_dim.p2, Point2::new(0.0, 2.0));
+        assert!((new_dim.arc_radius - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_dim_grip_ordinate_feature_moves_feature_only() {
+        let old = DimOrdinate {
+            origin: Point2::new(0.0, 0.0),
+            feature: Point2::new(3.0, 0.0),
+            leader_end: Point2::new(3.0, 5.0),
+            axis: OrdinateAxis::X,
+            annotation: DimAnnotation::default(),
+        };
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimOrdinate(old),
+            DimGripKind::OrdinateFeature,
+            Point2::new(7.0, 2.0),
+        )
+        .unwrap();
+        let EntityGeom::DimOrdinate(new_dim) = new_geom else {
+            panic!("expected DimOrdinate");
+        };
+        assert_eq!(new_dim.origin, Point2::new(0.0, 0.0));
+        assert_eq!(new_dim.feature, Point2::new(7.0, 2.0));
+        assert_eq!(new_dim.leader_end, Point2::new(3.0, 5.0));
+        assert_eq!(new_dim.axis, OrdinateAxis::X);
+    }
+
+    #[test]
+    fn apply_dim_grip_ordinate_leader_end_moves_leader_end_only() {
+        let old = DimOrdinate {
+            origin: Point2::new(0.0, 0.0),
+            feature: Point2::new(3.0, 0.0),
+            leader_end: Point2::new(3.0, 5.0),
+            axis: OrdinateAxis::X,
+            annotation: DimAnnotation::default(),
+        };
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimOrdinate(old),
+            DimGripKind::OrdinateLeaderEnd,
+            Point2::new(3.0, 9.0),
+        )
+        .unwrap();
+        let EntityGeom::DimOrdinate(new_dim) = new_geom else {
+            panic!("expected DimOrdinate");
+        };
+        assert_eq!(new_dim.feature, Point2::new(3.0, 0.0));
+        assert_eq!(new_dim.leader_end, Point2::new(3.0, 9.0));
+    }
+
+    #[test]
+    fn apply_dim_grip_radial_point_changes_leader_angle_only() {
+        let old = DimRadial {
+            center: Point2::new(0.0, 0.0),
+            radius: 5.0,
+            leader_angle: 0.0,
+            annotation: DimAnnotation::default(),
+        };
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimRadial(old),
+            DimGripKind::RadialPoint,
+            Point2::new(0.0, 7.0),
+        )
+        .unwrap();
+        let EntityGeom::DimRadial(new_dim) = new_geom else {
+            panic!("expected DimRadial");
+        };
+        assert_eq!(new_dim.center, Point2::new(0.0, 0.0));
+        assert_eq!(new_dim.radius, 5.0);
+        assert!((new_dim.leader_angle - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_dim_grip_diameter_point_changes_angle_only() {
+        let old = DimDiameter {
+            center: Point2::new(0.0, 0.0),
+            radius: 5.0,
+            angle: std::f64::consts::FRAC_PI_2,
+            annotation: DimAnnotation::default(),
+        };
+        let new_geom = apply_dim_grip(
+            &EntityGeom::DimDiameter(old),
+            DimGripKind::DiameterPoint,
+            Point2::new(5.0, 0.0),
+        )
+        .unwrap();
+        let EntityGeom::DimDiameter(new_dim) = new_geom else {
+            panic!("expected DimDiameter");
+        };
+        assert_eq!(new_dim.center, Point2::new(0.0, 0.0));
+        assert_eq!(new_dim.radius, 5.0);
+        assert!(new_dim.angle.abs() < 1e-9);
+    }
+
+    // --- グリップ編集: 退化時に確定しない ---
+
+    #[test]
+    fn apply_dim_grip_linear_p1_rejects_when_points_coincide() {
+        let old = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 2.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        };
+        let err = apply_dim_grip(
+            &EntityGeom::DimLinear(old),
+            DimGripKind::LinearP1,
+            Point2::new(4.0, 0.0),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Linear dim: measure points coincide");
+    }
+
+    #[test]
+    fn apply_dim_grip_linear_p1_rejects_zero_projected_length() {
+        let old = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(4.0, 0.0),
+            offset: 1.0,
+            direction: DimDirection::Rotated(0.0),
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        };
+        // p2 は (4,0) のまま。p1 を (4,5) へ動かすと、水平固定の向きに対する
+        // 投影長が 0 になる（点そのものは一致していない）。
+        let err = apply_dim_grip(
+            &EntityGeom::DimLinear(old),
+            DimGripKind::LinearP1,
+            Point2::new(4.0, 5.0),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Linear dim: projected length is zero");
+    }
+
+    #[test]
+    fn apply_dim_grip_angular_rejects_vertex_coincidence_same_direction_and_antiparallel() {
+        let base = DimAngular {
+            vertex: Point2::new(0.0, 0.0),
+            p1: Point2::new(2.0, 0.0),
+            p2: Point2::new(0.0, 2.0),
+            arc_radius: 3.0,
+            annotation: DimAnnotation::default(),
+        };
+
+        // p1 グリップを頂点まで動かす → 頂点一致。
+        let err = apply_dim_grip(
+            &EntityGeom::DimAngular(base.clone()),
+            DimGripKind::AngularP1,
+            Point2::new(0.0, 0.0),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Angular dim: leg point coincides with vertex");
+
+        // p2 グリップを p1 と同方向へ動かす → 同方向。
+        let err = apply_dim_grip(
+            &EntityGeom::DimAngular(base.clone()),
+            DimGripKind::AngularP2,
+            Point2::new(5.0, 0.0),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Angular dim: legs point the same direction");
+
+        // p2 グリップを p1 の真逆へ動かす → 反平行。
+        let err = apply_dim_grip(
+            &EntityGeom::DimAngular(base),
+            DimGripKind::AngularP2,
+            Point2::new(-2.0, 0.0),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Angular dim: legs are antiparallel");
+    }
+
+    #[test]
+    fn apply_dim_grip_ordinate_rejects_zero_leader_length() {
+        let old = DimOrdinate {
+            origin: Point2::new(0.0, 0.0),
+            feature: Point2::new(3.0, 0.0),
+            leader_end: Point2::new(3.0, 5.0),
+            axis: OrdinateAxis::X,
+            annotation: DimAnnotation::default(),
+        };
+        let err = apply_dim_grip(
+            &EntityGeom::DimOrdinate(old.clone()),
+            DimGripKind::OrdinateFeature,
+            Point2::new(3.0, 5.0),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Ordinate dim: leader length is zero");
+
+        let err = apply_dim_grip(
+            &EntityGeom::DimOrdinate(old),
+            DimGripKind::OrdinateLeaderEnd,
+            Point2::new(3.0, 0.0),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Ordinate dim: leader length is zero");
+    }
+
+    #[test]
+    fn apply_dim_grip_radial_and_diameter_reject_at_center() {
+        let radial = DimRadial {
+            center: Point2::new(0.0, 0.0),
+            radius: 5.0,
+            leader_angle: 0.0,
+            annotation: DimAnnotation::default(),
+        };
+        let err = apply_dim_grip(
+            &EntityGeom::DimRadial(radial),
+            DimGripKind::RadialPoint,
+            Point2::new(0.0, 0.0),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Radial dim: leader direction undefined at center");
+
+        let diameter = DimDiameter {
+            center: Point2::new(0.0, 0.0),
+            radius: 5.0,
+            angle: std::f64::consts::FRAC_PI_2,
+            annotation: DimAnnotation::default(),
+        };
+        let err = apply_dim_grip(
+            &EntityGeom::DimDiameter(diameter),
+            DimGripKind::DiameterPoint,
+            Point2::new(0.0, 0.0),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Diameter dim: dimension line direction undefined at center"
+        );
+    }
+
+    // --- グリップ編集: SelectTool 経由の確定（移動量の下限・破棄経路） ---
+
+    #[test]
+    fn end_grip_drag_below_tolerance_returns_none() {
+        let (doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        tool.start_grip_drag(id, DimGripKind::LinearP1, Point2::new(0.0, 0.0));
+        assert!(tool.is_grip_dragging());
+        tool.on_grip_drag(Point2::new(0.01, 0.0)); // 移動量 0.01 < tol 0.1
+        let outcome = tool.end_grip_drag(&doc, 0.1);
+        assert_eq!(outcome, GripDragOutcome::None);
+        assert!(!tool.is_grip_dragging());
+        // Document は不変。
+        let EntityGeom::DimLinear(dim) = &doc.entity(id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim.p1, Point2::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn end_grip_drag_commits_linear_p1_grip() {
+        let (doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        tool.start_grip_drag(id, DimGripKind::LinearP1, Point2::new(0.0, 0.0));
+        tool.on_grip_drag(Point2::new(-2.0, -1.0));
+        let outcome = tool.end_grip_drag(&doc, 0.1);
+        match outcome {
+            GripDragOutcome::Commit(Command::ModifyEntity {
+                id: modified_id,
+                new_geom: EntityGeom::DimLinear(dim),
+            }) => {
+                assert_eq!(modified_id, id);
+                assert_eq!(dim.p1, Point2::new(-2.0, -1.0));
+                assert_eq!(dim.p2, Point2::new(4.0, 0.0));
+            }
+            other => panic!("expected Commit(ModifyEntity(DimLinear)), got {other:?}"),
+        }
+        assert!(!tool.is_grip_dragging());
+    }
+
+    #[test]
+    fn end_grip_drag_rejects_degenerate_result_and_clears_drag_state() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let id = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(0.0, 0.0),
+                    p2: Point2::new(4.0, 0.0),
+                    offset: 1.0,
+                    direction: DimDirection::Rotated(0.0),
+                    ext_angle: None,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SelectTool::default();
+        tool.start_grip_drag(id, DimGripKind::LinearP1, Point2::new(0.0, 0.0));
+        tool.on_grip_drag(Point2::new(4.0, 5.0)); // 水平固定なので投影長 0 になる
+        let outcome = tool.end_grip_drag(&doc, 0.1);
+        assert_eq!(
+            outcome,
+            GripDragOutcome::Rejected("Linear dim: projected length is zero".to_string())
+        );
+        assert!(!tool.is_grip_dragging());
+        // Document は不変。
+        let EntityGeom::DimLinear(dim) = &doc.entity(id).unwrap().geom else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim.p1, Point2::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn on_cancel_during_grip_drag_discards_only_the_drag() {
+        let (_doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![id]);
+        tool.start_grip_drag(id, DimGripKind::LinearP1, Point2::new(0.0, 0.0));
+        assert!(tool.is_grip_dragging());
+        tool.on_cancel();
+        assert!(!tool.is_grip_dragging());
+        assert_eq!(tool.selection(), &[id]);
+    }
+
+    #[test]
+    fn cancel_drags_discards_every_drag_kind_but_keeps_selection() {
+        let mut tool = SelectTool::default();
+        let id = EntityId::default();
+        tool.set_selection(vec![id]);
+        assert!(!tool.cancel_drags(), "ドラッグが無ければ false");
+
+        tool.on_drag_start(Point2::new(0.0, 0.0));
+        assert!(tool.cancel_drags());
+        assert!(tool.drag_preview().is_none());
+
+        tool.start_text_drag(id, Point2::new(1.0, 1.0), Point2::new(1.0, 1.0));
+        assert!(tool.cancel_drags());
+        assert!(!tool.is_text_dragging());
+
+        tool.start_grip_drag(id, DimGripKind::LinearP1, Point2::new(0.0, 0.0));
+        assert!(tool.cancel_drags());
+        assert!(!tool.is_grip_dragging());
+
+        assert_eq!(tool.selection(), &[id], "選択集合は変えない");
+    }
+
+    #[test]
+    fn cancel_grip_drag_discards_drag_but_keeps_selection() {
+        let (_doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![id]);
+        tool.start_grip_drag(id, DimGripKind::LinearP1, Point2::new(0.0, 0.0));
+        assert!(tool.is_grip_dragging());
+        tool.cancel_grip_drag();
+        assert!(!tool.is_grip_dragging());
+        assert_eq!(tool.selection(), &[id]);
+    }
+
+    #[test]
+    fn start_grip_drag_takes_priority_and_is_exclusive_with_text_and_rect_drag() {
+        let (_doc, id) = doc_with_linear_dim();
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(Point2::new(9.0, 9.0)); // 矩形選択ドラッグ開始
+        tool.start_grip_drag(id, DimGripKind::LinearP1, Point2::new(0.0, 0.0));
+        assert!(tool.is_grip_dragging());
+        // 矩形選択ドラッグは破棄されている（drag_preview がグリップだけを返す）。
+        assert_eq!(
+            tool.drag_preview(),
+            Some(DragPreview::Grip {
+                id,
+                kind: DimGripKind::LinearP1,
+                point: Point2::new(0.0, 0.0),
+            })
+        );
+    }
+
+    // --- 直列/並列（M11 タスク75） ---
+
+    /// [`Tool::chain_options`] から現在選ばれているラベルだけを取り出す
+    /// （テスト用ヘルパー。`variant_label` と同型）。
+    fn chain_label(tool: &dyn Tool) -> Option<&'static str> {
+        tool.chain_options().map(|o| o.options[o.current])
+    }
+
+    #[test]
+    fn dim_linear_tool_chain_options_default_and_after_set() {
+        let mut tool = DimLinearTool::default();
+        assert_eq!(chain_label(&tool), Some("Single"));
+        tool.set_chain_variant(1);
+        assert_eq!(chain_label(&tool), Some("Series"));
+        tool.set_chain_variant(2);
+        assert_eq!(chain_label(&tool), Some("Parallel"));
+    }
+
+    #[test]
+    fn dim_linear_tool_series_clicks_build_collinear_dimensions() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.set_chain_variant(1); // Series
+
+        // 1本目は単発と同じ3クリック。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        let geom1 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        let EntityGeom::DimLinear(dim1) = geom1 else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim1.direction, DimDirection::Aligned);
+        assert!((dim1.offset - 2.0).abs() < 1e-9);
+
+        // 2本目以降は直列: 前の p2 が次の p1、1クリックで確定。次の計測点候補は
+        // 前の寸法の p2 = (4,0)。向きが Rotated(0.0)（水平固定）なので、以降のクリックは
+        // x 方向に離れた点を選ぶ（測定値は方向への投影長なので、y だけ動かしても
+        // 投影長ゼロで拒否される — これは仕様どおり）。
+        assert_eq!(tool.snap_points(), vec![Point2::new(4.0, 0.0)]);
+        let geom2 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 0.0))));
+        let EntityGeom::DimLinear(dim2) = geom2 else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim2.p1, Point2::new(4.0, 0.0));
+        assert_eq!(dim2.p2, Point2::new(9.0, 0.0));
+        // 1本目が Aligned でも、2本目以降は解決済み角度(0rad)の Rotated で保存する。
+        assert_eq!(dim2.direction, DimDirection::Rotated(0.0));
+        // 寸法線は1本目と同一直線上(y=2)に揃う。
+        assert!((dim2.offset - 2.0).abs() < 1e-9);
+
+        // 3本目も同じ直線上に続く。
+        assert_eq!(tool.snap_points(), vec![Point2::new(9.0, 0.0)]);
+        let geom3 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(15.0, 0.0))));
+        let EntityGeom::DimLinear(dim3) = geom3 else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim3.p1, Point2::new(9.0, 0.0));
+        assert_eq!(dim3.direction, DimDirection::Rotated(0.0));
+        assert!((dim3.offset - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dim_linear_tool_parallel_clicks_fix_first_p1_and_set_offset_per_click() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.set_chain_variant(2); // Parallel
+
+        // 1本目は単発と同じ3クリック。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        let geom1 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        let EntityGeom::DimLinear(dim1) = geom1 else {
+            panic!("expected DimLinear");
+        };
+        assert!((dim1.offset - 2.0).abs() < 1e-9);
+
+        // 並列: 1本目の p1=(0,0) を基準に固定。2クリック目(次の計測点)は Continue。
+        // 向きが Rotated(0.0)（水平固定）なので、測定値を非ゼロにするには次の計測点の
+        // x を p1 からずらす（`dim_linear_tool_series_clicks_build_collinear_dimensions`
+        // と同じ理由）。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(6.0, 5.0))),
+            ToolResult::Continue
+        );
+        // 3クリック目(寸法線位置)で確定。
+        let geom2 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, -3.0))));
+        let EntityGeom::DimLinear(dim2) = geom2 else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim2.p1, Point2::new(0.0, 0.0));
+        assert_eq!(dim2.p2, Point2::new(6.0, 5.0));
+        assert_eq!(dim2.direction, DimDirection::Rotated(0.0));
+        assert!((dim2.offset - (-3.0)).abs() < 1e-9);
+
+        // 次の並列寸法も p1 は同じ (0,0) に固定され、寸法線位置は毎回クリックで決まる。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(7.0, 2.0)));
+        let geom3 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 5.0))));
+        let EntityGeom::DimLinear(dim3) = geom3 else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim3.p1, Point2::new(0.0, 0.0));
+        assert_eq!(dim3.p2, Point2::new(7.0, 2.0));
+        assert!((dim3.offset - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dim_linear_tool_chain_mode_change_breaks_series() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.set_chain_variant(1); // Series
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0)));
+        // 系列進行中(次の計測点候補あり)。
+        assert_eq!(tool.snap_points(), vec![Point2::new(4.0, 0.0)]);
+
+        // 連続モードを単発へ変えると系列を破棄して p1 待ちへ戻る。
+        tool.set_chain_variant(0);
+        assert!(tool.snap_points().is_empty());
+        // 改めて3クリックで独立した1本目から始められる。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 9.0)));
+        assert_eq!(tool.snap_points(), vec![Point2::new(9.0, 9.0)]);
+    }
+
+    #[test]
+    fn dim_linear_tool_direction_change_breaks_series() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.set_chain_variant(1); // Series
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0)));
+        assert_eq!(tool.snap_points(), vec![Point2::new(4.0, 0.0)]);
+
+        // Tab (向きの循環) でも系列は打ち切られる。
+        tool.on_input(&ctx, InputEvent::Cycle);
+        assert!(tool.snap_points().is_empty());
+    }
+
+    #[test]
+    fn dim_linear_tool_single_commit_failure_rolls_back_to_waiting_line() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        assert_eq!(
+            tool.snap_points(),
+            vec![Point2::new(0.0, 0.0), Point2::new(4.0, 0.0)]
+        );
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0)));
+        assert!(matches!(result, ToolResult::Commit(_)));
+
+        // Document::apply が失敗したとみなし、後始末フックを呼ぶ。
+        tool.on_commit_failed();
+
+        // WaitingLine(p1,p2) を保っている(2点を失わない)。
+        assert_eq!(
+            tool.snap_points(),
+            vec![Point2::new(0.0, 0.0), Point2::new(4.0, 0.0)]
+        );
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        assert!(matches!(geom, EntityGeom::DimLinear(_)));
+    }
+
+    #[test]
+    fn dim_linear_tool_series_commit_failure_rolls_back_and_keeps_series() {
+        let (_doc, ctx) = ctx();
+        let mut tool = DimLinearTool::default();
+        tool.set_chain_variant(1); // Series
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 0.0)));
+        let geom1 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(2.0, 2.0))));
+        assert!(matches!(geom1, EntityGeom::DimLinear(_)));
+        assert_eq!(tool.snap_points(), vec![Point2::new(4.0, 0.0)]);
+
+        // 2本目のクリックは確定を返すが、Document::apply が失敗したとみなす
+        // （x を next_p1 からずらす理由は series テストと同じ）。
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 5.0)));
+        assert!(matches!(result, ToolResult::Commit(_)));
+        tool.on_commit_failed();
+
+        // 系列は失われず、次の計測点候補は失敗前の (4,0) のまま。
+        assert_eq!(tool.snap_points(), vec![Point2::new(4.0, 0.0)]);
+
+        // 同じ next_p1 から続けて確定できる(系列が生きている証拠)。
+        let geom2 = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(9.0, 0.0))));
+        let EntityGeom::DimLinear(dim2) = geom2 else {
+            panic!("expected DimLinear");
+        };
+        assert_eq!(dim2.p1, Point2::new(4.0, 0.0));
     }
 }

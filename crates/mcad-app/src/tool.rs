@@ -2022,28 +2022,225 @@ impl Tool for DimDiameterTool {
 // 角度寸法（DimAngular、M11 タスク74）
 // ---------------------------------------------------------------------
 
-/// 角度寸法ツール（`Shift+G`）の状態。頂点 → 1 辺目の点（p1） → 2 辺目の点（p2） →
-/// 弧の位置（半径）の 4 クリック（DESIGN.md タスク74 の UX 確定）。
+/// 角度寸法ツール（`Shift+G`）の状態。3 points モードは 頂点 → 1 辺目の点（p1） →
+/// 2 辺目の点（p2） → 弧の位置（半径）の 4 クリック（DESIGN.md タスク74 の UX 確定）。
+/// 2 lines モードは 線1 → 線2 → 弧の位置 の 3 クリック（DESIGN.md タスク80「着手時設計」）。
+/// 両モードの状態を同じ enum に同居させ、`wants_shape_pick`/`on_input` は `self.state` の
+/// 変異体だけで分岐する（`self.mode` は初期状態選択・コンボ表示にしか使わない）。
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 enum DimAngularState {
-    /// 頂点待ち。
+    /// [3 points] 頂点待ち。
     #[default]
     WaitingVertex,
-    /// 1 辺目の点（p1）待ち。頂点は確定済み。
+    /// [3 points] 1 辺目の点（p1）待ち。頂点は確定済み。
     WaitingP1(Point2),
-    /// 2 辺目の点（p2）待ち。頂点・p1 は確定済み。
+    /// [3 points] 2 辺目の点（p2）待ち。頂点・p1 は確定済み。
     WaitingP2(Point2, Point2),
-    /// 弧の位置（半径）のクリック待ち。頂点・p1・p2 は確定済み。
+    /// [3 points] 弧の位置（半径）のクリック待ち。頂点・p1・p2 は確定済み。
     WaitingArc(Point2, Point2, Point2),
+    /// [2 lines] 1 本目の線分／ポリライン辺のヒットテスト待ち。
+    WaitingLine1,
+    /// [2 lines] 2 本目のヒットテスト待ち。1 本目の辺は採取済み。
+    WaitingLine2 {
+        /// 1 本目として拾った辺（線分そのもの、ポリラインならクリックに最も近い辺）。
+        edge1: LineSeg,
+    },
+    /// [2 lines] 弧の位置のクリック待ち。頂点（2 直線の交点、延長上でもよい）と両辺は
+    /// 確定済み。p1/p2 と測る角はこの状態のクリック（またはカーソル）で初めて決まる
+    /// （DESIGN.md タスク80「測る角は弧の位置クリックで決める」）。
+    WaitingArcTwoLines {
+        /// 2 直線の交点。
+        vertex: Point2,
+        /// 1 本目の辺。
+        edge1: LineSeg,
+        /// 2 本目の辺。
+        edge2: LineSeg,
+    },
 }
 
-/// 角度寸法ツール（`Shift+G`）。頂点 → 1 辺目の点 → 2 辺目の点 → 弧の位置の 4 クリックで
-/// [`EntityGeom::DimAngular`] を確定する（DESIGN.md M11 タスク74）。優角（180°超）は
-/// 扱わない・反平行（180°ちょうど）は core が拒否するが、このツールは弧の位置クリックへ
-/// 進む前（2 辺目のクリック時点）に同じ基準で先回りして拒否する（無駄なクリックを
-/// 減らすため）。
+/// 角度寸法ツール（`Shift+G`）のモード（DESIGN.md タスク80「着手時設計」）。上部パネルの
+/// コンボ（[`Tool::variant_options`]/[`Tool::set_variant`]）と `Tab`
+/// （[`InputEvent::Cycle`]）の両方で切り替える（[`OrdAxisMode`] と同じ作り）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum DimAngularMode {
+    /// 頂点 → p1 → p2 → 弧の位置の 4 クリック（タスク74 の既存挙動）。`spawn()` の既定。
+    #[default]
+    ThreePoints,
+    /// 2 本の直線（線分／ポリライン辺）の交点を頂点とする角度寸法（タスク80）。
+    TwoLines,
+}
+
+impl DimAngularMode {
+    /// [`Tool::variant_options`] の選択肢一覧（`Tab` 循環の順序と一致）。上部パネルは
+    /// 英語領域なのでラベルも英語（DESIGN.md タスク80）。
+    const OPTIONS: [&'static str; 2] = ["3 points", "2 lines"];
+
+    /// `Tab` 循環の次の値（3 points → 2 lines → 3 points）。
+    fn next(self) -> Self {
+        match self {
+            DimAngularMode::ThreePoints => DimAngularMode::TwoLines,
+            DimAngularMode::TwoLines => DimAngularMode::ThreePoints,
+        }
+    }
+
+    /// [`Self::OPTIONS`] 内の現在の添字。
+    fn index(self) -> usize {
+        match self {
+            DimAngularMode::ThreePoints => 0,
+            DimAngularMode::TwoLines => 1,
+        }
+    }
+
+    /// [`Self::OPTIONS`] の添字からモードを作る。範囲外は `ThreePoints`（既定）に倒す。
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => DimAngularMode::TwoLines,
+            _ => DimAngularMode::ThreePoints,
+        }
+    }
+
+    /// このモードの最初の状態。モード切替時（`Tab`・コンボ・作り直し後の引き継ぎ）は
+    /// 進行中の入力を捨ててここへ戻る（DESIGN.md タスク80「着手時設計」）。
+    fn initial_state(self) -> DimAngularState {
+        match self {
+            DimAngularMode::ThreePoints => DimAngularState::WaitingVertex,
+            DimAngularMode::TwoLines => DimAngularState::WaitingLine1,
+        }
+    }
+}
+
+/// 形状 `shape` のうち、クリック点 `click` に最も近い直線的な辺を [`LineSeg`] で返す
+/// （DESIGN.md タスク80「2 lines の操作」）。対象は線分（[`Shape::Line`]、そのまま）と
+/// ポリラインの辺（[`Polyline::segments`] のうち `click` への最近距離が最小の辺。閉じた
+/// ポリラインは閉じ辺を含む）。円・円弧・その他は `None`（呼び出し側が理由付きで拒否する）。
+fn as_line_or_edge(shape: &Shape, click: Point2) -> Option<LineSeg> {
+    match shape {
+        Shape::Line(seg) => Some(*seg),
+        Shape::Polyline(pl) => pl
+            .segments()
+            .map(|seg| (seg.closest_point(click).distance_squared(click), seg))
+            .min_by(|(a, _), (b, _)| a.total_cmp(b))
+            .map(|(_, seg)| seg),
+        _ => None,
+    }
+}
+
+/// 無限直線どうしの交点。`p1` を通り単位方向 `d1` の直線と、`p2` を通り単位方向 `d2` の
+/// 直線。呼び出し側で「なす角が [`DIM_ANGULAR_ANTIPARALLEL_EPS`] 未満（ほぼ平行・反平行）」
+/// を先に拒否しているため、ここでの分母 0 判定は数値的な最終防衛線に過ぎない
+/// （geom の `line_intersection` は非公開かつポリラインオフセット用の別許容量を使うため、
+/// ここに専用の小さな純関数を置く。DESIGN.md タスク80「確認済みの事実」参照）。
+fn infinite_line_intersection(p1: Point2, d1: Vec2, p2: Point2, d2: Vec2) -> Option<Point2> {
+    let denom = d1.cross(d2);
+    if denom.abs() <= f64::EPSILON {
+        return None;
+    }
+    let t = (p2 - p1).cross(d2) / denom;
+    Some(p1 + d1 * t)
+}
+
+/// 2 lines モードの弧位置クリック（またはプレビュー中はカーソル）`click` から、頂点
+/// `vertex` を基準にした符号付き単位ベクトル u1・u2 と半径を求める（DESIGN.md タスク80
+/// 「測る角は弧の位置クリックで決める」）。エラーの ASCII 理由は [`ToolResult::Rejected`]
+/// へそのまま渡せる形にする。
+///
+/// `c = click − vertex` を 2 直線の単位方向 `d1`・`d2` を基底として
+/// `c = α·d1 + β·d2` と分解し、`u1 = sign(α)·d1`・`u2 = sign(β)·d2` を測る角の 2 辺の
+/// 向きとする（クラメルの公式: `α = (c×d2)/(d1×d2)`、`β = (d1×c)/(d1×d2)`）。
+///
+/// # なぜ内積の符号（`c·d1` 等）ではなく基底分解なのか
+///
+/// 直交する 2 直線では「`c` が各直線のどちら側にあるか」は内積の符号だけで判定できて
+/// しまうが、直交しない場合は内積が「`c` が直線の垂線に対してどちら側か」しか見ておらず、
+/// 4 つの角の境界（=2 直線そのもの）とずれる。基底分解なら境界は厳密に `α = 0`
+/// （`c` が `d2` 方向＝直線2上）・`β = 0`（`c` が `d1` 方向＝直線1上）と一致する。
+fn resolve_two_lines_arc(
+    vertex: Point2,
+    edge1: LineSeg,
+    edge2: LineSeg,
+    click: Point2,
+) -> Result<(Vec2, Vec2, f64), &'static str> {
+    let radius = vertex.distance(click);
+    if radius <= DIM_DEGENERATE_EPSILON {
+        return Err("Angular dim: arc radius is zero");
+    }
+    let (Some(d1), Some(d2)) = (edge1.direction().normalize(), edge2.direction().normalize())
+    else {
+        return Err("Angular dim (2 lines): line is degenerate");
+    };
+    let c = click - vertex;
+    let Some(c_unit) = c.normalize() else {
+        return Err("Angular dim: arc radius is zero");
+    };
+    // クリック点がどちらかの直線上（延長を含む）なら、その直線方向の外積がほぼ 0 になる
+    // （直線2上 ⇔ α≈0 ⇔ c∥d2 ⇔ c_unit×d2≈0、直線1上 ⇔ β≈0 ⇔ c∥d1 ⇔ c_unit×d1≈0）。
+    if c_unit.cross(d1).abs() <= DIM_ANGULAR_ANTIPARALLEL_EPS
+        || c_unit.cross(d2).abs() <= DIM_ANGULAR_ANTIPARALLEL_EPS
+    {
+        return Err("Angular dim (2 lines): arc position is on a leg line");
+    }
+    let denom = d1.cross(d2);
+    // 2 本目のピック時点（`on_shape_pick`）で平行・反平行は既に拒否済みなので、ここでの
+    // 分母 0 判定は数値的な最終防衛線に過ぎない。
+    if denom.abs() <= f64::EPSILON {
+        return Err("Angular dim (2 lines): the two lines are parallel");
+    }
+    let alpha = c.cross(d2) / denom;
+    let beta = d1.cross(c) / denom;
+    let u1 = if alpha >= 0.0 { d1 } else { -d1 };
+    let u2 = if beta >= 0.0 { d2 } else { -d2 };
+    Ok((u1, u2, radius))
+}
+
+/// 2 lines モードの p1/p2 の置き場所（DESIGN.md タスク80「p1/p2 の置き場所」）: 拾った辺
+/// `edge` の端点のうち `u` 方向（`(端点 − vertex)·u > DIM_DEGENERATE_EPSILON`）にあって
+/// 頂点から最も遠いものを採る。該当する端点が無ければ `vertex + u * arc_radius`。
+fn leg_point(vertex: Point2, edge: LineSeg, u: Vec2, arc_radius: f64) -> Point2 {
+    [edge.a, edge.b]
+        .into_iter()
+        .map(|ep| ((ep - vertex).dot(u), ep))
+        .filter(|(proj, _)| *proj > DIM_DEGENERATE_EPSILON)
+        .max_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, ep)| ep)
+        .unwrap_or_else(|| vertex + u * arc_radius)
+}
+
+/// `vertex` が辺 `edge` の実線の外（延長上）にあるなら、延長線を引く側の端点を返す
+/// （DESIGN.md タスク80「プレビュー」）。`vertex` が辺の実線内（端点間）にあれば `None`
+/// （延長線を描かない）。
+fn edge_extension_endpoint(edge: LineSeg, vertex: Point2) -> Option<Point2> {
+    let d = edge.direction();
+    let len2 = d.length_squared();
+    if len2 <= f64::EPSILON {
+        return None;
+    }
+    let t = (vertex - edge.a).dot(d) / len2;
+    if t < 0.0 {
+        Some(edge.a)
+    } else if t > 1.0 {
+        Some(edge.b)
+    } else {
+        None
+    }
+}
+
+/// 角度寸法ツール（`Shift+G`）。2 モードを持つ（DESIGN.md タスク80「着手時設計」）:
+///
+/// - **3 points**（既定、タスク74 の既存挙動）: 頂点 → 1 辺目の点 → 2 辺目の点 → 弧の位置の
+///   4 クリックで [`EntityGeom::DimAngular`] を確定する。優角（180°超）は扱わない・反平行
+///   （180°ちょうど）は core が拒否するが、このツールは弧の位置クリックへ進む前（2 辺目の
+///   クリック時点）に同じ基準で先回りして拒否する（無駄なクリックを減らすため）。
+/// - **2 lines**（タスク80）: 線1 → 線2 → 弧の位置 の 3 クリック。線のクリックは
+///   `wants_shape_pick`/`on_shape_pick`（フィレットと同じ経路、スナップなし）で当て、
+///   弧の位置は通常の `Click`（スナップあり）で受ける。2 直線（延長を含む）の交点を頂点と
+///   し、弧位置クリックが頂点から見てどの角を含むかで測る角を選ぶ。
+///
+/// モードは `variant_options`/`set_variant`（上部パネルのコンボ）と `Tab`
+/// （[`InputEvent::Cycle`]）の両方で切り替わり、切替時は進行中の入力を捨てて各モードの
+/// 最初の状態へ戻る。
 #[derive(Debug, Default)]
 pub struct DimAngularTool {
+    mode: DimAngularMode,
     state: DimAngularState,
     cursor: Option<Point2>,
 }
@@ -2121,12 +2318,55 @@ impl Tool for DimAngularTool {
                     self.state = DimAngularState::WaitingVertex;
                     ToolResult::Commit(cmd)
                 }
+                // [2 lines] 線1・線2 は wants_shape_pick/on_shape_pick を通るのでここへは
+                // 来ない想定(FilletTool と同じ流儀)。来ても状態は変えない。
+                DimAngularState::WaitingLine1 | DimAngularState::WaitingLine2 { .. } => {
+                    ToolResult::Continue
+                }
+                // [2 lines] 弧の位置は通常の Click(スナップあり)で受ける
+                // (DESIGN.md タスク80「2 lines の操作」)。
+                DimAngularState::WaitingArcTwoLines {
+                    vertex,
+                    edge1,
+                    edge2,
+                } => match resolve_two_lines_arc(vertex, edge1, edge2, p) {
+                    Ok((u1, u2, arc_radius)) => {
+                        let dim = DimAngular {
+                            vertex,
+                            p1: leg_point(vertex, edge1, u1, arc_radius),
+                            p2: leg_point(vertex, edge2, u2, arc_radius),
+                            arc_radius,
+                            // 作図直後は無注記(角度寸法に記号は無い。DimKind::Angular::allowed_symbols)。
+                            annotation: DimAnnotation::default(),
+                        };
+                        // 3 points と拒否の基準を共有する(DESIGN.md タスク80「確定前の検証」)。
+                        if let Err(reason) = check_angular_degenerate(&dim) {
+                            return ToolResult::Rejected(reason);
+                        }
+                        let cmd = Command::AddEntity(Entity::new(
+                            EntityGeom::DimAngular(dim),
+                            ctx.layer,
+                            ctx.style,
+                        ));
+                        // 確定後は1本目待ちへ戻る単発(DESIGN.md タスク80「確定後」)。
+                        self.state = DimAngularState::WaitingLine1;
+                        ToolResult::Commit(cmd)
+                    }
+                    Err(reason) => ToolResult::Rejected(reason),
+                },
             },
             InputEvent::Cancel => {
-                self.state = DimAngularState::WaitingVertex;
+                self.state = self.mode.initial_state();
                 ToolResult::Cancel
             }
-            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
+            // モードを切り替えたら進行中の入力は捨てて各モードの最初の状態へ戻す
+            // (DESIGN.md タスク80「着手時設計」)。
+            InputEvent::Cycle => {
+                self.mode = self.mode.next();
+                self.state = self.mode.initial_state();
+                ToolResult::Continue
+            }
+            InputEvent::Confirm => ToolResult::Continue,
         }
     }
 
@@ -2187,6 +2427,67 @@ impl Tool for DimAngularTool {
                     crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
                 }
             }
+            // [2 lines] 1 本目を拾った直後: その辺(ポリラインなら拾った辺)をハイライトする
+            // (DESIGN.md タスク80「プレビュー」)。
+            (DimAngularState::WaitingLine2 { edge1 }, _) => {
+                draw_shape(
+                    painter,
+                    rect,
+                    viewport,
+                    &Shape::Line(edge1),
+                    preview_stroke(),
+                    Linetype::Continuous,
+                    1.0,
+                );
+            }
+            // [2 lines] 弧位置待ち: 頂点が辺の実線の外(延長上)にあれば延長を細線で示し、
+            // カーソル位置で測る角を判定できれば寸法を丸ごとプレビューする
+            // (DESIGN.md タスク80「プレビュー」)。
+            (
+                DimAngularState::WaitingArcTwoLines {
+                    vertex,
+                    edge1,
+                    edge2,
+                },
+                cursor,
+            ) => {
+                if let Some(ext) = edge_extension_endpoint(edge1, vertex) {
+                    draw_shape(
+                        painter,
+                        rect,
+                        viewport,
+                        &Shape::Line(LineSeg::new(ext, vertex)),
+                        preview_stroke(),
+                        Linetype::Continuous,
+                        1.0,
+                    );
+                }
+                if let Some(ext) = edge_extension_endpoint(edge2, vertex) {
+                    draw_shape(
+                        painter,
+                        rect,
+                        viewport,
+                        &Shape::Line(LineSeg::new(ext, vertex)),
+                        preview_stroke(),
+                        Linetype::Continuous,
+                        1.0,
+                    );
+                }
+                if let Some(cursor) = cursor
+                    && let Ok((u1, u2, arc_radius)) =
+                        resolve_two_lines_arc(vertex, edge1, edge2, cursor)
+                {
+                    let dim = DimAngular {
+                        vertex,
+                        p1: leg_point(vertex, edge1, u1, arc_radius),
+                        p2: leg_point(vertex, edge2, u2, arc_radius),
+                        arc_radius,
+                        annotation: DimAnnotation::default(),
+                    };
+                    let ex = expand_angular(&dim, render);
+                    crate::draw_dim_expansion(painter, rect, viewport, &ex, preview_stroke());
+                }
+            }
             _ => {}
         }
     }
@@ -2197,7 +2498,83 @@ impl Tool for DimAngularTool {
             DimAngularState::WaitingP1(vertex) => vec![vertex],
             DimAngularState::WaitingP2(vertex, p1) => vec![vertex, p1],
             DimAngularState::WaitingArc(vertex, p1, p2) => vec![vertex, p1, p2],
+            DimAngularState::WaitingLine1 | DimAngularState::WaitingLine2 { .. } => Vec::new(),
+            DimAngularState::WaitingArcTwoLines { vertex, .. } => vec![vertex],
         }
+    }
+
+    /// [2 lines] 線1・線2 のヒットテスト待ちの間だけ `true`
+    /// (DESIGN.md タスク80「2 lines の操作」、`FilletTool` と同じ経路)。
+    fn wants_shape_pick(&self) -> bool {
+        matches!(
+            self.state,
+            DimAngularState::WaitingLine1 | DimAngularState::WaitingLine2 { .. }
+        )
+    }
+
+    fn on_shape_pick(&mut self, hit: ShapePick) -> ToolResult {
+        match self.state {
+            DimAngularState::WaitingLine1 => match as_line_or_edge(&hit.shape, hit.click) {
+                Some(edge1) => {
+                    self.state = DimAngularState::WaitingLine2 { edge1 };
+                    ToolResult::Continue
+                }
+                None => ToolResult::Rejected(
+                    "Angular dim (2 lines): first pick must be a line or polyline edge",
+                ),
+            },
+            DimAngularState::WaitingLine2 { edge1 } => {
+                let Some(edge2) = as_line_or_edge(&hit.shape, hit.click) else {
+                    return ToolResult::Rejected(
+                        "Angular dim (2 lines): second pick must be a line or polyline edge",
+                    );
+                };
+                // 同じ線分を 2 回拾った場合は方向が一致(または反転一致)するため、
+                // 下の平行・反平行判定が自然に拒否する(DESIGN.md タスク80「2 lines の
+                // 操作」)。1 本目は保持し状態を据え置く。
+                let (Some(d1), Some(d2)) =
+                    (edge1.direction().normalize(), edge2.direction().normalize())
+                else {
+                    return ToolResult::Rejected("Angular dim (2 lines): line is degenerate");
+                };
+                let angle = d1.dot(d2).clamp(-1.0, 1.0).acos();
+                if angle <= DIM_ANGULAR_ANTIPARALLEL_EPS
+                    || (std::f64::consts::PI - angle).abs() < DIM_ANGULAR_ANTIPARALLEL_EPS
+                {
+                    return ToolResult::Rejected(
+                        "Angular dim (2 lines): the two lines are parallel",
+                    );
+                }
+                let Some(vertex) = infinite_line_intersection(edge1.a, d1, edge2.a, d2) else {
+                    return ToolResult::Rejected(
+                        "Angular dim (2 lines): the two lines are parallel",
+                    );
+                };
+                self.state = DimAngularState::WaitingArcTwoLines {
+                    vertex,
+                    edge1,
+                    edge2,
+                };
+                ToolResult::Continue
+            }
+            // wants_shape_pick が false のときは app 層が本メソッドを呼ばない想定。
+            _ => ToolResult::Continue,
+        }
+    }
+
+    fn variant_options(&self) -> Option<VariantOptions> {
+        Some(VariantOptions {
+            heading: "Angular mode",
+            options: &DimAngularMode::OPTIONS,
+            current: self.mode.index(),
+        })
+    }
+
+    fn set_variant(&mut self, index: usize) {
+        self.mode = DimAngularMode::from_index(index);
+        // モードを切り替えたら進行中の入力は捨てて最初の状態へ戻す
+        // (DESIGN.md タスク80「着手時設計」)。
+        self.state = self.mode.initial_state();
     }
 }
 
@@ -7418,6 +7795,363 @@ mod tests {
         assert_eq!(tool.snap_points().len(), 2);
         assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
         assert!(tool.snap_points().is_empty());
+    }
+
+    // --- 角度寸法ツール 2 lines モード（M11 タスク80）---
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_measures_all_four_quadrants() {
+        // 頂点 (0,0) で交わる 2 直線: 1 本目は x 軸方向、2 本目は原点を通り x 軸から
+        // 30°の方向。4 つの角のうち隣り合う 2 つは 30°・150°で交互になり、
+        // 対辺どうしの和は 180°になる（DESIGN.md タスク80 検収基準 (ii)）。
+        let (mut doc, ctx) = ctx();
+        let edge_a = hline(-5.0, 5.0, 0.0);
+        let angle_b = 30f64.to_radians();
+        let edge_b = Shape::Line(LineSeg::new(
+            Point2::new(-5.0 * angle_b.cos(), -5.0 * angle_b.sin()),
+            Point2::new(5.0 * angle_b.cos(), 5.0 * angle_b.sin()),
+        ));
+
+        // (クリック角度, 期待する測定角度) の組。隣り合う象限は 30°/150°で交互になる。
+        let cases = [
+            (15f64, 30f64),
+            (100.0, 150.0),
+            (195.0, 30.0),
+            (280.0, 150.0),
+        ];
+        let mut measured = Vec::new();
+        for (click_deg, expected_deg) in cases {
+            let mut tool = DimAngularTool::default();
+            tool.set_variant(1); // "2 lines"
+            assert!(tool.wants_shape_pick());
+            let pick_a = shape_pick(&mut doc, edge_a.clone(), Point2::new(4.0, 0.0));
+            assert_eq!(tool.on_shape_pick(pick_a), ToolResult::Continue);
+            let pick_b = shape_pick(&mut doc, edge_b.clone(), Point2::new(4.0, 1.0));
+            assert_eq!(tool.on_shape_pick(pick_b), ToolResult::Continue);
+            assert!(!tool.wants_shape_pick(), "弧待ちは通常の Click で受ける");
+
+            let click_rad = click_deg.to_radians();
+            let click = Point2::new(click_rad.cos(), click_rad.sin());
+            let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(click)));
+            let EntityGeom::DimAngular(dim) = geom else {
+                panic!("expected DimAngular, got {geom:?}");
+            };
+            assert!(dim.vertex.distance(Point2::ORIGIN) < 1e-9);
+            let measured_deg = dim.measured_value().to_degrees();
+            assert!(
+                (measured_deg - expected_deg).abs() < 1e-6,
+                "click {click_deg}°: expected {expected_deg}°, got {measured_deg}°"
+            );
+            measured.push(measured_deg);
+        }
+        // 鋭角と補角の和は 180°(検収基準 (ii))。
+        assert!((measured[0] + measured[1] - 180.0).abs() < 1e-6);
+        assert!((measured[2] + measured[3] - 180.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_intersects_beyond_picked_segments() {
+        // フィレットで角が欠けた 2 線分（延長上の頂点）: どちらの線分も原点を含まないが、
+        // 無限直線としては原点で交わる（DESIGN.md タスク80 検収基準 (i)）。
+        let (mut doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.set_variant(1);
+        let pick_a = shape_pick(&mut doc, hline(2.0, 10.0, 0.0), Point2::new(6.0, 0.0));
+        tool.on_shape_pick(pick_a);
+        let pick_b = shape_pick(&mut doc, vline(0.0, 2.0, 10.0), Point2::new(0.0, 6.0));
+        tool.on_shape_pick(pick_b);
+
+        // クリックは頂点近傍(第 1 象限)。両方の実線が u 方向にあるので、p1/p2 は
+        // それぞれの実線の遠い端点になる。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0))));
+        let EntityGeom::DimAngular(dim) = geom else {
+            panic!("expected DimAngular, got {geom:?}");
+        };
+        assert!(dim.vertex.distance(Point2::ORIGIN) < 1e-9);
+        assert_eq!(dim.p1, Point2::new(10.0, 0.0));
+        assert_eq!(dim.p2, Point2::new(0.0, 10.0));
+        assert!((dim.arc_radius - 2f64.sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_accepts_two_edges_of_same_polyline() {
+        // 同じポリラインの別の辺は許す（DESIGN.md タスク80「2 lines の操作」）。
+        // L字ポリライン (0,0)-(5,0)-(5,5) の 2 辺を拾うと、頂点は共有点 (5,0)。
+        let (mut doc, ctx) = ctx();
+        let polyline = Shape::Polyline(Polyline::new(
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(5.0, 0.0),
+                Point2::new(5.0, 5.0),
+            ],
+            false,
+        ));
+        let mut tool = DimAngularTool::default();
+        tool.set_variant(1);
+        let pick1 = shape_pick(&mut doc, polyline.clone(), Point2::new(2.0, 0.0));
+        assert_eq!(tool.on_shape_pick(pick1), ToolResult::Continue);
+        let pick2 = shape_pick(&mut doc, polyline, Point2::new(5.0, 2.0));
+        assert_eq!(tool.on_shape_pick(pick2), ToolResult::Continue);
+
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 1.0))));
+        let EntityGeom::DimAngular(dim) = geom else {
+            panic!("expected DimAngular, got {geom:?}");
+        };
+        assert!(dim.vertex.distance(Point2::new(5.0, 0.0)) < 1e-9);
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_rejects_parallel_and_keeps_first() {
+        let (mut doc, _ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.set_variant(1);
+        let pick_a = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(5.0, 0.0));
+        tool.on_shape_pick(pick_a);
+        let before = tool.state;
+
+        let parallel = shape_pick(&mut doc, hline(0.0, 10.0, 5.0), Point2::new(5.0, 5.0));
+        let result = tool.on_shape_pick(parallel);
+        assert_eq!(
+            result,
+            ToolResult::Rejected("Angular dim (2 lines): the two lines are parallel")
+        );
+        assert_eq!(tool.state, before, "1 本目は保持される");
+
+        // 1 本目を選び直さず 2 本目だけ選び直せる。
+        let ok = shape_pick(&mut doc, vline(0.0, 0.0, 10.0), Point2::new(0.0, 5.0));
+        assert_eq!(tool.on_shape_pick(ok), ToolResult::Continue);
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_rejects_same_segment_twice() {
+        // 同じ線分を 2 回拾うのは方向が一致するため平行として拒否される。
+        let (mut doc, _ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.set_variant(1);
+        let id_and_shape = hline(0.0, 10.0, 0.0);
+        let pick_a = shape_pick(&mut doc, id_and_shape.clone(), Point2::new(3.0, 0.0));
+        tool.on_shape_pick(pick_a);
+        let pick_again = shape_pick(&mut doc, id_and_shape, Point2::new(7.0, 0.0));
+        assert_eq!(
+            tool.on_shape_pick(pick_again),
+            ToolResult::Rejected("Angular dim (2 lines): the two lines are parallel")
+        );
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_rejects_circle_or_arc_picks() {
+        let (mut doc, _ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.set_variant(1);
+
+        // 1 本目が円 → 拒否、1 本目待ちのまま。
+        let circle = shape_pick(
+            &mut doc,
+            Shape::Circle(mcad_geom::Circle::new(Point2::ORIGIN, 3.0)),
+            Point2::new(3.0, 0.0),
+        );
+        assert_eq!(
+            tool.on_shape_pick(circle),
+            ToolResult::Rejected(
+                "Angular dim (2 lines): first pick must be a line or polyline edge"
+            )
+        );
+        assert!(tool.wants_shape_pick());
+
+        // 1 本目に有効な線分を拾った後、2 本目が円弧 → 拒否、1 本目は保持。
+        let pick_a = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(5.0, 0.0));
+        tool.on_shape_pick(pick_a);
+        let before = tool.state;
+        let arc = shape_pick(
+            &mut doc,
+            Shape::Arc(Arc::new(Point2::ORIGIN, 3.0, 0.0, 1.0)),
+            Point2::new(3.0, 0.0),
+        );
+        assert_eq!(
+            tool.on_shape_pick(arc),
+            ToolResult::Rejected(
+                "Angular dim (2 lines): second pick must be a line or polyline edge"
+            )
+        );
+        assert_eq!(tool.state, before);
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_rejects_arc_position_on_a_leg_line() {
+        // クリック点が直線上にあると符号が定まらず拒否される（DESIGN.md タスク80
+        // 「測る角は弧の位置クリックで決める」）。
+        let (mut doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.set_variant(1);
+        let pick_a = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(5.0, 0.0));
+        tool.on_shape_pick(pick_a);
+        let pick_b = shape_pick(&mut doc, vline(0.0, 0.0, 10.0), Point2::new(0.0, 5.0));
+        tool.on_shape_pick(pick_b);
+
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 0.0))),
+            ToolResult::Rejected("Angular dim (2 lines): arc position is on a leg line")
+        );
+        // 状態据え置き。離れた点なら受理して確定できる。
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0))));
+        assert!(matches!(geom, EntityGeom::DimAngular(_)));
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_p1_p2_endpoint_and_extension_fallback() {
+        // p1/p2 の置き場所（DESIGN.md タスク80）: u 方向にある端点のうち頂点から
+        // 最も遠いものを採る。edge1 の実線は u1 方向と逆側にしか無いため
+        // `vertex + u1 * arc_radius` へフォールバックし、edge2 は実線側の遠い端点
+        // (0,10) を使う。
+        let (mut doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.set_variant(1);
+        let pick_a = shape_pick(&mut doc, hline(-10.0, -2.0, 0.0), Point2::new(-5.0, 0.0));
+        tool.on_shape_pick(pick_a);
+        let pick_b = shape_pick(&mut doc, vline(0.0, 2.0, 10.0), Point2::new(0.0, 6.0));
+        tool.on_shape_pick(pick_b);
+
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0))));
+        let EntityGeom::DimAngular(dim) = geom else {
+            panic!("expected DimAngular, got {geom:?}");
+        };
+        assert!(dim.vertex.distance(Point2::ORIGIN) < 1e-9);
+        let expected_radius = 2f64.sqrt();
+        assert!((dim.arc_radius - expected_radius).abs() < 1e-9);
+        // edge1: 実線は (-10,0)-(-2,0)。u1 は +x（クリックに合わせた符号）なので
+        // 実線側に該当端点が無く、頂点 + u1*半径 へフォールバックする。
+        assert!(dim.p1.distance(Point2::new(expected_radius, 0.0)) < 1e-9);
+        // edge2: 実線 (0,2)-(0,10) は u2(+y) 方向にあるので、最も遠い端点 (0,10) を使う。
+        assert_eq!(dim.p2, Point2::new(0.0, 10.0));
+    }
+
+    /// 直交しない 2 直線（d1 = 0°、d2 = 30°）を拾ったツールを組み立てるテスト用ヘルパー
+    /// （采配役の差し戻し: 象限判定の反例は直交する 2 直線では再現しないため）。
+    fn two_lines_tool_non_orthogonal(doc: &mut Document) -> DimAngularTool {
+        let edge_a = hline(-5.0, 5.0, 0.0); // d1 = 0°
+        let angle_b = 30f64.to_radians();
+        let edge_b = Shape::Line(LineSeg::new(
+            Point2::new(-5.0 * angle_b.cos(), -5.0 * angle_b.sin()),
+            Point2::new(5.0 * angle_b.cos(), 5.0 * angle_b.sin()),
+        )); // d2 = 30°
+        let mut tool = DimAngularTool::default();
+        tool.set_variant(1);
+        let pick_a = shape_pick(doc, edge_a, Point2::new(4.0, 0.0));
+        assert_eq!(tool.on_shape_pick(pick_a), ToolResult::Continue);
+        let pick_b = shape_pick(doc, edge_b, Point2::new(4.0, 1.0));
+        assert_eq!(tool.on_shape_pick(pick_b), ToolResult::Continue);
+        tool
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_basis_decomposition_counterexample() {
+        // 采配役の差し戻し反例: d1=0°・d2=30°で、クリックが 170°方向のとき、内積の符号
+        // （旧ルール）だと 180〜210°の角を誤って測るが、正しい基底分解では c(170°方向)を
+        // 含む 30〜180°の角（150°）を測り、u2 は 30°方向のまま（DESIGN.md タスク80
+        // 「測る角は弧の位置クリックで決める」）。
+        let (mut doc, ctx) = ctx();
+        let mut tool = two_lines_tool_non_orthogonal(&mut doc);
+
+        let click_rad = 170f64.to_radians();
+        let click = Point2::new(click_rad.cos(), click_rad.sin());
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(click)));
+        let EntityGeom::DimAngular(dim) = geom else {
+            panic!("expected DimAngular, got {geom:?}");
+        };
+        assert!(dim.vertex.distance(Point2::ORIGIN) < 1e-9);
+        let measured_deg = dim.measured_value().to_degrees();
+        assert!(
+            (measured_deg - 150.0).abs() < 1e-6,
+            "expected 150°, got {measured_deg}°"
+        );
+        // u1 は -d1（180°方向）、u2 は d2 のまま（30°方向）。
+        let p1_angle = (dim.p1 - dim.vertex).angle().to_degrees();
+        let p2_angle = (dim.p2 - dim.vertex).angle().to_degrees();
+        assert!((p1_angle - 180.0).abs() < 1e-6, "p1 angle {p1_angle}°");
+        assert!((p2_angle - 30.0).abs() < 1e-6, "p2 angle {p2_angle}°");
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_rejects_click_on_either_line_non_orthogonal() {
+        // クリック点が d1（0°/180°）または d2（30°/210°）のいずれかの直線上（延長を含む）
+        // にあると符号が定まらず拒否される。基底分解での境界（α≈0 または β≈0）と一致する。
+        for click_deg in [0.0f64, 180.0, 30.0, 210.0] {
+            let (mut doc, ctx) = ctx();
+            let mut tool = two_lines_tool_non_orthogonal(&mut doc);
+            let click_rad = click_deg.to_radians();
+            let click = Point2::new(3.0 * click_rad.cos(), 3.0 * click_rad.sin());
+            assert_eq!(
+                tool.on_input(&ctx, InputEvent::Click(click)),
+                ToolResult::Rejected("Angular dim (2 lines): arc position is on a leg line"),
+                "click at {click_deg}° should be rejected as on a leg line"
+            );
+        }
+    }
+
+    #[test]
+    fn dim_angular_tool_two_lines_mode_accepts_click_on_perpendicular_to_a_leg() {
+        // 采配役の差し戻し指摘: 旧ルールは内積(c・d1)の符号で判定していたため、d1 に
+        // 垂直なクリック（内積 = 0）を誤って「直線上」として拒否していた。正しい基底分解
+        // （外積で判定）では、d1 に垂直な方向（90°、d1=0°に対して垂線）は d1 上ではないので
+        // 拒否されず、正しい角（30〜180°の角の 150°側）を測れる。
+        let (mut doc, ctx) = ctx();
+        let mut tool = two_lines_tool_non_orthogonal(&mut doc);
+
+        let geom = committed_geom(tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 3.0))));
+        let EntityGeom::DimAngular(dim) = geom else {
+            panic!("expected DimAngular, got {geom:?}");
+        };
+        let measured_deg = dim.measured_value().to_degrees();
+        assert!(
+            (measured_deg - 150.0).abs() < 1e-6,
+            "expected 150°, got {measured_deg}°"
+        );
+    }
+
+    #[test]
+    fn dim_angular_tool_cycle_discards_in_progress_input_between_modes() {
+        // モード切替（Tab = InputEvent::Cycle）で進行中の入力は捨てられ、各モードの
+        // 最初の状態へ戻る（DESIGN.md タスク80「着手時設計」）。
+        let (mut doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        // 3 points で頂点まで進める。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0)));
+        assert_eq!(tool.snap_points().len(), 1);
+
+        // 2 lines へ切り替えると頂点は捨てられ、1 本目待ちになる。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+        assert!(tool.snap_points().is_empty());
+        assert!(tool.wants_shape_pick());
+
+        // 2 lines で 1 本目まで進める。
+        let pick_a = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(5.0, 0.0));
+        tool.on_shape_pick(pick_a);
+        assert!(!matches!(tool.state, DimAngularState::WaitingLine1));
+
+        // 3 points へ戻すと 1 本目の辺は捨てられ、頂点待ちになる。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+        assert!(!tool.wants_shape_pick());
+        assert_eq!(tool.state, DimAngularState::WaitingVertex);
+
+        // もう一度 2 lines へ戻すと、1 本目の辺は引き継がれず 1 本目待ちから始まる。
+        tool.on_input(&ctx, InputEvent::Cycle);
+        assert_eq!(tool.state, DimAngularState::WaitingLine1);
+    }
+
+    #[test]
+    fn dim_angular_tool_set_variant_discards_in_progress_input() {
+        // 上部パネルのコンボ経由（set_variant）でも Tab と同様に進行中の入力を捨てる。
+        let (_doc, ctx) = ctx();
+        let mut tool = DimAngularTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 1.0)));
+        assert_eq!(tool.snap_points().len(), 1);
+
+        tool.set_variant(1);
+        assert_eq!(tool.state, DimAngularState::WaitingLine1);
+        assert!(tool.snap_points().is_empty());
+
+        tool.set_variant(0);
+        assert_eq!(tool.state, DimAngularState::WaitingVertex);
     }
 
     // --- 座標寸法ツール（M11 タスク74）---

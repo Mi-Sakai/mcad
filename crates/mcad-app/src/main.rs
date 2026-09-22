@@ -642,8 +642,19 @@ impl ToolKind {
     /// （単一状態で、ヒットした形状は `on_shape_pick` の引数から確定コマンドを作るその場で
     /// しか使わない）ため、undo/redo・ファイル操作をまたいで持ち越される古いスナップショットが
     /// 存在しない。
+    ///
+    /// `DimAngular`（角度寸法）も M11 タスク80 で加わった: 2 lines モードの
+    /// `DimAngularTool` は 1 本目・2 本目の辺（`LineSeg`。頂点・弧位置待ちでは頂点も）を
+    /// 形状のスナップショットとして抱えるため、他4ツールと同じ理由で undo/redo・
+    /// ファイル操作の後は作り直す必要がある（DESIGN.md タスク80「着手時設計」）。
+    /// 3 points モードは既存エンティティの形状を抱えないため対象外にしたいところだが、
+    /// この判定はツール種別単位（`ToolKind`）で行うため、モードに関わらず一律 true になる
+    /// （3 points モードでの respawn は元々何も持たない状態を作り直すだけなので実害はない）。
     fn caches_picked_shapes(self) -> bool {
-        matches!(self, ToolKind::Trim | ToolKind::Extend | ToolKind::Fillet)
+        matches!(
+            self,
+            ToolKind::Trim | ToolKind::Extend | ToolKind::Fillet | ToolKind::DimAngular
+        )
     }
 
     /// `Document::apply` が失敗した（レイヤーロック等）ときも、このツールをそのまま
@@ -1308,9 +1319,21 @@ impl McadApp {
     /// 状態が残る。ツール種別自体は変えず（ユーザーが選んだモードは尊重する）、
     /// インスタンスだけ作り直して初期状態へ戻す。他のツール（Line の連続線分など）は
     /// 既存挙動を保つため触らない。
+    ///
+    /// `DimAngular` は作り直すと `spawn()` の既定（3 points モード）へ戻ってしまうため、
+    /// 作り直す前に `variant_options().current` を読み、作り直した後 `set_variant` で
+    /// 同じモードへ引き継ぐ（DESIGN.md タスク80「着手時設計」: 「2 lines のまま 1 本目待ちへ
+    /// 戻る」）。他のツールは `variant_options` を持たないか、その状態を保存する必要が
+    /// ないため影響しない。
     fn reset_picked_shape_tool(&mut self) {
         if self.tool_kind.caches_picked_shapes() {
+            let variant = self.tool.as_ref().and_then(|t| t.variant_options());
             self.tool = self.tool_kind.spawn();
+            if let Some(opts) = variant
+                && let Some(active) = self.tool.as_mut()
+            {
+                active.set_variant(opts.current);
+            }
         }
     }
 
@@ -8571,6 +8594,64 @@ mod tests {
         assert!(!ToolKind::Line.caches_picked_shapes());
         // Split は ShapePick を状態として跨いで保持しないので含まれない。
         assert!(!ToolKind::Split.caches_picked_shapes());
+    }
+
+    #[test]
+    fn dim_angular_tool_caches_picked_shapes() {
+        // M11 タスク80: 2 lines モードは辺（LineSeg）のスナップショットを抱えるため、
+        // フィレット等と同じ理由で対象に含める（DESIGN.md タスク80「着手時設計」）。
+        assert!(ToolKind::DimAngular.caches_picked_shapes());
+    }
+
+    #[test]
+    fn reset_picked_shape_tool_keeps_dim_angular_two_lines_mode() {
+        // undo/redo・ファイル操作の後の作り直しでモードが 3 points へ戻らないよう、
+        // 作り直し前のモード（variant_options().current）を set_variant で引き継ぐ
+        // （DESIGN.md タスク80「着手時設計」）。
+        let mut app = McadApp::new();
+        app.tool_kind = ToolKind::DimAngular;
+        app.tool = ToolKind::DimAngular.spawn();
+
+        // コンボ相当の操作で 2 lines へ切り替え、1 本目まで拾って進行中にする。
+        let active = app.tool.as_mut().expect("DimAngular always spawns a tool");
+        active.set_variant(1); // "2 lines"
+        assert!(active.wants_shape_pick(), "2 lines は 1 本目待ちで true");
+
+        let layer = app.document.current_layer();
+        let entity_id = app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0))),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        assert_eq!(
+            active.on_shape_pick(tool::ShapePick {
+                id: entity_id,
+                shape: Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0))),
+                click: Point2::new(8.0, 0.0),
+                layer,
+                style: Style::inherited(),
+            }),
+            ToolResult::Continue,
+            "1 本目のピックで 2 本目待ちへ進む"
+        );
+
+        app.reset_picked_shape_tool();
+
+        let after = app.tool.as_ref().expect("respawn keeps a tool instance");
+        let opts = after
+            .variant_options()
+            .expect("DimAngular always has variant_options");
+        assert_eq!(opts.current, 1, "モードは 2 lines のまま引き継がれる");
+        assert_eq!(opts.options[opts.current], "2 lines");
+        // 作り直しなので 1 本目の進行中入力は捨てられ、1 本目待ちへ戻る。
+        assert!(
+            after.wants_shape_pick(),
+            "作り直し後は 2 lines の 1 本目待ち"
+        );
     }
 
     #[test]

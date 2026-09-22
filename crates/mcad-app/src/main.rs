@@ -6178,12 +6178,16 @@ fn table_panel(
     // M10 設計方針2）— ここは列構成の置換と配置だけを行う。
     if ui.button("部品表にする").clicked() {
         let template_width_mm = document.sheet().title_block.template().width_mm;
-        let new_table = apply_bom_preset(table, template_width_mm);
-        if let Err(err) = document.apply(Command::ModifyEntity {
-            id,
-            new_geom: EntityGeom::Table(new_table),
-        }) {
-            set_status(status, now, format!("部品表への変換に失敗しました: {err}"));
+        match apply_bom_preset(table, template_width_mm) {
+            Ok(new_table) => {
+                if let Err(err) = document.apply(Command::ModifyEntity {
+                    id,
+                    new_geom: EntityGeom::Table(new_table),
+                }) {
+                    set_status(status, now, format!("部品表への変換に失敗しました: {err}"));
+                }
+            }
+            Err(reason) => set_status(status, now, reason),
         }
     }
 

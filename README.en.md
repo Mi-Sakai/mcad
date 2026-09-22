@@ -2,7 +2,7 @@
 
 *[日本語版 README](./README.md)*
 
-A 2D CAD application built with Rust and egui. Current version: **v0.11.0**.
+A 2D CAD application built with Rust and egui. Current version: **v0.11.1**.
 
 > **Note on language.** The project's design documents (`DESIGN.md`, `AGENTS.md`,
 > `CHANGELOG.md`) are written in Japanese, and the application UI is being migrated
@@ -27,7 +27,7 @@ for the design and [`AGENTS.md`](./AGENTS.md) for the development conventions
 - **Editing**: selection (click, rubber band, additive), move, duplicate, rotate, mirror, offset, **trim, extend, fillet, split**, dimension grip editing (drag endpoints or the dimension line position; a right-panel button clears appearance overrides in bulk), delete
 - **Isometric drawing aids**: isometric grid (`F5`), isometric axes for orthogonal mode, and an isometric circle tool (`I`, four-centre method). No Z axis or true ellipse; everything stays 2D arcs
 - **Snapping**: endpoint, intersection, midpoint, center and grid candidates chosen by priority, with a distinct marker per kind
-- **Tables and parts lists**: a general table entity (`K`, with cells, column widths and row heights edited in a dedicated dialog) and a parts-list preset from the drafting standard (item no. / name / quantity / material / remarks, placed right above the title block). Entries are typed by hand; nothing is aggregated from the drawing automatically
+- **Tables and parts lists**: a general table entity (`K`, with cells, column widths and row heights edited in a dedicated dialog) and a parts-list preset from the drafting standard (part no. (balloon) / item no. / name / quantity / material / mass [kg] / remarks, placed right above the title block; the B-format title block omits remarks). Entries are typed by hand; nothing is aggregated from the drawing automatically
 - **Layers**: color, visibility, lock, stacking order (front / back buttons), managed in a dedicated panel
 - **Undo/redo**: built on the command pattern
 - **Drawing frame and title block**: paper size, scale and title-block style (A/B/C) live in the sheet metadata and are drawn automatically; fields are filled in via a dedicated dialog
@@ -96,7 +96,7 @@ a settings file and restored on the next launch (see "Settings" below).
 
 ## File formats
 
-- **`.mcad`**: the native JSON format. As of v0.11.0 the schema is v7; v1 through v6 files still load (backward compatible: v6 files get the dimension types and annotation fields added in v7 filled in with defaults, v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era). v7 added linear dimension direction (aligned/horizontal/vertical/oblique, `DimLinear.direction`) and extension-line angle (`DimLinear.ext_angle`), angular (`DimAngular`) and ordinate (`DimOrdinate`) dimensions, and the annotation extensions (text rotation, reference/theoretically-exact value style, prefix/suffix)
+- **`.mcad`**: the native JSON format. As of v0.11.1 the schema is v7; v1 through v6 files still load (backward compatible: v6 files get the dimension types and annotation fields added in v7 filled in with defaults, v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era). v7 added linear dimension direction (aligned/horizontal/vertical/oblique, `DimLinear.direction`) and extension-line angle (`DimLinear.ext_angle`), angular (`DimAngular`) and ordinate (`DimOrdinate`) dimensions, and the annotation extensions (text rotation, reference/theoretically-exact value style, prefix/suffix)
 - **New drawings** start with `"0"` plus five layers matching the drafting standard's line table (centre line, hidden line, outline, dimension line, text, with their linetypes and widths), and the current layer is the outline layer. Dimensions and text are placed automatically on layers named `寸法線` (dimension line) and `文字` (text) when those exist (in a loaded drawing without them, the current layer is used). The standard layers can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
 
 ## Settings

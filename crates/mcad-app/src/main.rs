@@ -32,8 +32,8 @@ use mcad_core::{
     DimKind, DimLinear, DimOrdinate, DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom,
     EntityId, FitClass, Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize,
     ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style, TableGeom, TextGeom,
-    TitleBlockFields, TitleBlockKind, WidthMm, arrow_kind_occupies_line, expand_dim, expand_table,
-    label_box_center, label_box_contains, linear_pick_segments, table_world_aabb,
+    TitleBlockFields, TitleBlockKind, ValueStyle, WidthMm, arrow_kind_occupies_line, expand_dim,
+    expand_table, label_box_center, label_box_contains, linear_pick_segments, table_world_aabb,
 };
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
@@ -878,6 +878,18 @@ struct McadApp {
     dim_decimals_input_error: Option<String>,
     /// 表示値上書き(非比例寸法)の入力欄。
     dim_value_override_input: String,
+    /// 接頭辞（`DimAnnotation::prefix`）の入力欄（M11 タスク79）。
+    dim_prefix_input: String,
+    /// 接尾辞（`DimAnnotation::suffix`）の入力欄（M11 タスク79）。
+    dim_suffix_input: String,
+    /// 文字の向きコンボで「任意角」を選んでいる（度の入力欄+「確定」を表示中）か
+    /// （M11 タスク79。`dim_dir_editing` と同じ「明示編集フラグが選択中の共通値に
+    /// 優先する」流儀）。
+    dim_text_rotation_editing: bool,
+    /// 文字の向き（任意角）の度入力欄。
+    dim_text_rotation_angle_input: String,
+    /// 文字の向き入力の直近の拒否理由（インライン赤字表示用）。
+    dim_text_rotation_input_error: Option<String>,
     /// 右パネル「寸法」の長さ寸法専用セクション（M11 タスク73）が「どの選択集合を
     /// 対象に開いているか」。`dim_edit_target` と同じ「選択が変わったら入力欄一式を
     /// 再同期する」流儀だが、対象が `DimLinear` のみに絞られているため別に持つ。
@@ -1140,6 +1152,11 @@ impl McadApp {
             dim_decimals_input: String::new(),
             dim_decimals_input_error: None,
             dim_value_override_input: String::new(),
+            dim_prefix_input: String::new(),
+            dim_suffix_input: String::new(),
+            dim_text_rotation_editing: false,
+            dim_text_rotation_angle_input: String::new(),
+            dim_text_rotation_input_error: None,
             dim_linear_edit_target: Vec::new(),
             dim_dir_editing: false,
             dim_dir_angle_input: String::new(),
@@ -1210,6 +1227,11 @@ impl McadApp {
         self.dim_decimals_input.clear();
         self.dim_decimals_input_error = None;
         self.dim_value_override_input.clear();
+        self.dim_prefix_input.clear();
+        self.dim_suffix_input.clear();
+        self.dim_text_rotation_editing = false;
+        self.dim_text_rotation_angle_input.clear();
+        self.dim_text_rotation_input_error = None;
         self.dim_style_dialog = None;
         // 長さ寸法の向き・補助線の傾き編集中状態（M11 タスク73）も別図面へ持ち越さない。
         self.dim_linear_edit_target.clear();
@@ -2433,6 +2455,11 @@ impl eframe::App for McadApp {
                 &mut self.dim_decimals_input,
                 &mut self.dim_decimals_input_error,
                 &mut self.dim_value_override_input,
+                &mut self.dim_prefix_input,
+                &mut self.dim_suffix_input,
+                &mut self.dim_text_rotation_editing,
+                &mut self.dim_text_rotation_angle_input,
+                &mut self.dim_text_rotation_input_error,
                 &mut self.status,
                 now,
             );
@@ -4348,6 +4375,11 @@ fn sync_dim_edit_state(
     decimals_input: &mut String,
     decimals_input_error: &mut Option<String>,
     value_override_input: &mut String,
+    prefix_input: &mut String,
+    suffix_input: &mut String,
+    text_rotation_editing: &mut bool,
+    text_rotation_angle_input: &mut String,
+    text_rotation_input_error: &mut Option<String>,
 ) -> bool {
     let mut current_ids: Vec<EntityId> = live.iter().map(|(id, _, _)| *id).collect();
     current_ids.sort();
@@ -4367,6 +4399,11 @@ fn sync_dim_edit_state(
     decimals_input.clear();
     *decimals_input_error = None;
     value_override_input.clear();
+    prefix_input.clear();
+    suffix_input.clear();
+    *text_rotation_editing = false;
+    text_rotation_angle_input.clear();
+    *text_rotation_input_error = None;
 
     // 新しい選択の共通値（全件一致するものだけ）で入力欄を埋め直す。不一致（混在）は
     // 空欄のままにし、パネル側が「(混在)」表示で示す。
@@ -4389,7 +4426,77 @@ fn sync_dim_edit_state(
     if let Some(Some(value)) = all_same(live.iter().map(|(_, _, a)| a.value_override.clone())) {
         *value_override_input = value;
     }
+    if let Some(Some(prefix)) = all_same(live.iter().map(|(_, _, a)| a.prefix.clone())) {
+        *prefix_input = prefix;
+    }
+    if let Some(Some(suffix)) = all_same(live.iter().map(|(_, _, a)| a.suffix.clone())) {
+        *suffix_input = suffix;
+    }
+    // 文字の向きが全件一致し、かつ任意角なら度で編集欄を開いた状態にして埋める
+    // （`sync_dim_linear_edit_state` の向き（`dir_editing`）と同じ流儀）。
+    if let Some(Some(theta)) = all_same(live.iter().map(|(_, _, a)| a.text_rotation))
+        && classify_text_rotation(Some(theta)) == TextRotationKindUi::Oblique
+    {
+        *text_rotation_editing = true;
+        *text_rotation_angle_input = format!("{}", theta.to_degrees());
+    }
     true
+}
+
+/// 文字の向き（[`DimAnnotation::text_rotation`]）の分類（右パネル「寸法」の
+/// 向きコンボ表示用、M11 タスク79）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextRotationKindUi {
+    /// `None`（既定の読み取り方向規則に従う）。
+    Auto,
+    /// `Some(θ)` で θ が 2π を法として 0 に一致する（水平固定）。
+    Horizontal,
+    /// それ以外の `Some(θ)`（回転・鏡映で追従した結果「水平でなくなった値」も含む）。
+    Oblique,
+}
+
+/// [`TextRotationKindUi`] 分類の許容値（ラジアン）。[`LINEAR_DIR_CLASSIFY_EPS`] と
+/// 同じ理由（度⇔ラジアン往復の浮動小数点誤差を吸収する）で同じ大きさを採る。
+const TEXT_ROTATION_CLASSIFY_EPS: f64 = 1e-9;
+
+/// [`DimAnnotation::text_rotation`] を右パネルのコンボ3択（自動/水平/任意角）へ分類する。
+///
+/// `None` → 自動、`Some(θ)` で θ を 2π を法として 0 と比較（許容
+/// [`TEXT_ROTATION_CLASSIFY_EPS`]）→ 水平、それ以外 → 任意角
+/// （DESIGN.md「タスク79 の着手時設計」）。
+fn classify_text_rotation(text_rotation: Option<f64>) -> TextRotationKindUi {
+    match text_rotation {
+        None => TextRotationKindUi::Auto,
+        Some(theta) => {
+            let m = theta.rem_euclid(std::f64::consts::TAU);
+            let dist_to_zero = m.min(std::f64::consts::TAU - m);
+            if dist_to_zero <= TEXT_ROTATION_CLASSIFY_EPS {
+                TextRotationKindUi::Horizontal
+            } else {
+                TextRotationKindUi::Oblique
+            }
+        }
+    }
+}
+
+fn text_rotation_kind_label(kind: TextRotationKindUi) -> &'static str {
+    match kind {
+        TextRotationKindUi::Auto => "自動",
+        TextRotationKindUi::Horizontal => "水平",
+        TextRotationKindUi::Oblique => "任意角",
+    }
+}
+
+/// 寸法値の表記方式（[`ValueStyle`]）のコンボ表示ラベル（M11 タスク79）。
+/// `#[non_exhaustive]` のため将来のバリアントは `_` 腕で「(不明)」を返す
+/// （`DimTolKindUi::Other` と同じ「安全側は表示のみ」の扱い）。
+fn value_style_ui_label(style: ValueStyle) -> &'static str {
+    match style {
+        ValueStyle::Plain => "通常",
+        ValueStyle::Reference => "参考寸法 (括弧)",
+        ValueStyle::TheoreticallyExact => "理論的に正確な寸法 (枠)",
+        _ => "(不明)",
+    }
 }
 
 /// 右パネルの「寸法」セクション（M9タスク50-2）。選択中に寸法エンティティ
@@ -4415,6 +4522,11 @@ fn dim_panel(
     decimals_input: &mut String,
     decimals_input_error: &mut Option<String>,
     value_override_input: &mut String,
+    prefix_input: &mut String,
+    suffix_input: &mut String,
+    text_rotation_editing: &mut bool,
+    text_rotation_angle_input: &mut String,
+    text_rotation_input_error: &mut Option<String>,
     status: &mut Option<StatusMessage>,
     now: f64,
 ) {
@@ -4444,6 +4556,11 @@ fn dim_panel(
         decimals_input,
         decimals_input_error,
         value_override_input,
+        prefix_input,
+        suffix_input,
+        text_rotation_editing,
+        text_rotation_angle_input,
+        text_rotation_input_error,
     );
 
     if live.is_empty() {
@@ -4798,6 +4915,80 @@ fn dim_panel(
         }
     });
 
+    // --- 表記（value_style）: コンボ選択で即時適用（記号コンボと同じ）---
+    let value_style_common = all_same(live.iter().map(|(_, _, a)| a.value_style));
+    ui.horizontal(|ui| {
+        ui.label("表記:");
+        let selected_text = value_style_common.map_or("(混在)", value_style_ui_label);
+        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_value_style"))
+            .height(DIM_COMBO_MAX_HEIGHT)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for style in [
+                    ValueStyle::Plain,
+                    ValueStyle::Reference,
+                    ValueStyle::TheoreticallyExact,
+                ] {
+                    if ui
+                        .selectable_label(
+                            value_style_common == Some(style),
+                            value_style_ui_label(style),
+                        )
+                        .clicked()
+                    {
+                        let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                            a.value_style = style;
+                        });
+                        apply(cmds, errs);
+                    }
+                }
+            });
+    });
+
+    // --- 接頭辞・接尾辞（M11 タスク79）---
+    // 空欄の「確定」は何もしない（混在選択で誤って全件消さないため）。消去は「解除」の
+    // みで行う（「表示値の上書き」欄と同じ流儀）。入力は trim しない（「2× 」のような
+    // 空白での間隔取りを殺さないため。空文字列以外の検証は core（`MAX_DIM_AFFIX_LEN`
+    // 超過等）に任せる）。
+    ui.horizontal(|ui| {
+        ui.label("接頭辞:");
+        ui.add(egui::TextEdit::singleline(prefix_input).desired_width(96.0));
+        if ui.button("確定").clicked() && !prefix_input.is_empty() {
+            let new_value = Some(prefix_input.clone());
+            let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                a.prefix = new_value.clone();
+            });
+            apply(cmds, errs);
+        }
+        let has_prefix = live.iter().any(|(_, _, a)| a.prefix.is_some());
+        if has_prefix && ui.button("解除").clicked() {
+            let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                a.prefix = None;
+            });
+            apply(cmds, errs);
+            prefix_input.clear();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("接尾辞:");
+        ui.add(egui::TextEdit::singleline(suffix_input).desired_width(96.0));
+        if ui.button("確定").clicked() && !suffix_input.is_empty() {
+            let new_value = Some(suffix_input.clone());
+            let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                a.suffix = new_value.clone();
+            });
+            apply(cmds, errs);
+        }
+        let has_suffix = live.iter().any(|(_, _, a)| a.suffix.is_some());
+        if has_suffix && ui.button("解除").clicked() {
+            let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                a.suffix = None;
+            });
+            apply(cmds, errs);
+            suffix_input.clear();
+        }
+    });
+
     // --- 文字位置（M9 タスク51）---
     // `text_anchor` はドラッグ（`SelectTool` の文字ブロックドラッグ、main.rs の
     // `handle_select_input`）でしか `Some` にならない。ここは状態表示と「自動配置に
@@ -4823,6 +5014,94 @@ fn dim_panel(
             apply(cmds, errs);
         }
     });
+
+    // --- 文字の向き（text_rotation、M11 タスク79）---
+    // コンボ「自動 / 水平 / 任意角」。自動 = None、水平 = Some(0.0)、任意角を選ぶと
+    // 度の入力欄 + 「確定」が開き Some(deg.to_radians()) を書く（タスク73 の
+    // 「向き」コンボと同じ操作感。度⇔ラジアンの変換はこの UI 境界に閉じる）。
+    let text_rotation_kind_common = all_same(
+        live.iter()
+            .map(|(_, _, a)| classify_text_rotation(a.text_rotation)),
+    );
+    ui.horizontal(|ui| {
+        ui.label("文字の向き:");
+        let selected_text = if *text_rotation_editing {
+            text_rotation_kind_label(TextRotationKindUi::Oblique)
+        } else {
+            text_rotation_kind_common.map_or("(混在)", text_rotation_kind_label)
+        };
+        egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_text_rotation"))
+            .height(DIM_COMBO_MAX_HEIGHT)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for (kind, new_value) in [
+                    (TextRotationKindUi::Auto, None),
+                    (TextRotationKindUi::Horizontal, Some(0.0)),
+                ] {
+                    if ui
+                        .selectable_label(
+                            !*text_rotation_editing && text_rotation_kind_common == Some(kind),
+                            text_rotation_kind_label(kind),
+                        )
+                        .clicked()
+                    {
+                        let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                            a.text_rotation = new_value;
+                        });
+                        apply(cmds, errs);
+                        *text_rotation_editing = false;
+                        *text_rotation_input_error = None;
+                    }
+                }
+                if ui
+                    .selectable_label(
+                        *text_rotation_editing
+                            || text_rotation_kind_common == Some(TextRotationKindUi::Oblique),
+                        text_rotation_kind_label(TextRotationKindUi::Oblique),
+                    )
+                    .clicked()
+                {
+                    *text_rotation_editing = true;
+                    *text_rotation_input_error = None;
+                    if text_rotation_angle_input.is_empty()
+                        && let Some(Some(theta)) =
+                            all_same(live.iter().map(|(_, _, a)| a.text_rotation))
+                    {
+                        *text_rotation_angle_input = format!("{}", theta.to_degrees());
+                    }
+                }
+            });
+    });
+    if *text_rotation_editing {
+        ui.horizontal(|ui| {
+            ui.label("角度:");
+            ui.add(egui::TextEdit::singleline(text_rotation_angle_input).desired_width(64.0));
+            ui.label("度");
+            if ui.button("確定").clicked() {
+                match text_rotation_angle_input.trim().parse::<f64>() {
+                    Ok(deg) if deg.is_finite() => {
+                        let new_value = Some(deg.to_radians());
+                        let (cmds, errs) = build_annotation_edit_commands(document, &live, |a| {
+                            a.text_rotation = new_value;
+                        });
+                        if errs.is_empty() {
+                            apply(cmds, Vec::new());
+                            *text_rotation_input_error = None;
+                        } else {
+                            *text_rotation_input_error = Some(errs.join("; "));
+                        }
+                    }
+                    _ => {
+                        *text_rotation_input_error =
+                            Some("角度は数値で入力してください".to_string());
+                    }
+                }
+            }
+        });
+        if let Some(err) = text_rotation_input_error {
+            ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+        }
+    }
 
     // --- 見た目の上書きの一括解除（M11 タスク75、DESIGN.md「タスク75の着手時設計」(3)）---
     // 対象は表示上の上書きだけ（`decimals_override`・`text_anchor`・`text_rotation`・
@@ -4852,6 +5131,9 @@ fn dim_panel(
                 *decimals_input_error = None;
                 *decimals_editing = false;
                 value_override_input.clear();
+                *text_rotation_editing = false;
+                text_rotation_angle_input.clear();
+                *text_rotation_input_error = None;
             }
         });
     }
@@ -11133,6 +11415,11 @@ mod tests {
         decimals_input: String,
         decimals_input_error: Option<String>,
         value_override_input: String,
+        prefix_input: String,
+        suffix_input: String,
+        text_rotation_editing: bool,
+        text_rotation_angle_input: String,
+        text_rotation_input_error: Option<String>,
     }
 
     impl DimEditBuffers {
@@ -11150,6 +11437,11 @@ mod tests {
                 &mut self.decimals_input,
                 &mut self.decimals_input_error,
                 &mut self.value_override_input,
+                &mut self.prefix_input,
+                &mut self.suffix_input,
+                &mut self.text_rotation_editing,
+                &mut self.text_rotation_angle_input,
+                &mut self.text_rotation_input_error,
             )
         }
     }
@@ -11235,6 +11527,179 @@ mod tests {
         let trimmed = buffers.value_override_input.trim();
         assert!(!trimmed.is_empty(), "既存値が空欄化されていないこと");
         assert_eq!(Some(trimmed.to_string()), annotation.value_override);
+    }
+
+    #[test]
+    fn sync_dim_edit_state_loads_common_prefix_suffix_and_clears_on_mismatch() {
+        // 完了条件3: prefix/suffix の共通値をロードし、不一致なら空欄にすること。
+        // `sync_dim_edit_state` は ID 集合の変化で再同期を検知するため（`edit_target`
+        // 比較）、2回目の呼び出しは ID 集合そのものを変える必要がある。
+        let mut document = Document::new();
+        let id_a = add_test_dim_linear(&mut document);
+        let id_b = add_test_dim_linear(&mut document);
+        let id_c = add_test_dim_linear(&mut document);
+        let annotation_a = DimAnnotation {
+            prefix: Some("2x".to_string()),
+            suffix: Some("-M6".to_string()),
+            ..DimAnnotation::default()
+        };
+        let live_common = vec![(id_a, DimKind::Linear, annotation_a.clone())];
+
+        let mut buffers = DimEditBuffers::default();
+        assert!(buffers.sync(&live_common));
+        assert_eq!(buffers.prefix_input, "2x");
+        assert_eq!(buffers.suffix_input, "-M6");
+
+        // 不一致（B・C の接頭辞・接尾辞が違う）へ、ID 集合ごと切り替える。
+        let annotation_b = DimAnnotation {
+            prefix: Some("4x".to_string()),
+            suffix: Some("-M8".to_string()),
+            ..DimAnnotation::default()
+        };
+        let live_mismatch = vec![
+            (id_b, DimKind::Linear, annotation_a),
+            (id_c, DimKind::Linear, annotation_b),
+        ];
+        assert!(buffers.sync(&live_mismatch));
+        assert_eq!(buffers.prefix_input, "");
+        assert_eq!(buffers.suffix_input, "");
+    }
+
+    #[test]
+    fn sync_dim_edit_state_does_not_carry_prefix_suffix_and_text_rotation_across_selection() {
+        // 完了条件2・3: 選択切替時、入力途中の接頭辞・接尾辞・文字の向きの入力が別の
+        // 寸法へ持ち越されない（`value_override_input` と同じ流儀の回帰）。
+        let mut document = Document::new();
+        let id_a = add_test_dim_linear(&mut document);
+        let id_b = add_test_dim_linear(&mut document);
+
+        let mut buffers = DimEditBuffers::default();
+        let live_a = vec![(id_a, DimKind::Linear, DimAnnotation::default())];
+        assert!(buffers.sync(&live_a));
+
+        // A の入力途中を模す。
+        buffers.prefix_input = "A用の接頭辞".to_string();
+        buffers.suffix_input = "A用の接尾辞".to_string();
+        buffers.text_rotation_editing = true;
+        buffers.text_rotation_angle_input = "12.5".to_string();
+        buffers.text_rotation_input_error = Some("dummy".to_string());
+
+        let live_b = vec![(id_b, DimKind::Linear, DimAnnotation::default())];
+        assert!(buffers.sync(&live_b));
+
+        assert_eq!(buffers.prefix_input, "");
+        assert_eq!(buffers.suffix_input, "");
+        assert!(!buffers.text_rotation_editing);
+        assert_eq!(buffers.text_rotation_angle_input, "");
+        assert_eq!(buffers.text_rotation_input_error, None);
+    }
+
+    #[test]
+    fn sync_dim_edit_state_reopens_oblique_text_rotation_editor_with_common_angle() {
+        // タスク73 の「向き」コンボと同じ操作感: 共通の text_rotation が任意角へ
+        // 分類される値なら、選択直後から編集欄を開いた状態にして度で埋める。
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document);
+        let annotation = DimAnnotation {
+            text_rotation: Some(std::f64::consts::FRAC_PI_4),
+            ..DimAnnotation::default()
+        };
+        let live = vec![(id, DimKind::Linear, annotation)];
+
+        let mut buffers = DimEditBuffers::default();
+        assert!(buffers.sync(&live));
+
+        assert!(buffers.text_rotation_editing);
+        assert_eq!(buffers.text_rotation_angle_input, "45");
+    }
+
+    // -----------------------------------------------------------------
+    // 文字の向き（text_rotation）の分類（M11 タスク79）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_text_rotation_covers_auto_horizontal_and_oblique() {
+        assert_eq!(classify_text_rotation(None), TextRotationKindUi::Auto);
+        assert_eq!(
+            classify_text_rotation(Some(0.0)),
+            TextRotationKindUi::Horizontal
+        );
+        assert_eq!(
+            classify_text_rotation(Some(std::f64::consts::TAU)),
+            TextRotationKindUi::Horizontal,
+            "2π を法として 0 に一致する値も水平と分類する"
+        );
+        // 度→ラジアン往復の浮動小数点誤差程度は許容する。
+        assert_eq!(
+            classify_text_rotation(Some(360.0_f64.to_radians())),
+            TextRotationKindUi::Horizontal
+        );
+        assert_eq!(
+            classify_text_rotation(Some(std::f64::consts::FRAC_PI_4)),
+            TextRotationKindUi::Oblique
+        );
+        // 回転・鏡映で追従した結果「水平でなくなった値」も任意角。
+        assert_eq!(
+            classify_text_rotation(Some(std::f64::consts::PI)),
+            TextRotationKindUi::Oblique
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // value_style・接頭辞の編集コマンドが全選択へ Batch で効くこと（M11 タスク79）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn value_style_and_prefix_edit_commands_apply_as_one_batch_across_selection() {
+        let mut document = Document::new();
+        let id_a = add_test_dim_linear(&mut document);
+        let id_b = add_test_dim_linear(&mut document);
+        let live = vec![
+            (id_a, DimKind::Linear, DimAnnotation::default()),
+            (id_b, DimKind::Linear, DimAnnotation::default()),
+        ];
+
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |a| {
+            a.value_style = ValueStyle::Reference;
+            a.prefix = Some("2×".to_string());
+        });
+        assert!(errs.is_empty());
+        assert_eq!(cmds.len(), 2, "選択中の2件それぞれへコマンドが作られる");
+
+        assert!(document.apply(Command::Batch(cmds)).is_ok());
+        for id in [id_a, id_b] {
+            let EntityGeom::DimLinear(dim) = &document.entity(id).unwrap().geom else {
+                panic!("expected DimLinear");
+            };
+            assert_eq!(dim.annotation.value_style, ValueStyle::Reference);
+            assert_eq!(dim.annotation.prefix, Some("2×".to_string()));
+        }
+
+        // undo 1回で両方戻る（Batch は原子的、AGENTS.md 不変条件）。
+        assert!(document.undo());
+        for id in [id_a, id_b] {
+            let EntityGeom::DimLinear(dim) = &document.entity(id).unwrap().geom else {
+                panic!("expected DimLinear");
+            };
+            assert_eq!(dim.annotation.value_style, ValueStyle::Plain);
+            assert_eq!(dim.annotation.prefix, None);
+        }
+    }
+
+    #[test]
+    fn build_annotation_edit_commands_rejects_prefix_over_the_affix_length_limit() {
+        // 完了条件(iii): 33文字以上の接頭辞はステータスバーへ出るエラーとして拒否され、
+        // 適用されない。
+        let mut document = Document::new();
+        let id = add_test_dim_linear(&mut document);
+        let live = vec![(id, DimKind::Linear, DimAnnotation::default())];
+
+        let too_long = "x".repeat(mcad_core::MAX_DIM_AFFIX_LEN + 1);
+        let (cmds, errs) = build_annotation_edit_commands(&document, &live, |a| {
+            a.prefix = Some(too_long.clone());
+        });
+        assert!(cmds.is_empty(), "検証に失敗したのでコマンドは作られない");
+        assert!(!errs.is_empty(), "上限超過の理由がエラーとして返る");
     }
 
     // -----------------------------------------------------------------

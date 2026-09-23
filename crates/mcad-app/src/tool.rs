@@ -53,6 +53,7 @@ use mcad_geom::{
     trim,
 };
 
+use crate::bom::{BOM_STYLE_AC_WIDTH_MM, default_bom_table};
 use crate::draw_shape;
 use crate::iso::{IsoFace, iso_circle_arcs};
 use crate::viewport::Viewport;
@@ -439,6 +440,37 @@ pub trait Tool {
     /// [`Tool::chain_options`] が返した選択肢のうち `index` 番目へ、上部パネルの
     /// 2つ目のコンボボックス選択を書き戻す。既定は何もしない。`index` が範囲外なら無視する。
     fn set_chain_variant(&mut self, _index: usize) {}
+
+    /// 部品表モードの表ツール（[`TableTool::new_bom`]）が、ドキュメントに部品表が
+    /// 既に存在するなら汎用表モードへ下ろす（Codex レビュー指摘、M12 タスク82）。
+    /// `bom_exists` は `document.bom().is_some()`。表ツール以外は既定で何もしない。
+    ///
+    /// # なぜ Tool トレイトに置くのか
+    ///
+    /// [`TableTool`] は連続配置型（クリックのたびに独立したエンティティを確定し続ける。
+    /// [`PointTool`] と同型）で、部品表モードのまま 1 回目のクリックで部品表を置いた後も
+    /// `bom` フラグは立ったままのため、2 回目以降のクリックは 2 つ目の部品表を足そうとして
+    /// core の `CoreError::BomAlreadyExists` に拒否され続けてしまう。「確定した直後に
+    /// フラグを下ろす」方式だと、配置そのものが失敗した（レイヤーロック等）ときにも
+    /// 汎用表へ切り替わってしまい、部品表を置き直したい利用者の次のクリックが期待と
+    /// 違う挙動になる。そこで確定の成否ではなく `Document` の実際の状態（部品表が存在
+    /// するか）を都度問い合わせる形にする。ツールは [`Document`] を参照しない設計
+    /// （本モジュール冒頭 doc）なので、[`Tool::wants_circle_pick`] 系と同じ「判定は
+    /// app 層、結果の反映はツール」の役割分担に倣い、`main.rs` の `handle_tool_input`
+    /// がクリックをツールへ渡す前に呼ぶ。部品表を undo で消した後も汎用表モードの
+    /// ままになる（次に `K` を押せば `request_table_or_bom_key` が判定し直す）。
+    ///
+    /// [`TableTool::new_bom`]: TableTool::new_bom
+    fn sync_bom_mode(&mut self, _bom_exists: bool) {}
+
+    /// 表ツールが現在部品表モードかどうかを照会する。表ツール以外は既定で `false`。
+    /// [`Tool::sync_bom_mode`] の反映結果を確認するための読み出し口で、`main.rs` は
+    /// クリックの分岐に使わず（`Document::apply` の結果とエンティティの `TableKind` で
+    /// 十分なため）、現状はテストからのみ使う（`dead_code` を許容）。
+    #[allow(dead_code)]
+    fn is_bom_mode(&self) -> bool {
+        false
+    }
 }
 
 /// [`Tool::variant_options`] が返す、循環する選択肢を持つツールの現在状態
@@ -548,7 +580,8 @@ fn default_table(anchor: Point2) -> TableGeom {
 }
 
 /// 表ツール。クリック1回でアンカー（表の左下、スナップ適用）を置き、
-/// [`default_table`] を確定する。[`PointTool`] と同じく状態を持ち越さないので、
+/// [`default_table`]（汎用表）または [`default_bom_table`]（部品表、`bom` が
+/// `true` のとき）を確定する。[`PointTool`] と同じく状態を持ち越さないので、
 /// 確定後もクリックのたびに独立した表エンティティを確定し続ける（連続作図）。
 /// セル文字・列幅・行高さ・行列数の編集は右パネルの表編集ダイアログ
 /// （`main.rs` の `TableDialogState`、`Command::ModifyEntity` 経由）へ委ねる。
@@ -556,6 +589,23 @@ fn default_table(anchor: Point2) -> TableGeom {
 pub struct TableTool {
     /// アンカー未確定時のカーソル位置（配置プレビュー用）。
     cursor: Option<Point2>,
+    /// `true` なら部品表を置く（`K`、図面枠が無効なときの経路。DESIGN.md M12
+    /// 設計判断2）。図面枠が有効なときの即時配置は `McadApp` が `AddEntity` を
+    /// 直接発行するため、このツールを経由しない。列幅は様式A/C固定
+    /// （[`BOM_STYLE_AC_WIDTH_MM`]。表題欄が無く様式幅を参照できないため）。
+    bom: bool,
+}
+
+impl TableTool {
+    /// `K`（部品表を使う設定が ON・部品表が未配置・図面枠が無効）が使う、
+    /// クリック位置へ部品表を置くツール。
+    #[must_use]
+    pub fn new_bom() -> Self {
+        Self {
+            cursor: None,
+            bom: true,
+        }
+    }
 }
 
 impl Tool for TableTool {
@@ -565,11 +615,14 @@ impl Tool for TableTool {
                 self.cursor = Some(p);
                 ToolResult::Continue
             }
-            InputEvent::Click(p) => ToolResult::Commit(Command::AddEntity(Entity::new(
-                EntityGeom::Table(default_table(p)),
-                ctx.layer,
-                ctx.style,
-            ))),
+            InputEvent::Click(p) => {
+                let geom = if self.bom {
+                    EntityGeom::Table(default_bom_table(p, BOM_STYLE_AC_WIDTH_MM))
+                } else {
+                    EntityGeom::Table(default_table(p))
+                };
+                ToolResult::Commit(Command::AddEntity(Entity::new(geom, ctx.layer, ctx.style)))
+            }
             InputEvent::Cancel => ToolResult::Cancel,
             InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
         }
@@ -592,6 +645,16 @@ impl Tool for TableTool {
             painter.line_segment([c + egui::vec2(-s, 0.0), c + egui::vec2(s, 0.0)], stroke);
             painter.line_segment([c + egui::vec2(0.0, -s), c + egui::vec2(0.0, s)], stroke);
         }
+    }
+
+    fn sync_bom_mode(&mut self, bom_exists: bool) {
+        if self.bom && bom_exists {
+            self.bom = false;
+        }
+    }
+
+    fn is_bom_mode(&self) -> bool {
+        self.bom
     }
 }
 
@@ -4891,6 +4954,91 @@ mod tests {
         let (_doc, ctx) = ctx();
         let mut tool = TableTool::default();
         assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+    }
+
+    #[test]
+    fn table_tool_new_bom_commits_bom_table_with_style_ac_columns() {
+        // `K`（部品表を使う ON・図面枠が無効）の経路: クリック位置へ部品表を置く
+        // （DESIGN.md M12 設計判断2）。列幅は様式A/C固定。
+        let (_doc, ctx) = ctx();
+        let mut tool = TableTool::new_bom();
+        let anchor = Point2::new(1.0, 2.0);
+        let table = table_of(tool.on_input(&ctx, InputEvent::Click(anchor)));
+        assert_eq!(table.kind, mcad_core::TableKind::Bom);
+        assert_eq!(table.anchor, anchor);
+        assert_eq!(table.rows(), 4);
+        assert_eq!(table.cols(), 7);
+        for (c, name) in crate::bom::BOM_COLUMN_NAMES_AC.iter().enumerate() {
+            assert_eq!(table.cell(3, c), Some(*name));
+        }
+        assert!(EntityGeom::Table(table).validate().is_ok());
+    }
+
+    #[test]
+    fn table_tool_new_bom_second_click_places_generic_table_once_synced() {
+        // Codex レビュー指摘（M12タスク82）の回帰: `K`（図面枠無効）は部品表モードの
+        // 表ツールをクリック待ちに入れるが、連続配置型のため1回目のクリック後も
+        // `bom` フラグは立ったまま。`main.rs` の `handle_tool_input` が毎クリック前に
+        // 呼ぶ `Tool::sync_bom_mode` を模して、1回目確定→document へ反映→同期→
+        // 2回目クリックが汎用表になることを確かめる。
+        let (mut doc, ctx) = ctx();
+        let mut tool = TableTool::new_bom();
+        assert!(tool.is_bom_mode());
+
+        // handle_tool_input はクリックを渡す前に毎回同期する。1回目はまだ部品表が
+        // 無いので bom モードのまま。
+        tool.sync_bom_mode(doc.bom().is_some());
+        assert!(tool.is_bom_mode());
+        let first_cmd = match tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 2.0))) {
+            ToolResult::Commit(cmd) => cmd,
+            other => panic!("expected Commit, got {other:?}"),
+        };
+        doc.apply(first_cmd).expect("first placement succeeds");
+        assert!(doc.bom().is_some(), "部品表が document に反映されている");
+
+        // 2回目のクリック前の同期で、部品表が既に存在するため汎用表モードへ下りる。
+        tool.sync_bom_mode(doc.bom().is_some());
+        assert!(!tool.is_bom_mode());
+        let second = table_of(tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 6.0))));
+        assert_eq!(
+            second.kind,
+            mcad_core::TableKind::Table,
+            "2つ目の部品表を足そうとして BomAlreadyExists で拒否され続けず、汎用表になる"
+        );
+    }
+
+    #[test]
+    fn table_tool_new_bom_stays_bom_mode_after_placement_failure() {
+        // 1回目の配置そのものが失敗した（レイヤーロック等）場合、document に部品表は
+        // 反映されないので、次のクリック前の同期でも bom モードのまま留まる
+        // （「確定直後にフラグを下ろす」方式だと失敗時にも汎用表へ落ちてしまうため、
+        // 同期はドキュメントの実際の状態を問い合わせる形にする必要がある）。
+        let (mut doc, ctx) = ctx();
+        let layer = doc.current_layer();
+        let mut props = doc.layer(layer).unwrap().clone();
+        props.locked = true;
+        doc.apply(Command::SetLayerProps { id: layer, props })
+            .unwrap();
+
+        let mut tool = TableTool::new_bom();
+        tool.sync_bom_mode(doc.bom().is_some());
+        assert!(tool.is_bom_mode());
+
+        let first_cmd = match tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 2.0))) {
+            ToolResult::Commit(cmd) => cmd,
+            other => panic!("expected Commit, got {other:?}"),
+        };
+        assert!(
+            doc.apply(first_cmd).is_err(),
+            "ロックレイヤーなので配置は失敗する"
+        );
+        assert!(doc.bom().is_none());
+
+        // 次のクリック前の同期でも部品表モードのまま。
+        tool.sync_bom_mode(doc.bom().is_some());
+        assert!(tool.is_bom_mode());
+        let second = table_of(tool.on_input(&ctx, InputEvent::Click(Point2::new(5.0, 6.0))));
+        assert_eq!(second.kind, mcad_core::TableKind::Bom);
     }
 
     // --- Line ---

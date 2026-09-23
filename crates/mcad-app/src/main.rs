@@ -38,7 +38,7 @@ use mcad_core::{
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
-use bom::{apply_bom_preset, bom_anchor_above_title_block};
+use bom::{bom_anchor_above_title_block, default_bom_table};
 use dimension::dim_render;
 use frame::{frame_layout, paper_to_world, parse_scale_input};
 
@@ -1448,11 +1448,100 @@ impl McadApp {
     /// Ctrl+D: 選択集合の複製配置モードへ入る。選択が空なら ASCII ステータスメッセージを
     /// 出して何もしない。非空なら基準点クリック待ちに入り、以降のキャンバス入力は
     /// [`handle_select_input`] の配置モード経路が受け取る（DESIGN.md 設計判断2）。
+    ///
+    /// **選択に部品表が含まれる複製は開始時点で拒否する**（DESIGN.md M12 設計判断2:
+    /// 「部品表を含む複製は拒否する」）。2クリックの配置モードへ入ってから
+    /// `Document::apply` の `CoreError::BomAlreadyExists`（部品表は1図面に1つ）で
+    /// 弾かれるのを待たせるより、押した瞬間に理由を示すほうが分かりやすいため
+    /// （最終防衛としての core 側チェックはそのまま残る）。
     fn request_duplicate(&mut self, now: f64) {
+        if selection_contains_bom(&self.document, self.select_tool.selection()) {
+            set_status(
+                &mut self.status,
+                now,
+                "Cannot duplicate: selection includes the bill of materials",
+            );
+            return;
+        }
         if self.select_tool.start_duplicate() {
             set_status(&mut self.status, now, "Duplicate: click base point");
         } else {
             set_status(&mut self.status, now, "Select entities to duplicate");
+        }
+    }
+
+    /// `K`: 表/部品表ツール（DESIGN.md M12 設計判断2）。
+    ///
+    /// - 「部品表を使う」が ON で図面にまだ部品表が無ければ**部品表**を置く（見出し行 +
+    ///   空の部品行3行、列構成・列幅は表題欄の様式から。[`bom::default_bom_table`]）。
+    ///   - 図面枠が有効なら、キーを押した瞬間に表題欄の直上へ即時配置し（クリックを
+    ///     待たない）、選択モードへ戻って配置した部品表を選択状態にする（undo 1回で
+    ///     消える）。レイヤーロック等で失敗したらエンティティは追加されず、ツール・
+    ///     選択もそれまでの状態のまま、ステータスへ理由だけを出す。
+    ///   - 図面枠が無効なら、従来どおり表ツールのクリック位置へ置く（列幅は様式A/C
+    ///     固定 [`bom::BOM_STYLE_AC_WIDTH_MM`]。表題欄が無く様式幅を参照できないため）。
+    /// - それ以外（OFF、または部品表が既にある）は従来どおり**汎用表**を表ツールで置く。
+    ///
+    /// ツール切替と同じ後始末（進行中の配置モード・オフセットモードの解除）を行う
+    /// （[`handle_tool_shortcut_keys`] の他ツール切替と同じ規約）。
+    fn request_table_or_bom_key(&mut self, now: f64) {
+        let sheet = self.document.sheet();
+        let should_place_bom = should_place_bom_on_k(sheet.use_bom, self.document.bom().is_some());
+
+        if !should_place_bom {
+            // 状態を実際に変える分岐（汎用表ツールへ切替）でだけ進行中の選択操作を破棄する。
+            self.select_tool.cancel_placement();
+            self.select_tool.cancel_offset();
+            self.select_tool.cancel_text_drag();
+            self.select_tool.cancel_grip_drag();
+            self.tool_kind = ToolKind::Table;
+            self.tool = ToolKind::Table.spawn();
+            self.select_tool.clear_selection();
+            return;
+        }
+
+        if sheet.frame_visible {
+            let template_width_mm = sheet.title_block.template().width_mm;
+            let k = sheet.scale.world_mm_per_paper_mm();
+            let anchor = bom_anchor_above_title_block(sheet, k);
+            let table = default_bom_table(anchor, template_width_mm);
+            let layer = resolve_tool_layer(&self.document, ToolKind::Table);
+            let cmd = Command::AddEntity(Entity::new(
+                EntityGeom::Table(table),
+                layer,
+                Style::inherited(),
+            ));
+            match self.document.apply(cmd) {
+                Ok(new_ids) => {
+                    // 即時配置が成功したときだけ、進行中の選択操作を破棄して選択モードへ移る。
+                    self.select_tool.cancel_placement();
+                    self.select_tool.cancel_offset();
+                    self.select_tool.cancel_text_drag();
+                    self.select_tool.cancel_grip_drag();
+                    self.tool_kind = ToolKind::Select;
+                    self.tool = None;
+                    self.select_tool.set_selection(new_ids.entities);
+                    set_status(&mut self.status, now, "部品表を配置しました".to_owned());
+                }
+                Err(err) => {
+                    // 失敗時はツール・選択とも変えない（配置は起きなかった）。進行中の
+                    // 複製配置・オフセット・文字ドラッグ・グリップドラッグも取り消さない。
+                    set_status(
+                        &mut self.status,
+                        now,
+                        format!("部品表の配置に失敗しました: {err}"),
+                    );
+                }
+            }
+        } else {
+            // 図面枠無効: 部品表クリックツールへ切り替える分岐でも進行中の操作を破棄する。
+            self.select_tool.cancel_placement();
+            self.select_tool.cancel_offset();
+            self.select_tool.cancel_text_drag();
+            self.select_tool.cancel_grip_drag();
+            self.tool_kind = ToolKind::Table;
+            self.tool = Some(Box::new(TableTool::new_bom()));
+            self.select_tool.clear_selection();
         }
     }
 
@@ -2176,6 +2265,14 @@ impl eframe::App for McadApp {
                 &mut self.tool,
                 &mut self.select_tool,
             );
+            // K（表/部品表ツール、DESIGN.md M12 設計判断2）: document・status への参照を
+            // 要するため、上の汎用ショートカット処理とは別に扱う（`handle_tool_shortcut_keys`
+            // の doc コメント参照）。Ctrl 併用は他のツール切替と同じくショートカットとして
+            // 扱わない。
+            let k_pressed = ui.input(|i| i.key_pressed(Key::K) && !i.modifiers.command);
+            if k_pressed {
+                self.request_table_or_bom_key(now);
+            }
         }
 
         // M8タスク42: Home キーで手動ズームフィット（図面全体が収まるようフィット）。
@@ -3188,10 +3285,9 @@ fn handle_tool_shortcut_keys(
             requested = Some(ToolKind::Polyline);
         } else if i.key_pressed(Key::T) {
             requested = Some(ToolKind::Text);
-        } else if i.key_pressed(Key::K) {
-            // 未使用キー（2026-09-06、main.rs/tool.rs をともに `grep -n "Key::K"` して
-            // 確認済み）。DESIGN.md M10 詳細設計5。
-            requested = Some(ToolKind::Table);
+        // Key::K（表/部品表ツール）はここでは扱わない。`McadApp::request_table_or_bom_key`
+        // が document・status への参照を要する分岐（部品表を使う・即時配置）を持つため、
+        // 呼び出し側（`update`）が別途処理する（DESIGN.md M12 設計判断2）。
         } else if i.key_pressed(Key::G) {
             // 未使用キー（G/H/I/J/K/N/Q/U/V/W のうち G を採用。2026-09-04、
             // main.rs/tool.rs をともに `grep -n "Key::G"` して未使用を確認済み）。単押しは
@@ -3236,6 +3332,23 @@ fn handle_tool_shortcut_keys(
             select_tool.clear_selection();
         }
     }
+}
+
+/// `K` を押したとき部品表を置くべきか（DESIGN.md M12 設計判断2）。「部品表を使う」が
+/// ON で、図面にまだ部品表が無いときだけ `true`。`false` なら汎用表を置く。
+#[must_use]
+fn should_place_bom_on_k(use_bom: bool, has_bom: bool) -> bool {
+    use_bom && !has_bom
+}
+
+/// `selection` に部品表（[`EntityGeom::is_bom`]）が含まれるか。墓標化・削除済みの
+/// ID は無視する（`table_panel` 等と同じ防御）。複製（`Ctrl+D`）の拒否判定に使う
+/// （DESIGN.md M12 設計判断2「部品表を含む複製は拒否する」）。
+#[must_use]
+fn selection_contains_bom(document: &Document, selection: &[EntityId]) -> bool {
+    selection
+        .iter()
+        .any(|&id| document.entity(id).is_some_and(|e| e.geom.is_bom()))
 }
 
 /// 新規エンティティを追加する先のレイヤーを、作図ツールの種類から解決する
@@ -3304,6 +3417,13 @@ fn handle_tool_input(
     let Some(active) = tool.as_mut() else {
         return;
     };
+
+    // 部品表モードの表ツール（`K`、図面枠無効時）は連続配置型で、1回目のクリックで
+    // 部品表を置いた後も内部フラグは立ったままのため、クリックをツールへ渡す前に
+    // ドキュメントの実際の状態と同期し、部品表が既にあれば汎用表モードへ下ろす
+    // （Codex レビュー指摘、M12 タスク82。[`Tool::sync_bom_mode`] の doc 参照）。
+    // 表ツール以外では既定実装の no-op。
+    active.sync_bom_mode(document.bom().is_some());
 
     // 数値入力欄（フィレットの半径）の現在値をツールへ流し込む。フィレットは 2 クリック目の
     // ヒットテストと同時に確定するため、確定判断を行うツール側が値を持っている必要がある
@@ -5780,6 +5900,16 @@ fn sheet_panel(
         }
     });
 
+    // 部品表を使う（M12 設計判断1・2）: OFF は「`K` で部品表を自動で作らない」だけの
+    // 意味で、既存の部品表は消さず表示・出力も変えない。
+    let mut use_bom = sheet.use_bom;
+    if ui.checkbox(&mut use_bom, "部品表を使う").changed() {
+        pending = Some(SheetMeta {
+            use_bom,
+            ..sheet.clone()
+        });
+    }
+
     ui.horizontal(|ui| {
         ui.label("尺度:");
         let is_preset = SCALE_PRESETS
@@ -6180,10 +6310,14 @@ fn table_panel(
     }
 
     // 部品表プリセット（M10 詳細設計7、タスク60）。自動集計は非対応（規定 2-5-4 の 5)、
-    // M10 設計方針2）— ここは列構成の置換と配置だけを行う。
+    // M10 設計方針2）— 列構成の置換と配置だけを行う。汎用表（`kind == Table`）から
+    // 押せば種類を `Bom` にして列構成を適用し、既に部品表（`kind == Bom`）のときは
+    // 同じボタンで様式への再適用になる（種類は `Bom` のまま。DESIGN.md M12 設計判断2）。
+    // 図面に別の部品表が既にあれば、core が `CoreError::BomAlreadyExists` で拒否する
+    // （1図面1部品表、DESIGN.md M12 設計判断1）。
     if ui.button("部品表にする").clicked() {
         let template_width_mm = document.sheet().title_block.template().width_mm;
-        match apply_bom_preset(table, template_width_mm) {
+        match bom::designate_as_bom(table, template_width_mm) {
             Ok(new_table) => {
                 if let Err(err) = document.apply(Command::ModifyEntity {
                     id,
@@ -6193,6 +6327,20 @@ fn table_panel(
                 }
             }
             Err(reason) => set_status(status, now, reason),
+        }
+    }
+
+    // 表に戻す（部品表 → 表。中身は変えない。DESIGN.md M12 設計判断2）。部品表を
+    // 選んでいるときだけ有効。
+    let back_to_table_button =
+        ui.add_enabled(table.kind == TableKind::Bom, egui::Button::new("表に戻す"));
+    if back_to_table_button.clicked() {
+        let new_table = bom::reset_to_table(table);
+        if let Err(err) = document.apply(Command::ModifyEntity {
+            id,
+            new_geom: EntityGeom::Table(new_table),
+        }) {
+            set_status(status, now, format!("表への変更に失敗しました: {err}"));
         }
     }
 
@@ -9930,6 +10078,271 @@ mod tests {
         assert_eq!(
             resolve_tool_layer(&document, ToolKind::Line),
             document.current_layer()
+        );
+    }
+
+    // ---- M12 タスク82: 部品表の配置UI ----
+
+    #[test]
+    fn should_place_bom_on_k_true_only_when_use_bom_on_and_no_bom_yet() {
+        // 設計判断2:「部品表を使う」ON かつ図面に部品表が無いときだけ部品表を置く。
+        assert!(should_place_bom_on_k(true, false));
+        assert!(!should_place_bom_on_k(true, true));
+        assert!(!should_place_bom_on_k(false, false));
+        assert!(!should_place_bom_on_k(false, true));
+    }
+
+    fn table_entity(kind: TableKind, layer: LayerId) -> Entity {
+        Entity::new(
+            EntityGeom::Table(TableGeom {
+                kind,
+                anchor: Point2::ORIGIN,
+                col_widths_mm: vec![10.0],
+                row_heights_mm: vec![8.0],
+                text_height_mm: 3.5,
+                cells: vec![String::new()],
+            }),
+            layer,
+            Style::inherited(),
+        )
+    }
+
+    #[test]
+    fn selection_contains_bom_true_only_when_selection_has_a_live_bom() {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        let bom_id = document
+            .apply(Command::AddEntity(table_entity(TableKind::Bom, layer)))
+            .unwrap()
+            .entities[0];
+        let plain_id = document
+            .apply(Command::AddEntity(table_entity(TableKind::Table, layer)))
+            .unwrap()
+            .entities[0];
+
+        assert!(selection_contains_bom(&document, &[bom_id]));
+        assert!(selection_contains_bom(&document, &[plain_id, bom_id]));
+        assert!(!selection_contains_bom(&document, &[plain_id]));
+        assert!(!selection_contains_bom(&document, &[]));
+
+        // 削除済み（墓標）の部品表は数えない。
+        document.apply(Command::RemoveEntity(bom_id)).unwrap();
+        assert!(!selection_contains_bom(&document, &[bom_id]));
+    }
+
+    #[test]
+    fn request_table_or_bom_key_places_bom_above_frame_when_frame_visible() {
+        // 図面枠が有効・「部品表を使う」ON・部品表が無い: K を押した瞬間に表題欄の
+        // 直上へ即時配置し、選択モードへ戻って選択状態にする（undo 1回で消える）。
+        let mut sheet = config::Config::default().default_sheet_meta();
+        sheet.frame_visible = true;
+        sheet.use_bom = true;
+        let mut app = McadApp::new();
+        app.document = fresh_document(sheet);
+        app.tool_kind = ToolKind::Line;
+        app.tool = ToolKind::Line.spawn();
+
+        app.request_table_or_bom_key(0.0);
+
+        assert_eq!(app.document.entity_count(), 1);
+        let bom_id = app.document.bom().expect("a bom was placed");
+        assert_eq!(app.tool_kind, ToolKind::Select);
+        assert!(app.tool.is_none());
+        assert_eq!(app.select_tool.selection(), &[bom_id]);
+        assert!(app.document.can_undo());
+        app.document.undo();
+        assert_eq!(app.document.entity_count(), 0);
+    }
+
+    #[test]
+    fn request_table_or_bom_key_leaves_tool_and_selection_unchanged_on_failure() {
+        // レイヤーロックで AddEntity が失敗したら、エンティティは追加されず、
+        // ツール・選択ともそれまでの状態のまま（ステータスに理由だけ出す）。
+        let mut sheet = config::Config::default().default_sheet_meta();
+        sheet.frame_visible = true;
+        sheet.use_bom = true;
+        let mut app = McadApp::new();
+        app.document = fresh_document(sheet);
+        // K の部品表は文字レイヤーへ割り当てる（resolve_tool_layer）ので、それを
+        // ロックして AddEntity を失敗させる。
+        let text_layer = layer_named(&app.document, TEXT_LAYER_NAME).unwrap();
+        let mut props = app.document.layer(text_layer).unwrap().clone();
+        props.locked = true;
+        app.document
+            .apply(Command::SetLayerProps {
+                id: text_layer,
+                props,
+            })
+            .unwrap();
+        app.tool_kind = ToolKind::Line;
+        app.tool = ToolKind::Line.spawn();
+
+        app.request_table_or_bom_key(0.0);
+
+        assert_eq!(app.document.entity_count(), 0);
+        assert!(app.document.bom().is_none());
+        assert_eq!(app.tool_kind, ToolKind::Line);
+        assert!(app.tool.is_some());
+        assert!(app.select_tool.selection().is_empty());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("部品表の配置に失敗しました"))
+        );
+    }
+
+    #[test]
+    fn request_table_or_bom_key_on_failure_keeps_in_progress_duplicate_placement() {
+        // Codex レビュー指摘の回帰: 即時配置が失敗しても、進行中の複製配置モード
+        // （Ctrl+D で開始）は取り消されない（DESIGN.md「タスク82 の実装時追記」）。
+        let mut sheet = config::Config::default().default_sheet_meta();
+        sheet.frame_visible = true;
+        sheet.use_bom = true;
+        let mut app = McadApp::new();
+        app.document = fresh_document(sheet);
+        let text_layer = layer_named(&app.document, TEXT_LAYER_NAME).unwrap();
+        let mut props = app.document.layer(text_layer).unwrap().clone();
+        props.locked = true;
+        app.document
+            .apply(Command::SetLayerProps {
+                id: text_layer,
+                props,
+            })
+            .unwrap();
+
+        // 何か既存エンティティを選択して複製配置モードを開始しておく。
+        let layer = app.document.current_layer();
+        let ids = app
+            .document
+            .apply(Command::AddEntity(table_entity(TableKind::Table, layer)))
+            .unwrap()
+            .entities;
+        app.select_tool.set_selection(ids);
+        assert!(app.select_tool.start_duplicate());
+        assert!(app.select_tool.is_placing());
+
+        app.request_table_or_bom_key(0.0);
+
+        // 部品表の配置は失敗しているはず（文字レイヤーがロック済み）。
+        assert!(app.document.bom().is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("部品表の配置に失敗しました"))
+        );
+        // 進行中の複製配置モードは取り消されない。
+        assert!(app.select_tool.is_placing());
+    }
+
+    #[test]
+    fn request_table_or_bom_key_on_failure_keeps_in_progress_offset() {
+        // 同じ回帰観点をオフセットモードでも確認する。
+        let mut sheet = config::Config::default().default_sheet_meta();
+        sheet.frame_visible = true;
+        sheet.use_bom = true;
+        let mut app = McadApp::new();
+        app.document = fresh_document(sheet);
+        let text_layer = layer_named(&app.document, TEXT_LAYER_NAME).unwrap();
+        let mut props = app.document.layer(text_layer).unwrap().clone();
+        props.locked = true;
+        app.document
+            .apply(Command::SetLayerProps {
+                id: text_layer,
+                props,
+            })
+            .unwrap();
+
+        let layer = app.document.current_layer();
+        let ids = app
+            .document
+            .apply(Command::AddEntity(table_entity(TableKind::Table, layer)))
+            .unwrap()
+            .entities;
+        app.select_tool.set_selection(ids);
+        assert!(app.select_tool.start_offset());
+        assert!(app.select_tool.is_offsetting());
+
+        app.request_table_or_bom_key(0.0);
+
+        assert!(app.document.bom().is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|s| s.text.contains("部品表の配置に失敗しました"))
+        );
+        // 進行中のオフセットモードは取り消されない。
+        assert!(app.select_tool.is_offsetting());
+    }
+
+    #[test]
+    fn request_table_or_bom_key_spawns_bom_click_tool_when_frame_invisible() {
+        // 図面枠が無効: 従来どおりクリック位置へ置く（列幅は様式A/C固定）ので、
+        // このキー押下自体は Document を変えない。
+        let mut sheet = config::Config::default().default_sheet_meta();
+        sheet.frame_visible = false;
+        sheet.use_bom = true;
+        let mut app = McadApp::new();
+        app.document = fresh_document(sheet);
+
+        app.request_table_or_bom_key(0.0);
+
+        assert_eq!(app.tool_kind, ToolKind::Table);
+        assert!(app.tool.is_some());
+        assert_eq!(app.document.entity_count(), 0);
+    }
+
+    #[test]
+    fn request_table_or_bom_key_uses_generic_table_when_bom_already_exists() {
+        let mut sheet = config::Config::default().default_sheet_meta();
+        sheet.frame_visible = true;
+        sheet.use_bom = true;
+        let mut document = fresh_document(sheet);
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(table_entity(TableKind::Bom, layer)))
+            .unwrap();
+        let mut app = McadApp::new();
+        app.document = document;
+
+        app.request_table_or_bom_key(0.0);
+
+        // 既に部品表があるので、K は従来どおり汎用表ツールへ切り替えるだけ（即時配置しない）。
+        assert_eq!(app.tool_kind, ToolKind::Table);
+        assert_eq!(app.document.entity_count(), 1);
+    }
+
+    #[test]
+    fn request_table_or_bom_key_uses_generic_table_when_use_bom_off() {
+        let mut sheet = config::Config::default().default_sheet_meta();
+        sheet.frame_visible = true;
+        sheet.use_bom = false;
+        let mut app = McadApp::new();
+        app.document = fresh_document(sheet);
+
+        app.request_table_or_bom_key(0.0);
+
+        assert_eq!(app.tool_kind, ToolKind::Table);
+        assert_eq!(app.document.entity_count(), 0);
+    }
+
+    #[test]
+    fn request_duplicate_rejects_selection_containing_a_bom() {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        let bom_id = document
+            .apply(Command::AddEntity(table_entity(TableKind::Bom, layer)))
+            .unwrap()
+            .entities[0];
+        let mut app = McadApp::new();
+        app.document = document;
+        app.select_tool.set_selection(vec![bom_id]);
+
+        app.request_duplicate(0.0);
+
+        assert!(!app.select_tool.is_placing());
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Cannot duplicate: selection includes the bill of materials")
         );
     }
 

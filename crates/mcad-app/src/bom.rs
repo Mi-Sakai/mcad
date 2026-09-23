@@ -30,10 +30,14 @@
 //! 列名を返し、呼び出し側がステータスバーへ出す）。様式A/C から様式B へ切り替えるとき
 //! 備考に値があれば拒否される。見分けを推測しない理由は [`classify_bom_columns`]。
 
-use mcad_core::{SheetMeta, TableGeom};
+use mcad_core::{SheetMeta, TableGeom, TableKind};
 use mcad_geom::Point2;
 
 use crate::frame::{FRAME_MARGIN_MM, paper_to_world};
+
+/// 様式A/C の部品欄幅（紙 mm、規定 2-5-2）。図面枠が無効なとき（表題欄が無く様式幅を
+/// 参照できない）の `K`（M12 設計判断2）が使う固定値。
+pub const BOM_STYLE_AC_WIDTH_MM: f64 = 170.0;
 
 /// 部品欄の列名・様式A/C（幅170mm、7列。左から右へ。規定 2-5-2）。
 pub const BOM_COLUMN_NAMES_AC: [&str; 7] =
@@ -71,7 +75,7 @@ pub const BOM_TEXT_HEIGHT_MM: f64 = 3.5;
 /// ではなく静的スライス。
 #[must_use]
 pub fn bom_preset_columns(template_width_mm: f64) -> (&'static [&'static str], Vec<f64>) {
-    const AC_TOTAL: f64 = 170.0;
+    const AC_TOTAL: f64 = BOM_STYLE_AC_WIDTH_MM;
 
     if (template_width_mm - AC_TOTAL).abs() < 1e-9 {
         (&BOM_COLUMN_NAMES_AC, BOM_WIDTHS_AC_170.to_vec())
@@ -196,6 +200,35 @@ pub fn apply_bom_preset(table: &TableGeom, template_width_mm: f64) -> Result<Tab
     })
 }
 
+/// 右パネル「表」の「部品表にする」（M12 設計判断2）。選んだ表を部品表に指定する
+/// （汎用表 → 部品表）、または部品表の様式を再適用する（部品表 → 部品表、種類は
+/// 変わらない）。[`apply_bom_preset`] で列構成を適用したうえで、種類を常に
+/// [`TableKind::Bom`] にする（`apply_bom_preset` 自体は種類を変えない設計 —
+/// モジュール doc、タスク81 のテスト `apply_bom_preset_keeps_the_table_kind` 参照 —
+/// なので、種類を変えるのはこの呼び出し側の責務）。
+///
+/// # Errors
+///
+/// [`apply_bom_preset`] と同じ（値を捨てる変換・見分けられない表への変換を拒否）。
+/// 図面に既に別の部品表があるときの拒否（[`mcad_core::CoreError::BomAlreadyExists`]）は
+/// ここでは検査しない（呼び出し側の `Document::apply` が最終防衛として行う）。
+pub fn designate_as_bom(table: &TableGeom, template_width_mm: f64) -> Result<TableGeom, String> {
+    apply_bom_preset(table, template_width_mm).map(|applied| TableGeom {
+        kind: TableKind::Bom,
+        ..applied
+    })
+}
+
+/// 右パネル「表」の「表に戻す」（M12 設計判断2）。部品表を表に戻す。列構成・セル・
+/// アンカーなど中身は変えない（種類だけを [`TableKind::Table`] にする）。
+#[must_use]
+pub fn reset_to_table(table: &TableGeom) -> TableGeom {
+    TableGeom {
+        kind: TableKind::Table,
+        ..table.clone()
+    }
+}
+
 /// 既存の表が部品表のどの列構成か（旧5列・様式A/C の7列・様式B の6列）を見分け、
 /// 各列の意味（新しい列構成での列名）を返す。見分けられなければ `None`（値の入った表は
 /// 変換しない）。
@@ -234,11 +267,43 @@ pub fn bom_anchor_above_title_block(sheet: &SheetMeta, k: f64) -> Point2 {
     paper_to_world(Point2::new(block_left, block_top), k)
 }
 
+/// `K`（部品表を使う設定が ON で図面に部品表がまだ無い）が置く部品表の初期形状
+/// （M12 設計判断2）。見出し行（最下段）+ 空の部品行3行、列構成・列幅は
+/// `template_width_mm` に対応する [`bom_preset_columns`]。
+///
+/// - 図面枠が有効なとき: 呼び出し側（`McadApp`）が `template_width_mm` に表題欄の
+///   実際の様式幅を、`anchor` に [`bom_anchor_above_title_block`] の結果を渡す。
+/// - 図面枠が無効なとき: 表ツール（`K`）のクリック位置を `anchor` にし、
+///   `template_width_mm` は様式A/C固定（[`BOM_STYLE_AC_WIDTH_MM`]）を渡す
+///   （表題欄が無く様式幅を参照できないため）。
+///
+/// 返す [`TableGeom::kind`] は常に [`TableKind::Bom`]。
+#[must_use]
+pub fn default_bom_table(anchor: Point2, template_width_mm: f64) -> TableGeom {
+    const PART_ROWS: usize = 3;
+    let (names, widths) = bom_preset_columns(template_width_mm);
+    let rows = PART_ROWS + 1;
+    let cols = names.len();
+    let header_row = rows - 1;
+    let mut cells = vec![String::new(); rows * cols];
+    for (c, name) in names.iter().enumerate() {
+        cells[header_row * cols + c] = (*name).to_owned();
+    }
+    TableGeom {
+        kind: TableKind::Bom,
+        anchor,
+        col_widths_mm: widths,
+        row_heights_mm: vec![BOM_ROW_HEIGHT_MM; rows],
+        text_height_mm: BOM_TEXT_HEIGHT_MM,
+        cells,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::frame_layout;
-    use mcad_core::{Scale, TableKind, TitleBlockKind};
+    use mcad_core::{Scale, TitleBlockKind};
 
     fn approx(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-9, "{a} != {b}");
@@ -579,5 +644,87 @@ mod tests {
             assert_eq!(bom.cell(0, 0), Some(""));
             assert_eq!(bom.cell(2, 0), Some("部番"));
         }
+    }
+
+    // --- default_bom_table ---
+
+    #[test]
+    fn default_bom_table_has_header_row_at_bottom_and_three_empty_part_rows() {
+        let anchor = Point2::new(3.0, 4.0);
+        let table = default_bom_table(anchor, BOM_STYLE_AC_WIDTH_MM);
+        assert_eq!(table.kind, TableKind::Bom);
+        assert_eq!(table.anchor, anchor);
+        assert_eq!(table.rows(), 4);
+        assert_eq!(table.cols(), 7);
+        for (c, name) in BOM_COLUMN_NAMES_AC.iter().enumerate() {
+            assert_eq!(table.cell(3, c), Some(*name));
+        }
+        for r in 0..3 {
+            for c in 0..7 {
+                assert_eq!(table.cell(r, c), Some(""));
+            }
+        }
+        assert!(table.row_heights_mm.iter().all(|h| *h == BOM_ROW_HEIGHT_MM));
+        assert_eq!(table.text_height_mm, BOM_TEXT_HEIGHT_MM);
+        assert_eq!(table.col_widths_mm, BOM_WIDTHS_AC_170.to_vec());
+    }
+
+    #[test]
+    fn default_bom_table_uses_style_b_columns_for_120mm() {
+        let table = default_bom_table(Point2::ORIGIN, 120.0);
+        assert_eq!(table.cols(), 6);
+        for (c, name) in BOM_COLUMN_NAMES_B.iter().enumerate() {
+            assert_eq!(table.cell(3, c), Some(*name));
+        }
+    }
+
+    #[test]
+    fn default_bom_table_result_passes_validate() {
+        use mcad_core::EntityGeom;
+        let table = default_bom_table(Point2::ORIGIN, BOM_STYLE_AC_WIDTH_MM);
+        EntityGeom::Table(table)
+            .validate()
+            .expect("default bom table is valid");
+    }
+
+    // --- designate_as_bom / reset_to_table（M12 タスク82: 右パネル「部品表にする」「表に戻す」） ---
+
+    #[test]
+    fn designate_as_bom_sets_kind_to_bom_for_a_generic_table() {
+        let table = sample_table(2, 3);
+        assert_eq!(table.kind, TableKind::Table);
+        let bom = designate_as_bom(&table, 170.0).unwrap();
+        assert_eq!(bom.kind, TableKind::Bom);
+        assert_eq!(bom.cols(), 7);
+    }
+
+    #[test]
+    fn designate_as_bom_keeps_kind_bom_when_reapplying_style() {
+        // 既に部品表のときに同じボタンを押すと様式への再適用になる（種類は変わらない）。
+        let table = TableGeom {
+            kind: TableKind::Bom,
+            ..sample_table(2, 7)
+        };
+        let bom = designate_as_bom(&table, 170.0).unwrap();
+        assert_eq!(bom.kind, TableKind::Bom);
+    }
+
+    #[test]
+    fn designate_as_bom_propagates_apply_bom_preset_errors() {
+        // 値を捨てる変換の拒否（apply_bom_preset のエラー）はそのまま伝播する。
+        let mut table = sample_table(2, 7);
+        table.cells[6] = "値".to_owned(); // 見出しが既知の並びと一致しないのに値がある
+        assert!(designate_as_bom(&table, 170.0).is_err());
+    }
+
+    #[test]
+    fn reset_to_table_sets_kind_to_table_and_keeps_contents() {
+        let bom = default_bom_table(Point2::new(5.0, 6.0), BOM_STYLE_AC_WIDTH_MM);
+        assert_eq!(bom.kind, TableKind::Bom);
+        let table = reset_to_table(&bom);
+        assert_eq!(table.kind, TableKind::Table);
+        assert_eq!(table.anchor, bom.anchor);
+        assert_eq!(table.col_widths_mm, bom.col_widths_mm);
+        assert_eq!(table.cells, bom.cells);
     }
 }

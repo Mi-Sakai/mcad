@@ -18,7 +18,9 @@
 //! - 図面メタデータ: [`SheetMeta`]（[`Scale`] / [`PaperSize`] / [`Orientation`] /
 //!   [`TitleBlockKind`] / [`TitleBlockFields`]）と表題欄様式 [`TitleBlockTemplate`]
 //! - 表: [`TableGeom`]（[`EntityGeom::Table`] の中身。汎用表・部品表の土台。
-//!   行列数・寸法の上限は [`MAX_TABLE_ROWS`] / [`MAX_TABLE_COLS`] / [`MAX_TABLE_MM`]）
+//!   行列数・寸法の上限は [`MAX_TABLE_ROWS`] / [`MAX_TABLE_COLS`] / [`MAX_TABLE_MM`]）。
+//!   種類は [`TableKind`]（表 / 部品表。M12 タスク81）で、**部品表は 1 図面に 1 つ**
+//!   （[`Document::apply`] が守る。図面の部品表は [`Document::bom`]）
 //! - 展開（`expand` モジュール、M11 タスク71）: 寸法・表を描画可能な線・矢先・文字へ
 //!   組む純関数。寸法は [`expand_linear`] / [`expand_radial`] / [`expand_diameter`] /
 //!   [`expand_angular`] / [`expand_ordinate`]（パラメータは [`DimRender`]、結果は
@@ -70,7 +72,7 @@ pub use entity::Entity;
 pub use entity_geom::{
     DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimDiameter, DimDirection, DimLinear, DimOrdinate,
     DimRadial, EntityGeom, MAX_TABLE_COLS, MAX_TABLE_MM, MAX_TABLE_ROWS, OrdinateAxis, TableGeom,
-    TextGeom, approx_text_width,
+    TableKind, TextGeom, approx_text_width,
 };
 pub use error::CoreError;
 pub use expand::{

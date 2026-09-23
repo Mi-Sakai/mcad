@@ -131,8 +131,10 @@ impl Config {
     /// 新規文書用の [`SheetMeta`] を組み立てる。
     ///
     /// `fields`（表題欄記入内容）は空、`frame_visible` は `false`、`unit` は
-    /// [`mcad_core::Unit::Millimeter`] 固定 — いずれも config の永続化対象外
-    /// （記入内容は図面ごとに人が書くもの、枠表示は都度の作業状態、単位は現状 mm 固定）。
+    /// [`mcad_core::Unit::Millimeter`] 固定、`use_bom`（部品表を使う）は `true` — いずれも
+    /// config の永続化対象外（記入内容・部品表を使うかは図面ごとに決めるもの、枠表示は
+    /// 都度の作業状態、単位は現状 mm 固定。新規図面の「部品表を使う」は ON。DESIGN.md
+    /// M12 設計判断1）。
     #[must_use]
     pub fn default_sheet_meta(&self) -> SheetMeta {
         SheetMeta {
@@ -143,6 +145,7 @@ impl Config {
             title_block: self.default_title_block.to_kind(),
             fields: mcad_core::TitleBlockFields::default(),
             frame_visible: false,
+            use_bom: true,
         }
     }
 
@@ -482,6 +485,7 @@ mod tests {
             title_block: TitleBlockKind::C,
             fields: TitleBlockFields::default(),
             frame_visible: true,
+            use_bom: true,
         };
         assert!(config.remember_sheet_defaults(&sheet));
         assert_eq!(config.default_paper, PaperSize::A2);
@@ -512,6 +516,7 @@ mod tests {
             title_block: TitleBlockKind::Custom(custom_template),
             fields: TitleBlockFields::default(),
             frame_visible: false,
+            use_bom: true,
         };
         // 様式は据え置き(Custom は config に選択肢がないため)だが、それ以外が
         // 既定と一致しているので false。

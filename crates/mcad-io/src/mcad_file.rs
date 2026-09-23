@@ -12,7 +12,7 @@
 //!   （[`FileLayer`]）として書く。core 側の型変更がファイル形式へ直接漏れないように
 //!   するため。
 //! - 生存中のレイヤー・エンティティのみを列挙する。undo/redo 履歴・墓標は保存しない。
-//! - `version` フィールド必須（現行は `7`）。書き出しは常に v7。読込は v1〜v6 を
+//! - `version` フィールド必須（現行は `8`）。書き出しは常に v8。読込は v1〜v7 を
 //!   後方互換で受理し、それ以外の未知バージョンは拒否する（[`from_json`]）。
 //!
 //! # バージョン履歴と後方互換の変換規則
@@ -25,7 +25,8 @@
 //! | 4 | 図面メタデータ `sheet`、レイヤーの `linetype`/`width_mm`、`style` の線幅を px から紙 mm の ByLayer モデルへ（M8） | `dim_style = 既定`（`annotation` は元々 `EntityGeom` の `#[serde(default)]` で無注記に補完される） |
 //! | 5 | 寸法注記（[`mcad_core::DimAnnotation`]）・文書単位の寸法スタイル（`dim_style`）を永続化（M9 タスク48） | `arrow_kind = ClosedFilled`。表（[`EntityGeom::Table`]）は概念自体が無いため、凍結 DTO（[`EntityGeomV5`]）が `Table` タグを拒否する |
 //! | 6 | 汎用テーブル（[`EntityGeom::Table`]、M10）・[`mcad_core::DimStyle::arrow_kind`]（矢先種別。M10 タスク57で `.mcad` へ導入、形状生成は M10 タスク63）を追加 | `direction = Aligned`（凍結 DTO [`DimLinearV6`] が `direction` キーを拒否する） |
-//! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）、長さ寸法の補助線の傾き（`DimLinear::ext_angle`。M11 タスク78）を追加。現行 | なし |
+//! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）、長さ寸法の補助線の傾き（`DimLinear::ext_angle`。M11 タスク78）を追加 | `kind = Table`・`use_bom = true`（凍結 DTO [`TableGeomV7`] / [`SheetMetaV7`] が両キーを拒否する。**中身から部品表を推測しない**） |
+//! | 8 | 表の種類 [`TableKind`]（`TableGeom::kind`。表 / 部品表）・図面の「部品表を使う」（`SheetMeta::use_bom`）を追加（M12 タスク81）。現行 | なし |
 //!
 //! **v7 は M11-1 の中で 3 度拡張した（タスク68 → 69 → 78）が、版は上げていない。**
 //! タスク68 の v7 は未リリースで、同じマイルストーンの中で版を刻む意味がないため
@@ -38,19 +39,24 @@
 //! 引き上げる。段ごとに補完する値を 1 箇所へ閉じるためで、飛び級の変換は書かない。
 //!
 //! ```text
-//! v1 → v2 → v3 → v4 → v5 → v6 → v7(= FileDocument)
-//!      ^    ^    ^     ^    ^    ^
-//!      |    |    |     |    |    +-- DimLinearV6 → DimLinear（direction = Aligned・ext_angle = None）
-//!      |    |    |     |    +------- EntityGeomV5 → EntityGeomV6（Table は現れない）
-//!      |    |    |     +------------ dim_style = LEGACY_DIM_STYLE
-//!      |    |    +------------------ sheet = 既定、style.width(px) → width_mm
-//!      |    +----------------------- order = 配列インデックス
-//!      +---------------------------- Shape → EntityGeomV5::Shape
+//! v1 → v2 → v3 → v4 → v5 → v6 → v7 → v8(= FileDocument)
+//!      ^    ^    ^    ^    ^    ^    ^
+//!      |    |    |    |    |    |    +-- TableGeomV7 → TableGeom（kind = Table）、
+//!      |    |    |    |    |    |        SheetMetaV7 → SheetMeta（use_bom = true）
+//!      |    |    |    |    |    +------- DimLinearV6 → DimLinear（direction = Aligned・ext_angle = None）
+//!      |    |    |    |    +------------ EntityGeomV5 → EntityGeomV6（Table は現れない）
+//!      |    |    |    +----------------- dim_style = LEGACY_DIM_STYLE
+//!      |    |    +---------------------- sheet = 既定（SheetMetaV7）、style.width(px) → width_mm
+//!      |    +--------------------------- order = 配列インデックス
+//!      +-------------------------------- Shape → EntityGeomV5::Shape
 //! ```
 //!
-//! 幾何の凍結 DTO は 3 つある。[`DimLinearV6`]（`direction` を持たない長さ寸法。
-//! v1〜v6 が共有）、[`EntityGeomV5`]（`Table` を持たない幾何。v1〜v5）、
-//! [`EntityGeomV6`]（`Table` を持つが `direction` は無い幾何。v6）。
+//! 幾何の凍結 DTO は 5 つある。[`DimLinearV6`]（`direction` を持たない長さ寸法。
+//! v1〜v6 が共有）、[`TableGeomV7`]（`kind` を持たない表。v6・v7 が共有）、
+//! [`EntityGeomV5`]（`Table` を持たない幾何。v1〜v5）、[`EntityGeomV6`]（`Table` を
+//! 持つが `direction` は無い幾何。v6）、[`EntityGeomV7`]（表が `kind` を持たない幾何。
+//! v7）。図面メタデータの凍結 DTO は [`SheetMetaV7`]（`use_bom` を持たない。v4〜v7 が
+//! 共有）。
 //!
 //! `order` を持たない v1/v2 のレイヤーには **配列内のインデックスをそのまま
 //! `order` として採用する**。export は常にデフォルトレイヤーを先頭に列挙してきた
@@ -127,7 +133,7 @@
 //!   強制的に無注記化していた）ため、`EntityGeom` 側の `#[serde(default)]` により
 //!   全 annotation が無注記（`decimals_override` を含め全フィールド既定値）へ
 //!   補完される。`dim_style` も同様に v1〜v4 では存在せず既定値へ補完される
-//!   （[`FileDocumentV4::into_v7`]）。
+//!   （[`FileDocumentV4::into_v8`]）。
 //!
 //! # 汎用テーブルと矢先種別の永続化（v6・M10 タスク57）
 //!
@@ -228,6 +234,39 @@
 //!   [`IoError::InvalidGeometry`] として読込境界で拒否する（3 境界のうちの 1 つ。
 //!   **範囲は拒否も正規化もしない**のは core と同じ。回帰は
 //!   `v7_file_with_non_finite_extension_line_angle_is_rejected`）。
+//!
+//! # 表の種類・部品表を使う（v8・M12 タスク81）
+//!
+//! M12 タスク81 で [`TableGeom`] へ種類（[`TableKind`]。表 / 部品表）を、[`SheetMeta`] へ
+//! 「部品表を使う」（`use_bom`）を足した（DESIGN.md M12 設計判断1）。**v8 でこれを
+//! 永続化する**。v8 は M12 の間は未リリースで、構築線（M12 タスク91）が相乗りする
+//! （M11 の v7 と同じ運用）。
+//!
+//! - [`FileEntity::geom`] / [`FileDocument::sheet`] は core の型をそのまま serde するので、
+//!   `kind` / `use_bom` は追加の型を要らずそのまま書ける。どちらも既定値でも必ず書き、
+//!   **読込では欠落を拒否する**（`direction` とは扱いが違う。Codex adversarial review
+//!   指摘: 正規の v8 は両キーを常に書くので、欠けたファイルは壊れているか別版の
+//!   プログラムが書いたもの。既定値で補うと部品表が黙って表になったり、OFF の設定が
+//!   ON に戻ったりし、次の保存でその変化が確定する。回帰は
+//!   `v8_file_missing_table_kind_is_rejected` / `v8_file_missing_use_bom_is_rejected`）。
+//! - **v7 以前の DTO は凍結する**（v6 の `Table`・v7 の `direction` と同じ理由）。
+//!   `kind` を持たない [`TableGeomV7`]（v6・v7 が共有）と、それを使う [`EntityGeomV7`]
+//!   （v7）、`use_bom` を持たない [`SheetMetaV7`]（v4〜v7 が共有）を置く。どちらも
+//!   `#[serde(deny_unknown_fields)]` で、**v7 以前と自称するファイルに `kind` や `use_bom`
+//!   を混ぜると [`IoError::Json`] で読込ごと失敗する**（黙って無視すると、部品表が表へ・
+//!   「使わない」が「使う」へすり替わった図面を無警告で開くことになる。回帰は
+//!   `v7_file_with_table_kind_is_rejected` / `v7_file_with_use_bom_is_rejected`）。
+//! - **v7 以前の表はすべて [`TableKind::Table`]、「部品表を使う」は ON として読む。
+//!   中身（見出し行の並び等）から部品表を推測しない**（DESIGN.md 7章「部品欄の列構成の
+//!   見直し」最終形の教訓: 表の中身だけでは部品表かどうかを確実に見分けられない）。
+//!   旧部品表を部品表として扱うのは、読込後のユーザーの指定（M12 タスク82）に任せる。
+//!   推測しないので、旧部品表らしい表を 2 つ持つ v7 ファイルもそのまま読める
+//!   （fixture `v7_legacy_boms.mcad`）。
+//! - **部品表は 1 図面に 1 つ**（core の不変条件）。手編集で部品表を 2 つ持つ v8 ファイルは、
+//!   [`import_document`] の Command 再構築で `Document::apply` が
+//!   [`mcad_core::CoreError::BomAlreadyExists`] を返し、[`IoError::Core`] として読込ごと
+//!   失敗する（不正な表と同じ扱い。どちらかを黙って表へ落とさない。回帰は
+//!   `v8_file_with_two_boms_is_rejected`）。
 
 use std::fs;
 use std::path::Path;
@@ -235,9 +274,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use mcad_core::{
-    Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimStyle, Document,
-    Entity, EntityGeom, Layer, LayerId, Linetype, Rgb, SheetMeta, Style, TableGeom, TextGeom,
-    WidthMm,
+    Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimOrdinate,
+    DimRadial, DimStyle, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Orientation,
+    PaperSize, Rgb, Scale, SheetMeta, Style, TableGeom, TableKind, TextGeom, TitleBlockFields,
+    TitleBlockKind, Unit, WidthMm,
 };
 use mcad_geom::{Point2, Shape};
 
@@ -254,11 +294,13 @@ use crate::IoError;
 /// - v6（M10 タスク57）で汎用テーブル（[`mcad_core::EntityGeom::Table`]）と
 ///   矢先種別（[`mcad_core::DimStyle::arrow_kind`]）を追加。
 /// - v7（M11 タスク68）で長さ寸法の向き（[`mcad_core::DimDirection`]。回転寸法）を追加。
+/// - v8（M12 タスク81）で表の種類（[`TableKind`]）と図面の「部品表を使う」
+///   （[`SheetMeta::use_bom`]）を追加。
 ///
-/// 書き出しは常に v7。v1〜v6 のファイルは [`from_json`] が後方互換で読み込む
+/// 書き出しは常に v8。v1〜v7 のファイルは [`from_json`] が後方互換で読み込む
 /// （[`FileDocumentV1`] / [`FileDocumentV2`] / [`FileDocumentV3`] / [`FileDocumentV4`] /
-/// [`FileDocumentV5`] / [`FileDocumentV6`] 参照）。
-pub const FORMAT_VERSION: u32 = 7;
+/// [`FileDocumentV5`] / [`FileDocumentV6`] / [`FileDocumentV7`] 参照）。
+pub const FORMAT_VERSION: u32 = 8;
 
 /// v1〜v4(`dim_style` を持たない版)の読込で補完する寸法スタイル。
 ///
@@ -272,12 +314,13 @@ const LEGACY_DIM_STYLE: DimStyle = DimStyle {
     ..DimStyle::DEFAULT
 };
 
-/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v7）。
+/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v8）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDocument {
     /// フォーマットバージョン。[`FORMAT_VERSION`] 以外は読込を拒否する。
     pub version: u32,
-    /// 図面メタデータ（尺度・用紙・表題欄）。v4 で追加。
+    /// 図面メタデータ（尺度・用紙・表題欄）。v4 で追加、v8 で「部品表を使う」
+    /// （[`SheetMeta::use_bom`]）を追加。
     ///
     /// レイヤーと違って io 専用 DTO を挟まず core の [`SheetMeta`] をそのまま書く。
     /// [`FileEntity::geom`]（[`EntityGeom`]）と同じ扱いで、理由も同じ:
@@ -369,7 +412,7 @@ pub struct FileEntity {
     /// 幾何形状（v2 でテキスト・寸法を含む [`EntityGeom`] へ拡張、v6 で表
     /// [`EntityGeom::Table`] を追加、v7 で長さ寸法の向き
     /// [`mcad_core::DimDirection`]・角度寸法 [`EntityGeom::DimAngular`]・
-    /// 座標寸法 [`EntityGeom::DimOrdinate`] を追加）。
+    /// 座標寸法 [`EntityGeom::DimOrdinate`] を追加、v8 で表の種類 [`TableKind`] を追加）。
     pub geom: EntityGeom,
 }
 
@@ -569,7 +612,7 @@ impl FileDocumentV3 {
         let (entities, clamped_widths) = entities_v3_into_v4(self.entities);
         (
             FileDocumentV4 {
-                sheet: SheetMeta::default(),
+                sheet: SheetMetaV7::default(),
                 layers: self.layers.into_iter().map(FileLayerV3::into_v4).collect(),
                 current_layer: self.current_layer,
                 entities,
@@ -578,12 +621,12 @@ impl FileDocumentV3 {
         )
     }
 
-    /// v3 DTO を現行の v7 [`FileDocument`] へ変換する（[`FileDocumentV3::into_v4`] の
-    /// あと [`FileDocumentV4::into_v7`] を通す）。
-    fn into_v7(self) -> MigratedFile {
+    /// v3 DTO を現行の v8 [`FileDocument`] へ変換する（[`FileDocumentV3::into_v4`] の
+    /// あと [`FileDocumentV4::into_v8`] を通す）。
+    fn into_v8(self) -> MigratedFile {
         let (v4, clamped_widths) = self.into_v4();
         MigratedFile {
-            file: v4.into_v7(),
+            file: v4.into_v8(),
             clamped_widths,
         }
     }
@@ -600,15 +643,15 @@ struct FileDocumentV2 {
 }
 
 impl FileDocumentV2 {
-    /// v2 DTO を v3 相当へ引き上げてから v7 へ変換する。
-    fn into_v7(self) -> MigratedFile {
+    /// v2 DTO を v3 相当へ引き上げてから v8 へ変換する。
+    fn into_v8(self) -> MigratedFile {
         FileDocumentV3 {
             version: 3,
             layers: layers_v2_into_v3(self.layers),
             current_layer: self.current_layer,
             entities: self.entities,
         }
-        .into_v7()
+        .into_v8()
     }
 }
 
@@ -631,9 +674,9 @@ struct FileEntityV1 {
 }
 
 impl FileDocumentV1 {
-    /// v1 DTO を v2 相当へ引き上げてから v7 へ変換する（各 `Shape` を
+    /// v1 DTO を v2 相当へ引き上げてから v8 へ変換する（各 `Shape` を
     /// [`EntityGeomV5::Shape`] で包む）。
-    fn into_v7(self) -> MigratedFile {
+    fn into_v8(self) -> MigratedFile {
         FileDocumentV2 {
             version: 2,
             layers: self.layers,
@@ -648,7 +691,7 @@ impl FileDocumentV1 {
                 })
                 .collect(),
         }
-        .into_v7()
+        .into_v8()
     }
 }
 
@@ -762,7 +805,8 @@ impl From<EntityGeomV5> for EntityGeomV6 {
 /// [`EntityGeomV5`] と同じ [`DimLinearV6`] で、`direction` を持たない
 /// （凍結の理由は [`DimLinearV6`] の doc）。角度寸法・座標寸法（M11 タスク69）も
 /// 持たないので、v6 と自称するファイルにそれらのタグを混ぜると読込ごと失敗する
-/// （回帰は `v6_file_with_angular_dimension_is_rejected`）。
+/// （回帰は `v6_file_with_angular_dimension_is_rejected`）。表は [`TableGeomV7`]
+/// （`kind` を持たない。M12 タスク81）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 enum EntityGeomV6 {
     Shape(Shape),
@@ -770,20 +814,162 @@ enum EntityGeomV6 {
     DimLinear(DimLinearV6),
     DimRadial(DimRadial),
     DimDiameter(DimDiameter),
-    Table(TableGeom),
+    Table(TableGeomV7),
 }
 
-impl From<EntityGeomV6> for EntityGeom {
-    /// 凍結 enum を現行の [`EntityGeom`] へ写す（長さ寸法だけが
-    /// [`DimLinearV6`] → [`DimLinear`] の既定値補完を通る）。
+impl From<EntityGeomV6> for EntityGeomV7 {
+    /// v6 の幾何を v7 相当の凍結 enum へ引き上げる（長さ寸法だけが
+    /// [`DimLinearV6`] → [`DimLinear`] の既定値補完を通る。角度寸法・座標寸法は
+    /// v6 に存在しないので現れない）。
     fn from(geom: EntityGeomV6) -> Self {
         match geom {
-            EntityGeomV6::Shape(shape) => EntityGeom::Shape(shape),
-            EntityGeomV6::Text(text) => EntityGeom::Text(text),
-            EntityGeomV6::DimLinear(dim) => EntityGeom::DimLinear(dim.into()),
-            EntityGeomV6::DimRadial(dim) => EntityGeom::DimRadial(dim),
-            EntityGeomV6::DimDiameter(dim) => EntityGeom::DimDiameter(dim),
-            EntityGeomV6::Table(table) => EntityGeom::Table(table),
+            EntityGeomV6::Shape(shape) => EntityGeomV7::Shape(shape),
+            EntityGeomV6::Text(text) => EntityGeomV7::Text(text),
+            EntityGeomV6::DimLinear(dim) => EntityGeomV7::DimLinear(dim.into()),
+            EntityGeomV6::DimRadial(dim) => EntityGeomV7::DimRadial(dim),
+            EntityGeomV6::DimDiameter(dim) => EntityGeomV7::DimDiameter(dim),
+            EntityGeomV6::Table(table) => EntityGeomV7::Table(table),
+        }
+    }
+}
+
+/// v8 で [`TableGeom::kind`]（表の種類。M12 タスク81）が追加される**前**の表を表す
+/// 凍結 DTO（後方互換読込専用、v6・v7 が共有する）。
+///
+/// # なぜ凍結するか
+///
+/// [`TableGeom::kind`] は必須なので、現行の [`TableGeom`] をそのまま v7 以前の読込に
+/// 使うと `kind` を持たない正規の v6/v7 ファイルがことごとく読めなくなる。かといって
+/// `#[serde(default)]` を付け直すと「v7 と自称する手編集ファイルの部品表」も読めてしまい、
+/// **v7 以前の表は種類を持たない**という版数の意味が壊れる（[`DimLinearV6`] が
+/// `direction` に対してしているのと同じ防御）。
+///
+/// # 未知フィールドは無視せず拒否する
+///
+/// `#[serde(deny_unknown_fields)]` なので、v6/v7 として読むファイルの表に `kind` を
+/// 混ぜると [`IoError::Json`] で**読込ごと失敗する**（`"kind": "Table"` でも拒否する。
+/// 版数の意味を守るためで、[`DimLinearV6`] が `"direction": "Aligned"` を拒否するのと
+/// 同じ）。黙って無視して表として読むと、部品表が表へすり替わった図面を無警告で開く
+/// ことになる（回帰は `v7_file_with_table_kind_is_rejected`）。
+///
+/// [`TableGeom`] のフィールドは M10（v6）で導入してから変わっていないので、mcad が
+/// 書いた v6/v7 の表がこの属性で拒否されることは無い。
+///
+/// フィールドの意味は [`TableGeom`] と同じ。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableGeomV7 {
+    anchor: Point2,
+    col_widths_mm: Vec<f64>,
+    row_heights_mm: Vec<f64>,
+    text_height_mm: f64,
+    cells: Vec<String>,
+}
+
+impl From<TableGeomV7> for TableGeom {
+    /// 凍結 DTO を現行の [`TableGeom`] へ変換する。**種類は常に [`TableKind::Table`]**
+    /// （中身から部品表を推測しない。DESIGN.md M12 設計判断1）。
+    fn from(table: TableGeomV7) -> Self {
+        TableGeom {
+            kind: TableKind::Table,
+            anchor: table.anchor,
+            col_widths_mm: table.col_widths_mm,
+            row_heights_mm: table.row_heights_mm,
+            text_height_mm: table.text_height_mm,
+            cells: table.cells,
+        }
+    }
+}
+
+/// v8 で [`TableGeom::kind`] が追加される**前**のジオメトリを表す凍結 enum
+/// （後方互換読込専用、v7 が使う）。
+///
+/// 現行の [`EntityGeom`] との差は、表が [`TableGeomV7`]（`kind` を持たない）であること
+/// だけ。他のバリアントは v7 時点の core の型をそのまま使う（v8 で変わっていない。
+/// 変えるときはここも凍結する）。閉じた enum なので、**v8 以降に足すバリアント
+/// （M12 タスク91 の構築線など）は、v7 と自称するファイルに混ぜると未知のバリアントとして
+/// 自動的に拒否される**（[`EntityGeomV5`] が角度寸法を拒否するのと同じ構造）。
+///
+/// タグ名は [`EntityGeom`] の外部タグ形式と一致させる（v7 の export がこのタグで
+/// 書いてきたため）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+enum EntityGeomV7 {
+    Shape(Shape),
+    Text(TextGeom),
+    DimLinear(DimLinear),
+    DimRadial(DimRadial),
+    DimDiameter(DimDiameter),
+    Table(TableGeomV7),
+    DimAngular(DimAngular),
+    DimOrdinate(DimOrdinate),
+}
+
+impl From<EntityGeomV7> for EntityGeom {
+    /// 凍結 enum を現行の [`EntityGeom`] へ写す（表だけが [`TableGeomV7`] →
+    /// [`TableGeom`] の既定値補完 = [`TableKind::Table`] を通る）。
+    fn from(geom: EntityGeomV7) -> Self {
+        match geom {
+            EntityGeomV7::Shape(shape) => EntityGeom::Shape(shape),
+            EntityGeomV7::Text(text) => EntityGeom::Text(text),
+            EntityGeomV7::DimLinear(dim) => EntityGeom::DimLinear(dim),
+            EntityGeomV7::DimRadial(dim) => EntityGeom::DimRadial(dim),
+            EntityGeomV7::DimDiameter(dim) => EntityGeom::DimDiameter(dim),
+            EntityGeomV7::Table(table) => EntityGeom::Table(table.into()),
+            EntityGeomV7::DimAngular(dim) => EntityGeom::DimAngular(dim),
+            EntityGeomV7::DimOrdinate(dim) => EntityGeom::DimOrdinate(dim),
+        }
+    }
+}
+
+/// v8 で [`SheetMeta::use_bom`]（部品表を使う。M12 タスク81）が追加される**前**の
+/// 図面メタデータを表す凍結 DTO（後方互換読込専用、v4〜v7 が共有する）。
+///
+/// # なぜ凍結するか
+///
+/// core の [`SheetMeta`] は `use_bom` を必須にしたので、そのまま v7 以前の読込に使うと
+/// `use_bom` を持たない正規の v7 ファイルがことごとく読めなくなる。かといって
+/// `#[serde(default)]` を付け直すと「v7 と自称する手編集ファイルの `"use_bom": false`」も
+/// 読めてしまい、**v7 以前は「部品表を使う」を持たない（すべて ON）**という版数の意味が
+/// 壊れる（[`TableGeomV7`] と同じ防御）。
+///
+/// # 未知フィールドは無視せず拒否する
+///
+/// `#[serde(deny_unknown_fields)]` なので、v4〜v7 として読むファイルの `sheet` に
+/// `use_bom` を混ぜると [`IoError::Json`] で読込ごと失敗する（黙って無視して ON で読むと、
+/// OFF にした図面が ON にすり替わる。回帰は `v7_file_with_use_bom_is_rejected`）。
+/// **この属性は `use_bom` 以外の未知のキーも拒否する**（凍結前は黙って無視していた）。
+/// `sheet` のキーは v4（M8）で [`SheetMeta`] を導入してから v7 まで変わっていないので、
+/// mcad が書いた v4〜v7 の正規ファイルには影響しない（fixture `v4.mcad`〜`v7.mcad` が
+/// 回帰網）。
+///
+/// 中の型（[`Scale`] / [`TitleBlockKind`] 等）は core の型をそのまま使う（v4 以降
+/// 変わっていない。変えるときはここも凍結する）。`Default` は v1〜v3 の読込で補う
+/// 「A4 横・1:1・様式B・枠非表示」（DESIGN.md M8 設計判断6）。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SheetMetaV7 {
+    unit: Unit,
+    scale: Scale,
+    paper: PaperSize,
+    orientation: Orientation,
+    title_block: TitleBlockKind,
+    fields: TitleBlockFields,
+    frame_visible: bool,
+}
+
+impl From<SheetMetaV7> for SheetMeta {
+    /// 凍結 DTO を現行の [`SheetMeta`] へ変換する（「部品表を使う」は ON。
+    /// DESIGN.md M12 設計判断1）。
+    fn from(sheet: SheetMetaV7) -> Self {
+        SheetMeta {
+            unit: sheet.unit,
+            scale: sheet.scale,
+            paper: sheet.paper,
+            orientation: sheet.orientation,
+            title_block: sheet.title_block,
+            fields: sheet.fields,
+            frame_visible: sheet.frame_visible,
+            use_bom: true,
         }
     }
 }
@@ -808,9 +994,8 @@ impl From<FileEntityV5> for FileEntityV6 {
     }
 }
 
-/// v6 のエンティティ 1 件を表す凍結 DTO（後方互換読込専用）。現行の
-/// [`FileEntity`] との差は `geom` が [`EntityGeomV6`]（`direction` を持たない）で
-/// あること。
+/// v6 のエンティティ 1 件を表す凍結 DTO（後方互換読込専用）。[`FileEntityV7`] との
+/// 差は `geom` が [`EntityGeomV6`]（`direction` を持たない）であること。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FileEntityV6 {
     layer: usize,
@@ -818,8 +1003,27 @@ struct FileEntityV6 {
     geom: EntityGeomV6,
 }
 
-impl From<FileEntityV6> for FileEntity {
+impl From<FileEntityV6> for FileEntityV7 {
     fn from(entity: FileEntityV6) -> Self {
+        FileEntityV7 {
+            layer: entity.layer,
+            style: entity.style,
+            geom: entity.geom.into(),
+        }
+    }
+}
+
+/// v7 のエンティティ 1 件を表す凍結 DTO（後方互換読込専用）。現行の [`FileEntity`] との
+/// 差は `geom` が [`EntityGeomV7`]（表が `kind` を持たない）であること。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct FileEntityV7 {
+    layer: usize,
+    style: Style,
+    geom: EntityGeomV7,
+}
+
+impl From<FileEntityV7> for FileEntity {
+    fn from(entity: FileEntityV7) -> Self {
         FileEntity {
             layer: entity.layer,
             style: entity.style,
@@ -837,7 +1041,7 @@ impl From<FileEntityV6> for FileEntity {
 /// そのものへ直接デシリアライズするため、フィールドを持たせても使わない）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FileDocumentV4 {
-    sheet: SheetMeta,
+    sheet: SheetMetaV7,
     layers: Vec<FileLayer>,
     current_layer: usize,
     entities: Vec<FileEntityV5>,
@@ -858,9 +1062,9 @@ impl FileDocumentV4 {
         }
     }
 
-    /// v4 DTO を現行の v7 [`FileDocument`] へ変換する（v5 → v6 → v7 と 1 段ずつ）。
-    fn into_v7(self) -> FileDocument {
-        self.into_v5().into_v6().into_v7()
+    /// v4 DTO を現行の v8 [`FileDocument`] へ変換する（v5 → v6 → v7 → v8 と 1 段ずつ）。
+    fn into_v8(self) -> FileDocument {
+        self.into_v5().into_v6().into_v7().into_v8()
     }
 }
 
@@ -875,7 +1079,7 @@ impl FileDocumentV4 {
 /// `version` フィールドを持たない（[`FileDocumentV4`] と同じ理由）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FileDocumentV5 {
-    sheet: SheetMeta,
+    sheet: SheetMetaV7,
     layers: Vec<FileLayer>,
     current_layer: usize,
     entities: Vec<FileEntityV5>,
@@ -906,7 +1110,7 @@ impl FileDocumentV5 {
 /// `version` フィールドを持たない（[`FileDocumentV4`] と同じ理由）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FileDocumentV6 {
-    sheet: SheetMeta,
+    sheet: SheetMetaV7,
     layers: Vec<FileLayer>,
     current_layer: usize,
     entities: Vec<FileEntityV6>,
@@ -915,16 +1119,48 @@ struct FileDocumentV6 {
 }
 
 impl FileDocumentV6 {
-    /// v6 DTO を現行の v7 [`FileDocument`] へ変換する（`entities` の
-    /// [`EntityGeomV6`] を現行 [`EntityGeom`] へ写す＝長さ寸法へ
+    /// v6 DTO を v7 相当の凍結 DTO（[`FileDocumentV7`]）へ変換する（`entities` の
+    /// [`EntityGeomV6`] を [`EntityGeomV7`] へ引き上げる＝長さ寸法へ
     /// [`DimDirection::Aligned`] を補う以外は無変換）。
-    fn into_v7(self) -> FileDocument {
-        FileDocument {
-            version: FORMAT_VERSION,
+    fn into_v7(self) -> FileDocumentV7 {
+        FileDocumentV7 {
             sheet: self.sheet,
             layers: self.layers,
             current_layer: self.current_layer,
             entities: self.entities.into_iter().map(FileEntityV6::into).collect(),
+            dim_style: self.dim_style,
+        }
+    }
+}
+
+/// v7 ファイル全体を表す凍結 DTO（後方互換読込専用。M12 タスク81 で凍結）。v8 との差は
+/// `sheet` が [`SheetMetaV7`]（`use_bom` を持たない）で、`entities` が [`EntityGeomV7`]
+/// （表が `kind` を持たない）であること。レイヤー・`dim_style` は v8 で変わっていない
+/// ので現行の型を共有する。
+///
+/// `dim_style` の `#[serde(default)]` は v7 当時の [`FileDocument`] と同じ（v7 として
+/// 受理していた範囲を狭めない）。`version` フィールドを持たない（[`FileDocumentV4`] と
+/// 同じ理由）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct FileDocumentV7 {
+    sheet: SheetMetaV7,
+    layers: Vec<FileLayer>,
+    current_layer: usize,
+    entities: Vec<FileEntityV7>,
+    #[serde(default)]
+    dim_style: DimStyle,
+}
+
+impl FileDocumentV7 {
+    /// v7 DTO を現行の v8 [`FileDocument`] へ変換する（表は [`TableKind::Table`]、
+    /// 「部品表を使う」は ON で補う以外は無変換。**中身から部品表を推測しない**）。
+    fn into_v8(self) -> FileDocument {
+        FileDocument {
+            version: FORMAT_VERSION,
+            sheet: self.sheet.into(),
+            layers: self.layers,
+            current_layer: self.current_layer,
+            entities: self.entities.into_iter().map(FileEntityV7::into).collect(),
             dim_style: self.dim_style,
         }
     }
@@ -1104,9 +1340,12 @@ pub struct LoadSummary {
 ///   補完、幾何は [`EntityGeomV5`] に固定＝表を持たない）
 /// - `6`: [`FileDocumentV6`]（表・矢先種別はあるが、幾何は [`EntityGeomV6`] に
 ///   固定＝長さ寸法が `direction` を持たない → [`DimDirection::Aligned`] 補完）
-/// - `7`（[`FORMAT_VERSION`]）: 現行の [`FileDocument`]（長さ寸法の向きを含む）
+/// - `7`: [`FileDocumentV7`]（長さ寸法の向きはあるが、表は [`TableGeomV7`]・図面
+///   メタデータは [`SheetMetaV7`] に固定＝種類・「部品表を使う」を持たない →
+///   [`TableKind::Table`]・ON 補完）
+/// - `8`（[`FORMAT_VERSION`]）: 現行の [`FileDocument`]（表の種類・「部品表を使う」を含む）
 ///
-/// それ以外は [`IoError::UnsupportedVersion`] を返す。書き出しは常に v7。
+/// それ以外は [`IoError::UnsupportedVersion`] を返す。書き出しは常に v8。
 ///
 /// v3 以前の旧線幅はモジュール doc の規則で移行し、クランプ件数を
 /// [`LoadSummary::clamped_widths`] で返す。
@@ -1115,10 +1354,14 @@ pub struct LoadSummary {
 /// 失敗する（暗黙の既定値で埋めない = 壊れたファイルを検出できる）。同様に、
 /// 不正な尺度・線幅（0・負・範囲外）も検証済み型の `try_from` が
 /// [`IoError::Json`] として弾く。v4/v5 として読むファイルに `Table` ジオメトリを、
-/// v1〜v6 として読むファイルに長さ寸法の `direction` を手編集で混ぜても、凍結 DTO
-/// （[`EntityGeomV5`] / [`DimLinearV6`]）が受け付けないため [`IoError::Json`] で
-/// 拒否される（モジュール doc「汎用テーブルと矢先種別の永続化」・「長さ寸法の
-/// 向きの永続化」参照）。
+/// v1〜v6 として読むファイルに長さ寸法の `direction` を、v4〜v7 として読むファイルに
+/// 表の `kind`・図面の `use_bom` を手編集で混ぜても、凍結 DTO（[`EntityGeomV5`] /
+/// [`DimLinearV6`] / [`TableGeomV7`] / [`SheetMetaV7`]）が受け付けないため
+/// [`IoError::Json`] で拒否される（モジュール doc「汎用テーブルと矢先種別の永続化」・
+/// 「長さ寸法の向きの永続化」・「表の種類・部品表を使う」参照）。
+///
+/// 部品表を 2 つ持つ v8 ファイルは、再構築の `Document::apply` が拒否して
+/// [`IoError::Core`]（[`mcad_core::CoreError::BomAlreadyExists`]）になる。
 ///
 /// # Errors
 ///
@@ -1133,21 +1376,28 @@ pub fn from_json(json: &str) -> Result<LoadSummary, IoError> {
     }
     let probe: VersionProbe = serde_json::from_str(json)?;
     let migrated = match probe.version {
-        1 => serde_json::from_str::<FileDocumentV1>(json)?.into_v7(),
-        2 => serde_json::from_str::<FileDocumentV2>(json)?.into_v7(),
-        3 => serde_json::from_str::<FileDocumentV3>(json)?.into_v7(),
+        1 => serde_json::from_str::<FileDocumentV1>(json)?.into_v8(),
+        2 => serde_json::from_str::<FileDocumentV2>(json)?.into_v8(),
+        3 => serde_json::from_str::<FileDocumentV3>(json)?.into_v8(),
         4 => MigratedFile {
-            file: serde_json::from_str::<FileDocumentV4>(json)?.into_v7(),
+            file: serde_json::from_str::<FileDocumentV4>(json)?.into_v8(),
             clamped_widths: 0,
         },
         5 => MigratedFile {
             file: serde_json::from_str::<FileDocumentV5>(json)?
                 .into_v6()
-                .into_v7(),
+                .into_v7()
+                .into_v8(),
             clamped_widths: 0,
         },
         6 => MigratedFile {
-            file: serde_json::from_str::<FileDocumentV6>(json)?.into_v7(),
+            file: serde_json::from_str::<FileDocumentV6>(json)?
+                .into_v7()
+                .into_v8(),
+            clamped_widths: 0,
+        },
+        7 => MigratedFile {
+            file: serde_json::from_str::<FileDocumentV7>(json)?.into_v8(),
             clamped_widths: 0,
         },
         FORMAT_VERSION => MigratedFile {
@@ -1276,6 +1526,7 @@ mod tests {
                 revision: "B".to_owned(),
             },
             frame_visible: true,
+            use_bom: false,
         }
     }
 
@@ -1349,12 +1600,12 @@ mod tests {
 
     #[test]
     fn unsupported_version_fails() {
-        // 現行は v7。未知の将来バージョン（8）は拒否する。
+        // 現行は v8。未知の将来バージョン（9）は拒否する。
         let mut file = export_document(&Document::new());
-        file.version = 8;
+        file.version = 9;
         assert!(matches!(
             import_document(&file),
-            Err(IoError::UnsupportedVersion(8))
+            Err(IoError::UnsupportedVersion(9))
         ));
     }
 
@@ -2002,12 +2253,12 @@ mod tests {
     }
 
     #[test]
-    fn exported_json_declares_version_7() {
+    fn exported_json_declares_version_8() {
         let (doc, _geom) = document_with_annotated_dim_linear();
         let json = to_json(&doc).unwrap();
         assert!(
-            json.contains(r#""version": 7"#),
-            "export した JSON は version 7 を書くべき: {json}"
+            json.contains(r#""version": 8"#),
+            "export した JSON は version 8 を書くべき: {json}"
         );
     }
 
@@ -2265,6 +2516,7 @@ mod tests {
         let layer = doc.default_layer();
         doc.apply(Command::AddEntity(Entity::new(
             EntityGeom::Table(TableGeom {
+                kind: mcad_core::TableKind::Table,
                 anchor: Point2::new(5.0, -3.0),
                 col_widths_mm: vec![15.0, 65.0, 15.0, 35.0, 40.0],
                 row_heights_mm: vec![8.0, 8.0],
@@ -2815,6 +3067,243 @@ mod tests {
         let loaded = import_document(&file).expect("2π 超は正規化も拒否もしない");
         let (_, entity) = loaded.entities().next().unwrap();
         assert_eq!(entity.geom, dim(12.0));
+    }
+
+    // -----------------------------------------------------------------
+    // v8（M12 タスク81）: 表の種類・部品表を使う
+    // -----------------------------------------------------------------
+
+    /// 部品表（`kind = Bom`）の表。`x` でアンカーをずらす。
+    fn bom_table_at(x: f64) -> EntityGeom {
+        EntityGeom::Table(TableGeom {
+            kind: TableKind::Bom,
+            anchor: Point2::new(x, 0.0),
+            col_widths_mm: vec![10.0, 35.0],
+            row_heights_mm: vec![8.0, 8.0],
+            text_height_mm: 3.5,
+            cells: vec![
+                "1".to_owned(),
+                "ベース".to_owned(),
+                "部番".to_owned(),
+                "名称".to_owned(),
+            ],
+        })
+    }
+
+    /// v7 の本文（`v5_json` を版数だけ 7 へ振り替えたもの）に任意の `geom` を差し込む。
+    fn v7_json_with_geom(geom: &str) -> String {
+        v6_json_with_dimension(geom).replacen("\"version\": 6", "\"version\": 7", 1)
+    }
+
+    /// `sheet` に任意のキーを 1 つ足す（`"frame_visible": false` の直後へ差し込む）。
+    fn with_sheet_key(json: &str, key_value: &str) -> String {
+        let replaced = json.replacen(
+            r#""frame_visible": false"#,
+            &format!(r#""frame_visible": false, {key_value}"#),
+            1,
+        );
+        assert_ne!(replaced, json, "テスト前提: 置換が効いている");
+        replaced
+    }
+
+    #[test]
+    fn v8_round_trip_is_lossless_for_table_kind_and_use_bom() {
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::SetSheet(SheetMeta {
+            use_bom: false,
+            ..SheetMeta::default()
+        }))
+        .unwrap();
+        for geom in [
+            bom_table_at(0.0),
+            EntityGeom::Table(TableGeom {
+                kind: TableKind::Table,
+                ..match bom_table_at(100.0) {
+                    EntityGeom::Table(t) => t,
+                    _ => unreachable!(),
+                }
+            }),
+        ] {
+            doc.apply(Command::AddEntity(Entity::new(
+                geom,
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        }
+
+        let exported = export_document(&doc);
+        assert_eq!(exported.version, 8);
+        let json = to_json(&doc).unwrap();
+        assert!(json.contains(r#""kind": "Bom""#), "部品表の種類: {json}");
+        assert!(
+            json.contains(r#""kind": "Table""#),
+            "表の種類も書く: {json}"
+        );
+        assert!(json.contains(r#""use_bom": false"#), "部品表を使う: {json}");
+
+        let loaded = load(&json).unwrap();
+        assert_eq!(
+            export_document(&loaded),
+            exported,
+            "v8 往復は無損失であるべき"
+        );
+        assert!(!loaded.sheet().use_bom);
+        assert!(loaded.bom().is_some());
+    }
+
+    #[test]
+    fn v8_file_missing_table_kind_is_rejected() {
+        // 正規の v8 は `kind` を必ず書く。手編集で消したファイルは壊れているか
+        // 別版のプログラムが書いたものなので、既定値（Table）で補わず拒否する
+        // （Codex adversarial review 指摘。DESIGN.md M12 設計判断1）。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            bom_table_at(0.0),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&to_json(&doc).unwrap()).unwrap();
+        value["entities"][0]["geom"]["Table"]
+            .as_object_mut()
+            .unwrap()
+            .remove("kind");
+        let stripped = serde_json::to_string(&value).unwrap();
+        assert!(!stripped.contains(r#""kind""#), "テスト前提: {stripped}");
+        assert!(
+            matches!(load(&stripped), Err(IoError::Json(_))),
+            "kind を欠く v8 は拒否されるべき"
+        );
+    }
+
+    #[test]
+    fn v8_file_missing_use_bom_is_rejected() {
+        // 正規の v8 は `use_bom` を必ず書く。欠落を ON で補うと、OFF にした図面が
+        // 次の保存で黙って ON へ確定してしまうため拒否する
+        // （Codex adversarial review 指摘。DESIGN.md M12 設計判断1）。
+        let mut doc = Document::new();
+        doc.apply(Command::SetSheet(SheetMeta {
+            use_bom: false,
+            ..SheetMeta::default()
+        }))
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&to_json(&doc).unwrap()).unwrap();
+        value["sheet"].as_object_mut().unwrap().remove("use_bom");
+        let stripped = serde_json::to_string(&value).unwrap();
+        assert!(!stripped.contains(r#""use_bom""#), "テスト前提: {stripped}");
+        assert!(
+            matches!(load(&stripped), Err(IoError::Json(_))),
+            "use_bom を欠く v8 は拒否されるべき"
+        );
+    }
+
+    #[test]
+    fn v7_file_with_table_kind_is_rejected() {
+        // v7 以前の表に「種類」の概念は無い。凍結 DTO（`TableGeomV7`）が
+        // `deny_unknown_fields` なので、手編集で混ぜると読込ごと失敗する
+        // （`"Table"` でも拒否する。`direction: "Aligned"` を拒否するのと同じ）。
+        for kind in ["Bom", "Table"] {
+            let geom = format!(
+                r#"{{"Table": {{"kind": "{kind}", "anchor": {{"x": 0.0, "y": 0.0}},
+                    "col_widths_mm": [30.0], "row_heights_mm": [8.0], "text_height_mm": 3.5,
+                    "cells": [""]}}}}"#
+            );
+            for json in [v7_json_with_geom(&geom), v6_json_with_dimension(&geom)] {
+                assert!(
+                    matches!(from_json(&json), Err(IoError::Json(_))),
+                    "kind を持つ旧版ファイルは拒否されるべき: {json}"
+                );
+            }
+        }
+        // 前提: kind の無い同じ表は v6/v7 とも読める。
+        assert!(from_json(&v7_json_with_geom(TABLE_GEOM_JSON)).is_ok());
+        assert!(from_json(&v6_json_with_dimension(TABLE_GEOM_JSON)).is_ok());
+    }
+
+    #[test]
+    fn v7_file_with_use_bom_is_rejected() {
+        // v7 以前の `sheet` に「部品表を使う」は無い。凍結 DTO（`SheetMetaV7`）が
+        // `deny_unknown_fields` なので、v4〜v7 と自称するファイルに混ぜると読込ごと失敗する
+        // （黙って無視して ON で読むと、OFF の図面が ON へすり替わる）。
+        let default_style = serde_json::to_string(&DimStyle::default()).unwrap();
+        let v5 = v5_json(r#"{"num": 1, "den": 1}"#, "0.35", "null", &default_style);
+        let bases = [
+            v4_json(r#"{"num": 1, "den": 1}"#, "0.35", "null"),
+            v5.clone(),
+            v5.replacen("\"version\": 5", "\"version\": 6", 1),
+            v5.replacen("\"version\": 5", "\"version\": 7", 1),
+        ];
+        for base in &bases {
+            assert!(
+                from_json(base).is_ok(),
+                "テスト前提: 素の旧版は読める: {base}"
+            );
+            for key_value in [r#""use_bom": false"#, r#""use_bom": true"#] {
+                let json = with_sheet_key(base, key_value);
+                assert!(
+                    matches!(from_json(&json), Err(IoError::Json(_))),
+                    "use_bom を持つ旧版ファイルは拒否されるべき: {json}"
+                );
+            }
+            // 凍結 DTO は use_bom 以外の未知のキーも拒否する（`SheetMetaV7` の doc）。
+            let json = with_sheet_key(base, r#""unknown_key": 1"#);
+            assert!(matches!(from_json(&json), Err(IoError::Json(_))), "{json}");
+        }
+    }
+
+    #[test]
+    fn v8_file_with_two_boms_is_rejected() {
+        // 部品表は 1 図面に 1 つ（core の不変条件）。手編集で 2 つにした v8 は、再構築の
+        // `Document::apply` が拒否して `IoError::Core` になる（不正な表と同じ扱い）。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            bom_table_at(0.0),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        // (a) DTO を直接渡す公開 API。
+        let mut file = export_document(&doc);
+        file.entities.push(FileEntity {
+            layer: 0,
+            style: Style::inherited(),
+            geom: bom_table_at(200.0),
+        });
+        assert!(matches!(
+            import_document(&file),
+            Err(IoError::Core(mcad_core::CoreError::BomAlreadyExists(_)))
+        ));
+
+        // (b) JSON 経由（エンティティを複製しただけの手編集ファイル）。
+        let mut value: serde_json::Value = serde_json::from_str(&to_json(&doc).unwrap()).unwrap();
+        let entities = value["entities"].as_array_mut().unwrap();
+        let duplicate = entities[0].clone();
+        entities.push(duplicate);
+        let json = serde_json::to_string(&value).unwrap();
+        assert!(matches!(
+            from_json(&json),
+            Err(IoError::Core(mcad_core::CoreError::BomAlreadyExists(_)))
+        ));
+
+        // 前提: 部品表 1 つ + 表 1 つなら読める。
+        let mut file = export_document(&doc);
+        file.entities.push(FileEntity {
+            layer: 0,
+            style: Style::inherited(),
+            geom: EntityGeom::Table(TableGeom {
+                kind: TableKind::Table,
+                ..match bom_table_at(200.0) {
+                    EntityGeom::Table(t) => t,
+                    _ => unreachable!(),
+                }
+            }),
+        });
+        assert!(import_document(&file).is_ok());
     }
 
     #[test]

@@ -31,7 +31,7 @@ use mcad_core::{
     ArrowPlacement, Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimExpansion,
     DimKind, DimLinear, DimOrdinate, DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom,
     EntityId, FitClass, Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize,
-    ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style, TableGeom, TextGeom,
+    ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style, TableGeom, TableKind, TextGeom,
     TitleBlockFields, TitleBlockKind, ValueStyle, WidthMm, arrow_kind_occupies_line, expand_dim,
     expand_table, label_box_center, label_box_contains, linear_pick_segments, table_world_aabb,
 };
@@ -6001,6 +6001,9 @@ fn dim_style_panel(
 struct TableDialogState {
     /// 適用先エンティティの ID。
     id: EntityId,
+    /// 表の種類（M12 タスク81）。このダイアログでは編集しない（部品表を編集しても
+    /// 表へ戻らないよう、開いた時点の値をそのまま書き戻す）。
+    kind: TableKind,
     /// 表のアンカー（左下、ワールド座標）。このダイアログでは編集しない。
     anchor: Point2,
     /// セル文字列の作業コピー（行優先、行 0 = 最上段。`cells[r][c]`）。
@@ -6045,6 +6048,7 @@ impl TableDialogState {
         };
         Self {
             id,
+            kind: table.kind,
             anchor: table.anchor,
             cells,
             col_widths_mm,
@@ -6122,6 +6126,7 @@ fn build_table_from_dialog(state: &TableDialogState) -> Result<TableGeom, String
         .flat_map(|row| row.iter().cloned())
         .collect();
     let table = TableGeom {
+        kind: state.kind,
         anchor: state.anchor,
         col_widths_mm,
         row_heights_mm,
@@ -9940,6 +9945,7 @@ mod tests {
             title_block: TitleBlockKind::C,
             fields: mcad_core::TitleBlockFields::default(),
             frame_visible: false,
+            use_bom: true,
         };
         let document = fresh_document(sheet.clone());
 
@@ -10660,6 +10666,7 @@ mod tests {
     /// 2 行 3 列（列幅 10mm・行高さ 8mm）の表。1:1 のワールド AABB は 30mm × 16mm。
     fn sample_table(anchor: Point2) -> TableGeom {
         TableGeom {
+            kind: TableKind::Table,
             anchor,
             col_widths_mm: vec![10.0, 10.0, 10.0],
             row_heights_mm: vec![8.0, 8.0],
@@ -11326,6 +11333,7 @@ mod tests {
     /// 同じ）。セルは行優先で連番の文字列を入れる（並び順の確認用）。
     fn default_table_for_dialog_tests() -> TableGeom {
         TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::new(1.0, 2.0),
             col_widths_mm: vec![30.0; 3],
             row_heights_mm: vec![8.0; 3],
@@ -11340,6 +11348,15 @@ mod tests {
         let dialog = TableDialogState::from_table(EntityId::default(), &table);
         let rebuilt = build_table_from_dialog(&dialog).expect("valid round trip");
         assert_eq!(rebuilt, table);
+
+        // 部品表を編集しても種類は変わらない（M12 タスク81。表へ黙って戻さない）。
+        let bom = TableGeom {
+            kind: TableKind::Bom,
+            ..table
+        };
+        let dialog = TableDialogState::from_table(EntityId::default(), &bom);
+        let rebuilt = build_table_from_dialog(&dialog).expect("valid round trip");
+        assert_eq!(rebuilt, bom);
     }
 
     #[test]

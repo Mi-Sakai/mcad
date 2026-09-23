@@ -765,7 +765,7 @@ mod tests {
     use crate::frame::{CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
     use mcad_core::{
         Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimStyle, Layer,
-        Scale, SheetMeta, SizeTolerance, Style, WidthMm, expand_linear,
+        Scale, SheetMeta, SizeTolerance, Style, TableKind, WidthMm, expand_linear,
     };
     use mcad_geom::{ArrowKind, Circle, LineSeg, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
@@ -1422,6 +1422,7 @@ mod tests {
     /// 3 行 2 列・列幅 20/30mm・行高さ 8mm・文字高さ 3.5mm、セルは 3 つだけ非空。
     fn sample_table(anchor: Point2) -> TableGeom {
         TableGeom {
+            kind: TableKind::Table,
             anchor,
             col_widths_mm: vec![20.0, 30.0],
             row_heights_mm: vec![8.0, 8.0, 8.0],

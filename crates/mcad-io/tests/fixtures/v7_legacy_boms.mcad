@@ -1,0 +1,55 @@
+{
+  "version": 7,
+  "sheet": {
+    "unit": "Millimeter",
+    "scale": {"num": 1, "den": 1},
+    "paper": "A3",
+    "orientation": "Landscape",
+    "title_block": "A",
+    "fields": {
+      "drawing_number": "MCAD-V7-002",
+      "drawing_title": "v7 legacy boms",
+      "projection": "ThirdAngle",
+      "author": "almaz",
+      "date": "2026-09-22",
+      "revision": "B"
+    },
+    "frame_visible": true
+  },
+  "layers": [
+    {"name": "0", "color": {"r": 255, "g": 255, "b": 255},
+     "linetype": "Continuous", "width_mm": 0.35,
+     "visible": true, "locked": false, "order": 0}
+  ],
+  "current_layer": 0,
+  "entities": [
+    {"layer": 0, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"Shape": {"Line": {"a": {"x": 0.0, "y": 0.0}, "b": {"x": 50.0, "y": 0.0}}}}},
+    {"layer": 0, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"Table": {"anchor": {"x": 240.0, "y": 50.0},
+       "col_widths_mm": [15.0, 65.0, 15.0, 35.0, 40.0],
+       "row_heights_mm": [8.0, 8.0, 8.0],
+       "text_height_mm": 3.5,
+       "cells": ["2", "ボルト", "4", "SS400", "",
+                 "1", "ブラケット", "1", "SS400", "焼入れ",
+                 "品番", "名称", "個数", "材質", "備考"]}}},
+    {"layer": 0, "style": {"color": null, "width_mm": null, "linetype": null},
+     "geom": {"Table": {"anchor": {"x": 240.0, "y": 120.0},
+       "col_widths_mm": [10.0, 35.0, 35.0, 10.0, 30.0, 20.0, 30.0],
+       "row_heights_mm": [8.0, 8.0],
+       "text_height_mm": 3.5,
+       "cells": ["1", "MCAD-V7-002-01", "ベース", "1", "S45C", "0.520", "",
+                 "部番", "品番", "名称", "個数", "材質", "質量[kg]", "備考"]}}}
+  ],
+  "dim_style": {
+    "text_height_mm": 3.5,
+    "arrow_len_mm": 5.0,
+    "decimals": 2,
+    "trim_trailing_zeros": true,
+    "ext_gap_mm": 1.0,
+    "ext_overshoot_mm": 2.0,
+    "text_gap_mm": 1.4,
+    "tolerance_scale": 0.7,
+    "arrow_kind": "ClosedFilled"
+  }
+}

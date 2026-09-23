@@ -3686,6 +3686,7 @@ mod tests {
         let layer = doc.current_layer();
         doc.apply(Command::AddEntity(Entity::new(
             EntityGeom::Table(TableGeom {
+                kind: mcad_core::TableKind::Table,
                 anchor: Point2::new(10.0, 20.0),
                 col_widths_mm: vec![30.0, 20.0],
                 row_heights_mm: vec![8.0, 8.0],
@@ -3744,6 +3745,7 @@ mod tests {
         let layer = doc.current_layer();
         doc.apply(Command::AddEntity(Entity::new(
             EntityGeom::Table(TableGeom {
+                kind: mcad_core::TableKind::Table,
                 anchor: Point2::new(0.0, 0.0),
                 col_widths_mm: vec![30.0],
                 row_heights_mm: vec![8.0],
@@ -3788,6 +3790,7 @@ mod tests {
         let layer = doc.current_layer();
         doc.apply(Command::AddEntity(Entity::new(
             EntityGeom::Table(TableGeom {
+                kind: mcad_core::TableKind::Table,
                 anchor: Point2::new(0.0, 0.0),
                 col_widths_mm: vec![30.0],
                 row_heights_mm: vec![8.0],

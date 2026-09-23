@@ -285,6 +285,18 @@ impl Document {
         ordered
     }
 
+    /// 図面の部品表（[`crate::TableKind::Bom`] の表）の ID。無ければ `None`。
+    ///
+    /// **部品表は 1 図面に高々 1 つ**（[`Document::apply`] が守る不変条件。M12 タスク81、
+    /// DESIGN.md M12 設計判断1）なので、答えは一意に決まる。削除済み（墓標）は数えない。
+    /// 生存エンティティを走査する O(n)。
+    #[must_use]
+    pub fn bom(&self) -> Option<EntityId> {
+        self.entities()
+            .find(|(_, e)| e.geom.is_bom())
+            .map(|(id, _)| id)
+    }
+
     /// 生存エンティティ数。
     #[must_use]
     pub fn entity_count(&self) -> usize {
@@ -355,7 +367,8 @@ impl Document {
     /// # Errors
     ///
     /// 存在しない ID への操作、デフォルト/カレント/非空レイヤーの削除、
-    /// ロックされたレイヤー上のエンティティへの変更・削除などで [`CoreError`] を返す。
+    /// ロックされたレイヤー上のエンティティへの変更・削除、2 つ目の部品表を作る
+    /// 追加・変更（[`CoreError::BomAlreadyExists`]）などで [`CoreError`] を返す。
     pub fn apply(&mut self, cmd: Command) -> Result<NewIds, CoreError> {
         // 原子性（検証→変更、失敗時のロールバック）の保証内容は [`Command::Batch`] の
         // doc（「# 原子性」節）を参照。no-op 判定の仕組みは [`ExecuteOutcome`] の doc を参照。
@@ -434,6 +447,8 @@ impl Document {
                 // 宙に浮いた layer 参照を防ぐため所属レイヤーの存在を検証し、
                 // ロック済みレイヤーへの追加も Modify/Remove と対称に拒否する。
                 self.require_editable_layer(entity.layer)?;
+                // 部品表は 1 図面に 1 つ（M12 タスク81）。
+                self.ensure_single_bom(&entity.geom, None)?;
                 let id = self.entities.insert(Some(entity.clone()));
                 // 追加は常に状態を変えるので changed = true。
                 Ok(ExecuteOutcome {
@@ -458,6 +473,9 @@ impl Document {
                 // （DESIGN.md M4 タスク15）。
                 new_geom.validate().map_err(CoreError::InvalidGeometry)?;
                 self.require_editable_entity(id)?;
+                // 部品表は 1 図面に 1 つ（M12 タスク81）。対象自身が既に部品表なら数えない
+                // （部品表の移動・編集は通す）。部品表 → 表は常に通る。
+                self.ensure_single_bom(&new_geom, Some(id))?;
                 let slot = self.live_entity_mut(id);
                 let before = std::mem::replace(&mut slot.geom, new_geom.clone());
                 // 同一幾何への差し替えは意味的 no-op（履歴を汚さない）。
@@ -735,6 +753,43 @@ impl Document {
         self.ensure_layer_unlocked(layer_id)
     }
 
+    /// 「部品表は 1 図面に 1 つ」（M12 タスク81、DESIGN.md M12 設計判断1）の実行前チェック。
+    ///
+    /// `geom` が部品表のとき、`except`（`ModifyEntity` の対象自身）以外の生存エンティティに
+    /// 部品表があれば、既存の部品表の ID を載せた [`CoreError::BomAlreadyExists`] を返す。
+    /// 部品表でない `geom` は走査せず即 `Ok`（表・図形の追加に O(n) を払わない）。
+    ///
+    /// # 判定は「その時点の状態」に対して行う
+    ///
+    /// [`Command::Batch`] のサブコマンドも 1 つずつこのチェックを通るので、**バッチの
+    /// 途中の状態でも**部品表が 2 つになることは無い。したがって「部品表 A を表に戻して
+    /// から表 B を部品表にする」順のバッチは通り、逆順は B の時点で拒否される（失敗時は
+    /// 既存の原子性でバッチ全体が巻き戻る）。バッチ末尾だけで判定する案は採らなかった:
+    /// 途中状態の検証を新たに持ち込まずに済み、他の実行前チェック（ロック等）と同じ
+    /// 「サブコマンドごと」の規則に揃うため。
+    ///
+    /// # undo/redo はこのチェックを通らない
+    ///
+    /// `revert`/`reapply` はロック判定と同じくこのチェックを通らないが、不変条件は破れない:
+    /// undo/redo が到達するのは、いずれも過去に `apply`（このチェックを含む）が受理した
+    /// 状態そのものだから（履歴は線形で、新しい `apply` は redo スタックを捨てる）。
+    fn ensure_single_bom(
+        &self,
+        geom: &EntityGeom,
+        except: Option<EntityId>,
+    ) -> Result<(), CoreError> {
+        if !geom.is_bom() {
+            return Ok(());
+        }
+        match self
+            .entities()
+            .find(|(id, e)| Some(*id) != except && e.geom.is_bom())
+        {
+            Some((existing, _)) => Err(CoreError::BomAlreadyExists(existing)),
+            None => Ok(()),
+        }
+    }
+
     /// 生存エンティティを取り出してスロットを墓標化する。生存を前提とする。
     fn take_entity(&mut self, id: EntityId) -> Entity {
         self.entities
@@ -806,8 +861,8 @@ mod tests {
     use crate::{
         ArrowPlacement, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimStyle, FitClass,
         Linetype, MAX_DIM_DECIMALS, MAX_SCALE_TERM, MAX_TABLE_MM, MAX_TABLE_ROWS, Orientation,
-        PaperSize, ProjectionMethod, Scale, SizeTolerance, Style, TableGeom, TitleBlockFields,
-        TitleBlockKind, TitleBlockTemplate, Unit, ValueStyle, WidthMm,
+        PaperSize, ProjectionMethod, Scale, SizeTolerance, Style, TableGeom, TableKind,
+        TitleBlockFields, TitleBlockKind, TitleBlockTemplate, Unit, ValueStyle, WidthMm,
     };
     use mcad_geom::{ArrowKind, DimSymbol, LineSeg, Point2, Shape};
 
@@ -2132,6 +2187,7 @@ mod tests {
     /// 2 行 × 3 列の妥当な表（幅 120mm・高さ 18mm・文字 3.5mm）。
     fn table() -> TableGeom {
         TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::new(10.0, 20.0),
             col_widths_mm: vec![30.0, 40.0, 50.0],
             row_heights_mm: vec![8.0, 10.0],
@@ -2283,6 +2339,248 @@ mod tests {
         }
     }
 
+    // --- 部品表は 1 図面に 1 つ（M12 タスク81、DESIGN.md M12 設計判断1）---
+
+    /// 部品表（[`TableKind::Bom`]）の幾何。`x` でアンカーをずらして別物にする。
+    fn bom_at(x: f64) -> EntityGeom {
+        EntityGeom::Table(TableGeom {
+            kind: TableKind::Bom,
+            anchor: Point2::new(x, 0.0),
+            ..table()
+        })
+    }
+
+    /// 汎用の表（[`TableKind::Table`]）の幾何。
+    fn plain_table_at(x: f64) -> EntityGeom {
+        EntityGeom::Table(TableGeom {
+            anchor: Point2::new(x, 0.0),
+            ..table()
+        })
+    }
+
+    /// 生存している部品表の数（不変条件の観測用。[`Document::bom`] とは独立に数える）。
+    fn bom_count(doc: &Document) -> usize {
+        doc.entities().filter(|(_, e)| e.geom.is_bom()).count()
+    }
+
+    #[test]
+    fn document_bom_reports_the_single_bom() {
+        let mut doc = Document::new();
+        assert_eq!(doc.bom(), None);
+        // 汎用の表は部品表ではない。
+        doc.apply(add_line(&doc, plain_table_at(0.0))).unwrap();
+        assert_eq!(doc.bom(), None);
+        let layer = doc.current_layer();
+        let bom = add_entity_get_id(
+            &mut doc,
+            Entity::new(bom_at(200.0), layer, Style::inherited()),
+        );
+        assert_eq!(doc.bom(), Some(bom));
+    }
+
+    #[test]
+    fn second_bom_is_rejected_by_add_entity_without_mutating() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let first = add_entity_get_id(
+            &mut doc,
+            Entity::new(bom_at(0.0), layer, Style::inherited()),
+        );
+        let count_before = doc.entity_count();
+        let generation_before = doc.generation();
+        let undo_len_before = doc.undo_stack.len();
+
+        let result = doc.apply(add_line(&doc, bom_at(200.0)));
+        assert_eq!(result, Err(CoreError::BomAlreadyExists(first)));
+        assert_eq!(doc.entity_count(), count_before);
+        assert_eq!(doc.generation(), generation_before);
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+        assert_eq!(bom_count(&doc), 1);
+
+        // 汎用の表はいくつでも足せる。
+        doc.apply(add_line(&doc, plain_table_at(400.0))).unwrap();
+        doc.apply(add_line(&doc, plain_table_at(600.0))).unwrap();
+        assert_eq!(bom_count(&doc), 1);
+    }
+
+    #[test]
+    fn modify_entity_rejects_a_second_bom_but_allows_editing_the_bom_itself() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let bom = add_entity_get_id(
+            &mut doc,
+            Entity::new(bom_at(0.0), layer, Style::inherited()),
+        );
+        let plain = add_entity_get_id(
+            &mut doc,
+            Entity::new(plain_table_at(200.0), layer, Style::inherited()),
+        );
+
+        // 表 → 部品表（2 つ目）は拒否。表は変わらず、履歴も積まれない。
+        let undo_len_before = doc.undo_stack.len();
+        let result = doc.apply(Command::ModifyEntity {
+            id: plain,
+            new_geom: bom_at(200.0),
+        });
+        assert_eq!(result, Err(CoreError::BomAlreadyExists(bom)));
+        assert_eq!(doc.entity(plain).unwrap().geom, plain_table_at(200.0));
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+
+        // 部品表自身の移動・編集は通る（自分自身は数えない）。
+        doc.apply(Command::ModifyEntity {
+            id: bom,
+            new_geom: bom_at(50.0),
+        })
+        .unwrap();
+        assert_eq!(doc.bom(), Some(bom));
+
+        // 部品表 → 表（「表に戻す」）は常に通り、その後なら別の表を部品表にできる。
+        doc.apply(Command::ModifyEntity {
+            id: bom,
+            new_geom: plain_table_at(50.0),
+        })
+        .unwrap();
+        assert_eq!(doc.bom(), None);
+        doc.apply(Command::ModifyEntity {
+            id: plain,
+            new_geom: bom_at(200.0),
+        })
+        .unwrap();
+        assert_eq!(doc.bom(), Some(plain));
+        assert_eq!(bom_count(&doc), 1);
+    }
+
+    #[test]
+    fn batch_creating_a_second_bom_rolls_back_entirely() {
+        // (a) 既存の部品表があるところへ、図形 + 部品表を足すバッチ。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let bom = add_entity_get_id(
+            &mut doc,
+            Entity::new(bom_at(0.0), layer, Style::inherited()),
+        );
+        let count_before = doc.entity_count();
+        let generation_before = doc.generation();
+        let undo_len_before = doc.undo_stack.len();
+        let result = doc.apply(Command::Batch(vec![
+            add_line(&doc, line(5.0)),
+            add_line(&doc, bom_at(200.0)),
+        ]));
+        assert_eq!(result, Err(CoreError::BomAlreadyExists(bom)));
+        assert_eq!(doc.entity_count(), count_before, "先に足した図形も巻き戻る");
+        assert_eq!(doc.generation(), generation_before);
+        assert_eq!(doc.undo_stack.len(), undo_len_before);
+
+        // (b) 空の図面へ部品表を 2 つ足すバッチ（1 つ目もろとも巻き戻る）。
+        let mut doc = Document::new();
+        let result = doc.apply(Command::Batch(vec![
+            add_line(&doc, bom_at(0.0)),
+            add_line(&doc, bom_at(200.0)),
+        ]));
+        assert!(matches!(result, Err(CoreError::BomAlreadyExists(_))));
+        assert_eq!(doc.entity_count(), 0);
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn batch_is_checked_after_each_sub_command() {
+        // 判定はサブコマンドごとの途中状態に対して行う（`ensure_single_bom` の doc）。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let a = add_entity_get_id(
+            &mut doc,
+            Entity::new(bom_at(0.0), layer, Style::inherited()),
+        );
+        let b = add_entity_get_id(
+            &mut doc,
+            Entity::new(plain_table_at(200.0), layer, Style::inherited()),
+        );
+
+        // 先に B を部品表にする順は、途中で 2 つになるので全体が拒否・巻き戻る。
+        let result = doc.apply(Command::Batch(vec![
+            Command::ModifyEntity {
+                id: b,
+                new_geom: bom_at(200.0),
+            },
+            Command::ModifyEntity {
+                id: a,
+                new_geom: plain_table_at(0.0),
+            },
+        ]));
+        assert_eq!(result, Err(CoreError::BomAlreadyExists(a)));
+        assert_eq!(doc.bom(), Some(a));
+        assert_eq!(doc.entity(b).unwrap().geom, plain_table_at(200.0));
+
+        // 先に A を表に戻す順は通り、undo 1 回で両方戻る。
+        doc.apply(Command::Batch(vec![
+            Command::ModifyEntity {
+                id: a,
+                new_geom: plain_table_at(0.0),
+            },
+            Command::ModifyEntity {
+                id: b,
+                new_geom: bom_at(200.0),
+            },
+        ]))
+        .unwrap();
+        assert_eq!(doc.bom(), Some(b));
+        assert!(doc.undo());
+        assert_eq!(doc.bom(), Some(a));
+        assert_eq!(doc.entity(b).unwrap().geom, plain_table_at(200.0));
+        assert!(doc.redo());
+        assert_eq!(doc.bom(), Some(b));
+        assert_eq!(bom_count(&doc), 1);
+    }
+
+    #[test]
+    fn removed_bom_is_not_counted_and_undo_redo_keep_a_single_bom() {
+        // 部品表 A を削除 → 部品表 B を追加（墓標の A は数えない）→ undo/redo を往復。
+        // undo/redo は検査を通らないが、到達するのは過去に受理した状態だけなので、
+        // どの時点でも部品表は高々 1 つ。
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let a = add_entity_get_id(
+            &mut doc,
+            Entity::new(bom_at(0.0), layer, Style::inherited()),
+        );
+        doc.apply(Command::RemoveEntity(a)).unwrap();
+        assert_eq!(doc.bom(), None);
+        let b = add_entity_get_id(
+            &mut doc,
+            Entity::new(bom_at(200.0), layer, Style::inherited()),
+        );
+        assert_eq!(doc.bom(), Some(b));
+
+        // undo: B の追加を戻す → A の削除を戻す。
+        assert!(doc.undo());
+        assert_eq!(doc.bom(), None);
+        assert!(doc.undo());
+        assert_eq!(doc.bom(), Some(a));
+        assert_eq!(bom_count(&doc), 1);
+
+        // A が生き返った状態から新しい部品表を足す操作は拒否される（redo 側は温存）。
+        let result = doc.apply(add_line(&doc, bom_at(400.0)));
+        assert_eq!(result, Err(CoreError::BomAlreadyExists(a)));
+        assert!(doc.can_redo(), "拒否は redo スタックを捨てない");
+
+        // redo: A の削除 → B の追加。
+        assert!(doc.redo());
+        assert_eq!(doc.bom(), None);
+        assert!(doc.redo());
+        assert_eq!(doc.bom(), Some(b));
+        assert_eq!(bom_count(&doc), 1);
+
+        // 全部戻してから全部やり直しても、どの時点でも高々 1 つ。
+        while doc.undo() {
+            assert!(bom_count(&doc) <= 1);
+        }
+        assert_eq!(doc.entity_count(), 0);
+        while doc.redo() {
+            assert!(bom_count(&doc) <= 1);
+        }
+        assert_eq!(doc.bom(), Some(b));
+    }
+
     // --- 世代カウンタ（dirty 判定の基盤、DESIGN.md M4 タスク14）---
 
     #[test]
@@ -2418,6 +2716,7 @@ mod tests {
                 revision: "B".to_owned(),
             },
             frame_visible: true,
+            use_bom: false,
         }
     }
 

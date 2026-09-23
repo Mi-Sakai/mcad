@@ -2,7 +2,8 @@
 
 | ファイル | 用途 | テスト |
 |---|---|---|
-| `v1.mcad`〜`v7.mcad` | `.mcad` の後方互換 | `tests/backward_compat.rs` |
+| `v1.mcad`〜`v8.mcad` | `.mcad` の後方互換 | `tests/backward_compat.rs` |
+| `v7_legacy_boms.mcad` | v7 以前の旧部品表を表として読む(推測しない) | `tests/backward_compat.rs` |
 | `synthetic_dimensions.dxf` | 他 CAD が書いた DXF の DIMENSION import | `tests/dxf_dimensions.rs` |
 
 ## `synthetic_dimensions.dxf`
@@ -32,14 +33,15 @@ fixture 自体の役割は「今後の実装変更で読込結果が変わらな
 
 ## `.mcad` 後方互換 fixture
 
-`v1.mcad` 〜 `v7.mcad` は各フォーマットバージョンのスキーマが表現できる要素を
+`v1.mcad` 〜 `v8.mcad` は各フォーマットバージョンのスキーマが表現できる要素を
 一通り含む実ファイル。テストは `crates/mcad-io/tests/backward_compat.rs`。
 
 各版のスキーマの一次情報は `crates/mcad-io/src/mcad_file.rs` のモジュール doc と
 DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
-`DimLinearV6` 等）。fixture を手で書くときは必ずそちらを見て、その版のスキーマに
-存在しないキーを混ぜないこと（**v6 以前に `DimLinear.direction` を書くと読込が
-失敗する** — 凍結 DTO が未知フィールドを拒否する）。
+`EntityGeomV7` / `DimLinearV6` / `TableGeomV7` / `SheetMetaV7` 等）。fixture を手で
+書くときは必ずそちらを見て、その版のスキーマに存在しないキーを混ぜないこと
+（**v6 以前に `DimLinear.direction` を、v7 以前に表の `kind`・`sheet` の `use_bom` を
+書くと読込が失敗する** — 凍結 DTO が未知フィールドを拒否する）。
 
 **壊れた入力(不正 JSON・偽装 `Table` 等)のテストはここへ置かない。** それらは
 「正規のサンプル」という fixture ディレクトリの位置づけと紛らわしいので、
@@ -47,18 +49,18 @@ DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
 
 ## 次の版を追加するとき
 
-`.mcad` フォーマットが v8 へ上がったら:
-
-1. 現行版の mcad で保存したファイル(または既存 fixture と同じ流儀で手作りした
-   JSON)を `v8.mcad` として追加する。新フィールドを含めること。
-2. `backward_compat.rs` に `v8_fixture_loads_with_expected_content` を1ケース足す
-   (新フィールドの既定値補完・ラウンドトリップを確認)。
-3. `all_fixtures_declare_their_own_version_and_reexport_as_current` は
-   `1..=FORMAT_VERSION` を回すだけなので、`FORMAT_VERSION` を上げれば
-   自動的に新版も対象に入る。
-4. 旧版(v1〜v7)が変わらず読めることは、既存の `v1_*`〜`v7_*` テストがそのまま
-   回帰網として働く(変更不要)。
+手順は `backward_compat.rs` のモジュール doc「v9 を追加するとき」を参照。
 
 `v7.mcad` は M11 タスク68 で追加。同じ斜辺 `(0,0)`–`(120,30)` に整列・水平回転・
 鉛直回転の 3 通りの長さ寸法を付けてあり、向きによって表示値が実距離 123.693…・
 水平投影 120・鉛直投影 30 と変わることを `backward_compat.rs` が固定している。
+
+`v8.mcad` と `v7_legacy_boms.mcad` は M12 タスク81 で追加(手作り)。
+
+- `v8.mcad` は部品表(`"kind": "Bom"`、ロック済みレイヤー上)・表(`"kind": "Table"`)・
+  `"use_bom": false` を持つ。**現行版の書き出しと JSON として完全に一致する**ように
+  書いてある(`v8_fixture_is_exactly_what_the_exporter_writes` が固定。キーの過不足・
+  整数と小数の書き分けまで一致させること)。
+- `v7_legacy_boms.mcad` は v0.11.0 以前の旧 5 列部品表と v0.11.1 の様式A/C 7 列部品表を
+  1 つずつ持つ v7。どちらも表として読まれ(中身から部品表を推測しない)、読込が
+  「部品表は 1 図面に 1 つ」に引っかからないことを固定する。

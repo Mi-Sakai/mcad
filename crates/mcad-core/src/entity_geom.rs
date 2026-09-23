@@ -432,6 +432,20 @@ impl DimOrdinate {
 /// **`Copy` ではない**（`Vec` / `String` を持つため）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableGeom {
+    /// 表の種類（M12 タスク81、DESIGN.md M12 設計判断1）。既定は [`TableKind::Table`]。
+    ///
+    /// 種類の違いは「部品表の操作を許すか」と「部品表は 1 図面に 1 つ」
+    /// （[`crate::Document::apply`] が守る不変条件）だけで、描画・編集・DXF 分解 export は
+    /// 種類に関係なく同じ。幾何変換（平行移動・回転・鏡映）は種類を保つ。
+    ///
+    /// serde は必須（欠落を拒否する。`skip_serializing_if` も付けず常に書く）。
+    /// 正規のファイルは常にこのキーを書くので、欠けているファイルは壊れているか別版の
+    /// プログラムが書いたものであり、既定値で補うと部品表が黙って表へすり替わりうる
+    /// （Codex adversarial review 指摘。DESIGN.md M12 設計判断1）。既定値で補うのは
+    /// `.mcad` v7 以前からの移行だけ（読込側の `mcad-io` 凍結 DTO が、種類を持たない
+    /// v7 以前の表をすべて [`TableKind::Table`] として読む。**中身から部品表を推測
+    /// しない**）。
+    pub kind: TableKind,
     /// 表の左下（ワールド座標）。
     pub anchor: Point2,
     /// 各列の幅（紙 mm、左から右へ）。要素数が列数。
@@ -445,6 +459,28 @@ pub struct TableGeom {
     /// **空文字列は正当な値**（空欄のある表が普通なので、[`TextGeom::content`] と違って
     /// 空を拒否しない。M10 詳細設計1）。
     pub cells: Vec<String>,
+}
+
+/// 表の種類（[`TableGeom::kind`]。M12 タスク81、DESIGN.md M12 設計判断1）。
+///
+/// 別の [`EntityGeom`] バリアント（`EntityGeom::Bom` 等）にしないのは、描画・編集・
+/// DXF 分解 export が表と完全に同じで、種類の違いが「部品表の操作を許すか」と
+/// 「1 図面 1 つ」だけだから。
+///
+/// # `#[non_exhaustive]`
+///
+/// 表の種類は今後も増えうる（DESIGN.md 7章「部品欄の列構成の見直し」最終形:
+/// 「表/部品表、今後増やせる形」）。[`DimDirection`] と同じく、下位・外部クレートからの
+/// 網羅 `match` を禁じる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum TableKind {
+    /// 汎用の表。既定値であり、`.mcad` v7 以前の表はすべてこれとして読む。
+    #[default]
+    Table,
+    /// 部品表（規定 2-5）。**1 図面に高々 1 つ**（[`crate::Document::apply`] が
+    /// [`crate::CoreError::BomAlreadyExists`] で 2 つ目を拒否する）。
+    Bom,
 }
 
 /// 表の寸法（個々の列幅・行高さ・文字高さと、それらの合計）として許す最大の紙 mm 値。
@@ -632,6 +668,16 @@ impl EntityGeom {
             EntityGeom::Shape(shape) => Some(shape),
             _ => None,
         }
+    }
+
+    /// 部品表（[`TableKind::Bom`] の [`EntityGeom::Table`]）か。
+    ///
+    /// 「部品表は 1 図面に 1 つ」の判定（[`crate::Document::apply`]・
+    /// [`crate::Document::bom`]）が使う。
+    #[inline]
+    #[must_use]
+    pub fn is_bom(&self) -> bool {
+        matches!(self, EntityGeom::Table(table) if table.kind == TableKind::Bom)
     }
 
     /// 軸並行境界ボックス。
@@ -2245,6 +2291,7 @@ mod tests {
     /// `cells` は行優先で行 0（"a" "b" "c"）が最上段。
     fn table(anchor: Point2) -> TableGeom {
         TableGeom {
+            kind: TableKind::Table,
             anchor,
             col_widths_mm: vec![30.0, 40.0, 50.0],
             row_heights_mm: vec![8.0, 10.0],
@@ -2259,6 +2306,7 @@ mod tests {
     /// `rows` 行 × `cols` 列の、寸法としては妥当な表（件数の境界だけを見たいとき用）。
     fn table_with_counts(rows: usize, cols: usize) -> TableGeom {
         TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::ORIGIN,
             col_widths_mm: vec![1.0; cols],
             row_heights_mm: vec![1.0; rows],
@@ -2506,6 +2554,7 @@ mod tests {
 
         // 上限ちょうどは受理する（境界の向きを固定する）。
         let at_limit = TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::ORIGIN,
             col_widths_mm: vec![MAX_TABLE_MM],
             row_heights_mm: vec![MAX_TABLE_MM],
@@ -2541,5 +2590,59 @@ mod tests {
         let g = EntityGeom::Table(table(Point2::new(1.5, -2.5)));
         let json = serde_json::to_string(&g).unwrap();
         assert_eq!(serde_json::from_str::<EntityGeom>(&json).unwrap(), g);
+    }
+
+    // ------------------------------------------------------------------
+    // 表の種類（M12 タスク81）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn table_kind_is_always_written_and_missing_key_is_rejected() {
+        // 既定値（Table）も常に書く。
+        let json = serde_json::to_string(&EntityGeom::Table(table(Point2::ORIGIN))).unwrap();
+        assert!(json.contains(r#""kind":"Table""#), "表の種類: {json}");
+        let bom = EntityGeom::Table(TableGeom {
+            kind: TableKind::Bom,
+            ..table(Point2::ORIGIN)
+        });
+        let json = serde_json::to_string(&bom).unwrap();
+        assert!(json.contains(r#""kind":"Bom""#), "部品表の種類: {json}");
+        assert_eq!(serde_json::from_str::<EntityGeom>(&json).unwrap(), bom);
+
+        // キーを欠く JSON は拒否する（既定値で補うと部品表が黙って表へすり替わり得る。
+        // Codex adversarial review 指摘。DESIGN.md M12 設計判断1。io の凍結 DTO とは別に
+        // core 単体でも拒否する）。
+        let without_kind = json.replace(r#""kind":"Bom","#, "");
+        assert_ne!(without_kind, json, "テスト前提: 置換が効いている");
+        assert!(serde_json::from_str::<EntityGeom>(&without_kind).is_err());
+    }
+
+    #[test]
+    fn is_bom_only_for_bom_tables() {
+        assert!(!EntityGeom::Table(table(Point2::ORIGIN)).is_bom());
+        assert!(
+            EntityGeom::Table(TableGeom {
+                kind: TableKind::Bom,
+                ..table(Point2::ORIGIN)
+            })
+            .is_bom()
+        );
+        assert!(!EntityGeom::Shape(Shape::Point(Point2::ORIGIN)).is_bom());
+    }
+
+    #[test]
+    fn transforms_keep_the_table_kind() {
+        // 移動・回転・鏡映はアンカーだけを変え、種類は保つ（部品表が黙って表にならない）。
+        let bom = EntityGeom::Table(TableGeom {
+            kind: TableKind::Bom,
+            ..table(Point2::new(3.0, 4.0))
+        });
+        for moved in [
+            bom.translated(Vec2::new(10.0, -5.0)),
+            bom.rotated(Point2::ORIGIN, 1.0),
+            bom.mirrored(Point2::ORIGIN, Point2::new(0.0, 1.0)),
+        ] {
+            assert!(moved.is_bom(), "種類が変わった: {moved:?}");
+        }
     }
 }

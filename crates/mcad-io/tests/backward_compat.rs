@@ -1,44 +1,66 @@
-//! `.mcad` v1〜v7 の後方互換 fixture テスト（M11 タスク65、v7 はタスク68 で追加）。
+//! `.mcad` v1〜v8 の後方互換 fixture テスト（M11 タスク65、v7 はタスク68、v8 と
+//! `v7_legacy_boms.mcad` は M12 タスク81 で追加）。
 //!
 //! # fixture について
 //!
-//! `tests/fixtures/v{1..7}.mcad` は各バージョンのスキーマが表現できる要素を
+//! `tests/fixtures/v{1..8}.mcad` は各バージョンのスキーマが表現できる要素を
 //! 一通り含む実ファイル（レイヤー2枚・複数ジオメトリ種・その版で表現可能な
 //! メタデータ）。各版のスキーマの一次情報は
 //! `crates/mcad-io/src/mcad_file.rs` のモジュール doc と DTO 定義
-//! （`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` / `DimLinearV6` 等）。
+//! （`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` / `EntityGeomV7` /
+//! `DimLinearV6` / `TableGeomV7` / `SheetMetaV7` 等）。
+//!
+//! `v7_legacy_boms.mcad` は版ごとの代表ではなく、「v7 以前の旧部品表を中身から推測せず
+//! 表として読む」（DESIGN.md M12 設計判断1）ことを固定する追加の v7 ファイル。
 //!
 //! 「不正な JSON の拒否」「偽装 `Table` の拒否」「v6 に `direction` を混ぜた
 //! ファイルの拒否」のような**壊れた入力**のテストはここへは置かない
 //! （`mcad_file.rs` の `#[cfg(test)]` に残す）。fixture ディレクトリは
 //! 「正規のサンプル」という位置づけを保つため。
 //!
-//! # v8 を追加するとき
+//! # v9 を追加するとき
 //!
-//! `.mcad` フォーマットが v8 へ上がったら:
+//! `.mcad` フォーマットが v9 へ上がったら:
 //!
 //! 1. 現行版の mcad で保存したファイル（または本ファイルと同じ流儀で手作りした
-//!    JSON）を `tests/fixtures/v8.mcad` として追加する。新フィールドを含めること。
-//! 2. 本ファイルに `v8_*` の名前で新しいバージョンの検証項目
+//!    JSON）を `tests/fixtures/v9.mcad` として追加する。新フィールドを含めること。
+//! 2. 本ファイルに `v9_*` の名前で新しいバージョンの検証項目
 //!    （新フィールドの既定値補完・ラウンドトリップ）を1ケース足す。
 //! 3. `all_fixtures_declare_their_own_version_and_reexport_as_current` は
 //!    `1..=FORMAT_VERSION` を回すだけなので、`FORMAT_VERSION` を上げれば自動で対象に入る。
-//! 4. 旧版（このときは v7）が変わらず読めることは、既存の `v7_*` テストが
-//!    そのまま回帰網として働く。
+//! 4. 旧版（このときは v8）が変わらず読めることは、既存の `v8_*` テストが
+//!    そのまま回帰網として働く。`v8_fixture_is_exactly_what_the_exporter_writes` は
+//!    「現行版の書き出しと一致」を見るので、v9 では「v8 として読めて内容が保たれる」
+//!    検査へ書き換える。
 
 use std::fs;
 use std::path::PathBuf;
 
-use mcad_core::{ArrowPlacement, DimDirection, EntityGeom, Linetype};
+use mcad_core::{ArrowPlacement, DimDirection, Document, EntityGeom, Linetype, TableKind};
 use mcad_geom::{ArrowKind, DimSymbol};
 use mcad_io::{FORMAT_VERSION, export_document, from_json};
 
 /// `tests/fixtures/v{version}.mcad` の内容を読む。
 fn fixture(version: u32) -> String {
+    fixture_named(&format!("v{version}.mcad"))
+}
+
+/// `tests/fixtures/{name}` の内容を読む。
+fn fixture_named(name: &str) -> String {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests/fixtures");
-    path.push(format!("v{version}.mcad"));
+    path.push(name);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("fixture {path:?} を読めない: {e}"))
+}
+
+/// 文書内の表の種類を、生存エンティティの列挙順で集める。
+fn table_kinds(doc: &Document) -> Vec<TableKind> {
+    doc.entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::Table(t) => Some(t.kind),
+            _ => None,
+        })
+        .collect()
 }
 
 /// エンティティの `EntityGeom` バリアント名をカウントするための小さな分類。
@@ -355,7 +377,7 @@ fn v6_fixture_loads_with_expected_content() {
 
 #[test]
 fn v7_fixture_loads_with_expected_content() {
-    // v7(現行): 長さ寸法の向き（DimDirection）を追加。M11 タスク68。
+    // v7: 長さ寸法の向き（DimDirection）を追加。M11 タスク68。
     let summary = from_json(&fixture(7)).expect("v7 fixture は読めるべき");
     let doc = summary.document;
 
@@ -422,9 +444,114 @@ fn v7_fixture_loads_with_expected_content() {
     assert_eq!(export_document(&reloaded), exported);
 }
 
+#[test]
+fn v7_legacy_boms_fixture_loads_as_plain_tables() {
+    // v0.11.0 以前の旧 5 列部品表と v0.11.1 の様式A/C 7 列部品表を 1 つずつ持つ v7。
+    // どちらも見出しは部品表の並びそのものだが、**中身から推測せず表として読む**
+    // （DESIGN.md M12 設計判断1）。推測していたら部品表が 2 つになり読込が失敗する。
+    let summary = from_json(&fixture_named("v7_legacy_boms.mcad"))
+        .expect("旧部品表を 2 つ持つ v7 は読めるべき");
+    let doc = summary.document;
+
+    assert_eq!(doc.entity_count(), 3);
+    assert_eq!(table_kinds(&doc), vec![TableKind::Table, TableKind::Table]);
+    assert_eq!(doc.bom(), None);
+    assert!(doc.sheet().use_bom, "v7 以前は「部品表を使う」= ON で読む");
+
+    // 表の中身は変わらない（見出し行 = 最下段がそのまま残る）。
+    let headers: Vec<Vec<String>> = doc
+        .entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::Table(t) => Some(
+                (0..t.cols())
+                    .map(|c| t.cell(t.rows() - 1, c).unwrap().to_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        headers,
+        vec![
+            vec!["品番", "名称", "個数", "材質", "備考"],
+            vec!["部番", "品番", "名称", "個数", "材質", "質量[kg]", "備考"],
+        ]
+    );
+
+    // v8 で保存し直すと "kind": "Table" が書かれ、再読込しても表のまま。
+    let json = mcad_io::to_json(&doc).unwrap();
+    assert_eq!(json.matches(r#""kind": "Table""#).count(), 2, "{json}");
+    assert!(json.contains(r#""use_bom": true"#), "{json}");
+    let reloaded = from_json(&json).unwrap().document;
+    assert_eq!(export_document(&reloaded), export_document(&doc));
+}
+
+// ---------------------------------------------------------------------
+// v8
+// ---------------------------------------------------------------------
+
+#[test]
+fn v8_fixture_loads_with_expected_content() {
+    // v8(現行): 表の種類（TableKind）と「部品表を使う」（SheetMeta::use_bom）。M12 タスク81。
+    let summary = from_json(&fixture(8)).expect("v8 fixture は読めるべき");
+    let doc = summary.document;
+
+    assert_eq!(doc.layer_count(), 2);
+    assert_eq!(doc.entity_count(), 4);
+    assert!(!doc.sheet().use_bom, "use_bom = false はそのまま読む");
+    assert_eq!(table_kinds(&doc), vec![TableKind::Bom, TableKind::Table]);
+
+    // 部品表はロック済みレイヤー上にあっても読める（ロックはエンティティ投入後に適用）。
+    let bom = doc.bom().expect("部品表が 1 つあるはず");
+    let bom_layer = doc.layer(doc.entity(bom).unwrap().layer).unwrap();
+    assert_eq!(bom_layer.name, "tables");
+    assert!(bom_layer.locked);
+
+    // v7 までの要素（回転寸法・補助線の傾き）も v8 のまま読める。
+    let dim = doc
+        .entities()
+        .find_map(|(_, e)| match &e.geom {
+            EntityGeom::DimLinear(d) => Some(d.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(dim.direction, DimDirection::Rotated(0.0));
+    assert_eq!(dim.ext_angle, Some(1.2));
+}
+
+#[test]
+fn v8_fixture_is_exactly_what_the_exporter_writes() {
+    // v8 往復の無損失性を最も強い形で固定する: fixture を読んで書き出した JSON が、
+    // fixture そのものと（キーの並び・空白を除いて）一致する。数値は文字列を解析して
+    // 比べる（f32 の線幅を `to_value` 経由にすると f64 へ広げた誤差が出るため）。
+    let text = fixture(8);
+    let doc = from_json(&text).unwrap().document;
+    let written = mcad_io::to_json(&doc).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(actual, expected, "書き出し: {written}");
+}
+
 // ---------------------------------------------------------------------
 // バージョン横断
 // ---------------------------------------------------------------------
+
+#[test]
+fn fixtures_before_v8_read_tables_as_table_and_use_bom_as_on() {
+    // v7 以前は種類・「部品表を使う」を持たないので、表はすべて Table、
+    // 「部品表を使う」は ON（DESIGN.md M12 設計判断1）。
+    for version in 1..FORMAT_VERSION {
+        let doc = from_json(&fixture(version))
+            .unwrap_or_else(|e| panic!("v{version} fixture が読めない: {e}"))
+            .document;
+        assert!(doc.sheet().use_bom, "v{version}: use_bom は ON で読むべき");
+        assert!(
+            table_kinds(&doc).iter().all(|k| *k == TableKind::Table),
+            "v{version}: 表はすべて Table で読むべき"
+        );
+        assert_eq!(doc.bom(), None, "v{version}: 部品表は無いはず");
+    }
+}
 
 #[test]
 fn all_fixtures_declare_their_own_version_and_reexport_as_current() {

@@ -187,6 +187,7 @@ pub fn apply_bom_preset(table: &TableGeom, template_width_mm: f64) -> Result<Tab
     }
 
     Ok(TableGeom {
+        kind: table.kind,
         anchor: table.anchor,
         col_widths_mm: widths,
         row_heights_mm: vec![BOM_ROW_HEIGHT_MM; new_rows],
@@ -237,7 +238,7 @@ pub fn bom_anchor_above_title_block(sheet: &SheetMeta, k: f64) -> Point2 {
 mod tests {
     use super::*;
     use crate::frame::frame_layout;
-    use mcad_core::{Scale, TitleBlockKind};
+    use mcad_core::{Scale, TableKind, TitleBlockKind};
 
     fn approx(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-9, "{a} != {b}");
@@ -245,12 +246,27 @@ mod tests {
 
     fn sample_table(rows: usize, cols: usize) -> TableGeom {
         TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::new(1.0, 2.0),
             col_widths_mm: vec![10.0; cols],
             row_heights_mm: vec![8.0; rows],
             text_height_mm: 3.5,
             // 見出しが既知の並びと一致しない表は値が入っていると変換できないので、空にしておく。
             cells: vec![String::new(); rows * cols],
+        }
+    }
+
+    #[test]
+    fn apply_bom_preset_keeps_the_table_kind() {
+        // M12 タスク81: 表の種類を変えるのはタスク82 の UI（「部品表にする」の指定・
+        // 「表に戻す」）。列構成の適用そのものは種類を変えない。
+        for kind in [TableKind::Table, TableKind::Bom] {
+            let table = TableGeom {
+                kind,
+                ..sample_table(2, 3)
+            };
+            let applied = apply_bom_preset(&table, 170.0).unwrap();
+            assert_eq!(applied.kind, kind);
         }
     }
 
@@ -348,6 +364,7 @@ mod tests {
         // v0.11.0 以前の旧プリセット（5列: 品番=照合番号・名称・個数・材質・備考）。
         // 部品行1行 + ヘッダ行。
         let table = TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::new(0.0, 0.0),
             col_widths_mm: vec![10.0, 50.0, 10.0, 30.0, 70.0],
             row_heights_mm: vec![8.0, 8.0],
@@ -387,6 +404,7 @@ mod tests {
     fn apply_bom_preset_ac_to_b_rejects_filled_remarks_and_moves_named_columns() {
         // 新構成（様式A/C、7列）で埋まった部品表を様式B（120mm、6列・備考なし）へ適用。
         let table = TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::new(0.0, 0.0),
             col_widths_mm: vec![10.0, 35.0, 35.0, 10.0, 30.0, 20.0, 30.0],
             row_heights_mm: vec![8.0, 8.0],
@@ -492,6 +510,7 @@ mod tests {
     fn two_row_table(values: &[&str], header: &[&str]) -> TableGeom {
         assert_eq!(values.len(), header.len());
         TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::new(0.0, 0.0),
             col_widths_mm: vec![20.0; header.len()],
             row_heights_mm: vec![8.0, 8.0],

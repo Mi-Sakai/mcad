@@ -263,13 +263,14 @@ pub fn table_world_aabb(table: &TableGeom, k: f64) -> Aabb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EntityGeom;
+    use crate::{EntityGeom, TableKind};
 
     const T: f64 = 1e-9;
 
     /// `rows` 行 `cols` 列・列幅 10mm・行高さ 8mm・文字高さ 3.5mm の表。セルは空。
     fn table(rows: usize, cols: usize, anchor: Point2) -> TableGeom {
         TableGeom {
+            kind: TableKind::Table,
             anchor,
             col_widths_mm: vec![10.0; cols],
             row_heights_mm: vec![8.0; rows],
@@ -333,6 +334,7 @@ mod tests {
     #[test]
     fn inner_boundaries_span_the_whole_table_and_sit_on_the_cumulative_offsets() {
         let t = TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::ORIGIN,
             col_widths_mm: vec![10.0, 20.0, 30.0],
             row_heights_mm: vec![5.0, 8.0],
@@ -451,6 +453,7 @@ mod tests {
     #[test]
     fn cell_text_is_left_padded_and_vertically_centred_like_the_title_block() {
         let t = TableGeom {
+            kind: TableKind::Table,
             anchor: Point2::ORIGIN,
             col_widths_mm: vec![10.0, 20.0],
             row_heights_mm: vec![8.0, 6.0],

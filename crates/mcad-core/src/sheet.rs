@@ -264,9 +264,17 @@ pub struct TitleBlockFields {
 /// 図面メタデータ。[`crate::Document`] が 1 つ保持し、変更は
 /// [`crate::Command::SetSheet`] 経由でのみ行う（undo 対象）。
 ///
-/// 既定は **A4 横・1:1・様式B・枠非表示**（DESIGN.md M8 設計判断6。v1〜v3 の
-/// `.mcad` を読み込んだときもこの既定になる）。
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// 既定は **A4 横・1:1・様式B・枠非表示・部品表を使う**（DESIGN.md M8 設計判断6・
+/// M12 設計判断1。v1〜v3 の `.mcad` を読み込んだときもこの既定になる）。
+///
+/// # `Default` は手書き
+///
+/// [`SheetMeta::use_bom`] の既定が `true` なので `#[derive(Default)]` は使えない
+/// （`bool` の既定は `false`）。否定形のフィールド名（`bom_disabled` 等）にして derive を
+/// 残す案は採らなかった: UI の「部品表を使う」チェックボックスと `K` の分岐の両方で
+/// 否定を挟むことになり、取り違えの余地が増えるため。手書きの [`Default`] は全フィールドを
+/// 列挙するので、フィールドを足すと既定値の決定がコンパイルエラーとして必ず求められる。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SheetMeta {
     /// 図面の単位（現状 mm 固定。記録用）。
     pub unit: Unit,
@@ -282,6 +290,41 @@ pub struct SheetMeta {
     pub fields: TitleBlockFields,
     /// 図面枠・表題欄を表示するか。
     pub frame_visible: bool,
+    /// **部品表を使うか**（M12 タスク81、DESIGN.md M12 設計判断1。既定 `true`）。
+    ///
+    /// 計画図・見積図など部品表の要らない図面のための図面ごとの設定。**`false` は
+    /// 「`K` で部品表を自動で作らない」だけの意味**で、既存の部品表は消さず、表示・出力も
+    /// 変えない。部品表の数（1 図面に高々 1 つ）の不変条件とも独立で、core はこの値を
+    /// 検証にも描画にも使わない。
+    ///
+    /// serde は必須（欠落を拒否する）。正規のファイルは常にこのキーを書くので、
+    /// 欠けているファイルは壊れているか別版のプログラムが書いたものであり、既定値で
+    /// 補うと OFF にした設定が黙って ON へ戻り、次の保存でその変化が確定してしまう
+    /// （Codex adversarial review 指摘。DESIGN.md M12 設計判断1）。既定値で補うのは
+    /// `.mcad` v7 以前からの移行だけ（読込側の `mcad-io` 凍結 DTO が、このキーを
+    /// 持たない v7 以前の図面をすべて `true` として読む）。
+    pub use_bom: bool,
+}
+
+/// [`SheetMeta::use_bom`] の既定値（`true`）。[`SheetMeta`] の [`Default`] と serde の
+/// 欠落補完が共有する（既定値を 1 箇所に置く）。
+const fn default_use_bom() -> bool {
+    true
+}
+
+impl Default for SheetMeta {
+    fn default() -> Self {
+        Self {
+            unit: Unit::default(),
+            scale: Scale::default(),
+            paper: PaperSize::default(),
+            orientation: Orientation::default(),
+            title_block: TitleBlockKind::default(),
+            fields: TitleBlockFields::default(),
+            frame_visible: false,
+            use_bom: default_use_bom(),
+        }
+    }
 }
 
 impl SheetMeta {
@@ -409,6 +452,8 @@ mod tests {
         assert_eq!(sheet.fields, TitleBlockFields::default());
         assert_eq!(sheet.fields.projection, ProjectionMethod::ThirdAngle);
         assert_eq!(sheet.paper_extent_mm(), (297.0, 210.0));
+        // 部品表を使う（M12 設計判断1。新規図面の既定は ON）。
+        assert!(sheet.use_bom);
     }
 
     #[test]
@@ -468,8 +513,28 @@ mod tests {
                 revision: "A".to_owned(),
             },
             frame_visible: true,
+            use_bom: false,
         };
         let json = serde_json::to_string(&sheet).unwrap();
+        assert!(
+            json.contains(r#""use_bom":false"#),
+            "use_bom は常に書く: {json}"
+        );
         assert_eq!(serde_json::from_str::<SheetMeta>(&json).unwrap(), sheet);
+    }
+
+    #[test]
+    fn sheet_json_without_use_bom_is_rejected() {
+        // キーを欠く JSON は拒否する（既定値で補うと OFF が黙って ON へ戻り、次の
+        // 保存で確定してしまう。Codex adversarial review 指摘。DESIGN.md M12 設計判断1）。
+        // `.mcad` v7 以前の読込はこの拒否の影響を受けず、io の凍結 DTO が明示的に ON を
+        // 入れる。
+        let mut value = serde_json::to_value(SheetMeta {
+            use_bom: false,
+            ..SheetMeta::default()
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("use_bom");
+        assert!(serde_json::from_value::<SheetMeta>(value).is_err());
     }
 }

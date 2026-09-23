@@ -84,4 +84,13 @@ pub enum CoreError {
     /// `Command::SetDimStyle` の実行前チェックで返る。
     #[error("invalid dimension style: {0}")]
     InvalidDimStyle(String),
+
+    /// 図面には既に部品表（[`crate::TableKind::Bom`]）があるため、2 つ目の部品表を作る
+    /// 操作を拒否した（M12 タスク81、DESIGN.md M12 設計判断1「部品表は 1 図面に 1 つ」）。
+    ///
+    /// 値は**既存の**部品表の [`EntityId`]（呼び出し側がそれを示せるように）。
+    /// `Command::AddEntity` / `Command::ModifyEntity`（`Command::Batch` 内を含む）の
+    /// 実行前チェックで返る。削除済み（墓標）の部品表は数えない。
+    #[error("the drawing already has a bill of materials: {0:?}")]
+    BomAlreadyExists(EntityId),
 }

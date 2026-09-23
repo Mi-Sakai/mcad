@@ -43,8 +43,8 @@ use egui::{Color32, Painter, Rect, Stroke};
 use mcad_core::{
     Command, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation, DimDiameter, DimDirection,
     DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom, EntityId, LayerId,
-    Linetype, NewIds, OrdinateAxis, Style, TableGeom, diameter_pick_segments, dim_distance,
-    expand_angular, expand_diameter, expand_linear, expand_ordinate, expand_radial,
+    Linetype, NewIds, OrdinateAxis, Style, TableGeom, TableKind, diameter_pick_segments,
+    dim_distance, expand_angular, expand_diameter, expand_linear, expand_ordinate, expand_radial,
     linear_pick_segments, radial_pick_segments, table_world_aabb,
 };
 use mcad_geom::{
@@ -538,6 +538,7 @@ fn default_table(anchor: Point2) -> TableGeom {
     const ROWS: usize = 3;
     const COLS: usize = 3;
     TableGeom {
+        kind: TableKind::Table,
         anchor,
         col_widths_mm: vec![30.0; COLS],
         row_heights_mm: vec![8.0; ROWS],
@@ -7061,6 +7062,7 @@ mod tests {
         let layer = doc.current_layer();
         let entity = Entity::new(
             EntityGeom::Table(mcad_core::TableGeom {
+                kind: mcad_core::TableKind::Table,
                 anchor,
                 col_widths_mm: vec![10.0, 10.0],
                 row_heights_mm: vec![8.0, 8.0],

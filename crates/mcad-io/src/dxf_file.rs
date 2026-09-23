@@ -24,7 +24,8 @@
 //!   へ分解して書く。組版は `mcad-core` の [`mcad_core::expand_table`]（画面・SVG/PDF と
 //!   同じ唯一の出所。M11 タスク71 で core へ移すまでは依存方向の制約から `mcad-io` 側に
 //!   独立実装していた）。分解できるため `skipped_entities` には計上しない
-//!   （Text と同じ「対応済み」扱い）。
+//!   （Text と同じ「対応済み」扱い）。列ごとの揃え（M12 タスク93）は `TEXT` の水平揃えへ
+//!   写す（下の「表のセル文字の揃え」節）。
 //! - **import**: DXF に「表」に相当するプリミティブは無いので、分解後の
 //!   `LINE`/`TEXT` を import しても [`mcad_core::EntityGeom::Table`] へは戻らず、
 //!   ただの直線・文字の集合として復元される。**表として export したファイルを
@@ -47,7 +48,35 @@
 //! 寸法の分解が使う矢先の `SOLID`（下記「DIMENSION の分解 export」設計判断1）は
 //! `dxf_entity_to_geom` が対応しない `EntityType` のため、**re-import 時に
 //! [`ImportSummary::skipped_entities`] へ計上される**（`LINE`/`ARC`/`TEXT` 側は
-//! 通常どおり Shape/Text として取り込まれる）。
+//! 通常どおり Shape/Text として取り込まれる）。**ただし表でも、中央・右揃えの列のセル文字
+//! （M12 タスク93）は例外**で、水平揃えが `Left` 以外の `TEXT` になるため re-import 時に
+//! スキップされ `skipped_entities` へ計上される（下の「表のセル文字の揃え」節）。
+//!
+//! # 表のセル文字の揃え（M12 タスク93、DESIGN.md M12 設計判断11）
+//!
+//! 表の列ごとの揃え（`TableGeom::col_aligns`）は、`mcad-core` の展開
+//! （[`mcad_core::TableCellText`]）が返す「揃えの基準点 + 揃え」を、`TEXT` の水平揃えへ
+//! そのまま写す（[`table_cell_text_to_dxf_text`]）。
+//!
+//! | mcad | group 72（水平） | group 73（垂直） | group 10 | group 11 |
+//! |---|---|---|---|---|
+//! | 左 | `Left`（0、既定なので書かない） | `Baseline`（0、同） | 文字列の左端 | 書かない |
+//! | 中央 | `Center`（1） | `Baseline`（0） | 基準点 | 基準点 |
+//! | 右 | `Right`（2） | `Baseline`（0） | 基準点 | 基準点 |
+//!
+//! - **文字幅を推定して左端へ換算しない**。中央・右揃えの位置を決めるのは文字幅で、
+//!   それは読み手の CAD のフォントで決まる。推定値で group 10 を作って `Left` で書くと、
+//!   読み手のフォントでは中央からずれる（画面・SVG/PDF もそれぞれ自分の描く文字幅で
+//!   揃えている。`mcad_core::expand_table` のモジュール doc「揃え」節）。
+//! - group 10 にも基準点を書く理由（`dxf` 0.6.1 は原点の group 11 を書かない）は
+//!   [`table_cell_text_to_dxf_text`] の doc。
+//! - **非対称が 1 つ増える**: mcad の import は `Left`/`Baseline` 以外の `TEXT` を
+//!   スキップする（[`is_text_justification_supported`]。alignment point から左端を
+//!   逆算するにはフォントメトリクスが要り、io 層には無い）。したがって中央・右揃えの列の
+//!   セル文字は、mcad が書いた DXF を mcad へ読み戻すと取り込まれず、件数が
+//!   [`ImportSummary::skipped_entities`] に出る（回帰は
+//!   `reimporting_exported_centre_and_right_aligned_cell_text_skips_it`）。左揃えの列は
+//!   従来どおり `Text` として取り込まれる。
 //!
 //! # DIMENSION の import（M11 タスク67・タスク69）
 //!
@@ -447,8 +476,9 @@ use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
 
 use mcad_core::{
     Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimOrdinate,
-    DimRadial, DimRender, Document, Entity, EntityGeom, Layer, LayerId, Linetype, OrdinateAxis,
-    Rgb, Style, TableGeom, TextGeom, WidthMm, expand_dim, expand_table,
+    DimRadial, DimRender, Document, Entity, EntityGeom, HorizontalAlign, Layer, LayerId, Linetype,
+    OrdinateAxis, Rgb, Style, TableCellText, TableGeom, TextGeom, WidthMm, expand_dim,
+    expand_table,
 };
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
 
@@ -875,7 +905,9 @@ fn shape_to_dxf_entity(shape: &Shape) -> DxfEntity {
 ///
 /// 受理するのは水平 = `Left`（group code 72 = 0）かつ垂直 = `Baseline`
 /// （group code 73 = 0）の組み合わせだけ。どちらも DXF の既定値であり、
-/// [`text_to_dxf_entity`] が書き出す mcad 自身の TEXT は常にこの組み合わせになる。
+/// [`text_to_dxf_entity`] が書き出す mcad 自身の TEXT は常にこの組み合わせになる
+/// （例外は表の中央・右揃えの列のセル文字。[`table_cell_text_to_dxf_text`]、M12 タスク93。
+/// mcad が書いたそれらの TEXT もここでスキップされる）。
 /// それ以外は [`dxf_entity_to_geom`] が `None` を返し、呼び出し側が
 /// [`ImportSummary::skipped_entities`] に計上する。
 ///
@@ -886,8 +918,8 @@ fn shape_to_dxf_entity(shape: &Shape) -> DxfEntity {
 /// （group code 11 = [`DxfText::second_alignment_point`]）が持ち、`location`
 /// （group code 10）は意味を持たない**。そのため `location` をそのまま
 /// [`TextGeom::anchor`] へ入れると、外部 CAD が作った中央揃え・右揃え・非ベースライン
-/// 揃えの TEXT は**間違った位置に配置される**（mcad 自身の export は常に
-/// Left/Baseline なので、既存の往復テストではこの不整合を検出できない）。
+/// 揃えの TEXT は**間違った位置に配置される**（mcad 自身の export は表の中央・右揃えの
+/// 列を除いて Left/Baseline なので、既存の往復テストではこの不整合を検出できない）。
 ///
 /// では alignment point から `anchor` を逆算すればよい、とはならない。
 /// [`TextGeom`] は「左寄せ・ベースライン基準の 1 点（`anchor`）」しか持たないため、
@@ -1611,13 +1643,54 @@ fn table_to_dxf_entities(table: &TableGeom, world_mm_per_paper_mm: f64) -> Vec<D
         }))
     });
     // セル文字の `height` は紙 mm（`expand_table` の契約）なので、TEXT と同じく `× k`
-    // してモデル空間長へ直す（[`text_to_dxf_entity`] と同一の写像）。
+    // してモデル空間長へ直す（[`text_to_dxf_entity`] と同一の写像）。揃えは
+    // [`table_cell_text_to_dxf_text`] が水平揃えへ写す。
     let texts = expansion
         .texts
         .iter()
-        .map(|text| text_to_dxf_entity(text, world_mm_per_paper_mm));
+        .map(|cell| table_cell_text_to_dxf_text(cell, world_mm_per_paper_mm));
 
     lines.chain(texts).collect()
+}
+
+/// 表のセル文字 1 つ（[`TableCellText`]）を DXF `TEXT` へ変換する（M12 タスク93、
+/// DESIGN.md M12 設計判断11。モジュール doc「表のセル文字の揃え」節）。
+///
+/// - **左揃え**: [`text_to_dxf_entity`] をそのまま通す（水平 `Left`・垂直 `Baseline`、
+///   `location` = 文字列の左端。M12 以前の出力と同一）。
+/// - **中央・右揃え**: 水平揃え（group 72）を `Center` / `Right`、垂直は `Baseline` の
+///   ままにし、**揃えの基準点（[`TableCellText`] の `text.anchor`）を
+///   `second_alignment_point`（group 11）と `location`（group 10）の両方へ書く**。
+///   DXF の仕様では水平揃えが `Left` 以外のとき文字の位置は group 11 が持ち、group 10 は
+///   読み手が文字幅から計算し直す（[`is_text_justification_supported`] の doc と同じ理解。
+///   LibreCAD 2.2.0.2 の `dxf2pdf` で、group 10 だけをセル左端へずらしても group 11 の
+///   位置に中央揃えで描かれることを確認した。2026-09-23）。文字幅はフォントの問題なので
+///   mcad は推定しない。
+///   group 10 にも同じ点を書くのは、`dxf` 0.6.1 が group 11 を**原点 (0,0,0) のときだけ
+///   書かない**（生成コードの `second_alignment_point != Point::origin()` 条件）ためで、
+///   基準点がちょうど原点に来たときも group 10 = group 11 = 原点で食い違わない。
+///
+/// [`HorizontalAlign`] は `#[non_exhaustive]` なので、core に将来足される未知の揃えは
+/// 左揃えとして書く（基準点を文字列の左端として置く。揃えは落ちるが文字は失わない）。
+///
+/// **この `TEXT` を mcad 自身で re-import すると、中央・右揃えのものはスキップされる**
+/// （[`is_text_justification_supported`]。`Left`/`Baseline` 以外は `location` が文字の
+/// 左端を意味しないため）。表はもともと表へ戻らない非対称往復だが、中央・右揃えの列の
+/// 文字はさらに `skipped_entities` へ計上される（モジュール doc「表のセル文字の揃え」節）。
+fn table_cell_text_to_dxf_text(cell: &TableCellText, world_mm_per_paper_mm: f64) -> DxfEntity {
+    let mut entity = text_to_dxf_entity(&cell.text, world_mm_per_paper_mm);
+    let horizontal = match cell.align {
+        HorizontalAlign::Center => HorizontalTextJustification::Center,
+        HorizontalAlign::Right => HorizontalTextJustification::Right,
+        // 左揃えと、未知の揃え（上の doc）。
+        _ => return entity,
+    };
+    if let EntityType::Text(text) = &mut entity.specific {
+        text.horizontal_text_justification = horizontal;
+        text.vertical_text_justification = VerticalTextJustification::Baseline;
+        text.second_alignment_point = text.location.clone();
+    }
+    entity
 }
 
 /// 矢先の塗り（凸多角形、[`mcad_geom::ArrowGlyph::fills`]）を DXF `SOLID` へ**三角形扇**
@@ -3118,10 +3191,11 @@ mod tests {
     ///
     /// 誤配置を防ぐための意図的な取りこぼしであり、逆算にフォントメトリクスが必要で
     /// io 層では実装できないという依存方向の制約が根拠（詳細は
-    /// [`is_text_justification_supported`] の doc）。mcad 自身の export は常に
-    /// Left/Baseline なので、この経路は**外部 CAD が作った DXF でしか通らない**。
-    /// そのため往復テストでは検出できず、`dxf::Drawing` へ直接エンティティを
-    /// 注入して確認する。
+    /// [`is_text_justification_supported`] の doc）。mcad 自身の export は表の中央・
+    /// 右揃えの列（M12 タスク93。そちらの往復は
+    /// `reimporting_exported_centre_and_right_aligned_cell_text_skips_it`）を除いて
+    /// Left/Baseline なので、この経路は主に**外部 CAD が作った DXF で通る**。
+    /// そのため `dxf::Drawing` へ直接エンティティを注入して確認する。
     ///
     /// 同じ図面に Left/Baseline の TEXT も混ぜ、そちらは従来どおり import され
     /// 位置・内容が保たれることを同時に固定する（判定が広すぎて正常な TEXT まで
@@ -3689,6 +3763,7 @@ mod tests {
                 kind: mcad_core::TableKind::Table,
                 anchor: Point2::new(10.0, 20.0),
                 col_widths_mm: vec![30.0, 20.0],
+                col_aligns: vec![HorizontalAlign::Left; 2],
                 row_heights_mm: vec![8.0, 8.0],
                 text_height_mm: 3.5,
                 cells: vec!["a".into(), "b".into(), "c".into(), "d".into()],
@@ -3748,6 +3823,7 @@ mod tests {
                 kind: mcad_core::TableKind::Table,
                 anchor: Point2::new(0.0, 0.0),
                 col_widths_mm: vec![30.0],
+                col_aligns: vec![HorizontalAlign::Left; 1],
                 row_heights_mm: vec![8.0],
                 text_height_mm: 3.5,
                 cells: vec![String::new()],
@@ -3774,6 +3850,200 @@ mod tests {
         assert_eq!(line_count, 4);
     }
 
+    /// M12 タスク93: 3 列（左・中央・右揃え）の表。尺度 1:2（`k = 2`）で、アンカーは
+    /// 半端な値にして「原点だと group 11 が省かれる」偶然に頼らないようにする。
+    fn aligned_table_document() -> Document {
+        use mcad_core::Scale;
+
+        let mut doc = Document::new();
+        let mut sheet = doc.sheet().clone();
+        sheet.scale = Scale::new(1, 2).unwrap();
+        doc.apply(Command::SetSheet(sheet)).unwrap();
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Table(TableGeom {
+                kind: mcad_core::TableKind::Bom,
+                anchor: Point2::new(12.5, -7.25),
+                col_widths_mm: vec![10.0, 35.0, 20.0],
+                col_aligns: vec![
+                    HorizontalAlign::Center,
+                    HorizontalAlign::Left,
+                    HorizontalAlign::Right,
+                ],
+                row_heights_mm: vec![8.0],
+                text_height_mm: 3.5,
+                cells: vec!["1".into(), "ベース".into(), "0.520".into()],
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc
+    }
+
+    /// M12 タスク93: 表のセル文字の揃えは `TEXT` の水平揃え（group 72）と揃えの基準点
+    /// （group 11）へ写る。基準点は `expand_table` の値そのもの（画面・SVG/PDF と同じ
+    /// 唯一の出所）で、中央・右揃えでは group 10 にも同じ点を書く。左揃えは M12 以前と同じ
+    /// （`Left`/`Baseline`、group 11 は原点のまま = 書かない）。
+    #[test]
+    fn export_maps_table_column_alignment_to_text_justification() {
+        let doc = aligned_table_document();
+        let k = doc.sheet().scale.world_mm_per_paper_mm();
+        let table = doc
+            .entities()
+            .find_map(|(_, e)| match &e.geom {
+                EntityGeom::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let expected = expand_table(&table, k);
+        assert_eq!(expected.texts.len(), 3);
+
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 0);
+        let texts: Vec<&DxfText> = export
+            .drawing
+            .entities()
+            .filter_map(|e| match &e.specific {
+                EntityType::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 3);
+
+        for (cell, dxf) in expected.texts.iter().zip(&texts) {
+            assert_eq!(dxf.value, cell.text.content);
+            assert_eq!(
+                dxf.vertical_text_justification,
+                VerticalTextJustification::Baseline
+            );
+            // 高さは紙 mm × k（Text と同じ尺度契約）。
+            assert!((dxf.text_height - 3.5 * k).abs() < EPS);
+            // group 10 は揃えに関係なく基準点（左揃えでは文字列の左端）。ビット一致で比べる。
+            assert_eq!(from_dxf_point(&dxf.location), cell.text.anchor);
+        }
+        // 中央: 72 = Center、group 11 = 基準点 = セル中央。
+        assert_eq!(
+            texts[0].horizontal_text_justification,
+            HorizontalTextJustification::Center
+        );
+        assert_eq!(
+            from_dxf_point(&texts[0].second_alignment_point),
+            expected.texts[0].text.anchor
+        );
+        approx_point(
+            from_dxf_point(&texts[0].second_alignment_point),
+            Point2::new(12.5 + 5.0 * k, -7.25 + 2.25 * k),
+        );
+        // 左: M12 以前と同じ（Left、group 11 は既定の原点）。
+        assert_eq!(
+            texts[1].horizontal_text_justification,
+            HorizontalTextJustification::Left
+        );
+        assert_eq!(texts[1].second_alignment_point, DxfPoint::origin());
+        approx_point(
+            from_dxf_point(&texts[1].location),
+            Point2::new(
+                12.5 + (10.0 + mcad_core::CELL_TEXT_PAD_MM) * k,
+                -7.25 + 2.25 * k,
+            ),
+        );
+        // 右: 72 = Right、group 11 = セル右端 − パディング。
+        assert_eq!(
+            texts[2].horizontal_text_justification,
+            HorizontalTextJustification::Right
+        );
+        approx_point(
+            from_dxf_point(&texts[2].second_alignment_point),
+            Point2::new(
+                12.5 + (65.0 - mcad_core::CELL_TEXT_PAD_MM) * k,
+                -7.25 + 2.25 * k,
+            ),
+        );
+    }
+
+    /// M12 タスク93: 水平揃えと group 11 は DXF ファイルへ書いて読み直しても残る
+    /// （`dxf` 0.6.1 の書き出し・読込の両方を通す）。group 72・11 が実際にファイルへ
+    /// 書かれていることもテキストで確かめる。
+    #[test]
+    fn table_column_alignment_survives_writing_the_dxf_file() {
+        let doc = aligned_table_document();
+        let export = export_dxf(&doc);
+        let mut buf = Vec::new();
+        export.drawing.save(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        // 中央揃えの TEXT（値 "1"）の近くに 72 = 1 と group 11 がある。
+        assert!(
+            text.contains("\n 72\r\n     1\r\n") || text.contains("\n 72\n     1\n"),
+            "group 72 = 1 が書かれていない"
+        );
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let reloaded = Drawing::load(&mut cursor).unwrap();
+        let justification: Vec<(String, HorizontalTextJustification, Point2, Point2)> = reloaded
+            .entities()
+            .filter_map(|e| match &e.specific {
+                EntityType::Text(t) => Some((
+                    t.value.clone(),
+                    t.horizontal_text_justification,
+                    from_dxf_point(&t.location),
+                    from_dxf_point(&t.second_alignment_point),
+                )),
+                _ => None,
+            })
+            .collect();
+        let original: Vec<(String, HorizontalTextJustification, Point2, Point2)> = export
+            .drawing
+            .entities()
+            .filter_map(|e| match &e.specific {
+                EntityType::Text(t) => Some((
+                    t.value.clone(),
+                    t.horizontal_text_justification,
+                    from_dxf_point(&t.location),
+                    from_dxf_point(&t.second_alignment_point),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(justification.len(), 3);
+        for ((v0, h0, l0, a0), (v1, h1, l1, a1)) in original.iter().zip(&justification) {
+            assert_eq!(v0, v1);
+            assert_eq!(h0, h1);
+            approx_point(*l0, *l1);
+            approx_point(*a0, *a1);
+        }
+    }
+
+    /// M12 タスク93: 中央・右揃えのセル文字は mcad へ読み戻すとスキップされ、
+    /// `skipped_entities` へ計上される（モジュール doc「表のセル文字の揃え」節。
+    /// `Left`/`Baseline` 以外の TEXT は `location` が左端を意味しないため、
+    /// [`is_text_justification_supported`] が拒否する既存の規則）。左揃えの列は従来どおり
+    /// Text として取り込まれ、罫線は Line になる。
+    #[test]
+    fn reimporting_exported_centre_and_right_aligned_cell_text_skips_it() {
+        let export = export_dxf(&aligned_table_document());
+        let import = import_dxf(&export.drawing).expect("re-import must succeed");
+        assert_eq!(
+            import.skipped_entities, 2,
+            "中央・右揃えの 2 セルだけがスキップされるはず"
+        );
+        let texts: Vec<String> = import
+            .document
+            .entities()
+            .filter_map(|(_, e)| match &e.geom {
+                EntityGeom::Text(t) => Some(t.content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["ベース"]);
+        let line_count = import
+            .document
+            .entities()
+            .filter(|(_, e)| matches!(e.geom, EntityGeom::Shape(Shape::Line(_))))
+            .count();
+        assert_eq!(line_count, 4 + 2, "外枠 4 + 列境界 2");
+    }
+
     /// タスク61: 表の DXF 分解は紙 mm × k（ワールド）で座標を書く。尺度 1:2
     /// （`k = 2.0`）で 1行1列・列幅30mm・行高さ8mm・anchor (0,0) の表の外枠は
     /// ワールドで幅60mm・高さ16mmになる（`text_height_scales_by_sheet_scale_on_export`
@@ -3793,6 +4063,7 @@ mod tests {
                 kind: mcad_core::TableKind::Table,
                 anchor: Point2::new(0.0, 0.0),
                 col_widths_mm: vec![30.0],
+                col_aligns: vec![HorizontalAlign::Left; 1],
                 row_heights_mm: vec![8.0],
                 text_height_mm: 3.5,
                 cells: vec!["x".into()],

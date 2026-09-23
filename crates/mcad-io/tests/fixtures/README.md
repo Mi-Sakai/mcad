@@ -4,6 +4,7 @@
 |---|---|---|
 | `v1.mcad`〜`v8.mcad` | `.mcad` の後方互換 | `tests/backward_compat.rs` |
 | `v7_legacy_boms.mcad` | v7 以前の旧部品表を表として読む(推測しない) | `tests/backward_compat.rs` |
+| `v8_before_col_aligns.mcad` | `col_aligns` が無いタスク93以前の v8 を左揃え補完で読む | `tests/backward_compat.rs` |
 | `synthetic_dimensions.dxf` | 他 CAD が書いた DXF の DIMENSION import | `tests/dxf_dimensions.rs` |
 
 ## `synthetic_dimensions.dxf`
@@ -40,8 +41,8 @@ fixture 自体の役割は「今後の実装変更で読込結果が変わらな
 DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
 `EntityGeomV7` / `DimLinearV6` / `TableGeomV7` / `SheetMetaV7` 等）。fixture を手で
 書くときは必ずそちらを見て、その版のスキーマに存在しないキーを混ぜないこと
-（**v6 以前に `DimLinear.direction` を、v7 以前に表の `kind`・`sheet` の `use_bom` を
-書くと読込が失敗する** — 凍結 DTO が未知フィールドを拒否する）。
+（**v6 以前に `DimLinear.direction` を、v7 以前に表の `kind`・`col_aligns`・`sheet` の
+`use_bom` を書くと読込が失敗する** — 凍結 DTO が未知フィールドを拒否する）。
 
 **壊れた入力(不正 JSON・偽装 `Table` 等)のテストはここへ置かない。** それらは
 「正規のサンプル」という fixture ディレクトリの位置づけと紛らわしいので、
@@ -58,9 +59,20 @@ DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
 `v8.mcad` と `v7_legacy_boms.mcad` は M12 タスク81 で追加(手作り)。
 
 - `v8.mcad` は部品表(`"kind": "Bom"`、ロック済みレイヤー上)・表(`"kind": "Table"`)・
-  `"use_bom": false` を持つ。**現行版の書き出しと JSON として完全に一致する**ように
+  `"use_bom": false` を持つ。M12 タスク93 で列ごとの揃え(`col_aligns`)を足した(v8 に
+  相乗り): 部品表は部品表プリセットの既定(部番・個数・材質・質量[kg] = 中央、品番・名称・
+  備考 = 左)、表は中央・右。**現行版の書き出しと JSON として完全に一致する**ように
   書いてある(`v8_fixture_is_exactly_what_the_exporter_writes` が固定。キーの過不足・
   整数と小数の書き分けまで一致させること)。
 - `v7_legacy_boms.mcad` は v0.11.0 以前の旧 5 列部品表と v0.11.1 の様式A/C 7 列部品表を
   1 つずつ持つ v7。どちらも表として読まれ(中身から部品表を推測しない)、読込が
   「部品表は 1 図面に 1 つ」に引っかからないことを固定する。
+
+`v8_before_col_aligns.mcad` は M12 タスク93 で追加。タスク93 で `col_aligns` を
+`TableGeom` へ足す**前**（タスク81〜92 の間）の実際のビルドが書く v8 を固定したもの
+（`kind` はあるが `col_aligns` が無い。タスク93 直前のコミット（M12 タスク81「表の種類と
+`.mcad` v8」）の `v8.mcad` そのもの）。**手で書き換えないこと**
+（過去のビルドが実際に書いた形を保つのが目的）。読込は列数ぶんの左揃えで補って受理し
+（Codex レビュー指摘。その時期の v8 は中央・右揃えを表現できなかったので情報を失わない）、
+書き出すと `col_aligns` 付きの現行 v8 になることを `v8_before_col_aligns_fixture_is_backfilled_as_left`
+が固定する。

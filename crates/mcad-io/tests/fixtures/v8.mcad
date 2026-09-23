@@ -35,6 +35,7 @@
     {"layer": 1, "style": {"color": null, "width_mm": null, "linetype": null},
      "geom": {"Table": {"kind": "Bom", "anchor": {"x": 405.0, "y": 50.0},
        "col_widths_mm": [10.0, 35.0, 35.0, 10.0, 30.0, 20.0, 30.0],
+       "col_aligns": ["Center", "Left", "Left", "Center", "Center", "Center", "Left"],
        "row_heights_mm": [8.0, 8.0],
        "text_height_mm": 3.5,
        "cells": ["1", "MCAD-V8-001-01", "ベース", "1", "S45C", "0.520", "",
@@ -42,6 +43,7 @@
     {"layer": 1, "style": {"color": null, "width_mm": null, "linetype": null},
      "geom": {"Table": {"kind": "Table", "anchor": {"x": 20.0, "y": 200.0},
        "col_widths_mm": [30.0, 45.0],
+       "col_aligns": ["Center", "Right"],
        "row_heights_mm": [8.0, 8.0],
        "text_height_mm": 3.5,
        "cells": ["改訂", "内容", "A", "初版"]}}}

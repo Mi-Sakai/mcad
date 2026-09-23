@@ -89,8 +89,8 @@ pub use svg::to_svg;
 use std::f64::consts::FRAC_PI_2;
 
 use mcad_core::{
-    DimExpansion, DimRender, Document, Entity, EntityGeom, Layer, Linetype, Rgb, TableGeom,
-    TextGeom, expand_dim, expand_table,
+    DimExpansion, DimRender, Document, Entity, EntityGeom, Layer, Linetype, Rgb, TableCellText,
+    TableGeom, TextGeom, expand_dim, expand_table,
 };
 use mcad_geom::{Arc, Point2, Polyline, Shape, Vec2};
 use serde::{Deserialize, Serialize};
@@ -580,7 +580,8 @@ fn push_dim(
 ///
 /// 罫線は常に実線（線種を持たない）で、線幅は表題欄と同じ固定の定数
 /// （[`crate::frame::FRAME_BORDER_WIDTH_MM`] / [`crate::frame::FRAME_DIVIDER_WIDTH_MM`]）。
-/// セル文字は Text エンティティとまったく同じ経路（[`push_text`]）へ通す。
+/// セル文字は [`push_table_cell_text`] を通す（左揃えは Text エンティティとまったく同じ
+/// 経路の [`push_text`]、中央・右揃えは字送り幅だけ始点をずらす。M12 タスク93）。
 fn push_table(
     paths: &mut Vec<PlotPath>,
     table: &TableGeom,
@@ -601,9 +602,55 @@ fn push_table(
         ];
         paths.push(PlotPath::stroked(cmds, stroke));
     }
-    for text in &ex.texts {
-        push_text(paths, text, color, k, outliner);
+    for cell in &ex.texts {
+        push_table_cell_text(paths, cell, color, k, outliner);
     }
+}
+
+/// 表のセル文字 1 つをアウトラインへ展開する（M12 タスク93、DESIGN.md M12 設計判断11）。
+///
+/// # SVG の `text-anchor` や PDF の文字演算子は使わない（使えない）
+///
+/// 出力の文字は `<text>` / PDF のテキストオブジェクトではなく、埋め込みフォントの
+/// **アウトライン（塗りパス）**として IR に入る（M8 設計判断7。[`text_outline`] の
+/// モジュール doc）。SVG・PDF のバックエンドはパスを書くだけなので、`text-anchor` 相当の
+/// 揃えの仕組みはどちらの経路にも存在しない。そこで IR を作るこの段で揃える:
+///
+/// - 左揃え（ずらし 0）: [`push_text`] をそのまま通す（M12 以前の出力とビット一致）。
+/// - 中央・右揃え: アウトラインを作るのと同じフォントの**字送り幅**
+///   （[`GlyphOutliner::advance_mm`]）× [`mcad_core::HorizontalAlign::anchor_fraction`] だけ、
+///   基準点からベースラインの負の向きへ始点を戻して同じ経路で描く。字形を描くフォントと
+///   幅を測るフォントが同一なので、推定を含まない（`mcad_core` の `expand::table`
+///   モジュール doc「揃え」節）。SVG と PDF は同じ IR を共有するので、両者の位置は一致する。
+fn push_table_cell_text(
+    paths: &mut Vec<PlotPath>,
+    cell: &TableCellText,
+    color: Rgb,
+    k: f64,
+    outliner: Option<&GlyphOutliner>,
+) {
+    let fraction = cell.align.anchor_fraction();
+    if fraction == 0.0 {
+        push_text(paths, &cell.text, color, k, outliner);
+        return;
+    }
+    let Some(outliner) = outliner else {
+        return;
+    };
+    let text = &cell.text;
+    // `text.height` は紙 mm（`expand_table` の契約）なので字送り幅も紙 mm で出る。
+    let shift = outliner.advance_mm(&text.content, text.height) * fraction;
+    let (sin, cos) = text.angle.sin_cos();
+    let start = world_to_paper(text.anchor, k) - Vec2::new(shift * cos, shift * sin);
+    push_outlined_text(
+        paths,
+        Some(outliner),
+        &text.content,
+        start,
+        text.height,
+        text.angle,
+        color,
+    );
 }
 
 /// 図面枠・表題欄をパスへ展開する。
@@ -764,8 +811,9 @@ mod tests {
     use super::*;
     use crate::frame::{CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
     use mcad_core::{
-        Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimStyle, Layer,
-        Scale, SheetMeta, SizeTolerance, Style, TableKind, WidthMm, expand_linear,
+        Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimStyle,
+        HorizontalAlign, Layer, Scale, SheetMeta, SizeTolerance, Style, TableKind, WidthMm,
+        expand_linear,
     };
     use mcad_geom::{ArrowKind, Circle, LineSeg, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
@@ -1425,6 +1473,7 @@ mod tests {
             kind: TableKind::Table,
             anchor,
             col_widths_mm: vec![20.0, 30.0],
+            col_aligns: vec![HorizontalAlign::Left; 2],
             row_heights_mm: vec![8.0, 8.0, 8.0],
             text_height_mm: 3.5,
             cells: vec![
@@ -1549,6 +1598,115 @@ mod tests {
         );
         assert!(!expected.is_empty());
         assert_eq!(outlines[0].cmds, expected);
+    }
+
+    // ---- 4c: 表のセル文字の揃え（M12 タスク93） ----
+
+    /// 1 行 3 列（列幅 20/30/40mm、中央・右・左揃え）・行高さ 8mm・文字高さ 3.5mm。
+    /// 中央の列には CJK を入れ、字送り幅の実測（推定しない）を確かめる。
+    fn aligned_table(anchor: Point2) -> TableGeom {
+        TableGeom {
+            kind: TableKind::Bom,
+            anchor,
+            col_widths_mm: vec![20.0, 30.0, 40.0],
+            col_aligns: vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Right,
+                HorizontalAlign::Left,
+            ],
+            row_heights_mm: vec![8.0],
+            text_height_mm: 3.5,
+            cells: vec!["部品".to_owned(), "0.520".to_owned(), "ベース".to_owned()],
+        }
+    }
+
+    #[test]
+    fn aligned_cell_text_is_shifted_by_the_font_advance_width() {
+        // 中央・右揃えは、アウトラインを作るのと同じフォントの字送り幅 × 0.5 / 1 だけ
+        // 基準点から始点を戻して、同じ経路（`outline`）で描く。基準点は `expand_table` と
+        // 同じ（紙 mm へは ÷k）。尺度 1:2 で ÷k も通す。
+        let outliner = GlyphOutliner::embedded().unwrap();
+        let mut document = document_with_scale(1, 2); // k = 2
+        add(
+            &mut document,
+            EntityGeom::Table(aligned_table(Point2::new(100.0, 40.0))),
+        );
+        let outlines: Vec<Vec<PathCmd>> = filled(&plot_page(&document, PlotColorMode::Color))
+            .into_iter()
+            .map(|p| p.cmds.clone())
+            .collect();
+        assert_eq!(outlines.len(), 3);
+
+        // 紙 mm: 表の左下 (50, 20)、ベースライン 20 + (8 − 3.5)/2 = 22.25。
+        let baseline = 22.25;
+        // 中央: 基準点 = セル中央 (50 + 10)。
+        let centre_advance = outliner.advance_mm("部品", 3.5);
+        let expected = outliner.outline(
+            "部品",
+            Point2::new(60.0 - centre_advance / 2.0, baseline),
+            3.5,
+            0.0,
+        );
+        assert_eq!(outlines[0], expected);
+        // 右: 基準点 = セル右端 − パディング (50 + 50 − 1.5)。
+        let right_advance = outliner.advance_mm("0.520", 3.5);
+        let expected = outliner.outline(
+            "0.520",
+            Point2::new(100.0 - CELL_TEXT_PAD_MM - right_advance, baseline),
+            3.5,
+            0.0,
+        );
+        assert_eq!(outlines[1], expected);
+        // 左: 従来どおり（セル左端 + パディング = 50 + 50 + 1.5）。
+        let expected = outliner.outline("ベース", Point2::new(101.5, baseline), 3.5, 0.0);
+        assert_eq!(outlines[2], expected);
+    }
+
+    #[test]
+    fn centred_cell_text_advance_span_is_centred_on_the_cell() {
+        // 字送り幅の区間（始点〜始点 + 字送り幅）の中点がセル中央に来る。CJK の全角文字は
+        // Noto Sans JP で 1em 送りなので、推定式（approx_text_width も 1.0×高さ）と偶然
+        // 一致しないよう半角・全角を混ぜる。
+        let outliner = GlyphOutliner::embedded().unwrap();
+        for content in ["部品", "M8x1.25", "S45C 焼入れ", "i"] {
+            let mut document = document_with_scale(1, 1);
+            let table = TableGeom {
+                cells: vec![content.to_owned(), String::new(), String::new()],
+                ..aligned_table(Point2::ORIGIN)
+            };
+            add(&mut document, EntityGeom::Table(table));
+            let page = plot_page(&document, PlotColorMode::Color);
+            let outline = &filled(&page)[0].cmds;
+            let advance = outliner.advance_mm(content, 3.5);
+            assert!(advance > 0.0, "{content}");
+            // 同じ字列を x = 0 から描いたアウトラインとの差（平行移動量）が始点。
+            let at_zero = outliner.outline(content, Point2::new(0.0, 2.25), 3.5, 0.0);
+            let start = cmd_points(outline)[0].x - cmd_points(&at_zero)[0].x;
+            close_to(start + advance / 2.0, 10.0);
+        }
+    }
+
+    #[test]
+    fn advance_width_matches_the_pen_advance_of_the_outline() {
+        // `advance_mm` は `outline` が進める送りと同じ: "AB" のあとに "C" を
+        // `advance_mm("AB")` だけずらして描くと、"ABC" の後半と一致する。
+        let outliner = GlyphOutliner::embedded().unwrap();
+        let abc = outliner.outline("AB部", Point2::new(1.0, 2.0), 3.5, 0.0);
+        let ab = outliner.outline("AB", Point2::new(1.0, 2.0), 3.5, 0.0);
+        let c = outliner.outline(
+            "部",
+            Point2::new(1.0 + outliner.advance_mm("AB", 3.5), 2.0),
+            3.5,
+            0.0,
+        );
+        assert_eq!(abc.len(), ab.len() + c.len());
+        for (x, y) in cmd_points(&abc[ab.len()..]).iter().zip(cmd_points(&c)) {
+            point_close_to(*x, y.x, y.y);
+        }
+        // 全角の CJK は 1em 送り（Noto Sans JP）。空・非正の高さは 0。
+        close_to(outliner.advance_mm("部品", 3.5), 7.0);
+        assert_eq!(outliner.advance_mm("", 3.5), 0.0);
+        assert_eq!(outliner.advance_mm("A", 0.0), 0.0);
     }
 
     // ---- 5: 線幅はクランプしない ----

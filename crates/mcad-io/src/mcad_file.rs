@@ -25,8 +25,8 @@
 //! | 4 | 図面メタデータ `sheet`、レイヤーの `linetype`/`width_mm`、`style` の線幅を px から紙 mm の ByLayer モデルへ（M8） | `dim_style = 既定`（`annotation` は元々 `EntityGeom` の `#[serde(default)]` で無注記に補完される） |
 //! | 5 | 寸法注記（[`mcad_core::DimAnnotation`]）・文書単位の寸法スタイル（`dim_style`）を永続化（M9 タスク48） | `arrow_kind = ClosedFilled`。表（[`EntityGeom::Table`]）は概念自体が無いため、凍結 DTO（[`EntityGeomV5`]）が `Table` タグを拒否する |
 //! | 6 | 汎用テーブル（[`EntityGeom::Table`]、M10）・[`mcad_core::DimStyle::arrow_kind`]（矢先種別。M10 タスク57で `.mcad` へ導入、形状生成は M10 タスク63）を追加 | `direction = Aligned`（凍結 DTO [`DimLinearV6`] が `direction` キーを拒否する） |
-//! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）、長さ寸法の補助線の傾き（`DimLinear::ext_angle`。M11 タスク78）を追加 | `kind = Table`・`use_bom = true`（凍結 DTO [`TableGeomV7`] / [`SheetMetaV7`] が両キーを拒否する。**中身から部品表を推測しない**） |
-//! | 8 | 表の種類 [`TableKind`]（`TableGeom::kind`。表 / 部品表）・図面の「部品表を使う」（`SheetMeta::use_bom`）を追加（M12 タスク81）。現行 | なし |
+//! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）、長さ寸法の補助線の傾き（`DimLinear::ext_angle`。M11 タスク78）を追加 | `kind = Table`・`col_aligns = すべて Left`・`use_bom = true`（凍結 DTO [`TableGeomV7`] / [`SheetMetaV7`] が 3 キーを拒否する。**中身から部品表を推測しない**） |
+//! | 8 | 表の種類 [`TableKind`]（`TableGeom::kind`。表 / 部品表）・図面の「部品表を使う」（`SheetMeta::use_bom`）を追加（M12 タスク81）、表の列ごとの揃え（`TableGeom::col_aligns`。M12 タスク93）を追加。現行 | なし |
 //!
 //! **v7 は M11-1 の中で 3 度拡張した（タスク68 → 69 → 78）が、版は上げていない。**
 //! タスク68 の v7 は未リリースで、同じマイルストーンの中で版を刻む意味がないため
@@ -41,7 +41,7 @@
 //! ```text
 //! v1 → v2 → v3 → v4 → v5 → v6 → v7 → v8(= FileDocument)
 //!      ^    ^    ^    ^    ^    ^    ^
-//!      |    |    |    |    |    |    +-- TableGeomV7 → TableGeom（kind = Table）、
+//!      |    |    |    |    |    |    +-- TableGeomV7 → TableGeom（kind = Table・col_aligns = 左）、
 //!      |    |    |    |    |    |        SheetMetaV7 → SheetMeta（use_bom = true）
 //!      |    |    |    |    |    +------- DimLinearV6 → DimLinear（direction = Aligned・ext_angle = None）
 //!      |    |    |    |    +------------ EntityGeomV5 → EntityGeomV6（Table は現れない）
@@ -52,7 +52,7 @@
 //! ```
 //!
 //! 幾何の凍結 DTO は 5 つある。[`DimLinearV6`]（`direction` を持たない長さ寸法。
-//! v1〜v6 が共有）、[`TableGeomV7`]（`kind` を持たない表。v6・v7 が共有）、
+//! v1〜v6 が共有）、[`TableGeomV7`]（`kind`・`col_aligns` を持たない表。v6・v7 が共有）、
 //! [`EntityGeomV5`]（`Table` を持たない幾何。v1〜v5）、[`EntityGeomV6`]（`Table` を
 //! 持つが `direction` は無い幾何。v6）、[`EntityGeomV7`]（表が `kind` を持たない幾何。
 //! v7）。図面メタデータの凍結 DTO は [`SheetMetaV7`]（`use_bom` を持たない。v4〜v7 が
@@ -267,6 +267,29 @@
 //!   [`mcad_core::CoreError::BomAlreadyExists`] を返し、[`IoError::Core`] として読込ごと
 //!   失敗する（不正な表と同じ扱い。どちらかを黙って表へ落とさない。回帰は
 //!   `v8_file_with_two_boms_is_rejected`）。
+//!
+//! # 表の列ごとの揃え（v8 に相乗り・M12 タスク93）
+//!
+//! M12 タスク93 で [`TableGeom`] へ列ごとの文字の水平揃え（`col_aligns`、
+//! [`mcad_core::HorizontalAlign`] の配列。要素数 = 列数）を足した（DESIGN.md M12
+//! 設計判断11）。v8 は未リリースなので**版は上げずに v8 へ相乗りする**（タスク81 と同じ運用）。
+//!
+//! - export は常に書く（`kind` と同じく `skip_serializing_if` を付けない）。読込は
+//!   `kind` と扱いが違う: **`col_aligns` キーが欠けている v8 だけは、列数ぶんの
+//!   [`mcad_core::HorizontalAlign::Left`] で補って受理する**（[`from_json`] の
+//!   `backfill_missing_v8_col_aligns`。回帰は
+//!   `v8_before_col_aligns_fixture_is_backfilled_as_left`）。タスク93 で `col_aligns` を
+//!   追加した直後、それより前のビルド（タスク81〜92 の間。`kind` はあるが
+//!   `col_aligns` が無い v8）で保存したファイルが読めなくなっていたための移行措置
+//!   （Codex レビュー指摘）。その時期の v8 は中央・右揃えを表現できなかったので、
+//!   欠落時に全列左揃えで読むのは情報を失わない正確な移行になる。
+//! - 要素数が列数と食い違う v8（キー自体はある）は、JSON としては読めても読込境界の
+//!   [`mcad_core::EntityGeom::validate`] が拒否し、[`IoError::InvalidGeometry`] になる
+//!   （不正な表と同じ扱い。回帰は `v8_file_with_mismatched_col_aligns_is_rejected`）。
+//! - **v7 以前の表はすべて左揃えとして読む**（v7 以前は常に左寄せで描いていたので、
+//!   見え方が変わらない）。凍結 DTO [`TableGeomV7`] は `deny_unknown_fields` なので、
+//!   **v7 以前と自称するファイルに `col_aligns` を混ぜると読込ごと失敗する**（`kind` と
+//!   同じ防御。回帰は `v7_file_with_col_aligns_is_rejected`）。
 
 use std::fs;
 use std::path::Path;
@@ -275,9 +298,9 @@ use serde::{Deserialize, Serialize};
 
 use mcad_core::{
     Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimOrdinate,
-    DimRadial, DimStyle, Document, Entity, EntityGeom, Layer, LayerId, Linetype, Orientation,
-    PaperSize, Rgb, Scale, SheetMeta, Style, TableGeom, TableKind, TextGeom, TitleBlockFields,
-    TitleBlockKind, Unit, WidthMm,
+    DimRadial, DimStyle, Document, Entity, EntityGeom, HorizontalAlign, Layer, LayerId, Linetype,
+    Orientation, PaperSize, Rgb, Scale, SheetMeta, Style, TableGeom, TableKind, TextGeom,
+    TitleBlockFields, TitleBlockKind, Unit, WidthMm,
 };
 use mcad_geom::{Point2, Shape};
 
@@ -295,7 +318,9 @@ use crate::IoError;
 ///   矢先種別（[`mcad_core::DimStyle::arrow_kind`]）を追加。
 /// - v7（M11 タスク68）で長さ寸法の向き（[`mcad_core::DimDirection`]。回転寸法）を追加。
 /// - v8（M12 タスク81）で表の種類（[`TableKind`]）と図面の「部品表を使う」
-///   （[`SheetMeta::use_bom`]）を追加。
+///   （[`SheetMeta::use_bom`]）を追加。同じ v8 に表の列ごとの揃え
+///   （`TableGeom::col_aligns`。M12 タスク93）が相乗りした（v8 は未リリースのため版を
+///   上げていない）。
 ///
 /// 書き出しは常に v8。v1〜v7 のファイルは [`from_json`] が後方互換で読み込む
 /// （[`FileDocumentV1`] / [`FileDocumentV2`] / [`FileDocumentV3`] / [`FileDocumentV4`] /
@@ -833,7 +858,8 @@ impl From<EntityGeomV6> for EntityGeomV7 {
     }
 }
 
-/// v8 で [`TableGeom::kind`]（表の種類。M12 タスク81）が追加される**前**の表を表す
+/// v8 で [`TableGeom::kind`]（表の種類。M12 タスク81）と [`TableGeom::col_aligns`]
+/// （列ごとの揃え。M12 タスク93）が追加される**前**の表を表す
 /// 凍結 DTO（後方互換読込専用、v6・v7 が共有する）。
 ///
 /// # なぜ凍結するか
@@ -850,7 +876,9 @@ impl From<EntityGeomV6> for EntityGeomV7 {
 /// 混ぜると [`IoError::Json`] で**読込ごと失敗する**（`"kind": "Table"` でも拒否する。
 /// 版数の意味を守るためで、[`DimLinearV6`] が `"direction": "Aligned"` を拒否するのと
 /// 同じ）。黙って無視して表として読むと、部品表が表へすり替わった図面を無警告で開く
-/// ことになる（回帰は `v7_file_with_table_kind_is_rejected`）。
+/// ことになる（回帰は `v7_file_with_table_kind_is_rejected`）。`col_aligns` も同じで、
+/// 黙って無視すると中央揃えの列が左揃えへすり替わる（回帰は
+/// `v7_file_with_col_aligns_is_rejected`）。
 ///
 /// [`TableGeom`] のフィールドは M10（v6）で導入してから変わっていないので、mcad が
 /// 書いた v6/v7 の表がこの属性で拒否されることは無い。
@@ -868,11 +896,15 @@ struct TableGeomV7 {
 
 impl From<TableGeomV7> for TableGeom {
     /// 凍結 DTO を現行の [`TableGeom`] へ変換する。**種類は常に [`TableKind::Table`]**
-    /// （中身から部品表を推測しない。DESIGN.md M12 設計判断1）。
+    /// （中身から部品表を推測しない。DESIGN.md M12 設計判断1）。**揃えはすべての列で
+    /// [`HorizontalAlign::Left`]**（v7 以前は常に左寄せで描いていたので見え方を保つ。
+    /// DESIGN.md M12 設計判断11）。要素数は列幅と同じにするので、列数の検証は
+    /// 現行の表と同じ `validate` に任せられる。
     fn from(table: TableGeomV7) -> Self {
         TableGeom {
             kind: TableKind::Table,
             anchor: table.anchor,
+            col_aligns: vec![HorizontalAlign::Left; table.col_widths_mm.len()],
             col_widths_mm: table.col_widths_mm,
             row_heights_mm: table.row_heights_mm,
             text_height_mm: table.text_height_mm,
@@ -1368,6 +1400,53 @@ pub struct LoadSummary {
 /// JSON 構文・型の不一致・検証済み型の範囲外は [`IoError::Json`]、未知バージョンは
 /// [`IoError::UnsupportedVersion`]、その他フォーマット上の異常は
 /// [`import_document`] と同じ [`IoError`] を返す。
+/// v8 の表で `col_aligns` キーが**欠けている場合だけ**、列数ぶんの
+/// [`HorizontalAlign::Left`] で補う（Codex レビュー指摘。タスク93 で `col_aligns` を
+/// v8 の必須キーにしたところ、それより前のビルド（タスク81〜92 の間）が書いた
+/// v8 ファイル（`kind` はあるが `col_aligns` が無い）が読めなくなっていた）。
+///
+/// **キーが無いときだけ**この関数が値を挿入する。キーがあって要素数が列数と
+/// 食い違う場合はここでは触らず、従来どおり [`mcad_core::EntityGeom::validate`] に
+/// 判定を任せて [`IoError::InvalidGeometry`] で拒否する（回帰は
+/// `v8_file_with_mismatched_col_aligns_is_rejected`）。`kind`・`use_bom` の欠落は
+/// 対象外（従来どおり [`IoError::Json`] で拒否する）。
+///
+/// JSON 値の段階で補うのは、[`FileDocument`] が v8 の表に core の [`TableGeom`] を
+/// そのまま使っており（`col_aligns` は serde 必須）、その契約を緩めると
+/// 「要素数を列数へ合わせて補う」という today-specific な移行規則を書けないため
+/// （既定値 1 つに広げる `#[serde(default)]` では列数を知りようがない）。v7 以前のように
+/// 専用の凍結 DTO を挟む手もあるが、v8 は現行バージョンそのものなので別の型を
+/// 常設すると「現行の表の型」が 2 つ並んでしまう。壊れた入力の補正はこの関数へ閉じ、
+/// [`FileDocument`] 自体の型・serde 契約は変えない。
+///
+/// タスク93 より前の v8 fixture は `tests/fixtures/v8_before_col_aligns.mcad`
+/// （回帰は `v8_before_col_aligns_fixture_is_backfilled_as_left`）。
+fn backfill_missing_v8_col_aligns(value: &mut serde_json::Value) {
+    let Some(entities) = value.get_mut("entities").and_then(|e| e.as_array_mut()) else {
+        return;
+    };
+    for entity in entities {
+        let Some(table) = entity
+            .get_mut("geom")
+            .and_then(|g| g.get_mut("Table"))
+            .and_then(|t| t.as_object_mut())
+        else {
+            continue;
+        };
+        if table.contains_key("col_aligns") {
+            continue;
+        }
+        let cols = table
+            .get("col_widths_mm")
+            .and_then(|w| w.as_array())
+            .map_or(0, Vec::len);
+        table.insert(
+            "col_aligns".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String("Left".to_string()); cols]),
+        );
+    }
+}
+
 pub fn from_json(json: &str) -> Result<LoadSummary, IoError> {
     /// バージョンだけを先読みするための最小 DTO。
     #[derive(Deserialize)]
@@ -1400,10 +1479,14 @@ pub fn from_json(json: &str) -> Result<LoadSummary, IoError> {
             file: serde_json::from_str::<FileDocumentV7>(json)?.into_v8(),
             clamped_widths: 0,
         },
-        FORMAT_VERSION => MigratedFile {
-            file: serde_json::from_str::<FileDocument>(json)?,
-            clamped_widths: 0,
-        },
+        FORMAT_VERSION => {
+            let mut value: serde_json::Value = serde_json::from_str(json)?;
+            backfill_missing_v8_col_aligns(&mut value);
+            MigratedFile {
+                file: serde_json::from_value::<FileDocument>(value)?,
+                clamped_widths: 0,
+            }
+        }
         other => return Err(IoError::UnsupportedVersion(other)),
     };
     Ok(LoadSummary {
@@ -2519,6 +2602,7 @@ mod tests {
                 kind: mcad_core::TableKind::Table,
                 anchor: Point2::new(5.0, -3.0),
                 col_widths_mm: vec![15.0, 65.0, 15.0, 35.0, 40.0],
+                col_aligns: vec![mcad_core::HorizontalAlign::Left; 5],
                 row_heights_mm: vec![8.0, 8.0],
                 text_height_mm: 3.5,
                 cells: vec![String::new(); 10],
@@ -3079,6 +3163,7 @@ mod tests {
             kind: TableKind::Bom,
             anchor: Point2::new(x, 0.0),
             col_widths_mm: vec![10.0, 35.0],
+            col_aligns: vec![HorizontalAlign::Center, HorizontalAlign::Left],
             row_heights_mm: vec![8.0, 8.0],
             text_height_mm: 3.5,
             cells: vec![
@@ -3251,6 +3336,165 @@ mod tests {
             // 凍結 DTO は use_bom 以外の未知のキーも拒否する（`SheetMetaV7` の doc）。
             let json = with_sheet_key(base, r#""unknown_key": 1"#);
             assert!(matches!(from_json(&json), Err(IoError::Json(_))), "{json}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 表の列ごとの揃え（v8 に相乗り・M12 タスク93）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn v8_round_trip_is_lossless_for_column_alignments() {
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        let table = TableGeom {
+            kind: TableKind::Table,
+            anchor: Point2::new(-5.0, 7.5),
+            col_widths_mm: vec![10.0, 20.0, 30.0],
+            col_aligns: vec![
+                HorizontalAlign::Right,
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+            ],
+            row_heights_mm: vec![8.0],
+            text_height_mm: 3.5,
+            cells: vec!["1".to_owned(), "中央".to_owned(), String::new()],
+        };
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::Table(table.clone()),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+
+        let json = to_json(&doc).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["entities"][0]["geom"]["Table"]["col_aligns"],
+            serde_json::json!(["Right", "Center", "Left"]),
+            "{json}"
+        );
+        let loaded = load(&json).unwrap();
+        assert_eq!(export_document(&loaded), export_document(&doc));
+        let reloaded_table = loaded
+            .entities()
+            .find_map(|(_, e)| match &e.geom {
+                EntityGeom::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(reloaded_table, table);
+    }
+
+    #[test]
+    fn v8_file_missing_col_aligns_is_backfilled_as_left() {
+        // タスク93 より前のビルドが書いた v8（`kind` はあるが `col_aligns` が無い）は
+        // 拒否せず、列数ぶんの左揃えで補って読む（Codex レビュー指摘。その時期の v8 は
+        // 中央・右揃えを表現できなかったので、左揃えで補うのは情報を失わない正確な
+        // 移行になる）。`kind`・`use_bom` の欠落は対象外で、従来どおり拒否する
+        // （回帰は `v8_file_missing_table_kind_is_rejected` / `v8_file_missing_use_bom_is_rejected`）。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            bom_table_at(0.0),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&to_json(&doc).unwrap()).unwrap();
+        value["entities"][0]["geom"]["Table"]
+            .as_object_mut()
+            .unwrap()
+            .remove("col_aligns");
+        let stripped = serde_json::to_string(&value).unwrap();
+        assert!(
+            !stripped.contains(r#""col_aligns""#),
+            "テスト前提: {stripped}"
+        );
+        let loaded = load(&stripped).expect("col_aligns を欠く v8 は左揃え補完で読めるべき");
+        let table = loaded
+            .entities()
+            .find_map(|(_, e)| match &e.geom {
+                EntityGeom::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            table.col_aligns,
+            vec![HorizontalAlign::Left; table.col_widths_mm.len()],
+            "欠落時は列数ぶんの左揃えで補うべき"
+        );
+    }
+
+    #[test]
+    fn v8_file_with_mismatched_col_aligns_is_rejected() {
+        // 要素数 ≠ 列数は JSON としては読めるが、読込境界の `validate` が拒否する
+        // （3 境界のうちの 1 つ。不正な表と同じ扱い）。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            bom_table_at(0.0),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        for aligns in [
+            serde_json::json!(["Center"]),
+            serde_json::json!(["Center", "Left", "Right"]),
+            serde_json::json!([]),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&to_json(&doc).unwrap()).unwrap();
+            value["entities"][0]["geom"]["Table"]["col_aligns"] = aligns.clone();
+            let json = serde_json::to_string(&value).unwrap();
+            assert!(
+                matches!(load(&json), Err(IoError::InvalidGeometry { .. })),
+                "{aligns}: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn v7_file_with_col_aligns_is_rejected() {
+        // v7 以前の表に揃えの概念は無い。凍結 DTO（`TableGeomV7`）が `deny_unknown_fields`
+        // なので、手編集で混ぜると読込ごと失敗する（`["Left"]` でも拒否する。`kind` と同じ）。
+        for aligns in [r#"["Center"]"#, r#"["Left"]"#] {
+            let geom = format!(
+                r#"{{"Table": {{"anchor": {{"x": 0.0, "y": 0.0}},
+                    "col_widths_mm": [30.0], "col_aligns": {aligns}, "row_heights_mm": [8.0],
+                    "text_height_mm": 3.5, "cells": [""]}}}}"#
+            );
+            for json in [v7_json_with_geom(&geom), v6_json_with_dimension(&geom)] {
+                assert!(
+                    matches!(from_json(&json), Err(IoError::Json(_))),
+                    "col_aligns を持つ旧版ファイルは拒否されるべき: {json}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v7_tables_are_read_as_left_aligned_in_every_column() {
+        // v7 以前は常に左寄せで描いていたので、列数ぶんの左揃えとして読む（見え方を保つ）。
+        let geom = r#"{"Table": {"anchor": {"x": 0.0, "y": 0.0},
+            "col_widths_mm": [10.0, 20.0, 30.0], "row_heights_mm": [8.0],
+            "text_height_mm": 3.5, "cells": ["a", "b", "c"]}}"#;
+        for json in [v7_json_with_geom(geom), v6_json_with_dimension(geom)] {
+            let doc = from_json(&json).unwrap().document;
+            let table = doc
+                .entities()
+                .find_map(|(_, e)| match &e.geom {
+                    EntityGeom::Table(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(table.col_aligns, vec![HorizontalAlign::Left; 3], "{json}");
+            // v8 で保存し直すと、左揃えが明示的に書かれる。
+            let written = to_json(&doc).unwrap();
+            assert!(
+                written.contains(r#""col_aligns": ["#),
+                "揃えは常に書く: {written}"
+            );
         }
     }
 

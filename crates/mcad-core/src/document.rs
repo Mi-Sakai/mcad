@@ -860,9 +860,9 @@ mod tests {
     use super::*;
     use crate::{
         ArrowPlacement, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimStyle, FitClass,
-        Linetype, MAX_DIM_DECIMALS, MAX_SCALE_TERM, MAX_TABLE_MM, MAX_TABLE_ROWS, Orientation,
-        PaperSize, ProjectionMethod, Scale, SizeTolerance, Style, TableGeom, TableKind,
-        TitleBlockFields, TitleBlockKind, TitleBlockTemplate, Unit, ValueStyle, WidthMm,
+        HorizontalAlign, Linetype, MAX_DIM_DECIMALS, MAX_SCALE_TERM, MAX_TABLE_MM, MAX_TABLE_ROWS,
+        Orientation, PaperSize, ProjectionMethod, Scale, SizeTolerance, Style, TableGeom,
+        TableKind, TitleBlockFields, TitleBlockKind, TitleBlockTemplate, Unit, ValueStyle, WidthMm,
     };
     use mcad_geom::{ArrowKind, DimSymbol, LineSeg, Point2, Shape};
 
@@ -2190,6 +2190,11 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::new(10.0, 20.0),
             col_widths_mm: vec![30.0, 40.0, 50.0],
+            col_aligns: vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+                HorizontalAlign::Right,
+            ],
             row_heights_mm: vec![8.0, 10.0],
             text_height_mm: 3.5,
             cells: ["a", "b", "", "d", "e", "f"]
@@ -2225,6 +2230,18 @@ mod tests {
                 "cell count mismatch",
                 with(|t| {
                     t.cells.pop();
+                }),
+            ),
+            (
+                "column alignment count mismatch (too few)",
+                with(|t| {
+                    t.col_aligns.pop();
+                }),
+            ),
+            (
+                "column alignment count mismatch (too many)",
+                with(|t| {
+                    t.col_aligns.push(HorizontalAlign::Left);
                 }),
             ),
             (

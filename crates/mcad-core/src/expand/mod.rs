@@ -39,6 +39,6 @@ pub use dimension::{
 /// 同じ骨格を返すので、これを `pub` にはしない。
 pub(crate) use dimension::{angular_frame, linear_degenerate_dir_and_point, linear_frame};
 pub use table::{
-    CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM, TableExpansion, TableSegment,
-    expand_table, table_world_aabb,
+    CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM, TableCellText, TableExpansion,
+    TableSegment, expand_table, table_world_aabb,
 };

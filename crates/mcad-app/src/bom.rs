@@ -29,8 +29,16 @@
 //! どの場合も、**新しい列構成へ移らない列に空でないセルがあれば変換しない**（`Err` で
 //! 列名を返し、呼び出し側がステータスバーへ出す）。様式A/C から様式B へ切り替えるとき
 //! 備考に値があれば拒否される。見分けを推測しない理由は [`classify_bom_columns`]。
+//!
+//! # 列ごとの文字の揃え（M12 タスク93、DESIGN.md M12 設計判断11）
+//!
+//! 部品表プリセットの揃えは**列の意味（列名）で決める**（[`bom_preset_aligns`]）:
+//! 部番・個数・材質・質量[kg] = 中央、品番・名称・備考 = 左（2026-09-23 ユーザー要望）。
+//! [`apply_bom_preset`]（「部品表にする」の指定・様式への再適用）と [`default_bom_table`]
+//! （`K`）の両方がこの既定を入れる。**既存の表の揃えは引き継がない**（列構成そのものを
+//! 置き換える操作なので、列幅・行高さ・文字高さと同じく様式の既定へ揃える）。
 
-use mcad_core::{SheetMeta, TableGeom, TableKind};
+use mcad_core::{HorizontalAlign, SheetMeta, TableGeom, TableKind};
 use mcad_geom::Point2;
 
 use crate::frame::{FRAME_MARGIN_MM, paper_to_world};
@@ -59,6 +67,10 @@ const BOM_WIDTHS_AC_170: [f64; 7] = [10.0, 35.0, 35.0, 10.0, 30.0, 20.0, 30.0];
 
 /// 様式B（幅120mm）の列幅（紙 mm、規定 2-5-3）。
 const BOM_WIDTHS_B_120: [f64; 6] = [10.0, 25.0, 25.0, 10.0, 30.0, 20.0];
+
+/// 部品欄で中央揃えにする列（M12 タスク93、DESIGN.md M12 設計判断11）。ここに無い列
+/// （品番・名称・備考）は左揃え。短い記号・数値の列を中央へ寄せ、文の列は左に置く。
+const BOM_CENTERED_COLUMNS: [&str; 4] = ["部番", "個数", "材質", "質量[kg]"];
 
 /// 部品欄の行高さ（紙 mm、規定 2-5-3）。
 pub const BOM_ROW_HEIGHT_MM: f64 = 8.0;
@@ -91,6 +103,24 @@ pub fn bom_preset_columns(template_width_mm: f64) -> (&'static [&'static str], V
     }
 }
 
+/// 部品表プリセットの列名 `names`（[`bom_preset_columns`] の結果）に対応する列ごとの
+/// 揃え（M12 タスク93）。部番・個数・材質・質量[kg] = [`HorizontalAlign::Center`]、
+/// それ以外 = [`HorizontalAlign::Left`]（モジュール doc「列ごとの文字の揃え」）。
+/// 要素数は `names` と同じ（= 列数）。
+#[must_use]
+pub fn bom_preset_aligns(names: &[&str]) -> Vec<HorizontalAlign> {
+    names
+        .iter()
+        .map(|name| {
+            if BOM_CENTERED_COLUMNS.contains(name) {
+                HorizontalAlign::Center
+            } else {
+                HorizontalAlign::Left
+            }
+        })
+        .collect()
+}
+
 /// `table` を部品表プリセット（規定 2-5 の列構成・寸法・ヘッダ行）へ置換した新しい
 /// [`TableGeom`] を返す。
 ///
@@ -101,6 +131,8 @@ pub fn bom_preset_columns(template_width_mm: f64) -> (&'static [&'static str], V
 /// - ヘッダ行: **最下段**を列名で上書きする（表の行数が1のときはヘッダのみの表になる。
 ///   部品行はユーザーが「行を上に追加」で足す）。
 /// - 行高さ・文字高さ: 全行 [`BOM_ROW_HEIGHT_MM`] / [`BOM_TEXT_HEIGHT_MM`] に統一する。
+/// - 列ごとの揃え: [`bom_preset_aligns`] の既定に置き換える（元の表の揃えは引き継がない。
+///   M12 タスク93）。
 /// - `anchor`: 変更しない（配置は [`bom_anchor_above_title_block`] が別途受け持つ）。
 ///
 /// # Errors
@@ -194,6 +226,7 @@ pub fn apply_bom_preset(table: &TableGeom, template_width_mm: f64) -> Result<Tab
         kind: table.kind,
         anchor: table.anchor,
         col_widths_mm: widths,
+        col_aligns: bom_preset_aligns(names),
         row_heights_mm: vec![BOM_ROW_HEIGHT_MM; new_rows],
         text_height_mm: BOM_TEXT_HEIGHT_MM,
         cells,
@@ -277,7 +310,8 @@ pub fn bom_anchor_above_title_block(sheet: &SheetMeta, k: f64) -> Point2 {
 ///   `template_width_mm` は様式A/C固定（[`BOM_STYLE_AC_WIDTH_MM`]）を渡す
 ///   （表題欄が無く様式幅を参照できないため）。
 ///
-/// 返す [`TableGeom::kind`] は常に [`TableKind::Bom`]。
+/// 返す [`TableGeom::kind`] は常に [`TableKind::Bom`]。列ごとの揃えは
+/// [`bom_preset_aligns`] の既定（部番・個数・材質・質量[kg] = 中央、他 = 左。M12 タスク93）。
 #[must_use]
 pub fn default_bom_table(anchor: Point2, template_width_mm: f64) -> TableGeom {
     const PART_ROWS: usize = 3;
@@ -293,6 +327,7 @@ pub fn default_bom_table(anchor: Point2, template_width_mm: f64) -> TableGeom {
         kind: TableKind::Bom,
         anchor,
         col_widths_mm: widths,
+        col_aligns: bom_preset_aligns(names),
         row_heights_mm: vec![BOM_ROW_HEIGHT_MM; rows],
         text_height_mm: BOM_TEXT_HEIGHT_MM,
         cells,
@@ -314,6 +349,7 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::new(1.0, 2.0),
             col_widths_mm: vec![10.0; cols],
+            col_aligns: vec![HorizontalAlign::Left; cols],
             row_heights_mm: vec![8.0; rows],
             text_height_mm: 3.5,
             // 見出しが既知の並びと一致しない表は値が入っていると変換できないので、空にしておく。
@@ -374,6 +410,89 @@ mod tests {
         );
     }
 
+    // --- 列ごとの揃え（M12 タスク93、DESIGN.md M12 設計判断11） ---
+
+    /// 部品表プリセットの揃えの期待値（部番・個数・材質・質量[kg] = 中央、他 = 左）。
+    fn expected_aligns(names: &[&str]) -> Vec<HorizontalAlign> {
+        names
+            .iter()
+            .map(|n| match *n {
+                "部番" | "個数" | "材質" | "質量[kg]" => HorizontalAlign::Center,
+                "品番" | "名称" | "備考" => HorizontalAlign::Left,
+                other => panic!("想定外の列名 {other}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn preset_aligns_centre_part_number_quantity_material_and_mass() {
+        use HorizontalAlign::{Center, Left};
+        assert_eq!(
+            bom_preset_aligns(&BOM_COLUMN_NAMES_AC),
+            vec![Center, Left, Left, Center, Center, Center, Left]
+        );
+        assert_eq!(
+            bom_preset_aligns(&BOM_COLUMN_NAMES_B),
+            vec![Center, Left, Left, Center, Center, Center]
+        );
+        // 様式A/C 以外の幅（按分）でも列名は同じなので揃えも同じ。
+        for width in [170.0, 120.0, 150.0] {
+            let (names, widths) = bom_preset_columns(width);
+            let aligns = bom_preset_aligns(names);
+            assert_eq!(aligns.len(), widths.len(), "{width}");
+            assert_eq!(aligns, expected_aligns(names), "{width}");
+        }
+    }
+
+    #[test]
+    fn default_bom_table_uses_the_preset_alignments() {
+        // `K` で置く部品表（M12 設計判断2）にもプリセットの揃えが入る。
+        for (width, names) in [
+            (BOM_STYLE_AC_WIDTH_MM, BOM_COLUMN_NAMES_AC.as_slice()),
+            (120.0, BOM_COLUMN_NAMES_B.as_slice()),
+        ] {
+            let table = default_bom_table(Point2::ORIGIN, width);
+            assert_eq!(table.col_aligns, expected_aligns(names), "{width}");
+        }
+    }
+
+    #[test]
+    fn apply_bom_preset_and_designate_as_bom_replace_alignments_with_the_preset() {
+        // 「部品表にする」（指定・様式への再適用）はプリセットの揃えを入れる。元の表の
+        // 揃え（汎用表の既定 = 左、任意の揃え）は引き継がない（列構成ごと置き換える操作）。
+        let mut table = sample_table(2, 3);
+        table.col_aligns = vec![HorizontalAlign::Right; 3];
+        let applied = apply_bom_preset(&table, 170.0).unwrap();
+        assert_eq!(applied.col_aligns, expected_aligns(&BOM_COLUMN_NAMES_AC));
+        let designated = designate_as_bom(&table, 120.0).unwrap();
+        assert_eq!(designated.col_aligns, expected_aligns(&BOM_COLUMN_NAMES_B));
+        mcad_core::EntityGeom::Table(designated)
+            .validate()
+            .expect("列数と揃えの要素数が一致する");
+
+        // v7 以前から読んだ旧部品表（全列左・旧5列）も、押したときに既定が入る
+        // （DESIGN.md M12 設計判断11「部品表にする」を押したときに部品表の既定が入る）。
+        let legacy = two_row_table(
+            &["P-001", "ブラケット", "2", "S45C", ""],
+            &["品番", "名称", "個数", "材質", "備考"],
+        );
+        assert!(
+            legacy
+                .col_aligns
+                .iter()
+                .all(|a| *a == HorizontalAlign::Left)
+        );
+        let bom = designate_as_bom(&legacy, 170.0).unwrap();
+        assert_eq!(bom.col_aligns, expected_aligns(&BOM_COLUMN_NAMES_AC));
+    }
+
+    #[test]
+    fn reset_to_table_keeps_the_alignments() {
+        // 「表に戻す」は中身を変えない（揃えも保つ）。
+        let bom = default_bom_table(Point2::ORIGIN, BOM_STYLE_AC_WIDTH_MM);
+        assert_eq!(reset_to_table(&bom).col_aligns, bom.col_aligns);
+    }
+
     // --- apply_bom_preset ---
 
     #[test]
@@ -432,6 +551,7 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::new(0.0, 0.0),
             col_widths_mm: vec![10.0, 50.0, 10.0, 30.0, 70.0],
+            col_aligns: vec![HorizontalAlign::Left; 5],
             row_heights_mm: vec![8.0, 8.0],
             text_height_mm: 3.5,
             cells: vec![
@@ -472,6 +592,7 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::new(0.0, 0.0),
             col_widths_mm: vec![10.0, 35.0, 35.0, 10.0, 30.0, 20.0, 30.0],
+            col_aligns: vec![HorizontalAlign::Left; 7],
             row_heights_mm: vec![8.0, 8.0],
             text_height_mm: 3.5,
             cells: vec![
@@ -578,6 +699,7 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::new(0.0, 0.0),
             col_widths_mm: vec![20.0; header.len()],
+            col_aligns: vec![HorizontalAlign::Left; header.len()],
             row_heights_mm: vec![8.0, 8.0],
             text_height_mm: 3.5,
             cells: values

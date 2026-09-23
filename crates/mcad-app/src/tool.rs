@@ -42,10 +42,10 @@ use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
     Command, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation, DimDiameter, DimDirection,
-    DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom, EntityId, LayerId,
-    Linetype, NewIds, OrdinateAxis, Style, TableGeom, TableKind, diameter_pick_segments,
-    dim_distance, expand_angular, expand_diameter, expand_linear, expand_ordinate, expand_radial,
-    linear_pick_segments, radial_pick_segments, table_world_aabb,
+    DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom, EntityId,
+    HorizontalAlign, LayerId, Linetype, NewIds, OrdinateAxis, Style, TableGeom, TableKind,
+    diameter_pick_segments, dim_distance, expand_angular, expand_diameter, expand_linear,
+    expand_ordinate, expand_radial, linear_pick_segments, radial_pick_segments, table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
@@ -564,7 +564,8 @@ impl Tool for PointTool {
 // ---------------------------------------------------------------------
 
 /// 表ツール（`K`）が置く既定の表（M10 詳細設計5）: 3 行 × 3 列、列幅 30mm、
-/// 行高さ 8mm、文字高さ 3.5mm、空セル。行列数の事前入力は設けない
+/// 行高さ 8mm、文字高さ 3.5mm、空セル、全列左揃え（汎用表の揃えの既定。M12 タスク93）。
+/// 行列数の事前入力は設けない
 /// （セル・列幅・行高さの調整は右パネルの表編集ダイアログの方が往復が少ない）。
 fn default_table(anchor: Point2) -> TableGeom {
     const ROWS: usize = 3;
@@ -573,6 +574,7 @@ fn default_table(anchor: Point2) -> TableGeom {
         kind: TableKind::Table,
         anchor,
         col_widths_mm: vec![30.0; COLS],
+        col_aligns: vec![HorizontalAlign::Left; COLS],
         row_heights_mm: vec![8.0; ROWS],
         text_height_mm: 3.5,
         cells: vec![String::new(); ROWS * COLS],
@@ -4929,6 +4931,8 @@ mod tests {
         assert_eq!(table.rows(), 3);
         assert_eq!(table.cols(), 3);
         assert_eq!(table.col_widths_mm, vec![30.0; 3]);
+        // 汎用表の揃えの既定は全列左（M12 タスク93）。
+        assert_eq!(table.col_aligns, vec![HorizontalAlign::Left; 3]);
         assert_eq!(table.row_heights_mm, vec![8.0; 3]);
         assert_eq!(table.text_height_mm, 3.5);
         assert_eq!(table.cells, vec![String::new(); 9]);
@@ -7213,6 +7217,7 @@ mod tests {
                 kind: mcad_core::TableKind::Table,
                 anchor,
                 col_widths_mm: vec![10.0, 10.0],
+                col_aligns: vec![HorizontalAlign::Left; 2],
                 row_heights_mm: vec![8.0, 8.0],
                 text_height_mm: 3.5,
                 cells: vec![String::new(); 4],

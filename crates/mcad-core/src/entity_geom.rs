@@ -425,9 +425,13 @@ impl DimOrdinate {
 ///
 /// # 持たないもの
 ///
-/// **回転角を持たない**（M10 設計方針3）。罫線の太さ・セル内パディング・文字の寄せも
+/// **回転角を持たない**（M10 設計方針3）。罫線の太さ・セル内パディングも
 /// 保存しない（[`crate::expand_table`] の定数で表題欄と同じ見え方に揃える。M10 詳細設計1）。セル結合・
-/// 右寄せ/中央寄せ・行ごとの UI 個別高さは non-goal（M10 詳細設計10）。
+/// 行ごとの UI 個別高さは non-goal（M10 詳細設計10）。
+///
+/// 文字の揃えは M10 では保存しない（常に左寄せ）としていたが、M12 タスク93 で**列ごとの
+/// 水平揃え**（[`TableGeom::col_aligns`]）を持つようにした（DESIGN.md M12 設計判断11）。
+/// セルごと・垂直方向の揃えは持たない（垂直は常に行の中央）。
 ///
 /// **`Copy` ではない**（`Vec` / `String` を持つため）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -450,6 +454,19 @@ pub struct TableGeom {
     pub anchor: Point2,
     /// 各列の幅（紙 mm、左から右へ）。要素数が列数。
     pub col_widths_mm: Vec<f64>,
+    /// 各列のセル文字の水平揃え（左から右へ。M12 タスク93、DESIGN.md M12 設計判断11）。
+    /// **要素数は列数**（[`TableGeom::col_widths_mm`] と同じ）で、食い違いは
+    /// [`EntityGeom::validate`] が拒否する。
+    ///
+    /// 揃えの基準位置（セル内の左端パディング位置・中央・右端パディング位置）と、
+    /// それを各出力（画面・SVG/PDF・DXF）がどう使うかは [`crate::expand_table`] の
+    /// モジュール doc を参照。
+    ///
+    /// serde は [`TableGeom::kind`] と同じく必須（欠落を拒否し、既定値でも常に書く）。
+    /// 既定値（すべて [`HorizontalAlign::Left`]）で補うのは `.mcad` v7 以前からの移行
+    /// だけ（`mcad-io` の凍結 DTO。v7 以前の表は常に左寄せで描かれていたので、見え方が
+    /// 変わらない）。
+    pub col_aligns: Vec<HorizontalAlign>,
     /// 各行の高さ（紙 mm、**上から下へ**。`row_heights_mm[0]` が最上段）。要素数が行数。
     pub row_heights_mm: Vec<f64>,
     /// セル文字の高さ（紙 mm）。全セル共通（セルごとの文字高さは non-goal）。
@@ -481,6 +498,51 @@ pub enum TableKind {
     /// 部品表（規定 2-5）。**1 図面に高々 1 つ**（[`crate::Document::apply`] が
     /// [`crate::CoreError::BomAlreadyExists`] で 2 つ目を拒否する）。
     Bom,
+}
+
+/// 文字の水平揃え（[`TableGeom::col_aligns`] の要素。M12 タスク93、DESIGN.md M12
+/// 設計判断11）。
+///
+/// 揃えは「基準点に対して、文字列の**字送り幅**のどこを合わせるか」を表す。字送り幅を
+/// 測るのは各出力の側（画面は egui のガリー、SVG/PDF は埋め込みフォントの字送り、DXF は
+/// 読み手の CAD）で、core は文字幅を推定しない（推定すると CJK やフォントの違いで画面と
+/// 出力の位置がずれるため。[`crate::expand_table`] のモジュール doc 参照）。
+///
+/// [`TextGeom`] には持たせない（文字エンティティの保存形式が変わるため）。表の展開結果
+/// （[`crate::TableCellText`]）が [`TextGeom`] と組にして運ぶ。
+///
+/// # `#[non_exhaustive]`
+///
+/// 揃えの種類は増えうる（均等割付・小数点揃え等）。[`TableKind`] と同じく下位・外部
+/// クレートからの網羅 `match` を禁じる。クレート外で基準点からのずらし量が要るときは
+/// [`HorizontalAlign::anchor_fraction`] を使う（`match` を書かずに済む）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum HorizontalAlign {
+    /// 左揃え（基準点 = 文字列の左端）。既定値であり、`.mcad` v7 以前の表はすべてこれ。
+    #[default]
+    Left,
+    /// 中央揃え（基準点 = 文字列の字送り幅の中央）。
+    Center,
+    /// 右揃え（基準点 = 文字列の字送り幅の右端）。
+    Right,
+}
+
+impl HorizontalAlign {
+    /// 文字列の字送り幅のうち、基準点より**左（ベースラインの負の向き）**にある割合
+    /// （左 = 0、中央 = 0.5、右 = 1）。
+    ///
+    /// 描く側は「字送り幅 × この値」だけ始点をベースラインの負の向きへずらせばよい。
+    /// 左揃えでは 0 なので、呼び出し側は 0 のときにずらし計算を省いて従来の左端アンカー
+    /// の経路をそのまま通せる（左揃えの出力を M12 以前とビット一致に保つため）。
+    #[must_use]
+    pub fn anchor_fraction(self) -> f64 {
+        match self {
+            HorizontalAlign::Left => 0.0,
+            HorizontalAlign::Center => 0.5,
+            HorizontalAlign::Right => 1.0,
+        }
+    }
 }
 
 /// 表の寸法（個々の列幅・行高さ・文字高さと、それらの合計）として許す最大の紙 mm 値。
@@ -1166,7 +1228,7 @@ fn check_annotation(annotation: &DimAnnotation, kind: DimKind) -> Result<(), Str
 
 /// 表を検証する（[`EntityGeom::validate`] の [`EntityGeom::Table`] 腕の実体）。
 ///
-/// 検証するのは次の 7 つ。
+/// 検証するのは次の 8 つ。
 ///
 /// 1. アンカーが有限であること
 /// 2. 行数・列数が 1 以上 [`MAX_TABLE_ROWS`] / [`MAX_TABLE_COLS`] 以下であること
@@ -1180,6 +1242,8 @@ fn check_annotation(annotation: &DimAnnotation, kind: DimKind) -> Result<(), Str
 ///    （`.mcad` v6・タスク57、Codex adversarial review 2026-09-06 medium 指摘。
 ///    現行の [`MAX_TABLE_MM`] の下では実際には到達しないことを実測済み —
 ///    `validate_table` 内のコメント参照）。
+/// 8. [`TableGeom::col_aligns`] の要素数がちょうど列数であること（M12 タスク93。
+///    番号は追加順で、検査は 2 の直後に行う）
 ///
 /// 6 で **空文字列は拒否しない**（空欄のある表が普通。[`TextGeom`] が空を拒否するのとは
 /// 意図的に違える。M10 詳細設計1）。制御文字を拒むのは [`crate::DimAnnotation`] の
@@ -1206,6 +1270,15 @@ fn validate_table(table: &TableGeom) -> Result<(), String> {
     if cols > MAX_TABLE_COLS {
         return Err(format!(
             "table has too many columns: {cols} (max {MAX_TABLE_COLS})"
+        ));
+    }
+    // 列ごとの揃え（M12 タスク93）。要素数が列数と食い違うと、どの列にどの揃えが
+    // 掛かるかが決まらない（展開は足りない列を左寄せで描くが、それは未検証値への
+    // 全域性のためで、保存・編集の結果として許す形ではない）。
+    if table.col_aligns.len() != cols {
+        return Err(format!(
+            "table column alignment count mismatch: {} alignments for {cols} columns",
+            table.col_aligns.len()
         ));
     }
     for (c, width) in table.col_widths_mm.iter().enumerate() {
@@ -2294,6 +2367,11 @@ mod tests {
             kind: TableKind::Table,
             anchor,
             col_widths_mm: vec![30.0, 40.0, 50.0],
+            col_aligns: vec![
+                HorizontalAlign::Left,
+                HorizontalAlign::Center,
+                HorizontalAlign::Right,
+            ],
             row_heights_mm: vec![8.0, 10.0],
             text_height_mm: 3.5,
             cells: ["a", "b", "c", "d", "e", "f"]
@@ -2309,6 +2387,7 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::ORIGIN,
             col_widths_mm: vec![1.0; cols],
+            col_aligns: vec![HorizontalAlign::Left; cols],
             row_heights_mm: vec![1.0; rows],
             text_height_mm: 0.5,
             cells: vec![String::new(); rows * cols],
@@ -2371,6 +2450,9 @@ mod tests {
             assert_eq!(t.row_heights_mm, original.row_heights_mm, "{why}");
             assert_eq!(t.text_height_mm, original.text_height_mm, "{why}");
             assert_eq!(t.cells, original.cells, "{why}");
+            // 列ごとの揃え（M12 タスク93）も保つ。鏡映でも左右を入れ替えない（列の並びも
+            // セル文字も鏡像化しないのと同じ割り切り）。
+            assert_eq!(t.col_aligns, original.col_aligns, "{why}");
         };
 
         unchanged_except_anchor(
@@ -2542,6 +2624,7 @@ mod tests {
 
         let mut wide = table(Point2::ORIGIN);
         wide.col_widths_mm = vec![big, big];
+        wide.col_aligns = vec![HorizontalAlign::Left; 2];
         wide.cells = vec![String::new(); 4];
         let err = EntityGeom::Table(wide).validate().unwrap_err();
         assert!(err.contains("total table width"), "{err}");
@@ -2557,6 +2640,7 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::ORIGIN,
             col_widths_mm: vec![MAX_TABLE_MM],
+            col_aligns: vec![HorizontalAlign::Left],
             row_heights_mm: vec![MAX_TABLE_MM],
             text_height_mm: 3.5,
             cells: vec![String::new()],
@@ -2615,6 +2699,81 @@ mod tests {
         let without_kind = json.replace(r#""kind":"Bom","#, "");
         assert_ne!(without_kind, json, "テスト前提: 置換が効いている");
         assert!(serde_json::from_str::<EntityGeom>(&without_kind).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // 列ごとの揃え（M12 タスク93）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn table_validate_requires_one_alignment_per_column() {
+        // 参照表（3 列・揃え 3 つ）は通る（受理側の固定）。
+        assert_eq!(EntityGeom::Table(table(Point2::ORIGIN)).validate(), Ok(()));
+
+        // 過不足はどちらも拒否する（どの列にどの揃えが掛かるか決まらない）。
+        let mut too_few = table(Point2::ORIGIN);
+        too_few.col_aligns.pop();
+        let err = EntityGeom::Table(too_few).validate().unwrap_err();
+        assert!(err.contains("alignment count mismatch"), "{err}");
+
+        let mut too_many = table(Point2::ORIGIN);
+        too_many.col_aligns.push(HorizontalAlign::Center);
+        let err = EntityGeom::Table(too_many).validate().unwrap_err();
+        assert!(err.contains("alignment count mismatch"), "{err}");
+
+        let mut none = table(Point2::ORIGIN);
+        none.col_aligns.clear();
+        assert!(EntityGeom::Table(none).validate().is_err());
+
+        // 列を増やしたら揃えも増やせば通る（列の追加・削除は揃えと同時に行う契約）。
+        let mut wider = table(Point2::ORIGIN);
+        wider.col_widths_mm.push(10.0);
+        wider.cells = vec![String::new(); 8];
+        assert!(EntityGeom::Table(wider.clone()).validate().is_err());
+        wider.col_aligns.push(HorizontalAlign::Right);
+        assert_eq!(EntityGeom::Table(wider).validate(), Ok(()));
+    }
+
+    #[test]
+    fn table_col_aligns_are_always_written_and_missing_key_is_rejected() {
+        // 既定値（すべて左）でも常に書く。値は "Left" / "Center" / "Right"。
+        let all_left = EntityGeom::Table(TableGeom {
+            col_aligns: vec![HorizontalAlign::Left; 3],
+            ..table(Point2::ORIGIN)
+        });
+        let json = serde_json::to_string(&all_left).unwrap();
+        assert!(
+            json.contains(r#""col_aligns":["Left","Left","Left"]"#),
+            "{json}"
+        );
+        let json = serde_json::to_string(&EntityGeom::Table(table(Point2::ORIGIN))).unwrap();
+        assert!(
+            json.contains(r#""col_aligns":["Left","Center","Right"]"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<EntityGeom>(&json).unwrap(),
+            EntityGeom::Table(table(Point2::ORIGIN))
+        );
+
+        // キーを欠く JSON は拒否する（`kind` と同じ。既定値で補うと中央揃えの列が黙って
+        // 左へ戻り、次の保存で確定する）。
+        let without = json.replace(r#""col_aligns":["Left","Center","Right"],"#, "");
+        assert_ne!(without, json, "テスト前提: 置換が効いている");
+        assert!(serde_json::from_str::<EntityGeom>(&without).is_err());
+
+        // 未知の揃えも拒否する。
+        let unknown = json.replace(r#""Center""#, r#""Justify""#);
+        assert_ne!(unknown, json, "テスト前提: 置換が効いている");
+        assert!(serde_json::from_str::<EntityGeom>(&unknown).is_err());
+    }
+
+    #[test]
+    fn horizontal_align_default_and_anchor_fraction() {
+        assert_eq!(HorizontalAlign::default(), HorizontalAlign::Left);
+        assert_eq!(HorizontalAlign::Left.anchor_fraction(), 0.0);
+        assert_eq!(HorizontalAlign::Center.anchor_fraction(), 0.5);
+        assert_eq!(HorizontalAlign::Right.anchor_fraction(), 1.0);
     }
 
     #[test]

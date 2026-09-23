@@ -3,8 +3,9 @@
 //!
 //! # 位置づけ
 //!
-//! [`TableGeom`] が持つのは「アンカー・列幅・行高さ・文字高さ・セル文字列」だけで、
-//! 罫線の太さ・セル内パディング・文字の寄せは**保存しない**（M10 詳細設計1）。
+//! [`TableGeom`] が持つのは「アンカー・列幅・列ごとの揃え・行高さ・文字高さ・セル文字列」
+//! だけで、罫線の太さ・セル内パディングは**保存しない**（M10 詳細設計1。列ごとの揃えは
+//! M12 タスク93 で保存するようにした — 下の「揃え」節）。
 //! それらを与えて実際の線分と文字へ組み上げるのがこのモジュールで、画面
 //! （`mcad-app` の `draw_table`）・出力（`plot::push_table`）・ピック（`tool.rs`）・
 //! **DXF export（`mcad-io` の `table_to_dxf_entities`）**の**唯一の出所**になる。
@@ -23,8 +24,8 @@
 //! |---|---|
 //! | [`TableSegment::a`] / [`TableSegment::b`] | **ワールド座標** |
 //! | [`TableSegment::width_mm`] | **紙 mm**（`k` を掛けない。`mcad-app` の `frame::FrameLine` と同じ） |
-//! | [`TextGeom::anchor`] | **ワールド座標** |
-//! | [`TextGeom::height`] | **紙 mm**（[`TextGeom`] 本来の契約のまま） |
+//! | [`TableCellText::text`] の [`TextGeom::anchor`] | **ワールド座標**（揃えの基準点。下の「揃え」節） |
+//! | [`TableCellText::text`] の [`TextGeom::height`] | **紙 mm**（[`TextGeom`] 本来の契約のまま） |
 //!
 //! 組版は紙 mm（アンカー = 局所原点、y-up）で行い、最後に `anchor + 局所 mm * k` で
 //! ワールドへ写す（`k` = [`Scale::world_mm_per_paper_mm`](crate::Scale::world_mm_per_paper_mm)）。
@@ -36,6 +37,43 @@
 //! [`TextGeom::height`] とまったく同じ契約なので、consumers は Text エンティティ用の
 //! 既存経路（画面 `draw_text(.., text.height * k, ..)`、出力 `plot::push_text`）を
 //! そのまま再利用できる。`× k` してから出力側で `÷ k` して戻す往復も要らない。
+//!
+//! # 揃え（M12 タスク93、DESIGN.md M12 設計判断11）
+//!
+//! セル文字は [`TableGeom::col_aligns`] の列ごとの揃え（[`HorizontalAlign`]）で置く。
+//! 展開はセル文字を**「[`TextGeom`] + 揃え」の組**（[`TableCellText`]）で返し、
+//! [`TextGeom::anchor`] には**揃えの基準点**を入れる:
+//!
+//! | 揃え | 基準点の x（セル左端からの紙 mm） | 意味 |
+//! |---|---|---|
+//! | 左 | [`CELL_TEXT_PAD_MM`] | 文字列の左端（M12 以前と同じ位置・同じ式） |
+//! | 中央 | 列幅 / 2 | 文字列の字送り幅の中央 |
+//! | 右 | 列幅 − [`CELL_TEXT_PAD_MM`] | 文字列の字送り幅の右端 |
+//!
+//! y はどの揃えでも同じ（ベースライン = 行の下端 + (行高さ − 文字高さ) / 2 の近似垂直
+//! センタリング。表題欄と同じ式）。
+//!
+//! **中央・右揃えの位置を core で文字幅を推定して左端アンカーへ換算することはしない。**
+//! 推定幅（[`approx_text_width`]）は CJK やフォントの違いで実際の描画幅と食い違い、
+//! 画面と出力で位置がずれるからである。代わりに各出力が**自分の描く文字列の実際の幅**で
+//! 揃える:
+//!
+//! - 画面（`mcad-app` の `draw_table`）: egui がレイアウトしたガリーの幅で始点をずらす
+//!   （`egui::Align` の係数と同じ 0 / 0.5 / 1。[`HorizontalAlign::anchor_fraction`]）。
+//! - SVG/PDF（`mcad-app` の `plot::push_table`）: 文字は `<text>` ではなくアウトライン
+//!   （塗りパス）で出す（M8 設計判断7）ので、SVG の `text-anchor` や PDF の文字演算子は
+//!   使えない。アウトラインを作る埋め込みフォントの**字送りの合計**で始点をずらす
+//!   （描く字形と同じフォント・同じ字送りなので推定ではない）。
+//! - DXF（`mcad-io` の `table_to_dxf_entities`）: `TEXT` の水平揃え（group 72）と
+//!   揃えの基準点（group 11）をそのまま書き、幅の計算は読み手の CAD に任せる。
+//!
+//! 3 出力とも「基準点 = 字送り幅の同じ割合の位置」なので、**基準点の位置は定義上一致する**。
+//! 字送り幅そのものはフォントの違い（画面の ASCII は egui 既定フォント、出力は
+//! Noto Sans JP、DXF は読み手のフォント）で出力ごとに違いうるが、それは左揃えでも
+//! 同じ（文字列の右端の位置が違う）で、揃えが持ち込む差ではない。
+//!
+//! 左揃えは基準点・式とも M12 以前とまったく同じで、各出力も左揃えではずらし計算を
+//! 通さない（**M12 以前の出力とビット一致**）。
 //!
 //! # 紙基準表示トグル（F9）との関係
 //!
@@ -75,7 +113,7 @@
 
 use mcad_geom::{Aabb, Point2, Vec2};
 
-use crate::{TableGeom, TextGeom, approx_text_width};
+use crate::{HorizontalAlign, TableGeom, TextGeom, approx_text_width};
 
 /// 輪郭線・表題欄外枠・表の外枠の線幅（紙 mm、`製図規定.md` 2-3 の 2) / 2-4-3 の a) 外枠）。
 ///
@@ -90,6 +128,8 @@ pub const FRAME_DIVIDER_WIDTH_MM: f32 = 0.13;
 
 /// セル左端から文字アンカーまでの詰め（紙 mm）。`製図規定.md` はセル内の文字の
 /// 詰め量までは規定していないため、可読な余白として自前で定義した値。
+///
+/// 右揃えの列ではセル右端からの詰めにも同じ値を使う（M12 タスク93。左右で余白を揃える）。
 pub const CELL_TEXT_PAD_MM: f64 = 1.5;
 
 /// 表の罫線 1 本（ワールド座標）。
@@ -107,6 +147,24 @@ pub struct TableSegment {
     pub width_mm: f32,
 }
 
+/// 表のセル文字 1 つ（M12 タスク93）。**[`TextGeom`] と水平揃えの組**。
+///
+/// [`TextGeom::anchor`] は揃えの**基準点**（ワールド座標、ベースライン上）で、
+/// 左揃えのときだけ [`TextGeom`] 本来の意味（ベースライン左端）と一致する。中央・右揃えの
+/// ときは、描く側が自分の文字列の字送り幅 × [`HorizontalAlign::anchor_fraction`] だけ
+/// 始点をずらす（モジュール doc「揃え」節）。**`text` だけを取り出して Text エンティティと
+/// 同じ経路へ流すと、中央・右揃えの文字が右へずれる**ので、必ず `align` と組で扱う。
+///
+/// 揃えを [`TextGeom`] のフィールドにしないのは、[`TextGeom`] が文字エンティティの
+/// 保存形式でもあるため（足すと `.mcad` の文字エンティティの形が変わる）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableCellText {
+    /// セル文字（アンカーは揃えの基準点。高さは紙 mm）。
+    pub text: TextGeom,
+    /// 水平揃え（その列の [`TableGeom::col_aligns`]）。
+    pub align: HorizontalAlign,
+}
+
 /// 表の展開結果（罫線 + セル文字）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableExpansion {
@@ -116,11 +174,33 @@ pub struct TableExpansion {
     /// 出さない（表題欄 `mcad-app` の `frame::frame_layout` と同じ規則）。したがって
     /// `r` 行 `c` 列の表の本数は常に `4 + (r - 1) + (c - 1)`。
     pub segments: Vec<TableSegment>,
-    /// セル文字。**空セルは含まない**（[`TableGeom::cells`] は空文字列を許すが、
-    /// 描くものが無い）。並び順は行優先（行 0 = 最上段）。
+    /// セル文字（[`TextGeom`] + 揃え）。**空セルは含まない**（[`TableGeom::cells`] は
+    /// 空文字列を許すが、描くものが無い）。並び順は行優先（行 0 = 最上段）。
     ///
-    /// [`TextGeom::height`] は**紙 mm**（モジュール doc の表を参照）。
-    pub texts: Vec<TextGeom>,
+    /// [`TextGeom::height`] は**紙 mm**、[`TextGeom::anchor`] は揃えの基準点
+    /// （モジュール doc の表と「揃え」節を参照）。
+    pub texts: Vec<TableCellText>,
+}
+
+/// セル左端 `cell_left`（局所の紙 mm）・列幅 `col_width` の列で、揃え `align` の基準点の
+/// x（局所の紙 mm）を返す。モジュール doc「揃え」節の表の実体。
+///
+/// [`expand_table`]（描く位置）と [`table_world_aabb`]（はみ出しの推定）が共有する。
+/// 左揃えの式は M12 以前の `cell_left + CELL_TEXT_PAD_MM` のまま（ビット一致）。
+fn cell_anchor_x(cell_left: f64, col_width: f64, align: HorizontalAlign) -> f64 {
+    match align {
+        HorizontalAlign::Left => cell_left + CELL_TEXT_PAD_MM,
+        HorizontalAlign::Center => cell_left + col_width / 2.0,
+        HorizontalAlign::Right => cell_left + col_width - CELL_TEXT_PAD_MM,
+    }
+}
+
+/// 列 `c` の揃え。**要素数が列数に足りない**（[`EntityGeom::validate`] を通していない
+/// 値）ときは左揃えとして扱う（[`expand_table`] の全域性。`validate` は食い違いを拒否する）。
+///
+/// [`EntityGeom::validate`]: crate::EntityGeom::validate
+fn column_align(table: &TableGeom, c: usize) -> HorizontalAlign {
+    table.col_aligns.get(c).copied().unwrap_or_default()
 }
 
 /// 表を罫線とセル文字へ展開する（このモジュールの唯一の入口、純関数）。
@@ -134,7 +214,8 @@ pub struct TableExpansion {
 /// [`TableGeom`] — 読込直後や
 /// 編集ダイアログの作業コピー（M10 タスク59）— を渡してもよい。`cells` の要素数が
 /// 行 × 列と食い違っていても [`TableGeom::cell`] が `None` を返すだけで、添字の
-/// パニックは起きない。**行または列が 0 の退化した表は空の展開を返す**（幅も高さも
+/// パニックは起きない。`col_aligns` が足りない列は左揃えとして描く。
+/// **行または列が 0 の退化した表は空の展開を返す**（幅も高さも
 /// 0 の外枠 4 本を出しても見えず、出力ファイルに退化パスを混ぜるだけなので）。
 #[must_use]
 pub fn expand_table(table: &TableGeom, k: f64) -> TableExpansion {
@@ -178,21 +259,26 @@ pub fn expand_table(table: &TableGeom, k: f64) -> TableExpansion {
             push_seg(0.0, row_bottom, total_w, row_bottom, FRAME_DIVIDER_WIDTH_MM);
         }
 
-        // セル文字: 左詰め（パディング [`CELL_TEXT_PAD_MM`]）・近似垂直センタリングの
-        // 左下基準点。式は表題欄（`frame_layout`）とまったく同じで、同じ見え方になる。
+        // セル文字: 列の揃えの基準点（左 = パディング [`CELL_TEXT_PAD_MM`]、中央、
+        // 右 = 右端からパディング。[`cell_anchor_x`]）・近似垂直センタリングのベースライン。
+        // 左揃えの式は表題欄（`frame_layout`）とまったく同じで、同じ見え方になる。
         let mut cell_left = 0.0;
         for (c, col_width) in table.col_widths_mm.iter().enumerate() {
             if let Some(content) = table.cell(r, c)
                 && !content.is_empty()
             {
-                texts.push(TextGeom {
-                    anchor: to_world(
-                        cell_left + CELL_TEXT_PAD_MM,
-                        row_bottom + (row_height - table.text_height_mm) / 2.0,
-                    ),
-                    content: content.to_owned(),
-                    height: table.text_height_mm,
-                    angle: 0.0,
+                let align = column_align(table, c);
+                texts.push(TableCellText {
+                    text: TextGeom {
+                        anchor: to_world(
+                            cell_anchor_x(cell_left, *col_width, align),
+                            row_bottom + (row_height - table.text_height_mm) / 2.0,
+                        ),
+                        content: content.to_owned(),
+                        height: table.text_height_mm,
+                        angle: 0.0,
+                    },
+                    align,
                 });
             }
             cell_left += col_width;
@@ -232,15 +318,21 @@ pub fn expand_table(table: &TableGeom, k: f64) -> TableExpansion {
 /// # セル文字のはみ出し(Codex adversarial review 2026-09-06)
 ///
 /// `TableGeom::validate` はセル文字列の長さを制限しないので、長い文字は列幅を超えて
-/// 右へはみ出して描かれる(表題欄と同じく切り抜かない)。AABB が格子の矩形だけだと、
+/// はみ出して描かれる(表題欄と同じく切り抜かない)。AABB が格子の矩形だけだと、
 /// はみ出した文字がカリングで消えたり、ズームフィットで切れたり、矩形選択の内包判定と
-/// 見た目が食い違う。そこで**非空セルの文字の右端**(`approx_text_width` — core の Text
-/// AABB と同じ推定式)を格子の右端と比べ、超えるぶんだけ AABB を右へ広げる。文字は
-/// 水平・高さは行高さ未満(validate)なので、はみ出しうるのは右方向だけ。
+/// 見た目が食い違う。そこで**非空セルの文字の両端**(`approx_text_width` — core の Text
+/// AABB と同じ推定式)を格子の両端と比べ、超えるぶんだけ AABB を広げる。文字は
+/// 水平・高さは行高さ未満(validate)なので、はみ出しうるのは左右だけ: 左揃えは右へ、
+/// 右揃えは左へ、中央揃えは両側へ(M12 タスク93。揃えの基準点は [`expand_table`] と
+/// 同じ [`cell_anchor_x`])。ここでの幅は**推定**だが、AABB は描画位置を決めない
+/// (カリング・選択の当たり判定の近似。Text の AABB と同じ割り切り)。
 /// 文字列の複製はせず、`chars()` を走査するだけ(毎フレーム呼ばれる関数なので)。
+///
+/// 左揃えだけの表では左端は格子の左端(= アンカー)のままで、結果は M12 以前と一致する。
 #[must_use]
 pub fn table_world_aabb(table: &TableGeom, k: f64) -> Aabb {
     let total_w = table.width_mm();
+    let mut left_mm: f64 = 0.0;
     let mut right_mm = total_w;
     let cols = table.cols();
     for r in 0..table.rows() {
@@ -249,15 +341,28 @@ pub fn table_world_aabb(table: &TableGeom, k: f64) -> Aabb {
             if let Some(content) = table.cell(r, c)
                 && !content.is_empty()
             {
-                let end =
-                    cell_left + CELL_TEXT_PAD_MM + approx_text_width(content, table.text_height_mm);
-                right_mm = right_mm.max(end);
+                let align = column_align(table, c);
+                let anchor_x = cell_anchor_x(cell_left, *col_width, align);
+                let width = approx_text_width(content, table.text_height_mm);
+                if align == HorizontalAlign::Left {
+                    // M12 以前と同じ式（ビット一致のため分けておく）。
+                    right_mm = right_mm.max(anchor_x + width);
+                } else {
+                    let start = anchor_x - width * align.anchor_fraction();
+                    left_mm = left_mm.min(start);
+                    right_mm = right_mm.max(start + width);
+                }
             }
             cell_left += col_width;
         }
     }
     let size = Vec2::new(right_mm * k, table.height_mm() * k);
-    Aabb::from_corners(table.anchor, table.anchor + size)
+    let min = if left_mm < 0.0 {
+        Point2::new(table.anchor.x + left_mm * k, table.anchor.y)
+    } else {
+        table.anchor
+    };
+    Aabb::from_corners(min, table.anchor + size)
 }
 
 #[cfg(test)]
@@ -273,6 +378,7 @@ mod tests {
             kind: TableKind::Table,
             anchor,
             col_widths_mm: vec![10.0; cols],
+            col_aligns: vec![HorizontalAlign::Left; cols],
             row_heights_mm: vec![8.0; rows],
             text_height_mm: 3.5,
             cells: vec![String::new(); rows * cols],
@@ -337,6 +443,7 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::ORIGIN,
             col_widths_mm: vec![10.0, 20.0, 30.0],
+            col_aligns: vec![HorizontalAlign::Left; 3],
             row_heights_mm: vec![5.0, 8.0],
             text_height_mm: 3.5,
             cells: vec![String::new(); 6],
@@ -412,13 +519,13 @@ mod tests {
         assert_eq!(one.texts.len(), 1);
         assert_eq!(two.texts.len(), 1);
         point_close_to(
-            two.texts[0].anchor,
-            anchor.x + (one.texts[0].anchor.x - anchor.x) * 2.0,
-            anchor.y + (one.texts[0].anchor.y - anchor.y) * 2.0,
+            two.texts[0].text.anchor,
+            anchor.x + (one.texts[0].text.anchor.x - anchor.x) * 2.0,
+            anchor.y + (one.texts[0].text.anchor.y - anchor.y) * 2.0,
         );
         // 文字高さは紙 mm の契約のまま（`× k` しない）。
-        assert_eq!(one.texts[0].height, 3.5);
-        assert_eq!(two.texts[0].height, 3.5);
+        assert_eq!(one.texts[0].text.height, 3.5);
+        assert_eq!(two.texts[0].text.height, 3.5);
     }
 
     #[test]
@@ -456,6 +563,7 @@ mod tests {
             kind: TableKind::Table,
             anchor: Point2::ORIGIN,
             col_widths_mm: vec![10.0, 20.0],
+            col_aligns: vec![HorizontalAlign::Left; 2],
             row_heights_mm: vec![8.0, 6.0],
             text_height_mm: 3.5,
             cells: vec![
@@ -468,17 +576,17 @@ mod tests {
         let ex = expand_table(&t, 1.0);
         assert_eq!(ex.texts.len(), 4);
         // 並びは行優先（行 0 = 最上段）。
-        let contents: Vec<&str> = ex.texts.iter().map(|t| t.content.as_str()).collect();
+        let contents: Vec<&str> = ex.texts.iter().map(|t| t.text.content.as_str()).collect();
         assert_eq!(contents, ["r0c0", "r0c1", "r1c0", "r1c1"]);
 
         // 表の全高 14mm。行 0（最上段、高さ 8）の下端は y=6、行 1（高さ 6）の下端は y=0。
         // x はセル左端 + CELL_TEXT_PAD_MM、y は行下端 + (行高さ − 文字高さ)/2。
-        point_close_to(ex.texts[0].anchor, 1.5, 6.0 + (8.0 - 3.5) / 2.0);
-        point_close_to(ex.texts[1].anchor, 11.5, 6.0 + (8.0 - 3.5) / 2.0);
-        point_close_to(ex.texts[2].anchor, 1.5, (6.0 - 3.5) / 2.0);
-        point_close_to(ex.texts[3].anchor, 11.5, (6.0 - 3.5) / 2.0);
-        assert!(ex.texts.iter().all(|t| t.angle == 0.0));
-        assert!(ex.texts.iter().all(|t| t.height == 3.5));
+        point_close_to(ex.texts[0].text.anchor, 1.5, 6.0 + (8.0 - 3.5) / 2.0);
+        point_close_to(ex.texts[1].text.anchor, 11.5, 6.0 + (8.0 - 3.5) / 2.0);
+        point_close_to(ex.texts[2].text.anchor, 1.5, (6.0 - 3.5) / 2.0);
+        point_close_to(ex.texts[3].text.anchor, 11.5, (6.0 - 3.5) / 2.0);
+        assert!(ex.texts.iter().all(|t| t.text.angle == 0.0));
+        assert!(ex.texts.iter().all(|t| t.text.height == 3.5));
     }
 
     #[test]
@@ -488,9 +596,9 @@ mod tests {
         t.cells[2] = "bottom".to_owned();
         let ex = expand_table(&t, 1.0);
         assert_eq!(ex.texts.len(), 2);
-        assert_eq!(ex.texts[0].content, "top");
-        assert_eq!(ex.texts[1].content, "bottom");
-        assert!(ex.texts[0].anchor.y > ex.texts[1].anchor.y);
+        assert_eq!(ex.texts[0].text.content, "top");
+        assert_eq!(ex.texts[1].text.content, "bottom");
+        assert!(ex.texts[0].text.anchor.y > ex.texts[1].text.anchor.y);
     }
 
     #[test]
@@ -499,7 +607,7 @@ mod tests {
         t.cells[1] = "only".to_owned();
         let ex = expand_table(&t, 1.0);
         assert_eq!(ex.texts.len(), 1);
-        assert_eq!(ex.texts[0].content, "only");
+        assert_eq!(ex.texts[0].text.content, "only");
     }
 
     // ---- 全域性（検証していない値でも panic しない） ----
@@ -521,6 +629,179 @@ mod tests {
         t.cells[0] = "ab".to_owned();
         let bb2 = table_world_aabb(&t, k);
         assert!((bb2.max.x - (5.0 + 30.0 * k)).abs() < T, "{bb2:?}");
+    }
+
+    // ---- 揃え（M12 タスク93） ----
+
+    /// 1 行 3 列（列幅 10/20/30mm、左・中央・右揃え）・行高さ 8mm・文字高さ 3.5mm。
+    fn aligned_table(anchor: Point2) -> TableGeom {
+        TableGeom {
+            kind: TableKind::Table,
+            anchor,
+            col_widths_mm: vec![10.0, 20.0, 30.0],
+            col_aligns: vec![
+                HorizontalAlign::Left,
+                HorizontalAlign::Center,
+                HorizontalAlign::Right,
+            ],
+            row_heights_mm: vec![8.0],
+            text_height_mm: 3.5,
+            cells: vec!["L".to_owned(), "C".to_owned(), "R".to_owned()],
+        }
+    }
+
+    #[test]
+    fn cell_text_anchor_is_the_alignment_reference_point_of_its_column() {
+        // 左 = セル左端 + パディング、中央 = セル中央、右 = セル右端 − パディング
+        // （モジュール doc「揃え」節の表）。y（ベースライン）は揃えに依らない。
+        let ex = expand_table(&aligned_table(Point2::ORIGIN), 1.0);
+        assert_eq!(ex.texts.len(), 3);
+        let baseline = (8.0 - 3.5) / 2.0;
+        point_close_to(ex.texts[0].text.anchor, CELL_TEXT_PAD_MM, baseline);
+        point_close_to(ex.texts[1].text.anchor, 10.0 + 20.0 / 2.0, baseline);
+        point_close_to(ex.texts[2].text.anchor, 60.0 - CELL_TEXT_PAD_MM, baseline);
+        let aligns: Vec<HorizontalAlign> = ex.texts.iter().map(|t| t.align).collect();
+        assert_eq!(
+            aligns,
+            [
+                HorizontalAlign::Left,
+                HorizontalAlign::Center,
+                HorizontalAlign::Right
+            ]
+        );
+        // 文字の中身・高さ・角度は揃えに関係なく同じ契約（紙 mm・水平）。
+        assert!(ex.texts.iter().all(|t| t.text.height == 3.5));
+        assert!(ex.texts.iter().all(|t| t.text.angle == 0.0));
+    }
+
+    #[test]
+    fn aligned_anchors_scale_from_the_table_anchor_like_the_rules() {
+        // 基準点も罫線と同じ「anchor 基準で k 倍」の写像に乗る（尺度をまたいで紙の上の
+        // 位置が変わらない）。
+        let anchor = Point2::new(100.0, -50.0);
+        let one = expand_table(&aligned_table(anchor), 1.0);
+        let two = expand_table(&aligned_table(anchor), 2.0);
+        for (a, b) in one.texts.iter().zip(two.texts.iter()) {
+            assert_eq!(a.align, b.align);
+            point_close_to(
+                b.text.anchor,
+                anchor.x + (a.text.anchor.x - anchor.x) * 2.0,
+                anchor.y + (a.text.anchor.y - anchor.y) * 2.0,
+            );
+        }
+    }
+
+    #[test]
+    fn left_aligned_cell_text_is_bit_identical_to_the_pre_m12_formula() {
+        // 左揃えは M12 以前の式 `anchor + ((cell_left + PAD) * k, (row_bottom +
+        // (row_height − text_height) / 2) * k)` と**ビット一致**する（許容誤差で比べない）。
+        // 半端な値・尺度で丸めの順序まで固定する。
+        let t = TableGeom {
+            kind: TableKind::Table,
+            anchor: Point2::new(123.456_789, -7.891_011),
+            col_widths_mm: vec![12.3, 45.67, 8.9],
+            col_aligns: vec![HorizontalAlign::Left; 3],
+            row_heights_mm: vec![7.7, 9.13],
+            text_height_mm: 3.3,
+            cells: (0..6).map(|i| format!("c{i}")).collect(),
+        };
+        let k = 0.37;
+        let ex = expand_table(&t, k);
+        assert_eq!(ex.texts.len(), 6);
+        let mut expected = Vec::new();
+        let mut row_top = t.height_mm();
+        for row_height in &t.row_heights_mm {
+            let row_bottom = row_top - row_height;
+            let mut cell_left = 0.0;
+            for col_width in &t.col_widths_mm {
+                expected.push(
+                    t.anchor
+                        + Vec2::new(
+                            (cell_left + CELL_TEXT_PAD_MM) * k,
+                            (row_bottom + (row_height - t.text_height_mm) / 2.0) * k,
+                        ),
+                );
+                cell_left += col_width;
+            }
+            row_top = row_bottom;
+        }
+        let actual: Vec<Point2> = ex.texts.iter().map(|c| c.text.anchor).collect();
+        assert_eq!(actual, expected);
+        assert!(ex.texts.iter().all(|c| c.align == HorizontalAlign::Left));
+    }
+
+    #[test]
+    fn missing_column_alignments_expand_as_left() {
+        // `col_aligns` が列数に足りない未検証の値（`validate` は拒否する）でも panic せず、
+        // 足りない列は左揃えで描く（全域関数の契約）。
+        let t = TableGeom {
+            col_aligns: vec![HorizontalAlign::Right],
+            ..aligned_table(Point2::ORIGIN)
+        };
+        let ex = expand_table(&t, 1.0);
+        assert_eq!(ex.texts.len(), 3);
+        assert_eq!(ex.texts[0].align, HorizontalAlign::Right);
+        assert_eq!(ex.texts[1].align, HorizontalAlign::Left);
+        assert_eq!(ex.texts[2].align, HorizontalAlign::Left);
+        point_close_to(ex.texts[1].text.anchor, 10.0 + CELL_TEXT_PAD_MM, 2.25);
+        // AABB も同じ扱いで panic しない。
+        let _ = table_world_aabb(&t, 1.0);
+    }
+
+    #[test]
+    fn table_world_aabb_grows_to_the_left_for_right_and_centre_aligned_overflow() {
+        // 列幅 10mm・文字高さ 3.5mm に ASCII 40 文字（推定幅 0.55×3.5×40 = 77mm）。
+        let long = "A".repeat(40);
+        let width = 0.55 * 3.5 * 40.0;
+        let anchor = Point2::new(5.0, 5.0);
+        let k = 2.0;
+        let one_col = |align: HorizontalAlign| TableGeom {
+            kind: TableKind::Table,
+            anchor,
+            col_widths_mm: vec![10.0],
+            col_aligns: vec![align],
+            row_heights_mm: vec![8.0],
+            text_height_mm: 3.5,
+            cells: vec![long.clone()],
+        };
+
+        // 右揃え: 右端はセル右端 − パディング（格子内）、左端は基準点 − 幅（左へはみ出す）。
+        let bb = table_world_aabb(&one_col(HorizontalAlign::Right), k);
+        let start = 10.0 - CELL_TEXT_PAD_MM - width;
+        assert!((bb.min.x - (5.0 + start * k)).abs() < T, "{bb:?}");
+        assert!((bb.max.x - (5.0 + 10.0 * k)).abs() < T, "{bb:?}");
+        assert!((bb.min.y - 5.0).abs() < T && (bb.max.y - (5.0 + 8.0 * k)).abs() < T);
+
+        // 中央揃え: 両側へ半分ずつ。
+        let bb = table_world_aabb(&one_col(HorizontalAlign::Center), k);
+        assert!(
+            (bb.min.x - (5.0 + (5.0 - width / 2.0) * k)).abs() < T,
+            "{bb:?}"
+        );
+        assert!(
+            (bb.max.x - (5.0 + (5.0 + width / 2.0) * k)).abs() < T,
+            "{bb:?}"
+        );
+
+        // 左揃え: 従来どおり右へだけ広がり、左下はアンカーのまま（厳密に一致）。
+        let bb = table_world_aabb(&one_col(HorizontalAlign::Left), k);
+        assert_eq!(bb.min, anchor);
+        assert!((bb.max.x - (5.0 + (CELL_TEXT_PAD_MM + width) * k)).abs() < T);
+
+        // 収まる文字なら揃えに関係なく格子の矩形のまま。
+        for align in [
+            HorizontalAlign::Left,
+            HorizontalAlign::Center,
+            HorizontalAlign::Right,
+        ] {
+            let t = TableGeom {
+                cells: vec!["ab".to_owned()],
+                ..one_col(align)
+            };
+            let bb = table_world_aabb(&t, k);
+            assert_eq!(bb.min, anchor, "{align:?}");
+            assert!((bb.max.x - (5.0 + 10.0 * k)).abs() < T, "{align:?}: {bb:?}");
+        }
     }
 
     #[test]

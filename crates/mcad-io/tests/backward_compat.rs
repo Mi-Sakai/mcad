@@ -1,5 +1,6 @@
 //! `.mcad` v1〜v8 の後方互換 fixture テスト（M11 タスク65、v7 はタスク68、v8 と
-//! `v7_legacy_boms.mcad` は M12 タスク81 で追加）。
+//! `v7_legacy_boms.mcad` は M12 タスク81 で追加、`v8_before_col_aligns.mcad` は
+//! M12 タスク93 で追加）。
 //!
 //! # fixture について
 //!
@@ -12,6 +13,12 @@
 //!
 //! `v7_legacy_boms.mcad` は版ごとの代表ではなく、「v7 以前の旧部品表を中身から推測せず
 //! 表として読む」（DESIGN.md M12 設計判断1）ことを固定する追加の v7 ファイル。
+//!
+//! `v8_before_col_aligns.mcad` も版ごとの代表ではなく、タスク93 で `col_aligns` を
+//! v8 へ足す**前**（タスク81〜92 の間）の実際のビルドが書く v8 をそのまま固定した
+//! ファイル（`kind` はあるが `col_aligns` が無い。`git show <タスク93直前のコミット>:
+//! crates/mcad-io/tests/fixtures/v8.mcad` の内容そのもの）。「その時期の v8 ファイルが
+//! タスク93 後も読める」ことの回帰（Codex レビュー指摘）。
 //!
 //! 「不正な JSON の拒否」「偽装 `Table` の拒否」「v6 に `direction` を混ぜた
 //! ファイルの拒否」のような**壊れた入力**のテストはここへは置かない
@@ -36,7 +43,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use mcad_core::{ArrowPlacement, DimDirection, Document, EntityGeom, Linetype, TableKind};
+use mcad_core::{
+    ArrowPlacement, DimDirection, Document, EntityGeom, HorizontalAlign, Linetype, TableKind,
+};
 use mcad_geom::{ArrowKind, DimSymbol};
 use mcad_io::{FORMAT_VERSION, export_document, from_json};
 
@@ -51,6 +60,16 @@ fn fixture_named(name: &str) -> String {
     path.push("tests/fixtures");
     path.push(name);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("fixture {path:?} を読めない: {e}"))
+}
+
+/// 文書内の表の列ごとの揃えを、生存エンティティの列挙順で集める（M12 タスク93）。
+fn table_aligns(doc: &Document) -> Vec<Vec<HorizontalAlign>> {
+    doc.entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::Table(t) => Some(t.col_aligns.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 文書内の表の種類を、生存エンティティの列挙順で集める。
@@ -493,6 +512,7 @@ fn v7_legacy_boms_fixture_loads_as_plain_tables() {
 #[test]
 fn v8_fixture_loads_with_expected_content() {
     // v8(現行): 表の種類（TableKind）と「部品表を使う」（SheetMeta::use_bom）。M12 タスク81。
+    // 表の列ごとの揃え（TableGeom::col_aligns）が M12 タスク93 で相乗りした。
     let summary = from_json(&fixture(8)).expect("v8 fixture は読めるべき");
     let doc = summary.document;
 
@@ -500,6 +520,24 @@ fn v8_fixture_loads_with_expected_content() {
     assert_eq!(doc.entity_count(), 4);
     assert!(!doc.sheet().use_bom, "use_bom = false はそのまま読む");
     assert_eq!(table_kinds(&doc), vec![TableKind::Bom, TableKind::Table]);
+
+    // 列ごとの揃え（M12 タスク93、v8 に相乗り）はファイルの値をそのまま読む。部品表は
+    // 部品表プリセットの既定（部番・個数・材質・質量 = 中央、品番・名称・備考 = 左）。
+    assert_eq!(
+        table_aligns(&doc),
+        vec![
+            vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+                HorizontalAlign::Left,
+                HorizontalAlign::Center,
+                HorizontalAlign::Center,
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+            ],
+            vec![HorizontalAlign::Center, HorizontalAlign::Right],
+        ]
+    );
 
     // 部品表はロック済みレイヤー上にあっても読める（ロックはエンティティ投入後に適用）。
     let bom = doc.bom().expect("部品表が 1 つあるはず");
@@ -532,14 +570,60 @@ fn v8_fixture_is_exactly_what_the_exporter_writes() {
     assert_eq!(actual, expected, "書き出し: {written}");
 }
 
+#[test]
+fn v8_before_col_aligns_fixture_is_backfilled_as_left() {
+    // タスク93 より前のビルドが書いた v8（`kind` はあるが `col_aligns` が無い）は
+    // 拒否されず、列数ぶんの左揃えで補って読める（Codex レビュー指摘）。
+    let text = fixture_named("v8_before_col_aligns.mcad");
+    assert!(
+        !text.contains("col_aligns"),
+        "テスト前提: この fixture は col_aligns を持たない: {text}"
+    );
+    let doc = from_json(&text)
+        .expect("col_aligns を欠く旧い v8 fixture は読めるべき")
+        .document;
+    assert_eq!(doc.layer_count(), 2);
+    assert_eq!(doc.entity_count(), 4);
+    assert_eq!(table_kinds(&doc), vec![TableKind::Bom, TableKind::Table]);
+    for aligns in table_aligns(&doc) {
+        assert!(
+            aligns.iter().all(|a| *a == HorizontalAlign::Left),
+            "col_aligns 欠落時はすべて左揃えで読むべき: {aligns:?}"
+        );
+    }
+
+    // 書き出すと col_aligns 付きの現行 v8 になる（現行 fixture とはバージョン番号・
+    // スキーマが一致するが、値そのものは補完した左揃えのまま）。
+    let written = mcad_io::to_json(&doc).unwrap();
+    let written: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(written["version"], 8);
+    let table_entities: Vec<&serde_json::Value> = written["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["geom"].get("Table").is_some())
+        .collect();
+    assert_eq!(table_entities.len(), 2, "表は 2 つのはず: {written}");
+    for entity in table_entities {
+        let table = &entity["geom"]["Table"];
+        let cols = table["col_widths_mm"].as_array().unwrap().len();
+        assert_eq!(
+            table["col_aligns"],
+            serde_json::Value::Array(vec![serde_json::Value::String("Left".into()); cols]),
+            "書き出しは col_aligns を列数ぶん明示的に持つべき: {written}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------
 // バージョン横断
 // ---------------------------------------------------------------------
 
 #[test]
 fn fixtures_before_v8_read_tables_as_table_and_use_bom_as_on() {
-    // v7 以前は種類・「部品表を使う」を持たないので、表はすべて Table、
-    // 「部品表を使う」は ON（DESIGN.md M12 設計判断1）。
+    // v7 以前は種類・「部品表を使う」・列ごとの揃えを持たないので、表はすべて Table、
+    // 「部品表を使う」は ON（DESIGN.md M12 設計判断1）、揃えはすべての列で左
+    // （DESIGN.md M12 設計判断11）。
     for version in 1..FORMAT_VERSION {
         let doc = from_json(&fixture(version))
             .unwrap_or_else(|e| panic!("v{version} fixture が読めない: {e}"))
@@ -550,6 +634,21 @@ fn fixtures_before_v8_read_tables_as_table_and_use_bom_as_on() {
             "v{version}: 表はすべて Table で読むべき"
         );
         assert_eq!(doc.bom(), None, "v{version}: 部品表は無いはず");
+        for aligns in table_aligns(&doc) {
+            assert!(
+                aligns.iter().all(|a| *a == HorizontalAlign::Left),
+                "v{version}: 揃えはすべて左で読むべき: {aligns:?}"
+            );
+        }
+    }
+    // 旧部品表を 2 つ持つ v7 も同じ（v0.11.1 以前の部品表の見え方を変えない）。
+    let doc = from_json(&fixture_named("v7_legacy_boms.mcad"))
+        .unwrap()
+        .document;
+    let aligns = table_aligns(&doc);
+    assert_eq!(aligns.len(), 2);
+    for (aligns, cols) in aligns.iter().zip([5, 7]) {
+        assert_eq!(*aligns, vec![HorizontalAlign::Left; cols]);
     }
 }
 

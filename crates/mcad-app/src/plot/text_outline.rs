@@ -111,6 +111,29 @@ impl GlyphOutliner {
         cmds
     }
 
+    /// 文字列の字送り幅（**紙 mm**）。[`GlyphOutliner::outline`] が文字列の終わりまでに
+    /// 進める送り（ベースライン方向）と同じ値で、未収録の文字も同じ既定送りで数える
+    /// （M12 タスク93: 表のセル文字の中央・右揃えに使う）。
+    ///
+    /// アウトラインと**同じフォント・同じ字送りの足し算**から出すので、字形の実際の
+    /// 並びに対して推定を含まない（`mcad_core::approx_text_width` の係数推定とは違う）。
+    /// 空文字列・非有限・非正の高さでは 0（[`GlyphOutliner::outline`] が何も描かないのと
+    /// 同じ条件）。
+    #[must_use]
+    pub fn advance_mm(&self, content: &str, height_mm: f64) -> f64 {
+        if content.is_empty() || !height_mm.is_finite() || height_mm <= 0.0 {
+            return 0.0;
+        }
+        let pen_x: f64 = content
+            .chars()
+            .map(|ch| match self.face.glyph_index(ch) {
+                Some(glyph_id) => self.advance(glyph_id),
+                None => MISSING_GLYPH_ADVANCE_EM * self.units_per_em,
+            })
+            .sum();
+        pen_x * (height_mm / self.units_per_em)
+    }
+
     /// グリフの字送り（フォント単位）。`hmtx` に無い場合は未収録扱いの既定送りにする。
     fn advance(&self, glyph_id: GlyphId) -> f64 {
         self.face

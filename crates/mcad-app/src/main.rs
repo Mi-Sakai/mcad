@@ -30,10 +30,11 @@ use egui::{Color32, Key, Pos2, Rect, Stroke};
 use mcad_core::{
     ArrowPlacement, Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimExpansion,
     DimKind, DimLinear, DimOrdinate, DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom,
-    EntityId, FitClass, Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation, PaperSize,
-    ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style, TableGeom, TableKind, TextGeom,
-    TitleBlockFields, TitleBlockKind, ValueStyle, WidthMm, arrow_kind_occupies_line, expand_dim,
-    expand_table, label_box_center, label_box_contains, linear_pick_segments, table_world_aabb,
+    EntityId, FitClass, HorizontalAlign, Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation,
+    PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style, TableGeom, TableKind,
+    TextGeom, TitleBlockFields, TitleBlockKind, ValueStyle, WidthMm, arrow_kind_occupies_line,
+    expand_dim, expand_table, label_box_center, label_box_contains, linear_pick_segments,
+    table_world_aabb,
 };
 use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
@@ -6140,6 +6141,12 @@ struct TableDialogState {
     cells: Vec<Vec<String>>,
     /// 列幅の入力欄（列ごと、紙 mm）。
     col_widths_mm: Vec<String>,
+    /// 列ごとの文字の揃え（M12 タスク93）。このダイアログでは編集しない（揃えの編集 UI は
+    /// タスク94）が、開いた時点の値を保って書き戻す（固定で左を入れると、中央揃えの部品表を
+    /// ダイアログで編集しただけで左へ戻るため）。列の追加・削除では要素数を
+    /// [`TableDialogState::col_widths_mm`] と揃えて増減する（`validate` が要素数 = 列数を
+    /// 要求する）。
+    col_aligns: Vec<HorizontalAlign>,
     /// 行高さの入力欄（全行共通、紙 mm）。
     row_height_mm: String,
     /// 文字高さの入力欄（紙 mm）。
@@ -6182,6 +6189,7 @@ impl TableDialogState {
             anchor: table.anchor,
             cells,
             col_widths_mm,
+            col_aligns: table.col_aligns.clone(),
             row_height_mm,
             text_height_mm: table.text_height_mm.to_string(),
         }
@@ -6200,9 +6208,11 @@ impl TableDialogState {
         }
     }
 
-    /// 「列を右に追加」: 右端へ既定幅30mmの空列を追加する。
+    /// 「列を右に追加」: 右端へ既定幅30mm・左揃え（汎用表の揃えの既定。M12 タスク93）の
+    /// 空列を追加する。
     fn add_col_right(&mut self) {
         self.col_widths_mm.push("30".to_owned());
+        self.col_aligns.push(HorizontalAlign::Left);
         for row in &mut self.cells {
             row.push(String::new());
         }
@@ -6212,6 +6222,7 @@ impl TableDialogState {
     fn remove_right_col(&mut self) {
         if self.col_widths_mm.len() > 1 {
             self.col_widths_mm.pop();
+            self.col_aligns.pop();
             for row in &mut self.cells {
                 row.pop();
             }
@@ -6259,6 +6270,7 @@ fn build_table_from_dialog(state: &TableDialogState) -> Result<TableGeom, String
         kind: state.kind,
         anchor: state.anchor,
         col_widths_mm,
+        col_aligns: state.col_aligns.clone(),
         row_heights_mm,
         text_height_mm,
         cells,
@@ -8193,7 +8205,10 @@ fn entity_world_aabb(geom: &EntityGeom, k: f64) -> Aabb {
 ///
 /// 罫線は常に実線・幅は固定の定数で、エンティティ／レイヤーのスタイルからは
 /// **色だけ**を受け取る（M10 詳細設計1）。セル文字は Text エンティティとまったく同じ
-/// 経路（[`draw_text`] にワールド高さ `height * k` を渡す）で描く。
+/// 経路（[`draw_text_aligned`] にワールド高さ `height * k` を渡す）で描き、列ごとの揃え
+/// （M12 タスク93）は egui がレイアウトしたガリーの実際の幅で合わせる（文字幅を推定しない。
+/// 理由は `mcad_core` の `expand::table` モジュール doc「揃え」節）。左揃えは
+/// [`draw_text`] と同じ位置（M12 以前とビット一致）。
 fn draw_table(
     painter: &egui::Painter,
     rect: Rect,
@@ -8211,10 +8226,18 @@ fn draw_table(
             resolve_stroke_px_with_toggle(paper_display, seg.width_mm, k, viewport.zoom);
         painter.line_segment([a, b], Stroke::new(stroke_px, color));
     }
-    for text in &ex.texts {
+    for cell in &ex.texts {
         // `TextGeom::height` は紙 mm 契約のまま（core の `expand::table` モジュール doc）なので、
         // Text エンティティと同じく `height * k` をワールド高さとして渡す。
-        draw_text(painter, rect, viewport, text, text.height * k, color);
+        draw_text_aligned(
+            painter,
+            rect,
+            viewport,
+            &cell.text,
+            cell.text.height * k,
+            color,
+            cell.align,
+        );
     }
 }
 
@@ -8240,6 +8263,9 @@ fn draw_table(
 /// アンカー（ベースライン左端）にガリー下端左を合わせる（M6 の近似。降り部は無視）。
 /// egui の `TextShape` はガリー左上 `pos` まわりに回すため、下端左がアンカーに載るよう
 /// `pos` をずらす。角度はワールド CCW θ をスクリーン（y 下向き）用に `a = −θ` へ符号反転する。
+///
+/// 左揃え専用（Text エンティティ・寸法・表題欄）。表のセル文字のように揃えを持つものは
+/// [`draw_text_aligned`] を使う（こちらはその左揃え版）。
 fn draw_text(
     painter: &egui::Painter,
     rect: Rect,
@@ -8247,6 +8273,33 @@ fn draw_text(
     text: &TextGeom,
     world_height: f64,
     color: Color32,
+) {
+    draw_text_aligned(
+        painter,
+        rect,
+        viewport,
+        text,
+        world_height,
+        color,
+        HorizontalAlign::Left,
+    );
+}
+
+/// [`draw_text`] の水平揃えつき版（M12 タスク93。表のセル文字が使う）。
+///
+/// `text.anchor` は揃えの基準点（[`mcad_core::TableCellText`] の契約）。ガリー（egui が
+/// 実際にレイアウトした文字列）の幅 × [`HorizontalAlign::anchor_fraction`] だけ始点を
+/// ベースライン方向へ戻し、中央揃えならガリーの中央・右揃えなら右端が基準点に載るように
+/// する（位置の計算は純関数 [`text_galley_pos`]）。文字幅を推定しないので、CJK でも
+/// フォールバックフォントでも揃う。
+fn draw_text_aligned(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    text: &TextGeom,
+    world_height: f64,
+    color: Color32,
+    align: HorizontalAlign,
 ) {
     if text.content.is_empty() {
         return;
@@ -8259,14 +8312,34 @@ fn draw_text(
     let anchor = viewport.world_to_screen(rect, text.anchor);
     let font_id = egui::FontId::new(font_px, egui::FontFamily::Proportional);
     let galley = painter.layout_no_wrap(text.content.clone(), font_id, color);
-    let h = galley.size().y;
     // ワールド CCW 角 θ → スクリーン egui 角 a = −θ。
     let a = -(text.angle as f32);
+    let pos = text_galley_pos(anchor, galley.size(), a, align);
+    let shape = egui::epaint::TextShape::new(pos, galley, color).with_angle(a);
+    painter.add(egui::Shape::Text(shape));
+}
+
+/// ガリーの左上（egui の `TextShape::pos`。回転の中心）を、基準点 `anchor`（スクリーン
+/// 座標）・ガリーの大きさ `galley_size`（px）・スクリーン角 `a`（ラジアン、y 下向きの
+/// egui 角）・水平揃え `align` から求める純関数（[`draw_text_aligned`] の位置計算。
+/// headless テストで固定する）。
+///
+/// ガリー局所座標で (`幅 × f`, `高さ`)（f = [`HorizontalAlign::anchor_fraction`]。
+/// 左 0・中央 0.5・右 1。egui の `Align::to_factor` の Min/Center/Max と同じ値）の点が
+/// `anchor` に載るよう、`pos = anchor − Rot(a)·(幅 × f, 高さ)` とする。左揃え（f = 0）は
+/// M12 以前の式 `anchor − Rot(a)·(0, 高さ)` をそのまま使う（ビット一致）。
+fn text_galley_pos(anchor: Pos2, galley_size: egui::Vec2, a: f32, align: HorizontalAlign) -> Pos2 {
+    let h = galley_size.y;
     let (sin_a, cos_a) = a.sin_cos();
     // pos = anchor − Rot(a)·(0, h)。Rot(a)·(0, h) = (−h·sin_a, h·cos_a)。
     let pos = anchor - egui::vec2(-h * sin_a, h * cos_a);
-    let shape = egui::epaint::TextShape::new(pos, galley, color).with_angle(a);
-    painter.add(egui::Shape::Text(shape));
+    let fraction = align.anchor_fraction() as f32;
+    if fraction == 0.0 {
+        return pos;
+    }
+    // さらに Rot(a)·(幅 × f, 0) = (dx·cos_a, dx·sin_a) だけ戻す。
+    let dx = galley_size.x * fraction;
+    pos - egui::vec2(dx * cos_a, dx * sin_a)
 }
 
 /// 円弧を開始角〜終了角まで [`ARC_SEGMENTS`] 分割のポリラインで近似描画する。
@@ -10098,6 +10171,7 @@ mod tests {
                 kind,
                 anchor: Point2::ORIGIN,
                 col_widths_mm: vec![10.0],
+                col_aligns: vec![HorizontalAlign::Left; 1],
                 row_heights_mm: vec![8.0],
                 text_height_mm: 3.5,
                 cells: vec![String::new()],
@@ -11082,6 +11156,7 @@ mod tests {
             kind: TableKind::Table,
             anchor,
             col_widths_mm: vec![10.0, 10.0, 10.0],
+            col_aligns: vec![HorizontalAlign::Left; 3],
             row_heights_mm: vec![8.0, 8.0],
             text_height_mm: 3.5,
             cells: vec![String::new(); 6],
@@ -11744,11 +11819,18 @@ mod tests {
 
     /// 3行×3列・列幅30mm・行高さ8mm・文字高さ3.5mmの既定の表（`TableTool` の既定値と
     /// 同じ）。セルは行優先で連番の文字列を入れる（並び順の確認用）。
+    /// 列ごとの揃えは列ごとに違う値にして、ダイアログが揃えを保つことを確かめる
+    /// （M12 タスク93）。
     fn default_table_for_dialog_tests() -> TableGeom {
         TableGeom {
             kind: TableKind::Table,
             anchor: Point2::new(1.0, 2.0),
             col_widths_mm: vec![30.0; 3],
+            col_aligns: vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+                HorizontalAlign::Right,
+            ],
             row_heights_mm: vec![8.0; 3],
             text_height_mm: 3.5,
             cells: (0..9).map(|i| format!("c{i}")).collect(),
@@ -11859,6 +11941,17 @@ mod tests {
         assert_eq!(rebuilt.cols(), 4);
         assert_eq!(rebuilt.cell(0, 3), Some(""));
         assert_eq!(rebuilt.cell(0, 0), Some("c0"));
+        // 揃えも 1 つ増え（追加列は汎用表の既定 = 左）、既存の列の揃えは保たれる
+        // （M12 タスク93。要素数 = 列数でないと validate が通らない）。
+        assert_eq!(
+            rebuilt.col_aligns,
+            vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+                HorizontalAlign::Right,
+                HorizontalAlign::Left,
+            ]
+        );
     }
 
     #[test]
@@ -11868,12 +11961,221 @@ mod tests {
         dialog.remove_right_col();
         assert_eq!(dialog.col_widths_mm.len(), 2);
         assert_eq!(dialog.cells[0], vec!["c0", "c1"]);
+        // 揃えも右端から 1 つ減る（M12 タスク93）。組み立てた表は validate を通る。
+        assert_eq!(
+            build_table_from_dialog(&dialog).expect("valid").col_aligns,
+            vec![HorizontalAlign::Center, HorizontalAlign::Left]
+        );
 
         dialog.remove_right_col();
         assert_eq!(dialog.col_widths_mm.len(), 1);
         // 最後の1列は削除しない。
         dialog.remove_right_col();
         assert_eq!(dialog.col_widths_mm.len(), 1);
+        assert_eq!(
+            build_table_from_dialog(&dialog).expect("valid").col_aligns,
+            vec![HorizontalAlign::Center]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 表のセル文字の揃え（M12 タスク93）: 画面の位置計算と 3 出力の基準点
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn text_galley_pos_left_is_bit_identical_to_the_pre_m12_formula() {
+        // 左揃えは M12 以前の `pos = anchor − Rot(a)·(0, h)` と**ビット一致**する
+        // （Text エンティティ・寸法・表題欄・左揃えのセル文字の画面位置が変わらない）。
+        let anchor = Pos2::new(123.25, -45.5);
+        let size = egui::vec2(57.3, 13.7);
+        for a in [0.0_f32, 0.3, -1.2, std::f32::consts::FRAC_PI_2, 3.0] {
+            let (sin_a, cos_a) = a.sin_cos();
+            let h = size.y;
+            let old = anchor - egui::vec2(-h * sin_a, h * cos_a);
+            assert_eq!(
+                text_galley_pos(anchor, size, a, HorizontalAlign::Left),
+                old,
+                "a = {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_galley_pos_puts_the_alignment_point_of_the_galley_on_the_anchor() {
+        // ガリー局所 (幅 × f, 高さ)（f = 0.5 / 1）が基準点に載る。回転していても、
+        // ベースライン方向（Rot(a)·(1, 0)）に沿って戻す。
+        let anchor = Pos2::new(200.0, 150.0);
+        let size = egui::vec2(60.0, 14.0);
+        for a in [0.0_f32, 0.4, -2.0] {
+            let (sin_a, cos_a) = a.sin_cos();
+            for (align, f) in [
+                (HorizontalAlign::Center, 0.5),
+                (HorizontalAlign::Right, 1.0),
+            ] {
+                let pos = text_galley_pos(anchor, size, a, align);
+                let (lx, ly) = (size.x * f, size.y);
+                let landed = pos + egui::vec2(lx * cos_a - ly * sin_a, lx * sin_a + ly * cos_a);
+                assert!(
+                    (landed - anchor).length() < 1e-3,
+                    "{align:?} a={a}: {landed:?} != {anchor:?}"
+                );
+            }
+        }
+        // 水平なら単純に: 中央はガリーの中央、右は右端が基準点の x。
+        let centre = text_galley_pos(anchor, size, 0.0, HorizontalAlign::Center);
+        assert_eq!(centre, Pos2::new(170.0, 136.0));
+        let right = text_galley_pos(anchor, size, 0.0, HorizontalAlign::Right);
+        assert_eq!(right, Pos2::new(140.0, 136.0));
+    }
+
+    /// [`dxf_texts`] が返す `TEXT` 1 つ: `(値, group 72 の値, group 10 の (x, y),
+    /// group 11 の (x, y))`。
+    type DxfTextRecord = (String, i32, (f64, f64), Option<(f64, f64)>);
+
+    /// DXF（ASCII）を `(group code, 値)` の組へ分け、`TEXT` ごとに [`DxfTextRecord`] を
+    /// 取り出す（テスト専用の最小パーサ。mcad-app は `dxf` クレートに直接依存しないので、
+    /// 書き出した文字列を読む）。
+    fn dxf_texts(dxf: &str) -> Vec<DxfTextRecord> {
+        let lines: Vec<&str> = dxf.lines().map(str::trim).collect();
+        let pairs: Vec<(i32, &str)> = lines
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| (c[0].parse().unwrap(), c[1]))
+            .collect();
+        let mut texts = Vec::new();
+        let mut i = 0;
+        while i < pairs.len() {
+            if pairs[i] == (0, "TEXT") {
+                let (mut value, mut h72) = (String::new(), 0);
+                let (mut p10, mut p11) = ((0.0, 0.0), None::<(f64, f64)>);
+                i += 1;
+                while i < pairs.len() && pairs[i].0 != 0 {
+                    let (code, v) = pairs[i];
+                    match code {
+                        1 => value = v.to_owned(),
+                        72 => h72 = v.parse().unwrap(),
+                        10 => p10.0 = v.parse().unwrap(),
+                        20 => p10.1 = v.parse().unwrap(),
+                        11 => p11 = Some((v.parse().unwrap(), p11.map_or(0.0, |p| p.1))),
+                        21 => p11 = Some((p11.map_or(0.0, |p| p.0), v.parse().unwrap())),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                texts.push((value, h72, p10, p11));
+            } else {
+                i += 1;
+            }
+        }
+        texts
+    }
+
+    #[test]
+    fn table_cell_alignment_lands_on_the_same_reference_point_on_screen_svg_pdf_and_dxf() {
+        // DESIGN.md M12 設計判断11「画面・SVG/PDF・DXF で同じ位置に出す」の結合テスト。
+        // 3 出力とも `expand_table` の基準点を、それぞれの文字幅（画面 = ガリー、
+        // SVG/PDF = 埋め込みフォントの字送り、DXF = 読み手）の同じ割合の位置に合わせる。
+        let mut document = Document::new();
+        let sheet = SheetMeta {
+            scale: Scale::new(1, 2).unwrap(), // k = 2
+            ..document.sheet().clone()
+        };
+        document.apply(Command::SetSheet(sheet)).unwrap();
+        let layer = document.current_layer();
+        let table = TableGeom {
+            kind: TableKind::Bom,
+            anchor: Point2::new(30.0, 20.0),
+            col_widths_mm: vec![10.0, 35.0, 20.0],
+            col_aligns: vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+                HorizontalAlign::Right,
+            ],
+            row_heights_mm: vec![8.0],
+            text_height_mm: 3.5,
+            cells: vec!["12".to_owned(), "ベース".to_owned(), "0.520".to_owned()],
+        };
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::Table(table.clone()),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        let k = document.sheet().scale.world_mm_per_paper_mm();
+        let ex = expand_table(&table, k);
+        assert_eq!(ex.texts.len(), 3);
+
+        // 画面: 基準点のスクリーン座標に、ガリーの (幅 × f) の点が載る（ガリーの大きさは
+        // フォント次第なので任意の値で位置の規則だけを見る）。
+        let viewport = Viewport {
+            zoom: 3.0,
+            center: Point2::new(50.0, 25.0),
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        for cell in &ex.texts {
+            let screen_anchor = viewport.world_to_screen(rect, cell.text.anchor);
+            let size = egui::vec2(41.0, 12.0);
+            let pos = text_galley_pos(screen_anchor, size, 0.0, cell.align);
+            let f = cell.align.anchor_fraction() as f32;
+            assert!(
+                (pos.x + size.x * f - screen_anchor.x).abs() < 1e-3,
+                "{cell:?}"
+            );
+            assert!((pos.y + size.y - screen_anchor.y).abs() < 1e-3, "{cell:?}");
+        }
+
+        // SVG/PDF（共有の IR）: 字送り幅の区間の f の点が、基準点 ÷ k（紙 mm）に来る。
+        let outliner = plot::text_outline::GlyphOutliner::embedded().unwrap();
+        let page = plot::plot_page(&document, plot::PlotColorMode::Color);
+        let outlines: Vec<&plot::PlotPath> =
+            page.paths.iter().filter(|p| p.fill.is_some()).collect();
+        assert_eq!(outlines.len(), 3);
+        let first_x = |cmds: &[plot::PathCmd]| match cmds[0] {
+            plot::PathCmd::MoveTo(p) => p.x,
+            other => panic!("アウトラインは MoveTo で始まるはず: {other:?}"),
+        };
+        for (cell, path) in ex.texts.iter().zip(&outlines) {
+            let paper_anchor_x = cell.text.anchor.x / k;
+            let advance = outliner.advance_mm(&cell.text.content, cell.text.height);
+            let at_zero =
+                outliner.outline(&cell.text.content, Point2::ORIGIN, cell.text.height, 0.0);
+            let start = first_x(&path.cmds) - first_x(&at_zero);
+            let reference = start + advance * cell.align.anchor_fraction();
+            assert!(
+                (reference - paper_anchor_x).abs() < 1e-9,
+                "{cell:?}: {reference} != {paper_anchor_x}"
+            );
+        }
+
+        // DXF: 中央・右揃えは group 72 と group 11（= group 10）が基準点、左揃えは group 10 が
+        // 基準点（= 文字列の左端）で group 72・11 を書かない。書き出したファイルの文字列で見る。
+        let export = mcad_io::export_dxf(&document);
+        let mut buf = Vec::new();
+        export.drawing.save(&mut buf).unwrap();
+        let texts = dxf_texts(&String::from_utf8(buf).unwrap());
+        assert_eq!(texts.len(), 3);
+        for (cell, (value, h72, p10, p11)) in ex.texts.iter().zip(&texts) {
+            assert_eq!(*value, cell.text.content);
+            let anchor = (cell.text.anchor.x, cell.text.anchor.y);
+            let close =
+                |p: (f64, f64)| (p.0 - anchor.0).abs() < 1e-9 && (p.1 - anchor.1).abs() < 1e-9;
+            assert!(close(*p10), "{cell:?}: group 10 {p10:?}");
+            match cell.align {
+                HorizontalAlign::Center => {
+                    assert_eq!(*h72, 1);
+                    assert!(p11.is_some_and(close), "{cell:?}: group 11 {p11:?}");
+                }
+                HorizontalAlign::Right => {
+                    assert_eq!(*h72, 2);
+                    assert!(p11.is_some_and(close), "{cell:?}: group 11 {p11:?}");
+                }
+                _ => {
+                    assert_eq!(*h72, 0);
+                    assert_eq!(*p11, None);
+                }
+            }
+        }
     }
 
     #[test]

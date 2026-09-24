@@ -920,8 +920,9 @@ struct McadApp {
     /// 寸法スタイルダイアログの作業コピー。`Some` の間はモーダルが開いている
     /// (表題欄編集ダイアログと同じ流儀。M9タスク50-3)。
     dim_style_dialog: Option<DimStyleDialogState>,
-    /// 表編集ダイアログの作業コピー。`Some` の間はモーダルが開いている
-    /// (表題欄編集ダイアログと同じ流儀。M10タスク59)。
+    /// 表のダイアログ(「表を編集」「記入」「部品表の設定」。種類は
+    /// [`TableDialogState::mode`])の作業コピー。`Some` の間はモーダルが開いている
+    /// (表題欄編集ダイアログと同じ流儀。M10タスク59、M12タスク94)。
     table_dialog: Option<TableDialogState>,
 }
 
@@ -1522,7 +1523,7 @@ impl McadApp {
                     self.tool_kind = ToolKind::Select;
                     self.tool = None;
                     self.select_tool.set_selection(new_ids.entities);
-                    set_status(&mut self.status, now, "部品表を配置しました".to_owned());
+                    set_status(&mut self.status, now, "部品欄を配置しました".to_owned());
                 }
                 Err(err) => {
                     // 失敗時はツール・選択とも変えない（配置は起きなかった）。進行中の
@@ -1530,7 +1531,7 @@ impl McadApp {
                     set_status(
                         &mut self.status,
                         now,
-                        format!("部品表の配置に失敗しました: {err}"),
+                        format!("部品欄の配置に失敗しました: {err}"),
                     );
                 }
             }
@@ -2622,11 +2623,9 @@ impl eframe::App for McadApp {
             );
             table_panel(
                 ui,
-                &mut self.document,
+                &self.document,
                 self.select_tool.selection(),
                 &mut self.table_dialog,
-                &mut self.status,
-                now,
             );
             let (sheet_changed, plot_color_mode_changed) = sheet_panel(
                 ui,
@@ -2947,17 +2946,26 @@ impl eframe::App for McadApp {
                 // 適用する。作業コピーは fields 全体を置き換えるだけなので、失敗するのは
                 // ここでは事実上起こらない（SetSheet の検証対象は表題欄テンプレート寸法の
                 // みで、fields の文字列自体に不正値は無い）が、念のためステータス表示する。
+                // 図面設定を変えるユーザー操作は `apply_sheet_change` を通す（表題欄直上の
+                // 部品表の追従。M12 タスク94。記入欄だけの変更では表題欄は動かない）。
                 let new_sheet = self
                     .sheet_dialog
                     .as_ref()
                     .expect("ok_clicked implies Some")
                     .to_sheet(self.document.sheet());
-                if let Err(err) = self.document.apply(Command::SetSheet(new_sheet)) {
-                    set_status(
-                        &mut self.status,
-                        now,
-                        format!("表題欄の変更に失敗しました: {err}"),
-                    );
+                match apply_sheet_change(&mut self.document, new_sheet) {
+                    Ok(outcome) => {
+                        if let Some(message) = outcome.status_message() {
+                            set_status(&mut self.status, now, message);
+                        }
+                    }
+                    Err(err) => {
+                        set_status(
+                            &mut self.status,
+                            now,
+                            format!("表題欄の変更に失敗しました: {err}"),
+                        );
+                    }
                 }
                 self.sheet_dialog = None;
             } else if cancel_clicked || modal.should_close() {
@@ -3075,164 +3083,33 @@ impl eframe::App for McadApp {
             }
         }
 
-        // 表編集ダイアログ(M10タスク59)。表題欄編集ダイアログと同じ流儀(右パネルの
-        // 「表を編集…」ボタンから開き、OK で `Command::ModifyEntity` 1回、
-        // キャンセル/モーダル外クリックで無変更)。不正値は OK ボタンそのものを
-        // 無効化して理由を表示する(寸法スタイルダイアログは OK 後にエラー表示する
-        // 流儀だが、こちらは編集項目が多く誤操作の機会が多いため事前に防ぐ)。
-        if self.table_dialog.is_some() {
-            // セル・列幅欄の1列あたりの固定幅（日本語8文字程度が入る幅）。
-            // グリッドの `min_col_width`/`max_col_width` に加え `add_sized` でも
-            // 明示するため、列数が増えても1列の幅は変わらない
-            // （利用可能幅からの取り分ではなく定数 `TABLE_DIALOG_CELL_W` を使う）。
-            const TABLE_DIALOG_CELL_W: f32 = 96.0;
-            const TABLE_DIALOG_LABEL_W: f32 = 64.0;
-            const TABLE_DIALOG_ROW_H: f32 = 20.0;
-
-            let mut ok_clicked = false;
-            let mut cancel_clicked = false;
-            let modal = egui::Modal::new(egui::Id::new("table_dialog")).show(ui.ctx(), |ui| {
-                let dialog = self
-                    .table_dialog
-                    .as_mut()
-                    .expect("guarded by is_some() above");
-                // ダイアログ自体は画面幅の8割を上限にし、それを超える列数は
-                // 横スクロールへ逃がす（縦は行数が多いときのため既存どおり）。
-                let max_dialog_w = ui.ctx().input(|i| i.viewport_rect().width()) * 0.8;
-                ui.set_max_width(max_dialog_w);
-                ui.heading("表を編集");
-
-                ui.horizontal(|ui| {
-                    if ui.button("行を上に追加").clicked() {
-                        dialog.add_row_top();
-                    }
-                    if ui
-                        .add_enabled(dialog.cells.len() > 1, egui::Button::new("最上段を削除"))
-                        .clicked()
-                    {
-                        dialog.remove_top_row();
-                    }
-                    if ui.button("列を右に追加").clicked() {
-                        dialog.add_col_right();
-                    }
-                    if ui
-                        .add_enabled(
-                            dialog.col_widths_mm.len() > 1,
-                            egui::Button::new("右端の列を削除"),
-                        )
-                        .clicked()
-                    {
-                        dialog.remove_right_col();
-                    }
-                });
-                ui.add_space(4.0);
-
-                egui::Grid::new("table_dialog_size_grid")
-                    .num_columns(2)
-                    .spacing([8.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("行高さ[mm](全行共通):");
-                        ui.text_edit_singleline(&mut dialog.row_height_mm);
-                        ui.end_row();
-
-                        ui.label("文字高さ[mm]:");
-                        ui.text_edit_singleline(&mut dialog.text_height_mm);
-                        ui.end_row();
-                    });
-
-                ui.add_space(4.0);
-                ui.label("セル(行0が最上段)。1行目は各列の列幅[mm]:");
-                egui::ScrollArea::both()
-                    .max_height(280.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Grid::new("table_dialog_cells_grid")
-                            .num_columns(dialog.col_widths_mm.len().max(1) + 1)
-                            .min_col_width(TABLE_DIALOG_CELL_W)
-                            .max_col_width(TABLE_DIALOG_CELL_W)
-                            .spacing([4.0, 4.0])
-                            .show(ui, |ui| {
-                                // ヘッダ行: 左端に「列幅」ラベル、各列に列幅[mm]入力欄。
-                                // セル本体と同じグリッド・同じ固定列幅に置くことで、
-                                // 列位置が常にセルの真上に揃う。
-                                ui.add_sized(
-                                    [TABLE_DIALOG_LABEL_W, TABLE_DIALOG_ROW_H],
-                                    egui::Label::new("列幅[mm]"),
-                                );
-                                for (c, width) in dialog.col_widths_mm.iter_mut().enumerate() {
-                                    ui.add_sized(
-                                        [TABLE_DIALOG_CELL_W, TABLE_DIALOG_ROW_H],
-                                        egui::TextEdit::singleline(width)
-                                            .hint_text(format!("列{}", c + 1)),
-                                    );
-                                }
-                                ui.end_row();
-
-                                for (r, row) in dialog.cells.iter_mut().enumerate() {
-                                    ui.add_sized(
-                                        [TABLE_DIALOG_LABEL_W, TABLE_DIALOG_ROW_H],
-                                        egui::Label::new(format!("行{r}")),
-                                    );
-                                    for cell in row.iter_mut() {
-                                        ui.add_sized(
-                                            [TABLE_DIALOG_CELL_W, TABLE_DIALOG_ROW_H],
-                                            egui::TextEdit::singleline(cell),
-                                        );
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    });
-
-                let build_result = build_table_from_dialog(dialog);
-                if let Err(err) = &build_result {
-                    ui.add_space(4.0);
-                    ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(build_result.is_ok(), egui::Button::new("OK"))
-                        .clicked()
-                    {
-                        ok_clicked = true;
-                    }
-                    if ui.button("キャンセル").clicked() {
-                        cancel_clicked = true;
-                    }
-                });
-            });
-            if ok_clicked {
-                let dialog = self.table_dialog.as_ref().expect("ok_clicked implies Some");
-                // OK ボタンは build_table_from_dialog が Ok のときしか有効化されないので、
-                // ここでの Err は事実上起こらない（念のためステータスへ出す）。
-                match build_table_from_dialog(dialog) {
-                    Ok(table) => {
-                        let id = dialog.id;
-                        match self.document.apply(Command::ModifyEntity {
-                            id,
-                            new_geom: EntityGeom::Table(table),
-                        }) {
-                            Ok(_) => self.table_dialog = None,
-                            Err(err) => {
-                                set_status(
-                                    &mut self.status,
-                                    now,
-                                    format!("表の変更に失敗しました: {err}"),
-                                );
-                            }
+        // 表のダイアログ(M10タスク59、M12タスク94で「表を編集」「記入」「部品欄の設定」の
+        // 3種)。表題欄編集ダイアログと同じ流儀(右パネル「表」のボタンから開き、表を書き換える
+        // ボタンは `Command::ModifyEntity` 1回、キャンセル/モーダル外クリック/Esc で無変更)。
+        // 描画は `show_table_dialog`、コマンドの組み立ては `table_dialog_command`。
+        // 不正値は OK ボタンそのものを無効化して理由を表示する(寸法スタイルダイアログは
+        // OK 後にエラー表示する流儀だが、こちらは編集項目が多く誤操作の機会が多いため
+        // 事前に防ぐ)。失敗したらダイアログは開いたまま、理由をダイアログ内とステータスに出す。
+        if let Some(dialog) = self.table_dialog.as_mut() {
+            let frame_visible = self.document.sheet().frame_visible;
+            match show_table_dialog(ui.ctx(), dialog, frame_visible) {
+                TableDialogOutcome::Open => {}
+                TableDialogOutcome::Cancelled => self.table_dialog = None,
+                TableDialogOutcome::Action(action) => {
+                    let result =
+                        table_dialog_command(&self.document, dialog, action).and_then(|cmd| {
+                            self.document
+                                .apply(cmd)
+                                .map_err(|err| format!("{}: {err}", action.failure_label()))
+                        });
+                    match result {
+                        Ok(_) => self.table_dialog = None,
+                        Err(message) => {
+                            dialog.action_error = Some(message.clone());
+                            set_status(&mut self.status, now, message);
                         }
                     }
-                    Err(err) => {
-                        set_status(
-                            &mut self.status,
-                            now,
-                            format!("表の変更に失敗しました: {err}"),
-                        );
-                    }
                 }
-            } else if cancel_clicked || modal.should_close() {
-                self.table_dialog = None;
             }
         }
     }
@@ -5904,7 +5781,7 @@ fn sheet_panel(
     // 部品表を使う（M12 設計判断1・2）: OFF は「`K` で部品表を自動で作らない」だけの
     // 意味で、既存の部品表は消さず表示・出力も変えない。
     let mut use_bom = sheet.use_bom;
-    if ui.checkbox(&mut use_bom, "部品表を使う").changed() {
+    if ui.checkbox(&mut use_bom, "部品欄を使う").changed() {
         pending = Some(SheetMeta {
             use_bom,
             ..sheet.clone()
@@ -6007,9 +5884,15 @@ fn sheet_panel(
             .on_hover_text("SVG/PDF 出力の線色。画面表示と図面データには影響しません。");
     });
 
+    // 表題欄直上の部品表は設定の変更に追従させる（同じ undo 1回。M12 タスク94）。
     let sheet_changed = match pending {
-        Some(new_sheet) => match document.apply(Command::SetSheet(new_sheet)) {
-            Ok(_) => true,
+        Some(new_sheet) => match apply_sheet_change(document, new_sheet) {
+            Ok(outcome) => {
+                if let Some(message) = outcome.status_message() {
+                    set_status(status, now, message);
+                }
+                true
+            }
             Err(err) => {
                 set_status(status, now, format!("図面設定の変更に失敗しました: {err}"));
                 false
@@ -6121,40 +6004,112 @@ fn dim_style_panel(
     }
 }
 
-/// 表編集ダイアログの作業コピー（M10 タスク59）。表題欄・寸法スタイルの各ダイアログと
-/// 同じ流儀（作業コピー → OK で `Command::ModifyEntity` 1回 = undo 1単位、キャンセルで
-/// 無変更）。
+/// 表のダイアログの種類（M12 タスク94、DESIGN.md M12 設計判断12・「タスク94 の着手時の決定」）。
+///
+/// 作業コピー（[`TableDialogState`]）は 3 種とも表全体を持ち、OK で表全体を
+/// `Command::ModifyEntity` 1回で書き戻す。種類ごとに違うのは**画面に出す項目と、
+/// 許す行・列の操作**だけ（出さない項目は開いた時点の値をそのまま書き戻す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TableDialogMode {
+    /// 汎用表の「表を編集」: セル・行と列の挿入・削除・列幅・揃え・行高さ・文字高さの
+    /// すべて。下部に「表題欄の上に配置」。
+    Edit,
+    /// 部品表の「記入」: セルの記入と部品行の挿入・削除だけ。見出し行（最下段）は
+    /// 書き換え・削除できず、見出し行より下へは挿入できない。
+    BomEntry,
+    /// 「部品表の設定」: 列（列名 = 見出し行のセル・列幅・揃え）の挿入・削除と
+    /// 行高さ・文字高さ。行の操作は無い（部品行の追加・削除は「記入」の役割）。
+    /// 下部に「表題欄の上に配置」「様式に合わせ直す」。
+    BomSettings,
+}
+
+impl TableDialogMode {
+    /// ダイアログの見出し。
+    fn title(self) -> &'static str {
+        match self {
+            TableDialogMode::Edit => "表を編集",
+            TableDialogMode::BomEntry => "部品欄に記入",
+            TableDialogMode::BomSettings => "部品欄の設定",
+        }
+    }
+
+    /// 最下段を見出し行として扱うか（部品表の 2 種）。
+    fn has_header_row(self) -> bool {
+        matches!(
+            self,
+            TableDialogMode::BomEntry | TableDialogMode::BomSettings
+        )
+    }
+
+    /// 行の挿入・削除を許すか。
+    fn allows_row_ops(self) -> bool {
+        matches!(self, TableDialogMode::Edit | TableDialogMode::BomEntry)
+    }
+
+    /// 列の挿入・削除を許すか。
+    fn allows_col_ops(self) -> bool {
+        matches!(self, TableDialogMode::Edit | TableDialogMode::BomSettings)
+    }
+}
+
+/// 表のダイアログで行・列の見出しをクリックして選んだもの（M12 タスク94）。行と列は
+/// 同時には選ばない（片方を選ぶともう片方の選択は外れる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableDialogSelection {
+    /// 行（行 0 = 最上段）。
+    Row(usize),
+    /// 列（列 0 = 左端）。
+    Col(usize),
+}
+
+/// 表のダイアログの作業コピー（M10 タスク59、M12 タスク94 で 3 種に分けた）。表題欄・
+/// 寸法スタイルの各ダイアログと同じ流儀（作業コピー → OK で `Command::ModifyEntity` 1回 =
+/// undo 1単位、キャンセルで無変更）。種類は [`TableDialogMode`]。
 ///
 /// 行高さは [`TableGeom::row_heights_mm`] が行ごとの値を持てる設計のままだが、UI では
 /// 全行共通の1欄しか出さない（DESIGN.md M10 詳細設計6）。OK 時にその1値を全行へ
 /// 適用するため、開いた時点で行高さが不揃いだった表を編集すると個別値は失われる
-/// （設計が明示的に選んだ割り切り）。
+/// （設計が明示的に選んだ割り切り。行高さ欄を出さない「記入」でも同じ規則で書き戻す）。
+///
+/// # 不変条件
+///
+/// `cells` の各行の要素数・`col_widths_mm`・`col_aligns` の要素数は常に列数で一致し、
+/// 行数・列数は 1 以上。行・列の挿入・削除はこの型のメソッドだけが行い、3 つを
+/// 揃えて増減する（`validate` が揃えの要素数 = 列数を要求する。M12 タスク93）。
 struct TableDialogState {
+    /// ダイアログの種類（M12 タスク94）。
+    mode: TableDialogMode,
     /// 適用先エンティティの ID。
     id: EntityId,
     /// 表の種類（M12 タスク81）。このダイアログでは編集しない（部品表を編集しても
     /// 表へ戻らないよう、開いた時点の値をそのまま書き戻す）。
     kind: TableKind,
-    /// 表のアンカー（左下、ワールド座標）。このダイアログでは編集しない。
+    /// 表のアンカー（左下、ワールド座標）。このダイアログでは編集しない
+    /// （「表題欄の上に配置」は OK と同じ組み立てのアンカーだけを差し替えて適用する）。
     anchor: Point2,
     /// セル文字列の作業コピー（行優先、行 0 = 最上段。`cells[r][c]`）。
     cells: Vec<Vec<String>>,
     /// 列幅の入力欄（列ごと、紙 mm）。
     col_widths_mm: Vec<String>,
-    /// 列ごとの文字の揃え（M12 タスク93）。このダイアログでは編集しない（揃えの編集 UI は
-    /// タスク94）が、開いた時点の値を保って書き戻す（固定で左を入れると、中央揃えの部品表を
-    /// ダイアログで編集しただけで左へ戻るため）。列の追加・削除では要素数を
-    /// [`TableDialogState::col_widths_mm`] と揃えて増減する（`validate` が要素数 = 列数を
-    /// 要求する）。
+    /// 列ごとの文字の揃え（M12 タスク93）。「表を編集」「部品表の設定」で編集する
+    /// （M12 タスク94）。「記入」では編集しないが開いた時点の値を保って書き戻す。
     col_aligns: Vec<HorizontalAlign>,
     /// 行高さの入力欄（全行共通、紙 mm）。
     row_height_mm: String,
     /// 文字高さの入力欄（紙 mm）。
     text_height_mm: String,
+    /// 見出しのクリックで選んだ行・列（M12 タスク94）。ツールバーの挿入・削除の対象。
+    selection: Option<TableDialogSelection>,
+    /// 直前のボタン操作（OK・様式に合わせ直す等）が失敗した理由。ダイアログ内に赤字で出す
+    /// （ステータスバーはモーダルの背景で暗くなるため）。
+    action_error: Option<String>,
 }
 
+/// 列を挿入したときの既定の列幅（紙 mm）。
+const TABLE_DIALOG_NEW_COL_WIDTH_MM: &str = "30";
+
 impl TableDialogState {
-    /// 現在の [`TableGeom`] から作業コピーを作る（ダイアログを開くとき）。
+    /// 現在の [`TableGeom`] から「表を編集」の作業コピーを作る（ダイアログを開くとき）。
     ///
     /// 行高さが全行同値ならその値、不一致なら最小値を初期表示する
     /// （DESIGN.md M10 詳細設計6）。
@@ -6184,6 +6139,7 @@ impl TableDialogState {
             value.to_string()
         };
         Self {
+            mode: TableDialogMode::Edit,
             id,
             kind: table.kind,
             anchor: table.anchor,
@@ -6192,40 +6148,144 @@ impl TableDialogState {
             col_aligns: table.col_aligns.clone(),
             row_height_mm,
             text_height_mm: table.text_height_mm.to_string(),
+            selection: None,
+            action_error: None,
         }
     }
 
-    /// 「行を上に追加」: 行 0（最上段）へ空行を挿入する。列数は現状を引き継ぐ。
-    fn add_row_top(&mut self) {
-        let cols = self.col_widths_mm.len();
-        self.cells.insert(0, vec![String::new(); cols]);
-    }
-
-    /// 「最上段を削除」: 行 0 を削除する。最後の1行は削除しない（表は最低1行）。
-    fn remove_top_row(&mut self) {
-        if self.cells.len() > 1 {
-            self.cells.remove(0);
+    /// 種類 `mode` の作業コピーを作る（右パネル「表」のボタンから開くとき）。
+    fn open(id: EntityId, table: &TableGeom, mode: TableDialogMode) -> Self {
+        Self {
+            mode,
+            ..Self::from_table(id, table)
         }
     }
 
-    /// 「列を右に追加」: 右端へ既定幅30mm・左揃え（汎用表の揃えの既定。M12 タスク93）の
-    /// 空列を追加する。
-    fn add_col_right(&mut self) {
-        self.col_widths_mm.push("30".to_owned());
-        self.col_aligns.push(HorizontalAlign::Left);
+    /// 行数。
+    fn rows(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// 列数。
+    fn cols(&self) -> usize {
+        self.col_widths_mm.len()
+    }
+
+    /// 見出し行（部品表の最下段）の行番号。汎用表の「表を編集」では `None`。
+    fn header_row(&self) -> Option<usize> {
+        if self.mode.has_header_row() {
+            self.rows().checked_sub(1)
+        } else {
+            None
+        }
+    }
+
+    /// 行 `r` が見出し行か。
+    fn is_header_row(&self, r: usize) -> bool {
+        self.header_row() == Some(r)
+    }
+
+    /// 行・列の見出しをクリックしたときの選択の切り替え（選び直すと外れる）。
+    fn toggle_selection(&mut self, selection: TableDialogSelection) {
+        self.selection = if self.selection == Some(selection) {
+            None
+        } else {
+            Some(selection)
+        };
+    }
+
+    /// 行 `r` の上へ挿入できるか（見出し行の上 = 最後の部品行の位置へは挿入できる）。
+    fn can_insert_row_above(&self, r: usize) -> bool {
+        self.mode.allows_row_ops() && r < self.rows()
+    }
+
+    /// 行 `r` の下へ挿入できるか。部品表では見出し行より下へは挿入できない。
+    fn can_insert_row_below(&self, r: usize) -> bool {
+        self.mode.allows_row_ops() && r < self.rows() && !self.is_header_row(r)
+    }
+
+    /// 行 `r` を削除できるか。最後の1行（表は最低1行）と部品表の見出し行は削除できない。
+    fn can_remove_row(&self, r: usize) -> bool {
+        self.mode.allows_row_ops() && r < self.rows() && self.rows() > 1 && !self.is_header_row(r)
+    }
+
+    /// 列 `c` の左右へ挿入できるか。
+    fn can_insert_col(&self, c: usize) -> bool {
+        self.mode.allows_col_ops() && c < self.cols()
+    }
+
+    /// 列 `c` を削除できるか。最後の1列は削除できない（表は最低1列）。
+    fn can_remove_col(&self, c: usize) -> bool {
+        self.mode.allows_col_ops() && c < self.cols() && self.cols() > 1
+    }
+
+    /// 空行を位置 `at` へ差し込み、差し込んだ行を選択する。
+    fn insert_empty_row(&mut self, at: usize) {
+        let cols = self.cols();
+        self.cells.insert(at, vec![String::new(); cols]);
+        self.selection = Some(TableDialogSelection::Row(at));
+    }
+
+    /// 「上に挿入」: 行 `r` の上へ空行を挿入する。許されない操作なら何もしない。
+    fn insert_row_above(&mut self, r: usize) {
+        if self.can_insert_row_above(r) {
+            self.insert_empty_row(r);
+        }
+    }
+
+    /// 「下に挿入」: 行 `r` の下へ空行を挿入する。許されない操作なら何もしない。
+    fn insert_row_below(&mut self, r: usize) {
+        if self.can_insert_row_below(r) {
+            self.insert_empty_row(r + 1);
+        }
+    }
+
+    /// 「行を削除」: 行 `r` を削除する。許されない操作なら何もしない。削除後は同じ
+    /// 位置（最下段を消したときは新しい最下段）の行を選択する（表計算ソフトと同じ）。
+    fn remove_row(&mut self, r: usize) {
+        if self.can_remove_row(r) {
+            self.cells.remove(r);
+            self.selection = Some(TableDialogSelection::Row(r.min(self.rows() - 1)));
+        }
+    }
+
+    /// 空列（既定幅 [`TABLE_DIALOG_NEW_COL_WIDTH_MM`]・左揃え = 汎用表の揃えの既定。
+    /// M12 タスク93）を位置 `at` へ差し込み、差し込んだ列を選択する。部品表では見出し行の
+    /// セル（列名）も空になる。
+    fn insert_empty_col(&mut self, at: usize) {
+        self.col_widths_mm
+            .insert(at, TABLE_DIALOG_NEW_COL_WIDTH_MM.to_owned());
+        self.col_aligns.insert(at, HorizontalAlign::Left);
         for row in &mut self.cells {
-            row.push(String::new());
+            row.insert(at, String::new());
+        }
+        self.selection = Some(TableDialogSelection::Col(at));
+    }
+
+    /// 「左に挿入」: 列 `c` の左へ空列を挿入する。許されない操作なら何もしない。
+    fn insert_col_left(&mut self, c: usize) {
+        if self.can_insert_col(c) {
+            self.insert_empty_col(c);
         }
     }
 
-    /// 「右端の列を削除」: 右端の列を削除する。最後の1列は削除しない（表は最低1列）。
-    fn remove_right_col(&mut self) {
-        if self.col_widths_mm.len() > 1 {
-            self.col_widths_mm.pop();
-            self.col_aligns.pop();
+    /// 「右に挿入」: 列 `c` の右へ空列を挿入する。許されない操作なら何もしない。
+    fn insert_col_right(&mut self, c: usize) {
+        if self.can_insert_col(c) {
+            self.insert_empty_col(c + 1);
+        }
+    }
+
+    /// 「列を削除」: 列 `c` を削除する。許されない操作なら何もしない。削除後は同じ
+    /// 位置（右端を消したときは新しい右端）の列を選択する。
+    fn remove_col(&mut self, c: usize) {
+        if self.can_remove_col(c) {
+            self.col_widths_mm.remove(c);
+            self.col_aligns.remove(c);
             for row in &mut self.cells {
-                row.pop();
+                row.remove(c);
             }
+            self.selection = Some(TableDialogSelection::Col(c.min(self.cols() - 1)));
         }
     }
 }
@@ -6279,26 +6339,29 @@ fn build_table_from_dialog(state: &TableDialogState) -> Result<TableGeom, String
     Ok(table)
 }
 
-/// 右パネルの「表」セクション（M10 タスク59）。選択集合にちょうど1つの表が含まれる
-/// ときだけ表示する（他の種類のエンティティが混在していても対象は絞れる）。複数の
-/// 表が選択されている間は編集対象を一意に決められないため、その旨を表示するだけで
-/// ボタンは出さない（DESIGN.md M10 詳細設計6）。
+/// 右パネルの「表」セクション（M10 タスク59、M12 タスク94 で種類別にした）。選択集合に
+/// ちょうど1つの表が含まれるときだけ表示する（他の種類のエンティティが混在していても
+/// 対象は絞れる）。複数の表が選択されている間は編集対象を一意に決められないため、
+/// その旨を表示するだけでボタンは出さない（DESIGN.md M10 詳細設計6）。
+///
+/// 1 行目に種類と大きさを出し、ボタンは種類で絞る（DESIGN.md M12「タスク94 の着手時の
+/// 決定」）。汎用表は「表を編集…」だけ、部品表は「記入…」と「部品表の設定…」を横に
+/// 並べる。「表題欄の上に配置」「様式に合わせ直す」はダイアログの下部に置く
+/// （[`show_table_dialog`]。「部品表にする」「表に戻す」は 2026-09-25 に廃止）。
 fn table_panel(
     ui: &mut egui::Ui,
-    document: &mut Document,
+    document: &Document,
     selection: &[EntityId],
     table_dialog: &mut Option<TableDialogState>,
-    status: &mut Option<StatusMessage>,
-    now: f64,
 ) {
     // 選択されていても墓標化・削除済みの ID、表以外のエンティティは除く
     // （`dim_panel`/`entity_style_panel` と同じ防御）。
-    let tables: Vec<(EntityId, TableGeom)> = selection
+    let tables: Vec<(EntityId, &TableGeom)> = selection
         .iter()
         .filter_map(|&id| {
             let entity = document.entity(id)?;
             match &entity.geom {
-                EntityGeom::Table(table) => Some((id, table.clone())),
+                EntityGeom::Table(table) => Some((id, table)),
                 _ => None,
             }
         })
@@ -6314,73 +6377,636 @@ fn table_panel(
         ui.label("表を1つだけ選択してください");
         return;
     }
-    let (id, table) = &tables[0];
-    let id = *id;
-    ui.label(format!("表: {} 行 × {} 列", table.rows(), table.cols()));
-    if ui.button("表を編集…").clicked() {
-        *table_dialog = Some(TableDialogState::from_table(id, table));
-    }
-
-    // 部品表プリセット（M10 詳細設計7、タスク60）。自動集計は非対応（規定 2-5-4 の 5)、
-    // M10 設計方針2）— 列構成の置換と配置だけを行う。汎用表（`kind == Table`）から
-    // 押せば種類を `Bom` にして列構成を適用し、既に部品表（`kind == Bom`）のときは
-    // 同じボタンで様式への再適用になる（種類は `Bom` のまま。DESIGN.md M12 設計判断2）。
-    // 図面に別の部品表が既にあれば、core が `CoreError::BomAlreadyExists` で拒否する
-    // （1図面1部品表、DESIGN.md M12 設計判断1）。
-    if ui.button("部品表にする").clicked() {
-        let template_width_mm = document.sheet().title_block.template().width_mm;
-        match bom::designate_as_bom(table, template_width_mm) {
-            Ok(new_table) => {
-                if let Err(err) = document.apply(Command::ModifyEntity {
-                    id,
-                    new_geom: EntityGeom::Table(new_table),
-                }) {
-                    set_status(status, now, format!("部品表への変換に失敗しました: {err}"));
-                }
+    let (id, table) = tables[0];
+    if table.kind == TableKind::Bom {
+        // 部品行 = 見出し行（最下段）を除いた行。
+        ui.label(format!(
+            "部品欄: 部品 {} 行",
+            table.rows().saturating_sub(1)
+        ));
+        ui.horizontal(|ui| {
+            if ui.button("記入…").clicked() {
+                *table_dialog = Some(TableDialogState::open(id, table, TableDialogMode::BomEntry));
             }
-            Err(reason) => set_status(status, now, reason),
-        }
-    }
-
-    // 表に戻す（部品表 → 表。中身は変えない。DESIGN.md M12 設計判断2）。部品表を
-    // 選んでいるときだけ有効。
-    let back_to_table_button =
-        ui.add_enabled(table.kind == TableKind::Bom, egui::Button::new("表に戻す"));
-    if back_to_table_button.clicked() {
-        let new_table = bom::reset_to_table(table);
-        if let Err(err) = document.apply(Command::ModifyEntity {
-            id,
-            new_geom: EntityGeom::Table(new_table),
-        }) {
-            set_status(status, now, format!("表への変更に失敗しました: {err}"));
-        }
-    }
-
-    let frame_visible = document.sheet().frame_visible;
-    let place_button = ui.add_enabled(frame_visible, egui::Button::new("表題欄の上に配置"));
-    let place_button = if frame_visible {
-        place_button
+            if ui.button("部品欄の設定…").clicked() {
+                *table_dialog = Some(TableDialogState::open(
+                    id,
+                    table,
+                    TableDialogMode::BomSettings,
+                ));
+            }
+        });
+        // 自動集計は非対応（規定 2-5-4 の 5)、M10 設計方針2）。
+        ui.label("部品欄への記入は手動です（自動集計は行いません）。");
     } else {
-        place_button.on_disabled_hover_text("図面枠が無効です")
-    };
-    if place_button.clicked() {
-        let k = document.sheet().scale.world_mm_per_paper_mm();
-        let anchor = bom_anchor_above_title_block(document.sheet(), k);
-        let mut new_table = table.clone();
-        new_table.anchor = anchor;
-        if let Err(err) = document.apply(Command::ModifyEntity {
-            id,
-            new_geom: EntityGeom::Table(new_table),
-        }) {
-            set_status(
-                status,
-                now,
-                format!("表題欄上への配置に失敗しました: {err}"),
-            );
+        ui.label(format!("表: {} 行 × {} 列", table.rows(), table.cols()));
+        if ui.button("表を編集…").clicked() {
+            *table_dialog = Some(TableDialogState::open(id, table, TableDialogMode::Edit));
         }
     }
+}
 
-    ui.label("部品欄への記入は手動です（自動集計は行いません）。");
+/// 表のダイアログで押された、表を書き換えるボタン（M12 タスク94）。どれも対象の表への
+/// `Command::ModifyEntity` 1回（undo 1単位）で、成功したらダイアログを閉じる
+/// （[`table_dialog_command`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableDialogAction {
+    /// OK: 作業コピーを表へ書き戻す。
+    Ok,
+    /// 「表題欄の上に配置」（汎用表の「表を編集」・「部品欄の設定」）: OK と同じく作業コピーを
+    /// 書き戻し、アンカーだけを表題欄の直上へ差し替える（編集内容を失わない）。
+    PlaceAboveTitleBlock,
+    /// 「様式に合わせ直す」（「部品欄の設定」）: 編集内容は捨てて、図面上の部品欄へ様式を
+    /// 再適用する（列幅・行高さ・文字高さ・揃えが既定へ戻る）。
+    ApplyBomPreset,
+}
+
+impl TableDialogAction {
+    /// 失敗したときのメッセージの前置き。
+    fn failure_label(self) -> &'static str {
+        match self {
+            TableDialogAction::Ok => "表の変更に失敗しました",
+            TableDialogAction::PlaceAboveTitleBlock => "表題欄上への配置に失敗しました",
+            TableDialogAction::ApplyBomPreset => "様式への合わせ直しに失敗しました",
+        }
+    }
+}
+
+/// [`show_table_dialog`] の 1 フレームの結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableDialogOutcome {
+    /// 開いたまま（編集中）。
+    Open,
+    /// キャンセル・モーダル外クリック・Esc。作業コピーを捨てて閉じる。
+    Cancelled,
+    /// 表を書き換えるボタンが押された。
+    Action(TableDialogAction),
+}
+
+/// 表のダイアログのボタン操作 `action` が発行する `Command::ModifyEntity` を組み立てる
+/// （純関数、単体テスト対象。M12 タスク94）。
+///
+/// - [`TableDialogAction::Ok`]・[`TableDialogAction::PlaceAboveTitleBlock`] は作業コピー
+///   （[`build_table_from_dialog`]）から組み立てる。後者はアンカーだけを
+///   [`bom_anchor_above_title_block`] に差し替える（図面枠が無効なら拒否）。
+/// - [`TableDialogAction::ApplyBomPreset`] は作業コピーではなく**図面上の現在の表**に
+///   [`bom::apply_bom_preset`] を掛ける（ダイアログの編集は捨てる）。様式幅は表題欄の様式。
+///
+/// 図面に別の部品表があるときの拒否（1 図面 1 部品表）とレイヤーロックはここでは
+/// 検査しない（`Document::apply` が最終防衛として行う）。
+///
+/// # Errors
+///
+/// 作業コピーが検証を通らない・対象が表でない・図面枠が無効・様式の適用が拒否された
+/// ときに、[`TableDialogAction::failure_label`] を前置きした表示用のメッセージを返す。
+fn table_dialog_command(
+    document: &Document,
+    dialog: &TableDialogState,
+    action: TableDialogAction,
+) -> Result<Command, String> {
+    let fail = |reason: String| format!("{}: {reason}", action.failure_label());
+    let current_table = || match document.entity(dialog.id).map(|e| &e.geom) {
+        Some(EntityGeom::Table(table)) => Ok(table),
+        _ => Err(fail("対象の表が見つかりません".to_owned())),
+    };
+    let template_width_mm = document.sheet().title_block.template().width_mm;
+    let new_table = match action {
+        TableDialogAction::Ok => build_table_from_dialog(dialog).map_err(fail)?,
+        TableDialogAction::PlaceAboveTitleBlock => {
+            let sheet = document.sheet();
+            if !sheet.frame_visible {
+                return Err(fail("図面枠が無効です".to_owned()));
+            }
+            let k = sheet.scale.world_mm_per_paper_mm();
+            TableGeom {
+                anchor: bom_anchor_above_title_block(sheet, k),
+                ..build_table_from_dialog(dialog).map_err(fail)?
+            }
+        }
+        TableDialogAction::ApplyBomPreset => {
+            bom::apply_bom_preset(current_table()?, template_width_mm).map_err(fail)?
+        }
+    };
+    Ok(Command::ModifyEntity {
+        id: dialog.id,
+        new_geom: EntityGeom::Table(new_table),
+    })
+}
+
+/// 列ごとの揃えの選択肢と、ダイアログに出す短いラベル・説明（M12 タスク94）。
+const TABLE_DIALOG_ALIGN_CHOICES: [(HorizontalAlign, &str, &str); 3] = [
+    (HorizontalAlign::Left, "左", "左揃え"),
+    (HorizontalAlign::Center, "中", "中央揃え"),
+    (HorizontalAlign::Right, "右", "右揃え"),
+];
+
+/// 表のダイアログ（「表を編集」「記入」「部品表の設定」。M10 タスク59、M12 タスク94）を
+/// 1 フレーム分描き、押されたボタンを返す。表の書き換えは呼び出し側が
+/// [`table_dialog_command`] で行う。
+///
+/// # 広さを変えられるようにする方法
+///
+/// `egui::Modal` は大きさを変えられないので、中身を `egui::Resize` で包み、右下の角の
+/// ドラッグで広さを変える（DESIGN.md M12「タスク94 の実装時追記」）。モーダルのまま
+/// なので、背景の入力遮断・モーダル外クリックと Esc のキャンセルは表題欄・寸法スタイルの
+/// ダイアログと同じ。大きさは種類ごとに egui のメモリに残り、次に開いたときも使われる。
+/// セルの格子はスクロール領域に入れ、広げた分だけ多くの行・列が見える。
+///
+/// # 描く順序
+///
+/// 下部のボタン（OK/キャンセル・操作ボタン・エラー）を `bottom_up` で先に置き、残りの
+/// 高さをセルの格子に回す。そのため OK の有効・無効は、このフレームの編集が入る前の
+/// 作業コピーで判定する（1 フレーム遅れる）。押された操作は [`table_dialog_command`] が
+/// 改めて検証するので、不正な値が書き込まれることはない。
+fn show_table_dialog(
+    ctx: &egui::Context,
+    dialog: &mut TableDialogState,
+    frame_visible: bool,
+) -> TableDialogOutcome {
+    // セル・列幅欄の1列あたりの固定幅（日本語8文字程度が入る幅）。
+    // グリッドの `min_col_width`/`max_col_width` に加え `add_sized` でも
+    // 明示するため、列数が増えても1列の幅は変わらない
+    // （利用可能幅からの取り分ではなく定数 `TABLE_DIALOG_CELL_W` を使う）。
+    const TABLE_DIALOG_CELL_W: f32 = 96.0;
+    const TABLE_DIALOG_LABEL_W: f32 = 64.0;
+    const TABLE_DIALOG_ROW_H: f32 = 20.0;
+    const TABLE_DIALOG_GRID_SPACING: f32 = 4.0;
+    // 行高さ・文字高さの入力欄の幅（数値 6〜7 桁ぶん）。
+    const TABLE_DIALOG_NUMBER_W: f32 = 64.0;
+    // 広さの下限（ツールバー・下部のボタンが収まる大きさ）。
+    const TABLE_DIALOG_MIN_SIZE: egui::Vec2 = egui::vec2(380.0, 260.0);
+
+    let mut outcome = TableDialogOutcome::Open;
+    let mode = dialog.mode;
+    let modal = egui::Modal::new(egui::Id::new("table_dialog")).show(ctx, |ui| {
+        ui.heading(mode.title());
+
+        // 初めて開いたときの広さ: 全列が見える幅（画面の 9 割まで）。以後はユーザーが
+        // 変えた広さを egui が覚える。
+        let screen = ctx.content_rect().size();
+        let max_size = egui::vec2(screen.x * 0.9, screen.y * 0.8).max(TABLE_DIALOG_MIN_SIZE);
+        let grid_w = TABLE_DIALOG_CELL_W * (dialog.cols() + 1) as f32
+            + TABLE_DIALOG_GRID_SPACING * dialog.cols() as f32
+            + 24.0;
+        let default_size = egui::vec2(grid_w.max(480.0), 440.0)
+            .min(max_size)
+            .max(TABLE_DIALOG_MIN_SIZE);
+
+        let build_ok = build_table_from_dialog(dialog).is_ok();
+        egui::Resize::default()
+            .id_salt(("table_dialog_resize", mode))
+            .default_size(default_size)
+            .min_size(TABLE_DIALOG_MIN_SIZE)
+            .max_size(max_size)
+            .with_stroke(false)
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    // --- 下部（下から積む）: OK/キャンセル → 操作ボタン → エラー ---
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(build_ok, egui::Button::new("OK")).clicked() {
+                            outcome = TableDialogOutcome::Action(TableDialogAction::Ok);
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            outcome = TableDialogOutcome::Cancelled;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if let Some(action) =
+                        table_dialog_action_buttons(ui, mode, build_ok, frame_visible)
+                    {
+                        outcome = TableDialogOutcome::Action(action);
+                    }
+                    if let Some(err) = &dialog.action_error {
+                        ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+                    }
+                    if let Err(err) = build_table_from_dialog(dialog) {
+                        ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
+                    }
+                    ui.separator();
+
+                    // --- 上部: ツールバー・寸法欄・セルの格子（残りの高さを使う） ---
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        table_dialog_toolbar(ui, dialog);
+                        if mode != TableDialogMode::BomEntry {
+                            ui.horizontal(|ui| {
+                                ui.label("行高さ[mm](全行共通):");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dialog.row_height_mm)
+                                        .desired_width(TABLE_DIALOG_NUMBER_W),
+                                );
+                                ui.add_space(12.0);
+                                ui.label("文字高さ[mm]:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dialog.text_height_mm)
+                                        .desired_width(TABLE_DIALOG_NUMBER_W),
+                                );
+                            });
+                        }
+                        ui.add_space(4.0);
+
+                        let cols = dialog.cols();
+                        let selection = dialog.selection;
+                        let header_row = dialog.header_row();
+                        let mut clicked: Option<TableDialogSelection> = None;
+                        egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                egui::Grid::new("table_dialog_cells_grid")
+                                    .num_columns(cols + 1)
+                                    .min_col_width(TABLE_DIALOG_CELL_W)
+                                    .max_col_width(TABLE_DIALOG_CELL_W)
+                                    .spacing([TABLE_DIALOG_GRID_SPACING, TABLE_DIALOG_GRID_SPACING])
+                                    .show(ui, |ui| {
+                                        let label_size = [TABLE_DIALOG_LABEL_W, TABLE_DIALOG_ROW_H];
+                                        let cell_size = [TABLE_DIALOG_CELL_W, TABLE_DIALOG_ROW_H];
+
+                                        // 列の見出し。列を操作できる種類ではクリックで列を選ぶ
+                                        // ボタン、「記入」では列名（見出し行のセル）を出すだけ。
+                                        ui.label("");
+                                        for c in 0..cols {
+                                            if mode.allows_col_ops() {
+                                                let selected =
+                                                    selection == Some(TableDialogSelection::Col(c));
+                                                if ui
+                                                    .add_sized(
+                                                        cell_size,
+                                                        egui::Button::new(format!("列{}", c + 1))
+                                                            .selected(selected),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    clicked = Some(TableDialogSelection::Col(c));
+                                                }
+                                            } else {
+                                                let name = header_row
+                                                    .and_then(|r| dialog.cells[r].get(c))
+                                                    .map_or("", String::as_str);
+                                                ui.add_sized(
+                                                    cell_size,
+                                                    egui::Label::new(
+                                                        egui::RichText::new(name).strong(),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            }
+                                        }
+                                        ui.end_row();
+
+                                        // 列の属性（「表を編集」「部品表の設定」）。
+                                        if mode == TableDialogMode::BomSettings
+                                            && let Some(r) = header_row
+                                        {
+                                            ui.add_sized(label_size, egui::Label::new("列名"));
+                                            for name in dialog.cells[r].iter_mut() {
+                                                ui.add_sized(
+                                                    cell_size,
+                                                    egui::TextEdit::singleline(name),
+                                                );
+                                            }
+                                            ui.end_row();
+                                        }
+                                        if mode != TableDialogMode::BomEntry {
+                                            ui.add_sized(label_size, egui::Label::new("列幅[mm]"));
+                                            for (c, width) in
+                                                dialog.col_widths_mm.iter_mut().enumerate()
+                                            {
+                                                ui.add_sized(
+                                                    cell_size,
+                                                    egui::TextEdit::singleline(width)
+                                                        .hint_text(format!("列{}", c + 1)),
+                                                );
+                                            }
+                                            ui.end_row();
+
+                                            ui.add_sized(label_size, egui::Label::new("揃え"));
+                                            for align in dialog.col_aligns.iter_mut() {
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                                    for (value, label, hover) in
+                                                        TABLE_DIALOG_ALIGN_CHOICES
+                                                    {
+                                                        ui.selectable_value(align, value, label)
+                                                            .on_hover_text(hover);
+                                                    }
+                                                });
+                                            }
+                                            ui.end_row();
+                                        }
+
+                                        // セル（「表を編集」「記入」）。行の見出しはクリックで
+                                        // 行を選ぶボタン。「記入」の見出し行は書き換えられない。
+                                        if mode.allows_row_ops() {
+                                            for (r, row) in dialog.cells.iter_mut().enumerate() {
+                                                let is_header = header_row == Some(r);
+                                                let label = if is_header {
+                                                    "見出し".to_owned()
+                                                } else {
+                                                    format!("行{}", r + 1)
+                                                };
+                                                let selected =
+                                                    selection == Some(TableDialogSelection::Row(r));
+                                                if ui
+                                                    .add_sized(
+                                                        label_size,
+                                                        egui::Button::new(label).selected(selected),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    clicked = Some(TableDialogSelection::Row(r));
+                                                }
+                                                for cell in row.iter_mut() {
+                                                    if is_header {
+                                                        ui.add_sized(
+                                                            cell_size,
+                                                            egui::Label::new(cell.as_str())
+                                                                .truncate(),
+                                                        );
+                                                    } else {
+                                                        ui.add_sized(
+                                                            cell_size,
+                                                            egui::TextEdit::singleline(cell),
+                                                        );
+                                                    }
+                                                }
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            });
+                        if let Some(selection) = clicked {
+                            dialog.toggle_selection(selection);
+                        }
+                    });
+                });
+            });
+    });
+    if outcome == TableDialogOutcome::Open && modal.should_close() {
+        outcome = TableDialogOutcome::Cancelled;
+    }
+    outcome
+}
+
+/// 表のダイアログのツールバー（M12 タスク94）。見出しのクリックで選んだ行・列に対する
+/// 挿入・削除を、ダイアログの種類が許すものだけ並べる（未選択・許されない操作は無効）。
+fn table_dialog_toolbar(ui: &mut egui::Ui, dialog: &mut TableDialogState) {
+    let mode = dialog.mode;
+    let row = match dialog.selection {
+        Some(TableDialogSelection::Row(r)) => Some(r),
+        _ => None,
+    };
+    let col = match dialog.selection {
+        Some(TableDialogSelection::Col(c)) => Some(c),
+        _ => None,
+    };
+    ui.horizontal_wrapped(|ui| {
+        if mode.allows_row_ops() {
+            ui.label("行:");
+            if ui
+                .add_enabled(
+                    row.is_some_and(|r| dialog.can_insert_row_above(r)),
+                    egui::Button::new("上に挿入"),
+                )
+                .clicked()
+                && let Some(r) = row
+            {
+                dialog.insert_row_above(r);
+            }
+            if ui
+                .add_enabled(
+                    row.is_some_and(|r| dialog.can_insert_row_below(r)),
+                    egui::Button::new("下に挿入"),
+                )
+                .clicked()
+                && let Some(r) = row
+            {
+                dialog.insert_row_below(r);
+            }
+            if ui
+                .add_enabled(
+                    row.is_some_and(|r| dialog.can_remove_row(r)),
+                    egui::Button::new("行を削除"),
+                )
+                .clicked()
+                && let Some(r) = row
+            {
+                dialog.remove_row(r);
+            }
+        }
+        if mode.allows_row_ops() && mode.allows_col_ops() {
+            ui.separator();
+        }
+        if mode.allows_col_ops() {
+            ui.label("列:");
+            if ui
+                .add_enabled(
+                    col.is_some_and(|c| dialog.can_insert_col(c)),
+                    egui::Button::new("左に挿入"),
+                )
+                .clicked()
+                && let Some(c) = col
+            {
+                dialog.insert_col_left(c);
+            }
+            if ui
+                .add_enabled(
+                    col.is_some_and(|c| dialog.can_insert_col(c)),
+                    egui::Button::new("右に挿入"),
+                )
+                .clicked()
+                && let Some(c) = col
+            {
+                dialog.insert_col_right(c);
+            }
+            if ui
+                .add_enabled(
+                    col.is_some_and(|c| dialog.can_remove_col(c)),
+                    egui::Button::new("列を削除"),
+                )
+                .clicked()
+                && let Some(c) = col
+            {
+                dialog.remove_col(c);
+            }
+        }
+    });
+    let hint = match mode {
+        TableDialogMode::Edit => "行・列の見出しをクリックして選びます",
+        TableDialogMode::BomEntry => {
+            "行の見出しをクリックして選びます(見出し行は消せず、その下へは挿入できません)"
+        }
+        TableDialogMode::BomSettings => "列の見出しをクリックして選びます",
+    };
+    ui.weak(hint);
+}
+
+/// 表のダイアログ下部の操作ボタン（M12 タスク94。2026-09-25 「部品表にする」「表に戻す」を
+/// 廃止 — DESIGN.md M12「タスク94 の着手時の決定」）。押されたものを返す。
+///
+/// - 「表を編集」: 「表題欄の上に配置」。
+/// - 「部品欄の設定」: 「表題欄の上に配置」・「様式に合わせ直す」。
+/// - 「記入」: なし。
+///
+/// 「表題欄の上に配置」は図面枠が有効で、作業コピーが検証を通るときだけ有効（OK と同じく
+/// 編集内容も書き戻すため）。
+fn table_dialog_action_buttons(
+    ui: &mut egui::Ui,
+    mode: TableDialogMode,
+    build_ok: bool,
+    frame_visible: bool,
+) -> Option<TableDialogAction> {
+    let mut action = None;
+    let place_button = |ui: &mut egui::Ui| {
+        let response = ui
+            .add_enabled(
+                frame_visible && build_ok,
+                egui::Button::new("表題欄の上に配置"),
+            )
+            .on_hover_text("編集内容を反映し、表題欄の直上へ移して閉じます");
+        if !frame_visible {
+            response.on_disabled_hover_text("図面枠が無効です")
+        } else {
+            response.on_disabled_hover_text("入力に誤りがあります")
+        }
+    };
+    match mode {
+        TableDialogMode::Edit => {
+            ui.horizontal(|ui| {
+                if place_button(ui).clicked() {
+                    action = Some(TableDialogAction::PlaceAboveTitleBlock);
+                }
+            });
+        }
+        TableDialogMode::BomSettings => {
+            ui.horizontal(|ui| {
+                if place_button(ui).clicked() {
+                    action = Some(TableDialogAction::PlaceAboveTitleBlock);
+                }
+                if ui
+                    .button("様式に合わせ直す")
+                    .on_hover_text(
+                        "ダイアログでの編集は捨て、列構成・列幅・揃え・行高さ・文字高さを表題欄の様式の既定へ戻して閉じます",
+                    )
+                    .clicked()
+                {
+                    action = Some(TableDialogAction::ApplyBomPreset);
+                }
+            });
+        }
+        TableDialogMode::BomEntry => {}
+    }
+    action
+}
+
+/// 図面設定の変更で、表題欄の直上の部品表を追従させなかった理由（M12 タスク94）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BomFollowSkip {
+    /// 変更後の図面枠が無効（追従先の表題欄が無い）。
+    FrameHidden,
+    /// 部品表のレイヤーがロックされている。
+    LayerLocked,
+    /// 部品表の移動が想定外の理由で拒否された（設定の変更だけを適用した）。
+    Rejected(String),
+}
+
+/// [`apply_sheet_change`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SheetChangeOutcome {
+    /// 設定だけを変えた（部品表が無い・表題欄の直上に無い・表題欄が動かない）。
+    SheetOnly,
+    /// 設定の変更と部品表の移動を 1 操作（`Command::Batch`、undo 1回）で行った。
+    BomFollowed,
+    /// 部品表は表題欄の直上にあったが、追従させずに設定だけを変えた。
+    BomFollowSkipped(BomFollowSkip),
+}
+
+impl SheetChangeOutcome {
+    /// ステータスバーへ出す文言（追従を見送ったときだけ）。
+    fn status_message(&self) -> Option<String> {
+        match self {
+            SheetChangeOutcome::SheetOnly | SheetChangeOutcome::BomFollowed => None,
+            SheetChangeOutcome::BomFollowSkipped(BomFollowSkip::FrameHidden) => {
+                Some("図面枠が無効なため、部品欄の表題欄への追従を見送りました".to_owned())
+            }
+            SheetChangeOutcome::BomFollowSkipped(BomFollowSkip::LayerLocked) => Some(
+                "部品欄のレイヤーがロックされているため、部品欄の表題欄への追従を見送りました"
+                    .to_owned(),
+            ),
+            SheetChangeOutcome::BomFollowSkipped(BomFollowSkip::Rejected(err)) => {
+                Some(format!("部品欄の表題欄への追従を見送りました: {err}"))
+            }
+        }
+    }
+}
+
+/// 図面の設定を `new_sheet` へ変える（`Command::SetSheet`）。変更の直前に部品表が表題欄の
+/// 直上に揃っていれば、変更後の表題欄の直上へ一緒に動かす（M12 タスク94。DESIGN.md M12
+/// 「タスク93 の実装時追記」のスモーク後の決定）。ユーザー操作で設定を変える経路
+/// （右パネル「図面」・表題欄編集ダイアログ）はすべてここを通す。
+///
+/// 1. 追従先は [`bom::bom_follow_sheet_change`] が決める（揃っていない・表題欄が動かない
+///    なら追従しない）。
+/// 2. 変更後の図面枠が無効、または部品表のレイヤーがロック済みなら、**先に判定して**
+///    追従を見送り、設定だけを変える（[`BomFollowSkip`]。ロックは `Document::apply` と
+///    同じ `Layer::locked` を見る）。
+/// 3. それ以外は `Command::Batch([SetSheet, ModifyEntity])` を 1 回（undo 1回）発行する。
+///    万一 Batch が拒否されたら（原子的なので何も変わっていない）、設定の変更だけを
+///    やり直す（ユーザーの主目的は設定の変更なので、部品表のために止めない）。
+///
+/// # Errors
+///
+/// `Command::SetSheet` 自体が拒否されたとき（何も変わらない）。
+fn apply_sheet_change(
+    document: &mut Document,
+    new_sheet: SheetMeta,
+) -> Result<SheetChangeOutcome, mcad_core::CoreError> {
+    let follow = document.bom().and_then(|id| {
+        let entity = document.entity(id)?;
+        let EntityGeom::Table(table) = &entity.geom else {
+            return None;
+        };
+        let anchor = bom::bom_follow_sheet_change(document.sheet(), &new_sheet, table)?;
+        Some((
+            id,
+            entity.layer,
+            TableGeom {
+                anchor,
+                ..table.clone()
+            },
+        ))
+    });
+    let Some((id, layer, moved)) = follow else {
+        document.apply(Command::SetSheet(new_sheet))?;
+        return Ok(SheetChangeOutcome::SheetOnly);
+    };
+
+    let skip = if !new_sheet.frame_visible {
+        Some(BomFollowSkip::FrameHidden)
+    } else if document.layer(layer).is_some_and(|l| l.locked) {
+        Some(BomFollowSkip::LayerLocked)
+    } else {
+        None
+    };
+    if let Some(skip) = skip {
+        document.apply(Command::SetSheet(new_sheet))?;
+        return Ok(SheetChangeOutcome::BomFollowSkipped(skip));
+    }
+
+    let batch = Command::Batch(vec![
+        Command::SetSheet(new_sheet.clone()),
+        Command::ModifyEntity {
+            id,
+            new_geom: EntityGeom::Table(moved),
+        },
+    ]);
+    match document.apply(batch) {
+        Ok(_) => Ok(SheetChangeOutcome::BomFollowed),
+        Err(batch_err) => {
+            document.apply(Command::SetSheet(new_sheet))?;
+            Ok(SheetChangeOutcome::BomFollowSkipped(
+                BomFollowSkip::Rejected(batch_err.to_string()),
+            ))
+        }
+    }
 }
 
 /// 素のカーソル位置 `raw` にスナップを掛ける。有効かつ候補が見つかれば
@@ -10261,7 +10887,7 @@ mod tests {
         assert!(
             app.status
                 .as_ref()
-                .is_some_and(|s| s.text.contains("部品表の配置に失敗しました"))
+                .is_some_and(|s| s.text.contains("部品欄の配置に失敗しました"))
         );
     }
 
@@ -10302,7 +10928,7 @@ mod tests {
         assert!(
             app.status
                 .as_ref()
-                .is_some_and(|s| s.text.contains("部品表の配置に失敗しました"))
+                .is_some_and(|s| s.text.contains("部品欄の配置に失敗しました"))
         );
         // 進行中の複製配置モードは取り消されない。
         assert!(app.select_tool.is_placing());
@@ -10342,7 +10968,7 @@ mod tests {
         assert!(
             app.status
                 .as_ref()
-                .is_some_and(|s| s.text.contains("部品表の配置に失敗しました"))
+                .is_some_and(|s| s.text.contains("部品欄の配置に失敗しました"))
         );
         // 進行中のオフセットモードは取り消されない。
         assert!(app.select_tool.is_offsetting());
@@ -11892,15 +12518,55 @@ mod tests {
         );
     }
 
+    /// 作業コピーの不変条件（`TableDialogState` の doc「不変条件」）: 各行のセル数・列幅・
+    /// 揃えの要素数が列数で一致し、行数・列数は 1 以上。選択は範囲内を指す。
+    fn assert_table_dialog_invariants(dialog: &TableDialogState) {
+        let cols = dialog.col_widths_mm.len();
+        assert!(!dialog.cells.is_empty(), "表は最低1行");
+        assert!(cols >= 1, "表は最低1列");
+        assert_eq!(dialog.col_aligns.len(), cols, "揃えの要素数 = 列数");
+        for (r, row) in dialog.cells.iter().enumerate() {
+            assert_eq!(row.len(), cols, "行{r}のセル数 = 列数");
+        }
+        match dialog.selection {
+            Some(TableDialogSelection::Row(r)) => assert!(r < dialog.cells.len()),
+            Some(TableDialogSelection::Col(c)) => assert!(c < cols),
+            None => {}
+        }
+    }
+
+    /// 部品表（見出し行 = 最下段 + 部品行 `part_rows` 行、3 列）。揃えは列ごとに変える。
+    fn bom_for_dialog_tests(part_rows: usize) -> TableGeom {
+        let rows = part_rows + 1;
+        let mut cells: Vec<String> = (0..part_rows * 3).map(|i| format!("p{i}")).collect();
+        cells.extend(["部番", "名称", "個数"].map(str::to_owned));
+        TableGeom {
+            kind: TableKind::Bom,
+            anchor: Point2::new(1.0, 2.0),
+            col_widths_mm: vec![10.0, 35.0, 10.0],
+            col_aligns: vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+                HorizontalAlign::Center,
+            ],
+            row_heights_mm: vec![8.0; rows],
+            text_height_mm: 3.5,
+            cells,
+        }
+    }
+
     #[test]
-    fn table_dialog_add_row_top_inserts_an_empty_row_at_index_zero() {
+    fn table_dialog_insert_row_above_the_top_row_inserts_an_empty_row_at_index_zero() {
         let table = default_table_for_dialog_tests();
         let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
-        dialog.add_row_top();
+        dialog.insert_row_above(0);
+        assert_table_dialog_invariants(&dialog);
         assert_eq!(dialog.cells.len(), 4);
         assert_eq!(dialog.cells[0], vec![String::new(); 3]);
         // 元の行は1つ下へ押し出される（行0=最上段が新しい空行に置き換わる）。
         assert_eq!(dialog.cells[1], vec!["c0", "c1", "c2"]);
+        // 挿入した行が選ばれる。
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Row(0)));
 
         let rebuilt = build_table_from_dialog(&dialog).expect("valid");
         assert_eq!(rebuilt.rows(), 4);
@@ -11911,31 +12577,77 @@ mod tests {
     }
 
     #[test]
-    fn table_dialog_remove_top_row_drops_index_zero_but_keeps_at_least_one_row() {
+    fn table_dialog_inserts_rows_above_and_below_a_middle_row() {
         let table = default_table_for_dialog_tests();
         let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
-        dialog.remove_top_row();
-        assert_eq!(dialog.cells.len(), 2);
-        assert_eq!(dialog.cells[0], vec!["c3", "c4", "c5"]);
+        dialog.insert_row_below(1);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.cells[1], vec!["c3", "c4", "c5"]);
+        assert_eq!(dialog.cells[2], vec![String::new(); 3]);
+        assert_eq!(dialog.cells[3], vec!["c6", "c7", "c8"]);
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Row(2)));
 
-        dialog.remove_top_row();
-        assert_eq!(dialog.cells.len(), 1);
-        // 最後の1行は削除しない。
-        dialog.remove_top_row();
-        assert_eq!(dialog.cells.len(), 1);
+        dialog.insert_row_above(1);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.cells[0], vec!["c0", "c1", "c2"]);
+        assert_eq!(dialog.cells[1], vec![String::new(); 3]);
+        assert_eq!(dialog.cells[2], vec!["c3", "c4", "c5"]);
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Row(1)));
+
+        // 最下段の下（表の末尾）へも挿入できる（汎用表には見出し行の制約が無い）。
+        let last = dialog.cells.len() - 1;
+        assert!(dialog.can_insert_row_below(last));
+        dialog.insert_row_below(last);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.cells.len(), 6);
+        assert_eq!(dialog.cells[5], vec![String::new(); 3]);
+        assert!(build_table_from_dialog(&dialog).is_ok());
     }
 
     #[test]
-    fn table_dialog_add_col_right_appends_an_empty_column() {
+    fn table_dialog_remove_row_drops_the_selected_row_but_keeps_at_least_one_row() {
         let table = default_table_for_dialog_tests();
         let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
-        dialog.add_col_right();
+        dialog.remove_row(1);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(
+            dialog.cells,
+            vec![vec!["c0", "c1", "c2"], vec!["c6", "c7", "c8"]]
+        );
+        // 同じ位置の行（元の次の行）が選ばれる。
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Row(1)));
+
+        // 最下段を消すと新しい最下段が選ばれる。
+        dialog.remove_row(1);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.cells, vec![vec!["c0", "c1", "c2"]]);
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Row(0)));
+
+        // 最後の1行は削除しない。
+        assert!(!dialog.can_remove_row(0));
+        dialog.remove_row(0);
+        assert_eq!(dialog.cells.len(), 1);
+        // 範囲外の行番号は何もしない。
+        dialog.remove_row(5);
+        dialog.insert_row_above(5);
+        dialog.insert_row_below(5);
+        assert_eq!(dialog.cells.len(), 1);
+        assert_table_dialog_invariants(&dialog);
+    }
+
+    #[test]
+    fn table_dialog_insert_col_right_of_the_last_column_appends_an_empty_column() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.insert_col_right(2);
+        assert_table_dialog_invariants(&dialog);
         assert_eq!(dialog.col_widths_mm.len(), 4);
         assert_eq!(dialog.col_widths_mm[3], "30");
         for row in &dialog.cells {
             assert_eq!(row.len(), 4);
             assert_eq!(row[3], "");
         }
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Col(3)));
 
         let rebuilt = build_table_from_dialog(&dialog).expect("valid");
         assert_eq!(rebuilt.cols(), 4);
@@ -11955,27 +12667,603 @@ mod tests {
     }
 
     #[test]
-    fn table_dialog_remove_right_col_drops_the_last_column_but_keeps_at_least_one() {
+    fn table_dialog_inserts_columns_left_and_right_of_a_middle_column() {
         let table = default_table_for_dialog_tests();
         let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
-        dialog.remove_right_col();
-        assert_eq!(dialog.col_widths_mm.len(), 2);
-        assert_eq!(dialog.cells[0], vec!["c0", "c1"]);
-        // 揃えも右端から 1 つ減る（M12 タスク93）。組み立てた表は validate を通る。
+        dialog.col_widths_mm = vec!["10".to_owned(), "20".to_owned(), "40".to_owned()];
+        dialog.insert_col_left(1);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.col_widths_mm, vec!["10", "30", "20", "40"]);
         assert_eq!(
-            build_table_from_dialog(&dialog).expect("valid").col_aligns,
-            vec![HorizontalAlign::Center, HorizontalAlign::Left]
+            dialog.col_aligns,
+            vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+                HorizontalAlign::Left,
+                HorizontalAlign::Right,
+            ]
         );
+        assert_eq!(dialog.cells[0], vec!["c0", "", "c1", "c2"]);
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Col(1)));
 
-        dialog.remove_right_col();
-        assert_eq!(dialog.col_widths_mm.len(), 1);
-        // 最後の1列は削除しない。
-        dialog.remove_right_col();
-        assert_eq!(dialog.col_widths_mm.len(), 1);
+        // 元の列1（今は列2）の右へ挿入する。
+        dialog.insert_col_right(2);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.col_widths_mm, vec!["10", "30", "20", "30", "40"]);
+        assert_eq!(dialog.cells[2], vec!["c6", "", "c7", "", "c8"]);
+        assert_eq!(
+            dialog.col_aligns,
+            vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Left,
+                HorizontalAlign::Left,
+                HorizontalAlign::Left,
+                HorizontalAlign::Right,
+            ]
+        );
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Col(3)));
+        assert!(build_table_from_dialog(&dialog).is_ok());
+    }
+
+    #[test]
+    fn table_dialog_remove_col_drops_the_matching_width_and_alignment() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        dialog.col_widths_mm = vec!["10".to_owned(), "20".to_owned(), "40".to_owned()];
+        dialog.remove_col(1);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.col_widths_mm, vec!["10", "40"]);
+        assert_eq!(
+            dialog.col_aligns,
+            vec![HorizontalAlign::Center, HorizontalAlign::Right]
+        );
+        assert_eq!(dialog.cells[0], vec!["c0", "c2"]);
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Col(1)));
+
+        // 右端を消すと新しい右端が選ばれる。組み立てた表は validate を通る。
+        dialog.remove_col(1);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Col(0)));
         assert_eq!(
             build_table_from_dialog(&dialog).expect("valid").col_aligns,
             vec![HorizontalAlign::Center]
         );
+        // 最後の1列は削除しない。
+        assert!(!dialog.can_remove_col(0));
+        dialog.remove_col(0);
+        assert_eq!(dialog.col_widths_mm.len(), 1);
+        // 範囲外の列番号は何もしない。
+        dialog.insert_col_left(3);
+        dialog.insert_col_right(3);
+        dialog.remove_col(3);
+        assert_eq!(dialog.col_widths_mm.len(), 1);
+        assert_table_dialog_invariants(&dialog);
+    }
+
+    #[test]
+    fn table_dialog_row_and_col_ops_always_keep_cells_widths_and_aligns_in_step() {
+        // 途中への挿入・削除を決定的な擬似乱数で 400 回混ぜ、毎回不変条件と
+        // `build_table_from_dialog`（= validate）の通過を確かめる。3 種のダイアログとも。
+        for mode in [
+            TableDialogMode::Edit,
+            TableDialogMode::BomEntry,
+            TableDialogMode::BomSettings,
+        ] {
+            let table = bom_for_dialog_tests(2);
+            let mut dialog = TableDialogState::open(EntityId::default(), &table, mode);
+            let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut next = |n: usize| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((seed >> 33) as usize) % n
+            };
+            for _ in 0..400 {
+                let rows = dialog.cells.len();
+                let cols = dialog.col_widths_mm.len();
+                // 削除を挿入の 2 倍の重みにして、行数・列数が上限へ向かって増え続けない
+                // ようにする（最小の 1 行・1 列の境界も何度も踏む）。
+                match next(8) {
+                    0 => dialog.insert_row_above(next(rows)),
+                    1 => dialog.insert_row_below(next(rows)),
+                    2 | 3 => dialog.remove_row(next(rows)),
+                    4 => dialog.insert_col_left(next(cols)),
+                    5 => dialog.insert_col_right(next(cols)),
+                    _ => dialog.remove_col(next(cols)),
+                }
+                assert_table_dialog_invariants(&dialog);
+                assert!(
+                    dialog.cells.len() <= mcad_core::MAX_TABLE_ROWS
+                        && dialog.col_widths_mm.len() <= mcad_core::MAX_TABLE_COLS,
+                    "テストの操作回数は上限に届かない前提"
+                );
+                build_table_from_dialog(&dialog)
+                    .unwrap_or_else(|e| panic!("{mode:?}: 組み立てに失敗: {e}"));
+            }
+            if mode == TableDialogMode::BomEntry {
+                assert_eq!(
+                    dialog.cells.last().expect("at least one row"),
+                    &vec!["部番".to_owned(), "名称".to_owned(), "個数".to_owned()],
+                    "記入では見出し行は変わらない"
+                );
+                assert_eq!(dialog.col_widths_mm.len(), 3, "記入では列は変わらない");
+            }
+            if mode == TableDialogMode::BomSettings {
+                assert_eq!(dialog.cells.len(), 3, "部品表の設定では行は変わらない");
+            }
+        }
+    }
+
+    #[test]
+    fn bom_entry_dialog_cannot_remove_the_header_row_or_insert_below_it() {
+        let table = bom_for_dialog_tests(2);
+        let mut dialog =
+            TableDialogState::open(EntityId::default(), &table, TableDialogMode::BomEntry);
+        let header = 2;
+        assert_eq!(dialog.header_row(), Some(header));
+        assert!(!dialog.can_remove_row(header));
+        assert!(!dialog.can_insert_row_below(header));
+        dialog.remove_row(header);
+        dialog.insert_row_below(header);
+        assert_eq!(dialog.cells.len(), 3);
+        assert_eq!(dialog.cells[header], vec!["部番", "名称", "個数"]);
+
+        // 見出し行の上（最後の部品行の位置）へは挿入できる。
+        assert!(dialog.can_insert_row_above(header));
+        dialog.insert_row_above(header);
+        assert_table_dialog_invariants(&dialog);
+        assert_eq!(dialog.cells.len(), 4);
+        assert_eq!(dialog.cells[2], vec![String::new(); 3]);
+        assert_eq!(dialog.cells[3], vec!["部番", "名称", "個数"]);
+
+        // 部品行はすべて消せ、見出し行だけが残る。
+        while dialog.cells.len() > 1 {
+            assert!(dialog.can_remove_row(0));
+            dialog.remove_row(0);
+            assert_table_dialog_invariants(&dialog);
+        }
+        assert_eq!(dialog.cells, vec![vec!["部番", "名称", "個数"]]);
+        assert!(!dialog.can_remove_row(0));
+        // 見出しだけの部品表でも、見出し行の上へ部品行を足せる。
+        dialog.insert_row_above(0);
+        assert_eq!(dialog.cells.len(), 2);
+        assert_eq!(dialog.cells[1], vec!["部番", "名称", "個数"]);
+    }
+
+    #[test]
+    fn bom_dialogs_offer_only_their_own_operations() {
+        let table = bom_for_dialog_tests(2);
+        // 記入: 列の操作は無い。
+        let mut entry =
+            TableDialogState::open(EntityId::default(), &table, TableDialogMode::BomEntry);
+        assert!(!entry.can_insert_col(0));
+        assert!(!entry.can_remove_col(0));
+        entry.insert_col_left(0);
+        entry.insert_col_right(0);
+        entry.remove_col(0);
+        assert_eq!(entry.col_widths_mm.len(), 3);
+
+        // 部品表の設定: 行の操作は無い。列は途中へ挿入・削除できる。
+        let mut settings =
+            TableDialogState::open(EntityId::default(), &table, TableDialogMode::BomSettings);
+        assert!(!settings.can_insert_row_above(0));
+        assert!(!settings.can_insert_row_below(0));
+        assert!(!settings.can_remove_row(0));
+        settings.insert_row_above(0);
+        settings.insert_row_below(0);
+        settings.remove_row(0);
+        assert_eq!(settings.cells.len(), 3);
+        assert!(settings.can_insert_col(1));
+        assert!(settings.can_remove_col(1));
+
+        // 汎用表の「表を編集」は見出し行を持たない（最下段も普通の行）。
+        let edit = TableDialogState::open(EntityId::default(), &table, TableDialogMode::Edit);
+        assert_eq!(edit.header_row(), None);
+        assert!(edit.can_remove_row(2));
+        assert!(edit.can_insert_row_below(2));
+    }
+
+    #[test]
+    fn bom_settings_dialog_edits_columns_and_keeps_the_part_rows() {
+        let table = bom_for_dialog_tests(2);
+        let mut dialog =
+            TableDialogState::open(EntityId::default(), &table, TableDialogMode::BomSettings);
+        // 名称の右に「材質」列を足し、列名・列幅・揃えを変える。
+        dialog.insert_col_right(1);
+        let header = dialog.header_row().expect("bom has a header row");
+        dialog.cells[header][2] = "材質".to_owned();
+        dialog.col_widths_mm[2] = "25".to_owned();
+        dialog.col_aligns[2] = HorizontalAlign::Center;
+        dialog.col_aligns[1] = HorizontalAlign::Right;
+        dialog.row_height_mm = "9".to_owned();
+        dialog.text_height_mm = "4".to_owned();
+        let rebuilt = build_table_from_dialog(&dialog).expect("valid");
+
+        assert_eq!(rebuilt.kind, TableKind::Bom);
+        assert_eq!(rebuilt.cols(), 4);
+        assert_eq!(rebuilt.rows(), 3);
+        assert_eq!(rebuilt.col_widths_mm, vec![10.0, 35.0, 25.0, 10.0]);
+        assert_eq!(
+            rebuilt.col_aligns,
+            vec![
+                HorizontalAlign::Center,
+                HorizontalAlign::Right,
+                HorizontalAlign::Center,
+                HorizontalAlign::Center,
+            ]
+        );
+        assert_eq!(rebuilt.row_heights_mm, vec![9.0; 3]);
+        assert_eq!(rebuilt.text_height_mm, 4.0);
+        // 見出し行（最下段）は列名、部品行の値はそのまま（新しい列は空）。
+        assert_eq!(rebuilt.cell(2, 2), Some("材質"));
+        assert_eq!(rebuilt.cell(2, 3), Some("個数"));
+        assert_eq!(rebuilt.cell(0, 0), Some("p0"));
+        assert_eq!(rebuilt.cell(0, 2), Some(""));
+        assert_eq!(rebuilt.cell(1, 3), Some("p5"));
+    }
+
+    #[test]
+    fn bom_entry_dialog_writes_back_the_hidden_layout_unchanged() {
+        // 記入では列幅・揃え・行高さ・文字高さを出さないが、開いた時点の値を書き戻す。
+        let table = bom_for_dialog_tests(2);
+        let mut dialog =
+            TableDialogState::open(EntityId::default(), &table, TableDialogMode::BomEntry);
+        dialog.cells[0][1] = "ベース".to_owned();
+        dialog.insert_row_above(0);
+        let rebuilt = build_table_from_dialog(&dialog).expect("valid");
+        assert_eq!(rebuilt.kind, TableKind::Bom);
+        assert_eq!(rebuilt.col_widths_mm, table.col_widths_mm);
+        assert_eq!(rebuilt.col_aligns, table.col_aligns);
+        assert_eq!(rebuilt.text_height_mm, table.text_height_mm);
+        assert_eq!(rebuilt.row_heights_mm, vec![8.0; 4]);
+        assert_eq!(rebuilt.cell(1, 1), Some("ベース"));
+    }
+
+    #[test]
+    fn table_dialog_toggle_selection_switches_between_rows_and_columns() {
+        let table = default_table_for_dialog_tests();
+        let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
+        assert_eq!(dialog.selection, None);
+        dialog.toggle_selection(TableDialogSelection::Row(1));
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Row(1)));
+        // 列を選ぶと行の選択は外れる（同時には選ばない）。
+        dialog.toggle_selection(TableDialogSelection::Col(2));
+        assert_eq!(dialog.selection, Some(TableDialogSelection::Col(2)));
+        // 同じ見出しをもう一度クリックすると外れる。
+        dialog.toggle_selection(TableDialogSelection::Col(2));
+        assert_eq!(dialog.selection, None);
+    }
+
+    /// ヘッドレスの `egui::Context` で 1 フレーム回し、表のダイアログの結果とモーダルの
+    /// 矩形を返す。`events` はこのフレームの入力。
+    fn run_table_dialog_frame(
+        ctx: &egui::Context,
+        dialog: &mut TableDialogState,
+        events: Vec<egui::Event>,
+    ) -> (TableDialogOutcome, Rect) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+            events,
+            ..Default::default()
+        };
+        let mut outcome = TableDialogOutcome::Open;
+        let _ = ctx.run_ui(input, |ui| {
+            outcome = show_table_dialog(ui.ctx(), dialog, true);
+        });
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("table_dialog"));
+        let rect = ctx
+            .memory(|m| m.area_rect(layer.id))
+            .expect("modal area is shown");
+        (outcome, rect)
+    }
+
+    #[test]
+    fn table_dialog_renders_every_mode_and_its_size_can_be_dragged() {
+        // GUI の確認は手動スモークに委ねるが、3 種のダイアログが描画で落ちないこと、
+        // および `Modal` の中の `egui::Resize` の角をドラッグすると実際に広がること
+        // （M12 タスク94「広さを変えたい」）はヘッドレスで確かめられる。
+        for (table, mode) in [
+            (default_table_for_dialog_tests(), TableDialogMode::Edit),
+            (bom_for_dialog_tests(2), TableDialogMode::BomEntry),
+            (bom_for_dialog_tests(2), TableDialogMode::BomSettings),
+        ] {
+            let ctx = egui::Context::default();
+            let mut dialog = TableDialogState::open(EntityId::default(), &table, mode);
+            let mut rect = Rect::NOTHING;
+            for _ in 0..3 {
+                let (outcome, r) = run_table_dialog_frame(&ctx, &mut dialog, Vec::new());
+                assert_eq!(outcome, TableDialogOutcome::Open, "{mode:?}");
+                rect = r;
+            }
+            let before = rect;
+
+            // 右下の角（枠の内側の余白 6px + 角の大きさ 12px の内側）を掴んで右下へ引く。
+            let grab = before.max - egui::vec2(10.0, 10.0);
+            let target = grab + egui::vec2(120.0, 80.0);
+            let press = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            run_table_dialog_frame(
+                &ctx,
+                &mut dialog,
+                vec![egui::Event::PointerMoved(grab), press(grab, true)],
+            );
+            for step in 1..=4 {
+                let pos = grab + (target - grab) * (step as f32 / 4.0);
+                run_table_dialog_frame(&ctx, &mut dialog, vec![egui::Event::PointerMoved(pos)]);
+            }
+            // 押したまま数フレーム回して落ち着かせてから離す。
+            for _ in 0..8 {
+                run_table_dialog_frame(&ctx, &mut dialog, Vec::new());
+            }
+            let (outcome, _) =
+                run_table_dialog_frame(&ctx, &mut dialog, vec![press(target, false)]);
+            assert_eq!(
+                outcome,
+                TableDialogOutcome::Open,
+                "{mode:?}: ドラッグで閉じない"
+            );
+            let (_, after) = run_table_dialog_frame(&ctx, &mut dialog, Vec::new());
+            assert!(
+                after.width() > before.width() + 100.0 && after.height() > before.height() + 60.0,
+                "{mode:?}: 広がるはず {before:?} → {after:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 表のダイアログのボタン操作（M12 タスク94）: table_dialog_command
+    // -----------------------------------------------------------------
+
+    /// `table` を図面へ足して ID を返す。
+    fn add_table(document: &mut Document, table: &TableGeom) -> EntityId {
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::Table(table.clone()),
+                layer,
+                Style::inherited(),
+            )))
+            .expect("add table")
+            .entities[0]
+    }
+
+    fn table_of(document: &Document, id: EntityId) -> TableGeom {
+        match &document.entity(id).expect("live entity").geom {
+            EntityGeom::Table(table) => table.clone(),
+            other => panic!("表のはず: {other:?}"),
+        }
+    }
+
+    /// 図面枠を有効にした図面（表題欄 = 様式A、A4 横、尺度 1:1）。
+    fn document_with_frame() -> Document {
+        let mut document = Document::new();
+        let sheet = SheetMeta {
+            frame_visible: true,
+            ..document.sheet().clone()
+        };
+        document.apply(Command::SetSheet(sheet)).expect("set sheet");
+        document
+    }
+
+    #[test]
+    fn table_dialog_command_ok_writes_back_the_working_copy_in_one_undo() {
+        let mut document = Document::new();
+        let table = default_table_for_dialog_tests();
+        let id = add_table(&mut document, &table);
+        let mut dialog = TableDialogState::open(id, &table, TableDialogMode::Edit);
+        dialog.cells[0][0] = "編集".to_owned();
+        dialog.col_aligns[1] = HorizontalAlign::Right;
+        let cmd = table_dialog_command(&document, &dialog, TableDialogAction::Ok).expect("ok");
+        document.apply(cmd).expect("apply");
+        let after = table_of(&document, id);
+        assert_eq!(after.cell(0, 0), Some("編集"));
+        assert_eq!(after.col_aligns[1], HorizontalAlign::Right);
+        assert!(document.undo());
+        assert_eq!(table_of(&document, id), table);
+    }
+
+    #[test]
+    fn table_dialog_command_place_above_title_block_keeps_edits_and_moves_the_anchor() {
+        let mut document = document_with_frame();
+        let table = default_table_for_dialog_tests();
+        let id = add_table(&mut document, &table);
+        let mut dialog = TableDialogState::open(id, &table, TableDialogMode::Edit);
+        dialog.cells[1][1] = "残る".to_owned();
+        let cmd = table_dialog_command(&document, &dialog, TableDialogAction::PlaceAboveTitleBlock)
+            .expect("frame is visible");
+        document.apply(cmd).expect("apply");
+        let after = table_of(&document, id);
+        let k = document.sheet().scale.world_mm_per_paper_mm();
+        assert_eq!(
+            after.anchor,
+            bom_anchor_above_title_block(document.sheet(), k)
+        );
+        assert_eq!(after.cell(1, 1), Some("残る"));
+        // 1 操作 = undo 1 回で元へ戻る。
+        assert!(document.undo());
+        assert_eq!(table_of(&document, id), table);
+
+        // 図面枠が無効なら拒否する（ボタンも無効化されるが、念のため組み立てでも拒否）。
+        let mut hidden = Document::new();
+        let id = add_table(&mut hidden, &table);
+        let dialog = TableDialogState::open(id, &table, TableDialogMode::Edit);
+        let err = table_dialog_command(&hidden, &dialog, TableDialogAction::PlaceAboveTitleBlock)
+            .expect_err("frame is hidden");
+        assert!(err.contains("図面枠が無効です"), "{err}");
+    }
+
+    #[test]
+    fn table_dialog_command_apply_bom_preset_resets_edited_alignments() {
+        // 「様式に合わせ直す」はユーザーが編集した揃えも既定に戻す（DESIGN.md M12
+        // 「タスク94 の着手時の決定」）。ダイアログでの編集も捨てる。
+        let mut document = document_with_frame();
+        let width = document.sheet().title_block.template().width_mm;
+        let k = document.sheet().scale.world_mm_per_paper_mm();
+        let mut table =
+            bom::default_bom_table(bom_anchor_above_title_block(document.sheet(), k), width);
+        table.col_aligns = vec![HorizontalAlign::Right; table.cols()];
+        table.col_widths_mm[1] = 50.0;
+        let id = add_table(&mut document, &table);
+        let mut dialog = TableDialogState::open(id, &table, TableDialogMode::BomSettings);
+        dialog.row_height_mm = "12".to_owned();
+        let cmd = table_dialog_command(&document, &dialog, TableDialogAction::ApplyBomPreset)
+            .expect("preset applies");
+        document.apply(cmd).expect("apply");
+        let after = table_of(&document, id);
+        assert_eq!(after, bom::default_bom_table(table.anchor, width));
+    }
+
+    // -----------------------------------------------------------------
+    // 図面の設定変更で部品表を表題欄へ追従させる（M12 タスク94）: apply_sheet_change
+    // -----------------------------------------------------------------
+
+    /// 図面枠を有効にした図面と、その表題欄の直上に置いた部品表の ID。
+    fn document_with_bom_above_title_block() -> (Document, EntityId) {
+        let mut document = document_with_frame();
+        let k = document.sheet().scale.world_mm_per_paper_mm();
+        let table = bom::default_bom_table(
+            bom_anchor_above_title_block(document.sheet(), k),
+            document.sheet().title_block.template().width_mm,
+        );
+        let id = add_table(&mut document, &table);
+        (document, id)
+    }
+
+    fn expected_bom_anchor(sheet: &SheetMeta) -> Point2 {
+        bom_anchor_above_title_block(sheet, sheet.scale.world_mm_per_paper_mm())
+    }
+
+    #[test]
+    fn apply_sheet_change_moves_a_bom_above_the_title_block_in_one_undo() {
+        let (mut document, id) = document_with_bom_above_title_block();
+        let old_sheet = document.sheet().clone();
+        let old_table = table_of(&document, id);
+        let new_sheet = SheetMeta {
+            scale: Scale::new(1, 5).unwrap(),
+            paper: PaperSize::A3,
+            ..old_sheet.clone()
+        };
+        let outcome = apply_sheet_change(&mut document, new_sheet.clone()).expect("applies");
+        assert_eq!(outcome, SheetChangeOutcome::BomFollowed);
+        assert_eq!(outcome.status_message(), None);
+        assert_eq!(document.sheet(), &new_sheet);
+        let moved = table_of(&document, id);
+        assert_eq!(moved.anchor, expected_bom_anchor(&new_sheet));
+        assert_eq!(
+            moved,
+            TableGeom {
+                anchor: moved.anchor,
+                ..old_table.clone()
+            },
+            "動くのはアンカーだけ"
+        );
+        // 設定の変更と部品表の移動は undo 1 回で一緒に戻る。
+        assert!(document.undo());
+        assert_eq!(document.sheet(), &old_sheet);
+        assert_eq!(table_of(&document, id), old_table);
+    }
+
+    #[test]
+    fn apply_sheet_change_leaves_a_moved_bom_alone() {
+        let (mut document, id) = document_with_bom_above_title_block();
+        let mut table = table_of(&document, id);
+        table.anchor = Point2::new(table.anchor.x - 20.0, table.anchor.y + 5.0);
+        document
+            .apply(Command::ModifyEntity {
+                id,
+                new_geom: EntityGeom::Table(table.clone()),
+            })
+            .unwrap();
+        let new_sheet = SheetMeta {
+            scale: Scale::new(1, 5).unwrap(),
+            ..document.sheet().clone()
+        };
+        let outcome = apply_sheet_change(&mut document, new_sheet.clone()).expect("applies");
+        assert_eq!(outcome, SheetChangeOutcome::SheetOnly);
+        assert_eq!(document.sheet(), &new_sheet);
+        assert_eq!(table_of(&document, id), table);
+    }
+
+    #[test]
+    fn apply_sheet_change_without_a_bom_or_title_block_move_is_sheet_only() {
+        // 部品表が無い図面。
+        let mut document = document_with_frame();
+        let new_sheet = SheetMeta {
+            scale: Scale::new(1, 5).unwrap(),
+            ..document.sheet().clone()
+        };
+        assert_eq!(
+            apply_sheet_change(&mut document, new_sheet.clone()),
+            Ok(SheetChangeOutcome::SheetOnly)
+        );
+        assert_eq!(document.sheet(), &new_sheet);
+
+        // 表題欄の記入だけの変更（表題欄編集ダイアログの OK）では部品表は動かない。
+        let (mut document, id) = document_with_bom_above_title_block();
+        let before = table_of(&document, id);
+        let mut new_sheet = document.sheet().clone();
+        new_sheet.fields.drawing_title = "新しい名称".to_owned();
+        assert_eq!(
+            apply_sheet_change(&mut document, new_sheet.clone()),
+            Ok(SheetChangeOutcome::SheetOnly)
+        );
+        assert_eq!(document.sheet(), &new_sheet);
+        assert_eq!(table_of(&document, id), before);
+    }
+
+    #[test]
+    fn apply_sheet_change_skips_the_follow_when_the_frame_is_hidden() {
+        // 図面枠が無効な図面で、表題欄の位置（仮想）の直上にある部品表。
+        let (mut document, id) = document_with_bom_above_title_block();
+        let hidden = SheetMeta {
+            frame_visible: false,
+            ..document.sheet().clone()
+        };
+        // 枠の切替だけでは表題欄は動かないので追従も見送りも無い。
+        assert_eq!(
+            apply_sheet_change(&mut document, hidden.clone()),
+            Ok(SheetChangeOutcome::SheetOnly)
+        );
+        let before = table_of(&document, id);
+        let new_sheet = SheetMeta {
+            scale: Scale::new(1, 5).unwrap(),
+            ..hidden
+        };
+        let outcome = apply_sheet_change(&mut document, new_sheet.clone()).expect("applies");
+        assert_eq!(
+            outcome,
+            SheetChangeOutcome::BomFollowSkipped(BomFollowSkip::FrameHidden)
+        );
+        assert!(outcome.status_message().is_some());
+        assert_eq!(document.sheet(), &new_sheet);
+        assert_eq!(table_of(&document, id), before);
+    }
+
+    #[test]
+    fn apply_sheet_change_skips_the_follow_when_the_bom_layer_is_locked() {
+        let (mut document, id) = document_with_bom_above_title_block();
+        let before = table_of(&document, id);
+        lock_current_layer(&mut document);
+        let new_sheet = SheetMeta {
+            scale: Scale::new(1, 5).unwrap(),
+            ..document.sheet().clone()
+        };
+        let outcome = apply_sheet_change(&mut document, new_sheet.clone()).expect("applies");
+        assert_eq!(
+            outcome,
+            SheetChangeOutcome::BomFollowSkipped(BomFollowSkip::LayerLocked)
+        );
+        let message = outcome.status_message().expect("reported");
+        assert!(message.contains("追従を見送りました"), "{message}");
+        // 設定だけが変わり（undo 1 回で戻る）、部品表はそのまま。
+        assert_eq!(document.sheet(), &new_sheet);
+        assert_eq!(table_of(&document, id), before);
+        assert!(document.undo());
+        assert_ne!(document.sheet(), &new_sheet);
     }
 
     // -----------------------------------------------------------------
@@ -12232,7 +13520,7 @@ mod tests {
         let table = default_table_for_dialog_tests();
         let mut dialog = TableDialogState::from_table(EntityId::default(), &table);
         while dialog.cells.len() <= mcad_core::MAX_TABLE_ROWS {
-            dialog.add_row_top();
+            dialog.insert_row_above(0);
         }
         assert!(build_table_from_dialog(&dialog).is_err());
     }

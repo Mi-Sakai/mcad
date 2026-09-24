@@ -34,7 +34,7 @@
 //!
 //! 部品表プリセットの揃えは**列の意味（列名）で決める**（[`bom_preset_aligns`]）:
 //! 部番・個数・材質・質量[kg] = 中央、品番・名称・備考 = 左（2026-09-23 ユーザー要望）。
-//! [`apply_bom_preset`]（「部品表にする」の指定・様式への再適用）と [`default_bom_table`]
+//! [`apply_bom_preset`]（「部品欄の設定」の「様式に合わせ直す」）と [`default_bom_table`]
 //! （`K`）の両方がこの既定を入れる。**既存の表の揃えは引き継がない**（列構成そのものを
 //! 置き換える操作なので、列幅・行高さ・文字高さと同じく様式の既定へ揃える）。
 
@@ -129,7 +129,7 @@ pub fn bom_preset_aligns(names: &[&str]) -> Vec<HorizontalAlign> {
 /// - 既存セルの対応づけ: モジュール doc「既存の表への適用」の3分岐（旧5列プリセット／
 ///   現行プリセットの表／それ以外の表）に従い、名前または列番号でセルを移す。
 /// - ヘッダ行: **最下段**を列名で上書きする（表の行数が1のときはヘッダのみの表になる。
-///   部品行はユーザーが「行を上に追加」で足す）。
+///   部品行はユーザーが「記入」ダイアログの「上に挿入」で足す。M12 タスク94）。
 /// - 行高さ・文字高さ: 全行 [`BOM_ROW_HEIGHT_MM`] / [`BOM_TEXT_HEIGHT_MM`] に統一する。
 /// - 列ごとの揃え: [`bom_preset_aligns`] の既定に置き換える（元の表の揃えは引き継がない。
 ///   M12 タスク93）。
@@ -175,7 +175,7 @@ pub fn apply_bom_preset(table: &TableGeom, template_width_mm: f64) -> Result<Tab
         .any(|r| (0..old_cols).any(|c| !table.cell(r, c).unwrap_or("").is_empty()));
     if meanings.is_none() && has_values {
         return Err(
-            "見出しが部品表の列構成と一致しないため、値の入った表は部品表にできません(見出しを合わせるか、値を空にしてから変換してください)"
+            "見出しが部品欄の列構成と一致しないため、値の入った表は部品欄にできません(見出しを合わせるか、値を空にしてから変換してください)"
                 .to_owned(),
         );
     }
@@ -198,7 +198,7 @@ pub fn apply_bom_preset(table: &TableGeom, template_width_mm: f64) -> Result<Tab
         .collect();
     if !lost.is_empty() {
         return Err(format!(
-            "{} の値が新しい列構成に入らないため、部品表にできません(先に値を消すか、別の表へ移してください)",
+            "{} の値が新しい列構成に入らないため、部品欄にできません(先に値を消すか、別の表へ移してください)",
             lost.join("・")
         ));
     }
@@ -231,35 +231,6 @@ pub fn apply_bom_preset(table: &TableGeom, template_width_mm: f64) -> Result<Tab
         text_height_mm: BOM_TEXT_HEIGHT_MM,
         cells,
     })
-}
-
-/// 右パネル「表」の「部品表にする」（M12 設計判断2）。選んだ表を部品表に指定する
-/// （汎用表 → 部品表）、または部品表の様式を再適用する（部品表 → 部品表、種類は
-/// 変わらない）。[`apply_bom_preset`] で列構成を適用したうえで、種類を常に
-/// [`TableKind::Bom`] にする（`apply_bom_preset` 自体は種類を変えない設計 —
-/// モジュール doc、タスク81 のテスト `apply_bom_preset_keeps_the_table_kind` 参照 —
-/// なので、種類を変えるのはこの呼び出し側の責務）。
-///
-/// # Errors
-///
-/// [`apply_bom_preset`] と同じ（値を捨てる変換・見分けられない表への変換を拒否）。
-/// 図面に既に別の部品表があるときの拒否（[`mcad_core::CoreError::BomAlreadyExists`]）は
-/// ここでは検査しない（呼び出し側の `Document::apply` が最終防衛として行う）。
-pub fn designate_as_bom(table: &TableGeom, template_width_mm: f64) -> Result<TableGeom, String> {
-    apply_bom_preset(table, template_width_mm).map(|applied| TableGeom {
-        kind: TableKind::Bom,
-        ..applied
-    })
-}
-
-/// 右パネル「表」の「表に戻す」（M12 設計判断2）。部品表を表に戻す。列構成・セル・
-/// アンカーなど中身は変えない（種類だけを [`TableKind::Table`] にする）。
-#[must_use]
-pub fn reset_to_table(table: &TableGeom) -> TableGeom {
-    TableGeom {
-        kind: TableKind::Table,
-        ..table.clone()
-    }
 }
 
 /// 既存の表が部品表のどの列構成か（旧5列・様式A/C の7列・様式B の6列）を見分け、
@@ -298,6 +269,48 @@ pub fn bom_anchor_above_title_block(sheet: &SheetMeta, k: f64) -> Point2 {
     let block_left = paper_w_mm - FRAME_MARGIN_MM - template.width_mm;
     let block_top = FRAME_MARGIN_MM + template.height_mm();
     paper_to_world(Point2::new(block_left, block_top), k)
+}
+
+/// 部品表が「表題欄の直上に揃っている」とみなす許容差（紙 mm。M12 タスク94）。
+///
+/// ワールド座標で比べると尺度で意味が変わるので、差を `k` で割った紙 mm で比べる。
+/// `1e-6` 紙 mm（1 nm）は、目で見える・意図して動かせるどんなずれよりも十分小さく、
+/// 浮動小数の丸め（ワールド座標は最大でも A0 の 1189 mm × 1:10000 ≈ 1.2e7 mm で、
+/// その 1 ulp ≈ 1.9e-9 mm、紙 mm では 1e-12 台）よりは十分大きい。スナップや移動の
+/// 往復で数 ulp ずれた部品表も「揃っている」と判定できる。
+pub const BOM_FOLLOW_TOLERANCE_PAPER_MM: f64 = 1e-6;
+
+/// 図面の設定（用紙・向き・様式・尺度など）を `old_sheet` から `new_sheet` へ変えるとき、
+/// 部品表 `bom_table` を表題欄へ追従させる先のアンカー（ワールド座標。M12 タスク94）。
+///
+/// - 変更直前の部品表のアンカーが `old_sheet` での [`bom_anchor_above_title_block`] と
+///   [`BOM_FOLLOW_TOLERANCE_PAPER_MM`] 以内で一致していれば、`new_sheet` での
+///   [`bom_anchor_above_title_block`] を `Some` で返す。
+/// - 一致していなければ `None`（ユーザーが別の場所へ動かした部品表は追従させない）。
+/// - 一致していても、表題欄の位置が変わらない変更（表題欄の記入・枠表示・部品表を使う
+///   の切替など）では `None`（動かす必要が無い。呼び出し側が無意味な
+///   `ModifyEntity` や「追従を見送った」表示を出さないため）。
+///
+/// 図面枠が無効か・部品表のレイヤーがロックされているかはここでは見ない（ドキュメントの
+/// 状態に依るため呼び出し側が判定する）。
+#[must_use]
+pub fn bom_follow_sheet_change(
+    old_sheet: &SheetMeta,
+    new_sheet: &SheetMeta,
+    bom_table: &TableGeom,
+) -> Option<Point2> {
+    let old_k = old_sheet.scale.world_mm_per_paper_mm();
+    let old_anchor = bom_anchor_above_title_block(old_sheet, old_k);
+    if bom_table.anchor.distance(old_anchor) > BOM_FOLLOW_TOLERANCE_PAPER_MM * old_k {
+        return None;
+    }
+    let new_k = new_sheet.scale.world_mm_per_paper_mm();
+    let new_anchor = bom_anchor_above_title_block(new_sheet, new_k);
+    // 同じ入力からは同じ値が出る（決定的な計算）ので、表題欄が動かない変更は厳密に等しい。
+    if new_anchor == old_anchor {
+        return None;
+    }
+    Some(new_anchor)
 }
 
 /// `K`（部品表を使う設定が ON で図面に部品表がまだ無い）が置く部品表の初期形状
@@ -359,8 +372,8 @@ mod tests {
 
     #[test]
     fn apply_bom_preset_keeps_the_table_kind() {
-        // M12 タスク81: 表の種類を変えるのはタスク82 の UI（「部品表にする」の指定・
-        // 「表に戻す」）。列構成の適用そのものは種類を変えない。
+        // M12 タスク81: 列構成の適用そのものは種類を変えない（種類は作成時に決まり、
+        // 付け替える UI は無い。M12「タスク94 の着手時の決定」）。
         for kind in [TableKind::Table, TableKind::Bom] {
             let table = TableGeom {
                 kind,
@@ -457,21 +470,22 @@ mod tests {
     }
 
     #[test]
-    fn apply_bom_preset_and_designate_as_bom_replace_alignments_with_the_preset() {
-        // 「部品表にする」（指定・様式への再適用）はプリセットの揃えを入れる。元の表の
-        // 揃え（汎用表の既定 = 左、任意の揃え）は引き継がない（列構成ごと置き換える操作）。
+    fn apply_bom_preset_replaces_alignments_with_the_preset() {
+        // 「様式に合わせ直す」はプリセットの揃えを入れる。元の表の揃え（汎用表の既定 = 左、
+        // 任意の揃え）は引き継がない（列構成ごと置き換える操作）。
         let mut table = sample_table(2, 3);
         table.col_aligns = vec![HorizontalAlign::Right; 3];
         let applied = apply_bom_preset(&table, 170.0).unwrap();
         assert_eq!(applied.col_aligns, expected_aligns(&BOM_COLUMN_NAMES_AC));
-        let designated = designate_as_bom(&table, 120.0).unwrap();
-        assert_eq!(designated.col_aligns, expected_aligns(&BOM_COLUMN_NAMES_B));
-        mcad_core::EntityGeom::Table(designated)
-            .validate()
-            .expect("列数と揃えの要素数が一致する");
+        mcad_core::EntityGeom::Table(TableGeom {
+            kind: TableKind::Bom,
+            ..applied
+        })
+        .validate()
+        .expect("列数と揃えの要素数が一致する");
 
         // v7 以前から読んだ旧部品表（全列左・旧5列）も、押したときに既定が入る
-        // （DESIGN.md M12 設計判断11「部品表にする」を押したときに部品表の既定が入る）。
+        // （DESIGN.md M12 設計判断11「様式に合わせ直す」を押したときに部品表の既定が入る）。
         let legacy = two_row_table(
             &["P-001", "ブラケット", "2", "S45C", ""],
             &["品番", "名称", "個数", "材質", "備考"],
@@ -482,15 +496,8 @@ mod tests {
                 .iter()
                 .all(|a| *a == HorizontalAlign::Left)
         );
-        let bom = designate_as_bom(&legacy, 170.0).unwrap();
+        let bom = apply_bom_preset(&legacy, 170.0).unwrap();
         assert_eq!(bom.col_aligns, expected_aligns(&BOM_COLUMN_NAMES_AC));
-    }
-
-    #[test]
-    fn reset_to_table_keeps_the_alignments() {
-        // 「表に戻す」は中身を変えない（揃えも保つ）。
-        let bom = default_bom_table(Point2::ORIGIN, BOM_STYLE_AC_WIDTH_MM);
-        assert_eq!(reset_to_table(&bom).col_aligns, bom.col_aligns);
     }
 
     // --- apply_bom_preset ---
@@ -752,7 +759,7 @@ mod tests {
         let cases: Vec<TableGeom> = cases.into_iter().chain([last_row_only, one_row]).collect();
         for table in &cases {
             let err = apply_bom_preset(table, 170.0).unwrap_err();
-            assert!(err.contains("見出しが部品表の列構成と一致しない"), "{err}");
+            assert!(err.contains("見出しが部品欄の列構成と一致しない"), "{err}");
         }
     }
 
@@ -809,44 +816,129 @@ mod tests {
             .expect("default bom table is valid");
     }
 
-    // --- designate_as_bom / reset_to_table（M12 タスク82: 右パネル「部品表にする」「表に戻す」） ---
+    // --- bom_follow_sheet_change（M12 タスク94: 図面の設定変更で表題欄へ追従） ---
 
-    #[test]
-    fn designate_as_bom_sets_kind_to_bom_for_a_generic_table() {
-        let table = sample_table(2, 3);
-        assert_eq!(table.kind, TableKind::Table);
-        let bom = designate_as_bom(&table, 170.0).unwrap();
-        assert_eq!(bom.kind, TableKind::Bom);
-        assert_eq!(bom.cols(), 7);
+    /// `sheet` の表題欄直上に置いた部品表（`K` の即時配置・「表題欄の上に配置」と同じ位置）。
+    fn bom_above_title_block(sheet: &SheetMeta) -> TableGeom {
+        let k = sheet.scale.world_mm_per_paper_mm();
+        default_bom_table(
+            bom_anchor_above_title_block(sheet, k),
+            sheet.title_block.template().width_mm,
+        )
     }
 
     #[test]
-    fn designate_as_bom_keeps_kind_bom_when_reapplying_style() {
-        // 既に部品表のときに同じボタンを押すと様式への再適用になる（種類は変わらない）。
-        let table = TableGeom {
-            kind: TableKind::Bom,
-            ..sample_table(2, 7)
+    fn bom_follow_moves_a_bom_above_the_title_block_to_the_new_title_block() {
+        use mcad_core::{Orientation, PaperSize};
+        let old_sheet = SheetMeta::default();
+        let bom = bom_above_title_block(&old_sheet);
+        // 用紙・向き・様式・尺度のどれを変えても、変更後の表題欄直上が返る。
+        let changes = [
+            SheetMeta {
+                paper: PaperSize::A3,
+                ..old_sheet.clone()
+            },
+            SheetMeta {
+                orientation: Orientation::Portrait,
+                ..old_sheet.clone()
+            },
+            SheetMeta {
+                // 既定は様式B なので、A（幅・高さの違う様式）へ変える。
+                title_block: TitleBlockKind::A,
+                ..old_sheet.clone()
+            },
+            SheetMeta {
+                scale: Scale::new(1, 5).expect("valid scale"),
+                ..old_sheet.clone()
+            },
+        ];
+        for new_sheet in changes {
+            let new_k = new_sheet.scale.world_mm_per_paper_mm();
+            let expected = bom_anchor_above_title_block(&new_sheet, new_k);
+            assert_ne!(
+                expected, bom.anchor,
+                "変更で表題欄が動く前提: {new_sheet:?}"
+            );
+            assert_eq!(
+                bom_follow_sheet_change(&old_sheet, &new_sheet, &bom),
+                Some(expected),
+                "{new_sheet:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bom_follow_leaves_a_moved_bom_alone() {
+        // ユーザーが別の場所へ動かした部品表は追従させない。
+        let old_sheet = SheetMeta::default();
+        let mut bom = bom_above_title_block(&old_sheet);
+        bom.anchor = Point2::new(bom.anchor.x + 1.0, bom.anchor.y);
+        let new_sheet = SheetMeta {
+            scale: Scale::new(1, 5).expect("valid scale"),
+            ..old_sheet.clone()
         };
-        let bom = designate_as_bom(&table, 170.0).unwrap();
-        assert_eq!(bom.kind, TableKind::Bom);
+        assert_eq!(bom_follow_sheet_change(&old_sheet, &new_sheet, &bom), None);
     }
 
     #[test]
-    fn designate_as_bom_propagates_apply_bom_preset_errors() {
-        // 値を捨てる変換の拒否（apply_bom_preset のエラー）はそのまま伝播する。
-        let mut table = sample_table(2, 7);
-        table.cells[6] = "値".to_owned(); // 見出しが既知の並びと一致しないのに値がある
-        assert!(designate_as_bom(&table, 170.0).is_err());
+    fn bom_follow_tolerates_rounding_but_not_visible_offsets() {
+        // 尺度 1:100（k = 100）で、許容差（紙 mm）の内側は追従し、外側は追従しない。
+        let old_sheet = SheetMeta {
+            scale: Scale::new(1, 100).expect("valid scale"),
+            ..SheetMeta::default()
+        };
+        let k = old_sheet.scale.world_mm_per_paper_mm();
+        let new_sheet = SheetMeta {
+            scale: Scale::new(1, 50).expect("valid scale"),
+            ..old_sheet.clone()
+        };
+        let base = bom_above_title_block(&old_sheet);
+        let shifted = |dx_paper_mm: f64| TableGeom {
+            anchor: Point2::new(base.anchor.x + dx_paper_mm * k, base.anchor.y),
+            ..base.clone()
+        };
+        assert!(
+            bom_follow_sheet_change(&old_sheet, &new_sheet, &shifted(1e-9)).is_some(),
+            "丸め程度のずれは揃っているとみなす"
+        );
+        assert!(
+            bom_follow_sheet_change(
+                &old_sheet,
+                &new_sheet,
+                &shifted(BOM_FOLLOW_TOLERANCE_PAPER_MM * 0.5)
+            )
+            .is_some()
+        );
+        assert!(
+            bom_follow_sheet_change(&old_sheet, &new_sheet, &shifted(1e-3)).is_none(),
+            "0.001 紙 mm のずれは動かしたものとみなす"
+        );
     }
 
     #[test]
-    fn reset_to_table_sets_kind_to_table_and_keeps_contents() {
-        let bom = default_bom_table(Point2::new(5.0, 6.0), BOM_STYLE_AC_WIDTH_MM);
-        assert_eq!(bom.kind, TableKind::Bom);
-        let table = reset_to_table(&bom);
-        assert_eq!(table.kind, TableKind::Table);
-        assert_eq!(table.anchor, bom.anchor);
-        assert_eq!(table.col_widths_mm, bom.col_widths_mm);
-        assert_eq!(table.cells, bom.cells);
+    fn bom_follow_returns_none_when_the_title_block_does_not_move() {
+        // 表題欄の記入・枠表示・部品表を使うの切替では表題欄が動かないので、何もしない。
+        let old_sheet = SheetMeta::default();
+        let bom = bom_above_title_block(&old_sheet);
+        let mut fields_changed = old_sheet.clone();
+        fields_changed.fields.drawing_title = "新しい名称".to_owned();
+        for new_sheet in [
+            fields_changed,
+            SheetMeta {
+                frame_visible: !old_sheet.frame_visible,
+                ..old_sheet.clone()
+            },
+            SheetMeta {
+                use_bom: !old_sheet.use_bom,
+                ..old_sheet.clone()
+            },
+            old_sheet.clone(),
+        ] {
+            assert_eq!(
+                bom_follow_sheet_change(&old_sheet, &new_sheet, &bom),
+                None,
+                "{new_sheet:?}"
+            );
+        }
     }
 }

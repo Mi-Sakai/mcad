@@ -15,6 +15,7 @@ mod dimension;
 mod fonts;
 mod frame;
 mod iso;
+mod numeric_input;
 mod ortho;
 #[cfg(test)]
 mod perf_tests;
@@ -42,6 +43,7 @@ use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mc
 use bom::{bom_anchor_above_title_block, default_bom_table};
 use dimension::dim_render;
 use frame::{frame_layout, paper_to_world, parse_scale_input};
+use numeric_input::{KeyRouting, NumericInputState};
 
 // 破線パターンの紙 mm 定数は「画面と出力の唯一の出所」として `plot` に置く（M8 タスク39）。
 // 画面側（`dash_pattern_px`）はここから参照するだけで、挙動は変えない。
@@ -89,6 +91,20 @@ const SNAP_RADIUS_PX: f64 = 12.0;
 const SNAP_MARKER_COLOR: Color32 = Color32::from_rgb(60, 255, 120);
 /// スナップマーカーの基準サイズ（スクリーンピクセル。中心からの半幅相当）。
 const SNAP_MARKER_SIZE: f32 = 6.0;
+
+/// 数値入力欄（M12 タスク83）の文字色。
+const NUMERIC_INPUT_TEXT_COLOR: Color32 = Color32::from_rgb(240, 240, 240);
+/// 数値入力欄の背景（キャンバスの図形の上でも読めるよう不透明に近い暗色）。
+const NUMERIC_INPUT_BG_COLOR: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 235);
+/// 数値入力欄の枠と確定先のプレビュー点の色（作図プレビューと同じ暖色。スナップマーカーの
+/// 緑と区別し、「スナップではなく打った値」であることを示す）。
+const NUMERIC_INPUT_ACCENT_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
+/// 数値入力欄の書式ヒントの色。
+const NUMERIC_INPUT_HINT_COLOR: Color32 = Color32::from_gray(150);
+/// ポインタから数値入力欄までのずらし量（px）。カーソルとスナップマーカーに重ねない。
+const NUMERIC_INPUT_OFFSET_PX: f32 = 18.0;
+/// 数値入力欄の 2 行目に出す書式ヒント（ビューポート上の表示。ステータスバーと同じく英語）。
+const NUMERIC_INPUT_HINT: &str = "x,y  |  @dx,dy  |  len<deg  |  len     Enter / Esc";
 
 /// ステータスメッセージ（通常の操作フィードバック）の表示時間（秒）。経過後は自動で
 /// 消える。旧値は5.0秒で、手動スモークテストで「読む前に消える」との指摘を受けて
@@ -924,6 +940,11 @@ struct McadApp {
     /// [`TableDialogState::mode`])の作業コピー。`Some` の間はモーダルが開いている
     /// (表題欄編集ダイアログと同じ流儀。M10タスク59、M12タスク94)。
     table_dialog: Option<TableDialogState>,
+    /// カーソル横の数値入力欄（M12 タスク83、DESIGN.md M12 設計判断3）。開いている間は
+    /// 文字キーのショートカットを止め、`Enter` で確定した点を作図ツール・移動/複製の配置へ
+    /// クリックとして渡す（[`McadApp::route_numeric_input`]）。egui の `TextEdit` ではなく
+    /// ビューポートに描く独自の欄なので、egui のフォーカスは持たない。
+    numeric_input: NumericInputState,
 }
 
 /// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
@@ -956,6 +977,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "Ctrl+D=Duplicate",
     "Del=Delete",
     "Esc=Cancel",
+    "0-9 . - @=Numeric input",
     "F3=Snap",
     "F5=Iso Grid",
     "F8=Ortho",
@@ -1178,6 +1200,7 @@ impl McadApp {
             dim_ext_angle_edit_input_error: None,
             dim_style_dialog: None,
             table_dialog: None,
+            numeric_input: NumericInputState::default(),
         };
         if let Some(warning) = startup.warning {
             // 起動時はまだ egui の InputState が無いため now=0.0（[`STATUS_MESSAGE_SECS_IMPORTANT`]
@@ -1255,6 +1278,78 @@ impl McadApp {
         self.dim_ext_angle_edit_input_error = None;
         // 表編集ダイアログも別図面へ持ち越さない。
         self.table_dialog = None;
+        // 打ちかけの数値入力も持ち越さない（ツールが Select へ戻るので受け手も無くなる）。
+        self.numeric_input.close();
+    }
+
+    /// カーソル横の数値入力欄（M12 タスク83）の受け手があるか: 点を受け付ける作図ツール
+    /// （[`Tool::accepts_numeric_input`]）、または選択モードの移動・複製の配置
+    /// （[`SelectTool::numeric_input_kind`]）。回転・鏡映・オフセット・通常の選択は対象外。
+    fn numeric_input_available(&self) -> bool {
+        match self.tool.as_ref() {
+            Some(tool) => tool.accepts_numeric_input(),
+            None => {
+                self.tool_kind == ToolKind::Select
+                    && self.select_tool.numeric_input_kind().is_some()
+            }
+        }
+    }
+
+    /// 数値入力欄の受け手が無くなっていれば閉じる（M12 タスク83。同じフレームのツール切替・
+    /// キャンセルの後で呼ぶ。[`McadApp::numeric_input_available`]）。
+    fn close_numeric_input_without_target(&mut self) {
+        if !self.numeric_input_available() {
+            self.numeric_input.close();
+        }
+    }
+
+    /// そのフレームのキー入力を、他のショートカットより先に数値入力欄へ振り分ける
+    /// （M12 タスク83。規則は [`numeric_input::route_keys`]）。戻り値は「空でない入力欄で
+    /// `Enter` が押された」か（キャンバスの入力処理が点にしてクリックとして渡す）。
+    ///
+    /// モーダル表示中・テキスト欄にフォーカスがある間・受け手が無いときは入力欄を閉じ、
+    /// 何も取り除かない（右パネルの欄をクリックして打ち始めたら、そちらが優先）。
+    ///
+    /// 前のフレームで保留したイベント（空でない `Enter` の後に同じフレームで届いたもの）は、
+    /// このフレームの状況を判定してから、その範囲だけをイベント列の先頭へ戻す
+    /// （[`numeric_input::PendingReplay::for_frame`]）。数値入力欄が処理できるフレームでは
+    /// 全部、受け手が無い（移動の確定で配置が終わった等）・モーダル表示中のフレームでは押下の
+    /// キーだけ（ショートカットとして流す）、テキスト欄にフォーカスがあるフレームでは何も戻さない。
+    /// 文字・貼り付けを未消費のまま共有のイベント列へ戻すと、フォーカス中の `TextEdit` に
+    /// 入ってしまうため（Codex adversarial review [medium]、2026-09-25）。`text_focused` は
+    /// フレーム開始時の値なので、同じフレームのクリックでフォーカスを得る欄は捕まえられない。
+    /// マウスボタンの押下があるフレームでは保留を何も戻さない
+    /// （[`numeric_input::frame_has_pointer_press`]。Codex 5 回目のレビュー [medium] への
+    /// ユーザー選択の対処、2026-09-25）。
+    ///
+    /// 入力欄が開いていた（または確定した）フレームの `Tab` は egui のフォーカス移動を打ち消す。
+    /// 打ち消さないと次のフレームで上部パネルのウィジェットにフォーカスが移り、入力欄が閉じて
+    /// しまう（循環する選択肢を持つツールでは、`Tab` の循環は従来どおり効く）。egui は `Tab` を
+    /// フレームの開始時に読むので、`route_keys` が `Tab` を保留へ回したフレームでも打ち消す。
+    fn route_numeric_input(&mut self, ui: &egui::Ui, text_focused: bool) -> bool {
+        let routable = !self.modal_open() && !text_focused && self.numeric_input_available();
+        ui.input_mut(|i| {
+            // 保留を戻す前のイベント列にマウスボタンの押下があれば何も戻さない
+            // （同じフレームでフォーカスを得る欄へ届けない。`frame_has_pointer_press`）。
+            let pointer_pressed = numeric_input::frame_has_pointer_press(&i.events);
+            let replay =
+                numeric_input::PendingReplay::for_frame(routable, text_focused, pointer_pressed);
+            let modifiers = i.modifiers;
+            self.numeric_input
+                .restore_pending(&mut i.events, modifiers, replay);
+        });
+        if !routable {
+            self.numeric_input.close();
+            return false;
+        }
+        let tab_pressed = ui.input(|i| i.key_pressed(Key::Tab));
+        let routing =
+            ui.input_mut(|i| numeric_input::route_keys(&mut self.numeric_input, &mut i.events));
+        let submitted = routing == KeyRouting::Submit;
+        if tab_pressed && (self.numeric_input.is_open() || submitted) {
+            ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        }
+        submitted
     }
 
     /// undo/redo が成功した直後の UI 状態の後始末。
@@ -2070,6 +2165,9 @@ fn fit_target_aabb(document: &Document) -> Option<Aabb> {
 /// - テキスト入力欄にフォーカスがある間（オフセット距離入力欄の編集中など）は抑止する。
 ///   タイプした `Ctrl+Z` がドキュメントを undo する、`d` でツールが切り替わる、といった
 ///   テキスト入力とショートカットの競合を防ぐ（DESIGN.md M5 設計判断5 の 2026-07-19 追記）。
+///   カーソル横の数値入力欄（M12 タスク83）はこのゲートを通さない: 開いている間のキー押下
+///   （`Ctrl`/`Cmd` 併用を含む。`Tab` とファンクションキーを除く）は `numeric_input::route_keys`
+///   がイベント列から取り除くので、下流のどのショートカットにも届かない。
 ///
 /// egui のフォーカス判定を `bool` で受け取り、この方針を GUI なしで単体テストできるようにする。
 fn app_shortcuts_enabled(modal_open: bool, text_focused: bool) -> bool {
@@ -2098,6 +2196,15 @@ impl eframe::App for McadApp {
         // フレームをまたいで保持されるので、パネル描画より前のここで前フレームの状態を読めば、
         // 編集中のショートカット競合を全経路まとめて抑止できる（`app_shortcuts_enabled`）。
         let text_focused = ui.memory(|m| m.focused().is_some());
+
+        // カーソル横の数値入力欄（M12 タスク83）へのキーの振り分けは、どのショートカットよりも
+        // 先に行う。入力欄が開いている区間のキー押下（文字キー・`Ctrl`/`Cmd` 併用・`Delete`・
+        // `Enter`/`Esc` 等。`Tab` とファンクションキーを除く）は `route_keys` がイベント列から
+        // 取り除くので、下流の `key_pressed` には見えない。開く前・閉じた後に同じフレームで
+        // 届いたキーは到着順のまま残り、従来どおりショートカットとして効く。そのため入力欄の
+        // 開閉で下のゲート（`app_shortcuts_enabled`）を切り替える必要は無く、ゲートは従来どおり
+        // モーダルとテキスト欄のフォーカスだけを見る。
+        let numeric_submit = self.route_numeric_input(ui, text_focused);
 
         // 未保存確認モーダル表示中（`confirm_state != Idle`）は、履歴操作・ファイル
         // 操作ショートカットを一切処理しない。モーダル表示中に Ctrl+N 等が先に走ると、
@@ -2259,7 +2366,8 @@ impl eframe::App for McadApp {
         // ツール切替はモーダルの裏で作図ツールが起動する副作用があり、また距離入力欄の編集中に
         // 素の文字キーでツールが切り替わりオフセットモードが解除されるのを防ぐ
         // （AGENTS.md「テキスト入力欄がない前提」はオフセット距離欄の追加で崩れるため、
-        // `app_shortcuts_enabled` の共通ゲートで抑止する）。
+        // `app_shortcuts_enabled` の共通ゲートで抑止する）。数値入力欄が開いている間の文字キーは
+        // `route_keys` が取り除き済み（M12 タスク83）。
         if app_shortcuts_enabled(self.modal_open(), text_focused) {
             handle_tool_shortcut_keys(
                 ui,
@@ -2276,6 +2384,11 @@ impl eframe::App for McadApp {
                 self.request_table_or_bom_key(now);
             }
         }
+        // 同じフレームで開始キーより前のキーがツールを切り替えた場合（線分ツール中に `C` と `1`
+        // が同時に届く等）、入力欄は切替前のツールを受け手として開いている。切替後のツールも
+        // 受け手なら開いたまま引き継ぎ（円ツールで `1` から打てる）、受け手でなければここで
+        // 閉じる（次のフレームを待たずに、受け手の無い入力欄を描かない）。
+        self.close_numeric_input_without_target();
 
         // M8タスク42: Home キーで手動ズームフィット（図面全体が収まるようフィット）。
         // Home はテキスト入力欄ではカーソルを行頭へ移動する一般的なキーなので、
@@ -2339,6 +2452,8 @@ impl eframe::App for McadApp {
         // 次のフレーム以降ツール切替も Tab 自身も効かなくなってしまう。パネルを1つも
         // 描いていないこの時点なら `move_focus(None)` で予約を取り消せる
         // （`consume_key` はイベント自体も取り上げ、下流のウィジェットに渡さない）。
+        // 数値入力欄が開いていても効く（`route_keys` は `Tab` を残す。アイソメ円の半径を打ち
+        // ながら面を切り替えられる。M12 タスク83）。
         if app_shortcuts_enabled(self.modal_open(), text_focused)
             && self
                 .tool
@@ -2665,6 +2780,12 @@ impl eframe::App for McadApp {
                 self.pending_zoom_fit = false;
             }
 
+            // 数値入力欄（M12 タスク83）はポインタの横に描く。ポインタがキャンバスを外れたら
+            // 最後の位置に残す。
+            if let Some(pos) = response.hover_pos() {
+                self.numeric_input.set_anchor(pos);
+            }
+
             handle_pan_input(ui, &response, &mut self.viewport);
             handle_zoom_input(ui, &response, rect, &mut self.viewport);
             handle_modifier_view_input(
@@ -2702,6 +2823,8 @@ impl eframe::App for McadApp {
                         text_focused,
                         self.config.paper_display_enabled,
                         dim_scale_k,
+                        &mut self.numeric_input,
+                        numeric_submit,
                     );
                 } else {
                     handle_tool_input(
@@ -2721,6 +2844,8 @@ impl eframe::App for McadApp {
                         now,
                         parse_fillet_radius(&self.fillet_radius_input),
                         parse_ext_angle_deg(&self.ext_angle_input),
+                        &mut self.numeric_input,
+                        numeric_submit,
                     );
                 }
             }
@@ -2813,6 +2938,10 @@ impl eframe::App for McadApp {
             if let Some(marker) = &self.snap_marker {
                 draw_snap_marker(&painter, rect, &self.viewport, marker);
             }
+            // 数値入力欄とその確定先のプレビュー点（M12 タスク83）。最前面に描く。キャンバスの
+            // 入力処理でツールが終わった（開始キーより前の `Esc` 等）なら、描く前に閉じる。
+            self.close_numeric_input_without_target();
+            draw_numeric_input(&painter, rect, &self.viewport, &self.numeric_input);
         });
 
         // 未保存確認モーダル（OS の閉じるボタン / Ctrl+N / Ctrl+O 共通、非ブロッキング）。
@@ -3122,6 +3251,14 @@ impl eframe::App for McadApp {
 /// `Shift+V`=Ordinate Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
 /// 作図ツールへ切り替えるときは、描画中に古い選択ハイライトが残らないよう選択をクリアする。
+///
+/// **`1`（点ツール）への切替は選択モードからだけ効く**（DESIGN.md M12 設計判断3 の代償、
+/// ユーザー了承済み。2026-09-25 のユーザー確認で、数値入力を受け付けない作図ツールでも止める
+/// ことに確定）。作図ツールの使用中は、数値入力を受け付けるツールなら数字キーが先に数値入力欄へ
+/// 取られ（[`McadApp::route_numeric_input`]）、受け付けないツール（寸法・トリム・延長・
+/// フィレット・分割・文字・表）ならここで無視する（入力欄も開かず何も起きない。ステータス表示も
+/// しない）。選択モード（回転・鏡映の配置中を含む）では従来どおり点ツールへ切り替わり、移動・
+/// 複製の配置中は数値入力欄が先に取る。
 fn handle_tool_shortcut_keys(
     ui: &egui::Ui,
     tool_kind: &mut ToolKind,
@@ -3131,6 +3268,9 @@ fn handle_tool_shortcut_keys(
     // テキスト入力欄がない前提なので、修飾キーなしのキー入力はすべてショートカット
     // として扱ってよい。
     let mut requested: Option<ToolKind> = None;
+    // `1` の点ツール切替は選択モードからだけ（上の doc。作図ツール中は `Num1` の分岐へ入らず、
+    // 同じフレームの他の切替キーは従来どおり効く）。
+    let point_key_enabled = *tool_kind == ToolKind::Select;
     ui.input(|i| {
         // Ctrl/Cmd 併用はツール切替として扱わない（Ctrl+Z/Ctrl+Y の undo/redo や
         // 将来の Ctrl+C/Ctrl+S 系ショートカットと衝突させない）。
@@ -3147,7 +3287,7 @@ fn handle_tool_shortcut_keys(
             });
         } else if i.key_pressed(Key::S) {
             requested = Some(ToolKind::Select);
-        } else if i.key_pressed(Key::Num1) {
+        } else if point_key_enabled && i.key_pressed(Key::Num1) {
             requested = Some(ToolKind::Point);
         } else if i.key_pressed(Key::L) {
             requested = Some(ToolKind::Line);
@@ -3273,6 +3413,13 @@ fn resolve_tool_layer(document: &Document, tool_kind: ToolKind) -> LayerId {
 /// ツール（Point/Line/…）にのみ効かせる。選択・編集ツールはドラッグ矩形・移動の
 /// 変位を扱い、頂点入力とは性質が異なるため MVP ではスナップ対象外とする
 /// （`handle_select_input` は素のワールド座標を使う）。
+///
+/// # 数値入力（M12 タスク83）
+///
+/// `numeric_submit`（空でない数値入力欄で `Enter`）なら、打った点を
+/// [`InputEvent::Click`] としてツールへ渡す（相対系の基点は [`Tool::numeric_input_base`]、
+/// `L` の方向は `numeric` が覚えているラバーバンドの先）。入力欄が開いていて点になる間は
+/// プレビューもその点へ寄せる。マウスのクリックは入力欄より優先し、打ちかけの文字列は捨てる。
 #[allow(clippy::too_many_arguments)]
 fn handle_tool_input(
     ui: &egui::Ui,
@@ -3291,6 +3438,8 @@ fn handle_tool_input(
     now: f64,
     fillet_radius: Option<f64>,
     ext_angle_input: ExtAngleInput,
+    numeric: &mut NumericInputState,
+    numeric_submit: bool,
 ) {
     let Some(active) = tool.as_mut() else {
         return;
@@ -3357,10 +3506,21 @@ fn handle_tool_input(
             *snap_marker = marker;
             let world =
                 resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin(), grid_mode);
+            // 数値入力の `L`（長さのみ）の方向は、いまツールがラバーバンドを引いている先
+            // （スナップ > 直交 > 素のカーソル）。入力欄が閉じていても覚えておく（M12 タスク83）。
+            numeric.set_cursor(world);
             let _ = active.on_input(&ctx, InputEvent::Move(world));
         }
     } else {
         *snap_marker = None;
+    }
+
+    // 数値入力欄（M12 タスク83）が開いていて、いまの文字列が点になるなら、プレビューを
+    // その点へ寄せる（確定と同じ点を見せる）。スナップは掛からないのでマーカーは消す。
+    // 解釈できない途中の文字列では従来どおりカーソルに追従する。
+    if let Some(point) = numeric.refresh_preview(active.numeric_input_base()) {
+        *snap_marker = None;
+        let _ = active.on_input(&ctx, InputEvent::Move(point));
     }
 
     // Space 押下中の左ドラッグはパン操作に使われているため、作図クリックとしては
@@ -3371,6 +3531,9 @@ fn handle_tool_input(
         && response.clicked_by(egui::PointerButton::Primary)
         && let Some(pos) = response.interact_pointer_pos()
     {
+        // マウスのクリックは数値入力より優先する（打ちかけの文字列は捨てる。AutoCAD の
+        // 動的入力と同じ）。
+        numeric.close();
         let raw = viewport.screen_to_world(rect, pos);
         if active.wants_circle_pick() {
             // 半径寸法ツールの1クリック目: 円/円弧のヒットテストは Document を要するため
@@ -3415,6 +3578,18 @@ fn handle_tool_input(
             let world =
                 resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin(), grid_mode);
             result = active.on_input(&ctx, InputEvent::Click(world));
+        }
+    } else if numeric_submit {
+        // 数値入力の確定（M12 タスク83、DESIGN.md M12 設計判断3）: 打った点を通常のクリック
+        // として渡す。スナップ・直交は掛けない（明示値が優先）。点にできなければ入力欄を
+        // 開いたまま理由をステータスへ出す（打ち直せるように文字列を残す）。`Enter` は
+        // 入力欄が取り除き済みなので、下の `Confirm` へは届かない。
+        match numeric.resolve(active.numeric_input_base()) {
+            Ok(point) => {
+                numeric.close();
+                result = active.on_input(&ctx, InputEvent::Click(point));
+            }
+            Err(err) => set_status(status, now, err.message()),
         }
     }
 
@@ -7167,6 +7342,8 @@ fn handle_select_input(
     text_focused: bool,
     paper_display: bool,
     dim_scale_k: f64,
+    numeric: &mut NumericInputState,
+    numeric_submit: bool,
 ) {
     // オフセットモード中は専用経路が入力を占有する（配置モードと同じ入力ゲート思想）。
     if select_tool.is_offsetting() {
@@ -7201,6 +7378,8 @@ fn handle_select_input(
             grid_mode,
             status,
             now,
+            numeric,
+            numeric_submit,
         );
         return;
     }
@@ -7405,6 +7584,9 @@ fn handle_select_input(
 ///   種別に応じた後処理を行う（複製は `NewIds.entities` を新選択にして "Duplicated N"、
 ///   移動は選択維持で "Moved N"）。失敗（レイヤーロック等）は Batch 原子性で全体が失敗し、
 ///   ステータスバーへ表示する。
+/// - 数値入力（M12 タスク83。移動・複製のみ）: `numeric_submit` なら打った点を単発クリックと
+///   同じ経路で渡す。相対系の書式の基点は 1 クリック目の基準点
+///   （[`SelectTool::numeric_input_base`]）。
 #[allow(clippy::too_many_arguments)]
 fn handle_placement_input(
     ui: &egui::Ui,
@@ -7418,10 +7600,14 @@ fn handle_placement_input(
     grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
     now: f64,
+    numeric: &mut NumericInputState,
+    numeric_submit: bool,
 ) {
-    // Esc: 配置モードを解除する（Document は変更しない）。
+    // Esc: 配置モードを解除する（Document は変更しない）。数値入力欄が開いていれば
+    // 1 回目の Esc は入力欄が取り除き済みなので、ここへ来るのは 2 回目（M12 タスク83）。
     if ui.input(|i| i.key_pressed(Key::Escape)) {
         select_tool.cancel_placement();
+        numeric.close();
         *snap_marker = None;
         return;
     }
@@ -7438,22 +7624,49 @@ fn handle_placement_input(
         let raw = viewport.screen_to_world(rect, pos);
         let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
         *snap_marker = marker;
+        // 数値入力の `L` の方向（配置は直交を掛けないので、スナップ後の点）。
+        numeric.set_cursor(world);
         select_tool.placement_move(world);
     } else {
         *snap_marker = None;
     }
 
-    // Space 押下中の左ドラッグはパン。配置クリックとは扱わない。
-    if ui.input(|i| i.key_down(Key::Space)) {
-        return;
+    // 数値入力欄が開いていて点になるなら、ゴーストをその点へ寄せる（作図ツールと同じ）。
+    if let Some(point) = numeric.refresh_preview(select_tool.numeric_input_base()) {
+        *snap_marker = None;
+        select_tool.placement_move(point);
     }
 
-    // 単発クリックで基準点／配置先を確定する（ドラッグではない）。
-    if response.clicked_by(egui::PointerButton::Primary)
+    // 単発クリックで基準点／配置先を確定する（ドラッグではない）。Space 押下中の左ドラッグは
+    // パンなので配置クリックとは扱わない。数値入力の確定（M12 タスク83）は打った点を
+    // クリックとして渡す（スナップは掛けない）。ゼロ変位のしきい値はピック許容量（画面
+    // 基準）ではなくスケール非依存の幾何許容値にする: 打った値は画面の大きさと無関係で、
+    // 縮小表示中に `@1,0` のような小さな変位が「ゼロ変位」として捨てられないように。
+    let space_down = ui.input(|i| i.key_down(Key::Space));
+    let click = if !space_down
+        && response.clicked_by(egui::PointerButton::Primary)
         && let Some(pos) = response.interact_pointer_pos()
     {
+        // マウスのクリックは数値入力より優先する（打ちかけの文字列は捨てる）。
+        numeric.close();
         let raw = viewport.screen_to_world(rect, pos);
         let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
+        Some((world, tol))
+    } else if numeric_submit {
+        match numeric.resolve(select_tool.numeric_input_base()) {
+            Ok(point) => {
+                numeric.close();
+                Some((point, DIM_DEGENERATE_EPSILON))
+            }
+            Err(err) => {
+                set_status(status, now, err.message());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some((world, tol)) = click {
         match select_tool.placement_click(document, world, tol) {
             PlacementOutcome::Continue => {}
             PlacementOutcome::Cancelled(msg) => {
@@ -8607,6 +8820,86 @@ fn draw_aabb_outline(
     painter.line_segment([r.right_top(), r.right_bottom()], stroke);
     painter.line_segment([r.right_bottom(), r.left_bottom()], stroke);
     painter.line_segment([r.left_bottom(), r.left_top()], stroke);
+}
+
+/// カーソル横の数値入力欄（M12 タスク83）と、いまの文字列で確定したときの点（解釈できる
+/// ときだけ）を描く。閉じていれば何もしない。
+///
+/// egui の `TextEdit` ではなく painter で描く: 入力欄はキャンバスのキー入力を横取りする
+/// だけの一時的な表示で、egui のフォーカスを持たせるとフォーカス中は全ショートカットが
+/// 止まる既存のゲート（`app_shortcuts_enabled`）やキャンバスクリックでのフォーカス喪失と
+/// 絡み合うため（キーの扱いは [`numeric_input::route_keys`] が一手に持つ）。
+fn draw_numeric_input(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    state: &NumericInputState,
+) {
+    let Some(text) = state.text() else {
+        return;
+    };
+    if let Some(point) = state.preview() {
+        // 確定先: ○に×（スナップマーカーのどの形とも違う形）。
+        let c = viewport.world_to_screen(rect, point);
+        let s = SNAP_MARKER_SIZE;
+        let stroke = Stroke::new(1.5, NUMERIC_INPUT_ACCENT_COLOR);
+        painter.circle_stroke(c, s, stroke);
+        painter.line_segment([c + egui::vec2(-s, -s), c + egui::vec2(s, s)], stroke);
+        painter.line_segment([c + egui::vec2(-s, s), c + egui::vec2(s, -s)], stroke);
+    }
+
+    let value = painter.layout_no_wrap(
+        format!("{text}_"),
+        egui::FontId::monospace(14.0),
+        NUMERIC_INPUT_TEXT_COLOR,
+    );
+    let hint = painter.layout_no_wrap(
+        NUMERIC_INPUT_HINT.to_owned(),
+        egui::FontId::proportional(11.0),
+        NUMERIC_INPUT_HINT_COLOR,
+    );
+    let pad = 4.0;
+    let value_size = value.size();
+    let hint_size = hint.size();
+    let size = egui::vec2(
+        value_size.x.max(hint_size.x) + 2.0 * pad,
+        value_size.y + hint_size.y + 3.0 * pad,
+    );
+    let anchor = state.anchor().unwrap_or_else(|| rect.center());
+    let box_rect = numeric_input_box_rect(rect, anchor, size);
+    painter.rect_filled(box_rect, 3.0, NUMERIC_INPUT_BG_COLOR);
+    painter.rect_stroke(
+        box_rect,
+        3.0,
+        Stroke::new(1.0, NUMERIC_INPUT_ACCENT_COLOR),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        box_rect.min + egui::vec2(pad, pad),
+        value,
+        NUMERIC_INPUT_TEXT_COLOR,
+    );
+    painter.galley(
+        box_rect.min + egui::vec2(pad, 2.0 * pad + value_size.y),
+        hint,
+        NUMERIC_INPUT_HINT_COLOR,
+    );
+}
+
+/// 数値入力欄の矩形。ポインタ `anchor` の右下へずらして置き、キャンバス `canvas` の右端・
+/// 下端からはみ出すならポインタの左・上へ回す（それでも収まらなければ左上端に寄せる）。
+fn numeric_input_box_rect(canvas: Rect, anchor: Pos2, size: egui::Vec2) -> Rect {
+    let offset = NUMERIC_INPUT_OFFSET_PX;
+    let mut min = anchor + egui::vec2(offset, offset);
+    if min.x + size.x > canvas.right() {
+        min.x = anchor.x - offset - size.x;
+    }
+    if min.y + size.y > canvas.bottom() {
+        min.y = anchor.y - offset - size.y;
+    }
+    min.x = min.x.max(canvas.left());
+    min.y = min.y.max(canvas.top());
+    Rect::from_min_size(min, size)
 }
 
 /// スナップ先にマーカーを描画する。候補種別ごとに形を変えて、どの種別に吸着したか
@@ -14111,5 +14404,643 @@ mod tests {
         });
         assert!(errs.is_empty(), "errors: {errs:?}");
         assert_eq!(cmds.len(), 2, "角度・座標の両方へ適用できる");
+    }
+}
+
+/// 数値入力（M12 タスク83）のアプリ全体の結線を、ヘッドレスの egui でフレームを回して
+/// 確かめる（キーの振り分け → ツール・配置へのクリック → `Document` の変化）。書式の解釈と
+/// キーの振り分け規則そのものは `numeric_input` のテストが固定する。
+///
+/// `eframe::Frame::_new_kittest` は eframe がアプリのテスト用に公開している（`doc(hidden)`）
+/// 空の `Frame`。`McadApp::ui` は `frame` をファイルダイアログ（Ctrl 系のキー）でしか使わない。
+#[cfg(test)]
+mod numeric_input_app_tests {
+    use super::*;
+    use eframe::App as _;
+    use mcad_geom::LineSeg;
+
+    /// キャンバス上のどこか（上部パネルの下・右パネルの左）。
+    const CANVAS_POS: Pos2 = Pos2::new(300.0, 500.0);
+
+    struct Harness {
+        app: McadApp,
+        ctx: egui::Context,
+        frame: eframe::Frame,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let mut harness = Self {
+                app: McadApp::new(),
+                ctx: egui::Context::default(),
+                frame: eframe::Frame::_new_kittest(),
+            };
+            // ポインタをキャンバスへ載せ、レイアウトを落ち着かせる。
+            harness.run_with(
+                vec![egui::Event::PointerMoved(CANVAS_POS)],
+                egui::Modifiers::NONE,
+            );
+            harness.run(Vec::new());
+            harness
+        }
+
+        fn run_with(&mut self, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                events,
+                modifiers,
+                ..Default::default()
+            };
+            let Self { app, ctx, frame } = self;
+            let _ = ctx.run_ui(input, |ui| app.ui(ui, frame));
+        }
+
+        fn run(&mut self, events: Vec<egui::Event>) {
+            self.run_with(events, egui::Modifiers::NONE);
+        }
+
+        /// egui-winit と同じく、文字キーは押下イベントと文字イベントの 2 つで届ける。
+        fn type_text(&mut self, text: &str) {
+            for c in text.chars() {
+                let key = match c {
+                    '0'..='9' => Key::from_name(&c.to_string()),
+                    '.' => Some(Key::Period),
+                    '-' => Some(Key::Minus),
+                    ',' => Some(Key::Comma),
+                    'a'..='z' => Key::from_name(&c.to_ascii_uppercase().to_string()),
+                    _ => None, // `@`・`<` は Shift 併用の記号（キー押下は下流が使わない）
+                };
+                let mut events: Vec<egui::Event> = key.into_iter().map(key_press).collect();
+                events.push(egui::Event::Text(c.to_string()));
+                self.run(events);
+            }
+        }
+
+        fn press(&mut self, key: Key) {
+            self.run(vec![key_press(key)]);
+        }
+
+        /// `text` を打って `Enter` で確定する。
+        fn enter(&mut self, text: &str) {
+            self.type_text(text);
+            self.press(Key::Enter);
+        }
+
+        fn shapes(&self) -> Vec<Shape> {
+            self.app
+                .document
+                .entities()
+                .filter_map(|(_, e)| e.geom.as_shape().cloned())
+                .collect()
+        }
+    }
+
+    fn key_press(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn line(a: (f64, f64), b: (f64, f64)) -> Shape {
+        Shape::Line(LineSeg::new(Point2::new(a.0, a.1), Point2::new(b.0, b.1)))
+    }
+
+    #[test]
+    fn line_tool_takes_absolute_relative_and_polar_points() {
+        let mut h = Harness::new();
+        h.press(Key::L);
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+
+        h.enter("0,0");
+        assert!(!h.app.numeric_input.is_open(), "closes after a valid point");
+        assert!(h.shapes().is_empty());
+        h.enter("@100,0");
+        assert_eq!(h.shapes(), vec![line((0.0, 0.0), (100.0, 0.0))]);
+        // 連続線分: 次の基点は確定した終点。90° は厳密に真上。
+        h.enter("50<90");
+        assert_eq!(
+            h.shapes(),
+            vec![
+                line((0.0, 0.0), (100.0, 0.0)),
+                line((100.0, 0.0), (100.0, 50.0))
+            ]
+        );
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+        // undo は 1 本ずつ（打った点も通常のクリックと同じ確定）。
+        assert!(h.app.document.undo());
+        assert_eq!(h.shapes().len(), 1);
+    }
+
+    #[test]
+    fn digit_opens_the_box_instead_of_switching_to_the_point_tool() {
+        let mut h = Harness::new();
+        h.press(Key::L);
+        h.type_text("1");
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+        assert_eq!(h.app.numeric_input.text(), Some("1"));
+        // 開いている間は文字キーのツール切替も効かない（`c` は円ツールへ切り替えない）。
+        // 文字は欄に入る（書式外の文字も黙って捨てない。確定は parse が拒否する）。
+        h.type_text("c");
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+        assert_eq!(h.app.numeric_input.text(), Some("1c"));
+
+        // Esc 1 回目は入力欄だけを閉じ、2 回目で従来のキャンセル（選択モードへ）。
+        h.press(Key::Escape);
+        assert!(!h.app.numeric_input.is_open());
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+        h.press(Key::Escape);
+        assert_eq!(h.app.tool_kind, ToolKind::Select);
+
+        // 選択モードでは `1` は従来どおり点ツールへの切替。
+        h.type_text("1");
+        assert_eq!(h.app.tool_kind, ToolKind::Point);
+        assert!(!h.app.numeric_input.is_open());
+    }
+
+    /// `1`（点ツール）への切替は選択モードからだけ（DESIGN.md M12 設計判断3、2026-09-25 の
+    /// ユーザー確認）。数値入力を受け付けない作図ツールでも止め、入力欄も開かない。
+    #[test]
+    fn point_tool_key_works_only_from_select_mode() {
+        let mut h = Harness::new();
+        for (switch, kind) in [
+            (Key::D, ToolKind::DimLinear),
+            (Key::X, ToolKind::Trim),
+            (Key::T, ToolKind::Text),
+            (Key::F, ToolKind::Fillet),
+        ] {
+            h.press(switch);
+            assert_eq!(h.app.tool_kind, kind);
+            h.type_text("1");
+            assert_eq!(h.app.tool_kind, kind, "`1` must not switch from {kind:?}");
+            assert!(
+                !h.app.numeric_input.is_open(),
+                "{kind:?} takes no numeric input"
+            );
+            // 同じフレームの他の切替キーは従来どおり効く。
+            h.run(vec![
+                key_press(Key::Num1),
+                egui::Event::Text("1".into()),
+                key_press(Key::S),
+                egui::Event::Text("s".into()),
+            ]);
+            assert_eq!(h.app.tool_kind, ToolKind::Select);
+        }
+
+        // 選択モード（回転の配置中を含む）からは点ツールへ切り替わる。
+        let layer = h.app.document.current_layer();
+        let id = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                line((0.0, 0.0), (1.0, 0.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        h.app.select_tool.set_selection(vec![id]);
+        h.press(Key::R);
+        assert!(h.app.select_tool.is_placing());
+        h.type_text("1");
+        assert_eq!(h.app.tool_kind, ToolKind::Point);
+        assert!(
+            !h.app.select_tool.is_placing(),
+            "switching cancels the rotate"
+        );
+        assert!(!h.app.numeric_input.is_open());
+    }
+
+    /// 同じフレームに「ツール切替のキー」と「入力欄を開く数字」が届いたとき（Codex adversarial
+    /// review [medium]、2026-09-25）。切替は失われず、入力欄は切替前のツールを受け手として
+    /// 開いた後、切替後のツールも受け手なら引き継がれ、受け手でなければ同じフレームで閉じる。
+    #[test]
+    fn tool_switch_before_the_opening_digit_in_the_same_frame_is_not_lost() {
+        let mut h = Harness::new();
+        h.press(Key::L);
+        // 線分 → 円（受け手）: 円ツールで `1` から打てる。
+        h.run(vec![
+            key_press(Key::C),
+            egui::Event::Text("c".into()),
+            key_press(Key::Num1),
+            egui::Event::Text("1".into()),
+        ]);
+        assert_eq!(h.app.tool_kind, ToolKind::Circle);
+        assert_eq!(h.app.numeric_input.text(), Some("1"));
+        h.type_text("0,0");
+        h.press(Key::Enter);
+        h.enter("@5,0");
+        let shapes = h.shapes();
+        let [Shape::Circle(circle)] = shapes.as_slice() else {
+            panic!("expected one circle, got {shapes:?}");
+        };
+        assert_eq!(circle.center, Point2::new(10.0, 0.0));
+        assert_eq!(circle.radius, 5.0);
+
+        // 円 → 長さ寸法（受け手でない）: 切り替わり、入力欄は同じフレームで閉じる
+        // （`1` は取り除かれているので点ツールにもならない）。
+        h.run(vec![
+            key_press(Key::D),
+            egui::Event::Text("d".into()),
+            key_press(Key::Num1),
+            egui::Event::Text("1".into()),
+        ]);
+        assert_eq!(h.app.tool_kind, ToolKind::DimLinear);
+        assert!(!h.app.numeric_input.is_open());
+
+        // 開いた後に届いた文字キーは従来どおり切替にならない。
+        h.press(Key::L);
+        h.run(vec![
+            key_press(Key::Num1),
+            egui::Event::Text("1".into()),
+            key_press(Key::C),
+            egui::Event::Text("c".into()),
+        ]);
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+        assert_eq!(h.app.numeric_input.text(), Some("1c"));
+    }
+
+    /// 同じフレームの `Ctrl` 系と入力欄の開始の順序（Codex adversarial review [high]、
+    /// 2026-09-25）。開始キーより後の `Ctrl+Z` は止まり、前の `Ctrl+Z` は効く。
+    #[test]
+    fn ctrl_shortcuts_follow_the_arrival_order_around_the_opening_key() {
+        let mut h = Harness::new();
+        h.press(Key::L);
+        h.enter("0,0");
+        h.enter("@1,0");
+        assert_eq!(h.shapes().len(), 1);
+
+        // 開始キー → Ctrl+Z: 入力欄が開いた後の Ctrl+Z なので undo しない。
+        h.run_with(
+            vec![
+                key_press(Key::Num1),
+                egui::Event::Text("1".into()),
+                key_press_with(Key::Z, egui::Modifiers::COMMAND),
+            ],
+            egui::Modifiers::COMMAND,
+        );
+        assert_eq!(h.shapes().len(), 1, "Ctrl+Z after opening must not undo");
+        assert_eq!(h.app.numeric_input.text(), Some("1"));
+        h.press(Key::Escape);
+        assert!(!h.app.numeric_input.is_open());
+
+        // Ctrl+Z → 開始キー: 開く前の Ctrl+Z は従来どおり undo し、入力欄も開く。
+        h.run_with(
+            vec![
+                key_press_with(Key::Z, egui::Modifiers::COMMAND),
+                key_press(Key::Num1),
+                egui::Event::Text("1".into()),
+            ],
+            egui::Modifiers::COMMAND,
+        );
+        assert!(h.shapes().is_empty(), "Ctrl+Z before opening undoes");
+        assert_eq!(h.app.numeric_input.text(), Some("1"));
+    }
+
+    /// 空でない `Enter` の後に同じフレームで届いた打鍵（Codex adversarial review [medium]、
+    /// 2026-09-25）。確定する値は `Enter` までの文字列で、後の打鍵は次のフレームで到着順に届く。
+    #[test]
+    fn keys_after_enter_in_the_same_frame_are_replayed_next_frame() {
+        let mut h = Harness::new();
+        h.press(Key::C);
+        h.enter("10,20");
+        // [1, Enter, 2]: 半径 1 で確定し（`12` にならない）、次のフレームで `2` が欄を開く。
+        h.run(vec![
+            key_press(Key::Num1),
+            egui::Event::Text("1".into()),
+            key_press(Key::Enter),
+            key_press(Key::Num2),
+            egui::Event::Text("2".into()),
+        ]);
+        let shapes = h.shapes();
+        let [Shape::Circle(circle)] = shapes.as_slice() else {
+            panic!("expected one circle, got {shapes:?}");
+        };
+        assert!((circle.radius - 1.0).abs() < 1e-9, "{}", circle.radius);
+        assert!(!h.app.numeric_input.is_open());
+        h.run(Vec::new());
+        assert_eq!(h.app.numeric_input.text(), Some("2"));
+        assert_eq!(h.app.tool_kind, ToolKind::Circle);
+
+        // [1, Enter, Esc]: 半径 1 で確定し、Esc は次のフレームでツールへ届く（キャンセル）。
+        h.press(Key::Escape); // 開いている `2` の欄を閉じる
+        h.enter("10,20");
+        h.run(vec![
+            key_press(Key::Num1),
+            egui::Event::Text("1".into()),
+            key_press(Key::Enter),
+            key_press(Key::Escape),
+        ]);
+        assert_eq!(h.shapes().len(), 2);
+        assert_eq!(h.app.tool_kind, ToolKind::Circle, "Esc is held this frame");
+        assert!(!h.app.numeric_input.is_open());
+        h.run(Vec::new());
+        assert_eq!(h.app.tool_kind, ToolKind::Select, "Esc reached the tool");
+    }
+
+    /// 確定で受け手が無くなった（移動の配置が終わった）次のフレームでも、保留した打鍵は
+    /// 捨てずに通常の入力として下流へ届く（`M` で再び移動を始められる）。
+    #[test]
+    fn replayed_keys_reach_the_shortcuts_after_the_target_is_gone() {
+        let mut h = Harness::new();
+        let layer = h.app.document.current_layer();
+        let id = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                line((0.0, 0.0), (1.0, 0.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        h.app.select_tool.set_selection(vec![id]);
+        h.press(Key::M);
+        h.enter("0,0");
+        h.type_text("@5,0");
+        h.run(vec![
+            key_press(Key::Enter),
+            key_press(Key::M),
+            egui::Event::Text("m".into()),
+            egui::Event::Paste("12".into()),
+            egui::Event::Cut,
+        ]);
+        assert_eq!(
+            h.app.document.entity(id).unwrap().geom,
+            EntityGeom::Shape(line((5.0, 0.0), (6.0, 0.0)))
+        );
+        assert!(!h.app.select_tool.is_placing(), "M is held this frame");
+        h.run(Vec::new());
+        assert!(
+            h.app.select_tool.is_placing(),
+            "replayed M starts a new move"
+        );
+        // 受け手が無かったフレームでは押下のキーだけが戻り、文字・貼り付け・切り取りは共有の
+        // イベント列に残らない（フォーカスを得た `TextEdit` に入らない。Codex [medium]、2026-09-25）。
+        let events = h.ctx.input(|i| i.events.clone());
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                egui::Event::Key {
+                    key: Key::M,
+                    pressed: true,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// マウスボタンの押下があるフレームでは、受け手の有無に関わらず保留を何も戻さない（同じ
+    /// フレームのクリックでフォーカスを得る欄へ届けない。Codex 5 回目 [medium] へのユーザー選択の
+    /// 対処、2026-09-25）。捨てた保留は後のフレームにも出てこない。
+    #[test]
+    fn pending_input_is_dropped_in_a_frame_with_a_pointer_press() {
+        let mut h = Harness::new();
+        let layer = h.app.document.current_layer();
+        let id = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                line((0.0, 0.0), (1.0, 0.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        h.app.select_tool.set_selection(vec![id]);
+        h.press(Key::M);
+        h.enter("0,0");
+        h.type_text("@5,0");
+        h.run(vec![
+            key_press(Key::Enter),
+            key_press(Key::M),
+            egui::Event::Text("m".into()),
+        ]);
+        assert!(!h.app.select_tool.is_placing());
+        // 右パネルの下端あたりを押す（どの欄でもよい。押下があること自体で判定する）。
+        let pos = Pos2::new(1590.0, 990.0);
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.run(vec![egui::Event::PointerMoved(pos), press(true)]);
+        let events = h.ctx.input(|i| i.events.clone());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_))),
+            "{events:?}"
+        );
+        h.run(vec![press(false)]);
+        h.run(Vec::new());
+        assert!(
+            !h.app.select_tool.is_placing(),
+            "the dropped M never starts a move"
+        );
+    }
+
+    /// テキスト欄にフォーカスがあるフレームでは、保留を何も戻さない（`Backspace` 等がフォーカス
+    /// 中の `TextEdit` に効かない）。受け手があるフレームでは従来どおり全部戻る
+    /// （`keys_after_enter_in_the_same_frame_are_replayed_next_frame`）。
+    #[test]
+    fn pending_input_is_dropped_while_a_text_field_has_focus() {
+        let mut h = Harness::new();
+        h.press(Key::C);
+        h.enter("10,20");
+        h.run(vec![
+            key_press(Key::Num1),
+            egui::Event::Text("1".into()),
+            key_press(Key::Enter),
+            key_press(Key::Backspace),
+            egui::Event::Text("5".into()),
+        ]);
+        assert_eq!(h.shapes().len(), 1);
+        // 次のフレームの開始時に何かのウィジェットがフォーカスを持っている状態を作る
+        // （フォーカスは egui の約束で、使われなければ 1 フレームで外れる）。
+        h.ctx
+            .memory_mut(|m| m.request_focus(egui::Id::new("some_text_field_for_test")));
+        h.run(Vec::new());
+        let events = h.ctx.input(|i| i.events.clone());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_))),
+            "{events:?}"
+        );
+        // 捨てた分は後のフレームにも出てこない（`5` で入力欄が開かない）。
+        h.run(Vec::new());
+        assert!(!h.app.numeric_input.is_open());
+        assert_eq!(h.app.tool_kind, ToolKind::Circle);
+    }
+
+    #[test]
+    fn relative_input_without_base_is_rejected_and_kept_for_editing() {
+        let mut h = Harness::new();
+        h.press(Key::L);
+        h.enter("@10,0");
+        assert!(h.shapes().is_empty());
+        assert_eq!(
+            h.app.numeric_input.text(),
+            Some("@10,0"),
+            "kept for editing"
+        );
+        assert_eq!(
+            h.app.status.as_ref().map(|s| s.text.as_str()),
+            Some(numeric_input::NumericInputError::NoBasePoint.message())
+        );
+        // 書式の誤りも同じく開いたまま。
+        h.press(Key::Escape);
+        h.enter("1,2,3");
+        assert_eq!(h.app.numeric_input.text(), Some("1,2,3"));
+        assert_eq!(
+            h.app.status.as_ref().map(|s| s.text.as_str()),
+            Some(numeric_input::NumericInputError::InvalidFormat.message())
+        );
+    }
+
+    #[test]
+    fn out_of_format_characters_reject_the_point_instead_of_altering_it() {
+        // `1e3` の `e` を黙って捨てて `13` で確定しない（Codex adversarial review [high]、
+        // 2026-09-25）。`e` の文字キーが延長ツールへの切替にもならない。
+        let mut h = Harness::new();
+        h.press(Key::L);
+        h.enter("0,0");
+        h.enter("1e3");
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+        assert!(h.shapes().is_empty());
+        assert_eq!(h.app.numeric_input.text(), Some("1e3"), "kept for editing");
+        assert_eq!(
+            h.app.status.as_ref().map(|s| s.text.as_str()),
+            Some(numeric_input::NumericInputError::InvalidFormat.message())
+        );
+        // Backspace で直して確定できる。
+        h.press(Key::Backspace);
+        h.press(Key::Backspace);
+        h.type_text(",0");
+        h.press(Key::Enter);
+        assert_eq!(h.shapes(), vec![line((0.0, 0.0), (1.0, 0.0))]);
+    }
+
+    #[test]
+    fn empty_enter_still_confirms_the_polyline() {
+        let mut h = Harness::new();
+        h.press(Key::P);
+        h.enter("0,0");
+        h.enter("@10,0");
+        h.enter("@0,10");
+        assert!(h.shapes().is_empty(), "polyline is still open");
+        // 打ってから消した空の入力欄の Enter は、閉じたうえで従来の Confirm になる。
+        h.type_text("5");
+        h.press(Key::Backspace);
+        assert_eq!(h.app.numeric_input.text(), Some(""));
+        h.press(Key::Enter);
+        assert!(!h.app.numeric_input.is_open());
+        assert_eq!(
+            h.shapes(),
+            vec![Shape::Polyline(Polyline::new(
+                vec![
+                    Point2::new(0.0, 0.0),
+                    Point2::new(10.0, 0.0),
+                    Point2::new(10.0, 10.0)
+                ],
+                false
+            ))]
+        );
+    }
+
+    #[test]
+    fn circle_length_is_the_radius_from_the_center() {
+        let mut h = Harness::new();
+        h.press(Key::C);
+        h.enter("10,20");
+        // 長さのみ = 中心からカーソル方向へ 25（方向によらず半径は 25）。
+        h.enter("25");
+        let shapes = h.shapes();
+        let [Shape::Circle(circle)] = shapes.as_slice() else {
+            panic!("expected one circle, got {shapes:?}");
+        };
+        assert_eq!(circle.center, Point2::new(10.0, 20.0));
+        assert!((circle.radius - 25.0).abs() < 1e-9, "{}", circle.radius);
+    }
+
+    #[test]
+    fn move_and_duplicate_take_typed_base_and_target() {
+        let mut h = Harness::new();
+        let layer = h.app.document.current_layer();
+        let id = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                line((0.0, 0.0), (1.0, 0.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        h.app.select_tool.set_selection(vec![id]);
+
+        h.press(Key::M);
+        assert!(h.app.select_tool.is_placing());
+        h.enter("0,0");
+        // 画面上はピック許容量より小さい変位でも、打った値は捨てない。
+        h.enter("@0.001,0");
+        assert!(!h.app.select_tool.is_placing());
+        assert_eq!(
+            h.app.document.entity(id).unwrap().geom,
+            EntityGeom::Shape(line((0.001, 0.0), (1.001, 0.0)))
+        );
+
+        h.run_with(
+            vec![key_press_with(Key::D, egui::Modifiers::COMMAND)],
+            egui::Modifiers::COMMAND,
+        );
+        assert!(h.app.select_tool.is_placing());
+        h.enter("0.001,0");
+        h.enter("@0,5");
+        assert_eq!(h.shapes().len(), 2);
+        assert!(h.shapes().contains(&line((0.001, 5.0), (1.001, 5.0))));
+    }
+
+    #[test]
+    fn open_box_blocks_ctrl_shortcuts_and_file_changes_close_it() {
+        let mut h = Harness::new();
+        h.press(Key::L);
+        h.enter("0,0");
+        h.enter("@1,0");
+        assert_eq!(h.shapes().len(), 1);
+        h.type_text("5");
+        // 入力欄が開いている間は Ctrl+Z も止まる（テキスト欄の編集中と同じ）。
+        h.run_with(
+            vec![key_press_with(Key::Z, egui::Modifiers::COMMAND)],
+            egui::Modifiers::COMMAND,
+        );
+        assert_eq!(h.shapes().len(), 1);
+        assert_eq!(h.app.numeric_input.text(), Some("5"));
+        // 新規・読込（reset_transient_ui_state）で閉じる。
+        h.app.reset_transient_ui_state();
+        assert!(!h.app.numeric_input.is_open());
+    }
+
+    fn key_press_with(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
     }
 }

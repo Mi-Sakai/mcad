@@ -388,6 +388,38 @@ pub trait Tool {
         None
     }
 
+    /// カーソル横の数値入力欄（M12 タスク83、`crate::numeric_input`）を受け付けるか。
+    /// 既定は `false`（入力欄は開かない。作図ツールの使用中は `1` の点ツール切替も効かない。
+    /// `handle_tool_shortcut_keys` の doc 参照）。
+    ///
+    /// `true` を返すツールの使用中は、`0`〜`9`・`.`・`-`・`@` で入力欄が開き、`Enter` で
+    /// 確定した点が [`InputEvent::Click`] として [`Tool::on_input`] へ届く（スナップ・直交は
+    /// 掛からない）。点を受け付けるツールが増えたら（矩形・正多角形・構築線。タスク89・91）、
+    /// これを override するだけで乗れる。基点が [`Tool::ortho_origin`] と違うツールは
+    /// [`Tool::numeric_input_base`] も override する。
+    ///
+    /// override するのは点・線分・円・円弧・アイソメ円・ポリラインの 6 つ。既存図形を当てる
+    /// ツール（トリム・延長・フィレット・分割）・寸法ツール・文字・表は対象外
+    /// （DESIGN.md M12 設計判断3・10）。
+    fn accepts_numeric_input(&self) -> bool {
+        false
+    }
+
+    /// 数値入力の相対系の書式（`@dx,dy`・`L<A`・`L`）が基準にする点。`None` なら相対系は
+    /// 拒否される（絶対座標 `x,y` だけが使える）。既定は [`Tool::ortho_origin`]
+    /// （DESIGN.md M12「着手前に確認した事実」: 相対入力・極トラッキング・垂線/接線スナップは
+    /// この基点を共有する）。
+    ///
+    /// # なぜ `ortho_origin` そのものにしないのか
+    ///
+    /// 円・アイソメ円は「中心からの方向が結果に効かない」ため `ortho_origin` を override
+    /// しない（直交を掛けると半径が軸への射影長に変わってしまう）。一方、数値入力では中心が
+    /// 基点でないと `L`（= 半径）も `@dx,dy` も使えない。直交の挙動を変えずに基点だけを
+    /// 与えるため、別の拡張点にして 2 つのツールだけが中心を返す。
+    fn numeric_input_base(&self) -> Option<Point2> {
+        self.ortho_origin()
+    }
+
     /// app 層が持つ数値入力欄（[`FilletTool`] の半径欄）の解析値をツールへ渡す
     /// （正の有限値のみ `Some`、空欄・不正値は `None`）。既定は何もしない。
     ///
@@ -556,6 +588,11 @@ impl Tool for PointTool {
                 1.0,
             );
         }
+    }
+
+    // 基点は持たない（クリックごとに独立）ので、数値入力は絶対座標 `x,y` だけが使える。
+    fn accepts_numeric_input(&self) -> bool {
+        true
     }
 }
 
@@ -748,6 +785,10 @@ impl Tool for LineTool {
             LineState::WaitingSecond(first) => Some(first),
         }
     }
+
+    fn accepts_numeric_input(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -826,6 +867,19 @@ impl Tool for CircleTool {
         match self.state {
             CircleState::WaitingCenter => Vec::new(),
             CircleState::WaitingRadiusPoint(center) => vec![center],
+        }
+    }
+
+    fn accepts_numeric_input(&self) -> bool {
+        true
+    }
+
+    // 2 点目（円周上の点）の基点は中心。`L` がそのまま半径になる。`ortho_origin` は
+    // 既定の `None` のまま（直交を掛けると半径が変わるため。[`Tool::numeric_input_base`] 参照）。
+    fn numeric_input_base(&self) -> Option<Point2> {
+        match self.state {
+            CircleState::WaitingCenter => None,
+            CircleState::WaitingRadiusPoint(center) => Some(center),
         }
     }
 }
@@ -968,6 +1022,10 @@ impl Tool for ArcTool {
             ArcState::WaitingP3(_p1, p2) => Some(p2),
         }
     }
+
+    fn accepts_numeric_input(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1100,6 +1158,18 @@ impl Tool for IsoCircleTool {
         }
     }
 
+    fn accepts_numeric_input(&self) -> bool {
+        true
+    }
+
+    // [`CircleTool`] と同じく、2 点目の基点は中心（`L` = 実半径）。
+    fn numeric_input_base(&self) -> Option<Point2> {
+        match self.state {
+            IsoCircleState::WaitingCenter => None,
+            IsoCircleState::WaitingRadius(center) => Some(center),
+        }
+    }
+
     fn variant_options(&self) -> Option<VariantOptions> {
         Some(VariantOptions {
             heading: "Iso face",
@@ -1214,6 +1284,10 @@ impl Tool for PolylineTool {
 
     fn ortho_origin(&self) -> Option<Point2> {
         self.vertices.last().copied()
+    }
+
+    fn accepts_numeric_input(&self) -> bool {
+        true
     }
 }
 
@@ -4658,6 +4732,32 @@ impl SelectTool {
     /// Document は一切変更しない。選択集合も変えない。
     pub fn cancel_placement(&mut self) {
         self.placement = None;
+    }
+
+    /// 進行中の配置が数値入力（M12 タスク83）を受け付けるなら、その種別を返す。
+    ///
+    /// 受け付けるのは移動・複製だけ（DESIGN.md M12 設計判断3「選択モードの移動・複製の
+    /// 配置（基点 → 目的点）」）。回転・鏡映は `None` のままで、数字キーは従来どおり
+    /// ツール切替として扱われる。
+    #[must_use]
+    pub fn numeric_input_kind(&self) -> Option<PlacementKind> {
+        self.placement
+            .map(|p| p.kind)
+            .filter(|kind| matches!(kind, PlacementKind::Move | PlacementKind::Duplicate))
+    }
+
+    /// 移動・複製の配置で、数値入力の相対系の書式（`@dx,dy`・`L<A`・`L`）が基準にする点
+    /// （= 1 クリック目の基準点）。基準点を待っている段階・移動/複製以外・非配置中は `None`
+    /// （絶対座標 `x,y` だけが使える）。
+    #[must_use]
+    pub fn numeric_input_base(&self) -> Option<Point2> {
+        match self.placement {
+            Some(Placement {
+                kind: PlacementKind::Move | PlacementKind::Duplicate,
+                stage: PlacementStage::WaitingP2 { p1, .. },
+            }) => Some(p1),
+            _ => None,
+        }
     }
 
     // --- オフセットモード（O、単一エンティティ1クリック。設計判断5） ---
@@ -10595,5 +10695,166 @@ mod tests {
             panic!("expected DimLinear");
         };
         assert_eq!(dim2.p1, Point2::new(4.0, 0.0));
+    }
+
+    // --- 数値入力の受け手と基点（M12 タスク83） ---
+
+    #[test]
+    fn numeric_input_is_accepted_by_point_taking_tools_only() {
+        let accepting: [Box<dyn Tool>; 6] = [
+            Box::new(PointTool::default()),
+            Box::new(LineTool::default()),
+            Box::new(CircleTool::default()),
+            Box::new(ArcTool::default()),
+            Box::new(IsoCircleTool::default()),
+            Box::new(PolylineTool::default()),
+        ];
+        for tool in &accepting {
+            assert!(tool.accepts_numeric_input());
+        }
+        // 既存図形を当てるツール・寸法・文字・表は対象外（DESIGN.md M12 設計判断3・10）。
+        let rejecting: [Box<dyn Tool>; 11] = [
+            Box::new(TextTool::default()),
+            Box::new(TableTool::default()),
+            Box::new(DimLinearTool::default()),
+            Box::new(DimRadialTool::default()),
+            Box::new(DimDiameterTool::default()),
+            Box::new(DimAngularTool::default()),
+            Box::new(DimOrdinateTool::default()),
+            Box::new(TrimTool::default()),
+            Box::new(ExtendTool::default()),
+            Box::new(FilletTool::default()),
+            Box::new(SplitTool::default()),
+        ];
+        for tool in &rejecting {
+            assert!(!tool.accepts_numeric_input());
+        }
+    }
+
+    #[test]
+    fn numeric_input_base_is_the_ortho_origin_for_line_arc_and_polyline() {
+        let (_doc, ctx) = ctx();
+        let (a, b, c) = (
+            Point2::new(1.0, 2.0),
+            Point2::new(5.0, 2.0),
+            Point2::new(5.0, 6.0),
+        );
+
+        let mut line = LineTool::default();
+        assert_eq!(line.numeric_input_base(), None);
+        line.on_input(&ctx, InputEvent::Click(a));
+        assert_eq!(line.numeric_input_base(), Some(a));
+        // 連続線分: 確定した終点が次の基点。
+        line.on_input(&ctx, InputEvent::Click(b));
+        assert_eq!(line.numeric_input_base(), Some(b));
+
+        let mut arc = ArcTool::default();
+        assert_eq!(arc.numeric_input_base(), None);
+        arc.on_input(&ctx, InputEvent::Click(a));
+        assert_eq!(arc.numeric_input_base(), Some(a));
+        arc.on_input(&ctx, InputEvent::Click(b));
+        assert_eq!(arc.numeric_input_base(), Some(b));
+
+        let mut polyline = PolylineTool::default();
+        assert_eq!(polyline.numeric_input_base(), None);
+        for p in [a, b, c] {
+            polyline.on_input(&ctx, InputEvent::Click(p));
+            assert_eq!(polyline.numeric_input_base(), Some(p));
+        }
+
+        // 点ツールは基点を持たない（絶対座標だけ）。
+        let point = PointTool::default();
+        assert_eq!(point.numeric_input_base(), None);
+    }
+
+    #[test]
+    fn numeric_input_base_of_circles_is_the_center_without_enabling_ortho() {
+        let (_doc, ctx) = ctx();
+        let center = Point2::new(3.0, 4.0);
+
+        let mut circle = CircleTool::default();
+        assert_eq!(circle.numeric_input_base(), None);
+        circle.on_input(&ctx, InputEvent::Click(center));
+        assert_eq!(circle.numeric_input_base(), Some(center));
+        // 直交の基点は従来どおり持たない（半径が軸への射影長に変わらないように）。
+        assert_eq!(circle.ortho_origin(), None);
+
+        let mut iso = IsoCircleTool::default();
+        assert_eq!(iso.numeric_input_base(), None);
+        iso.on_input(&ctx, InputEvent::Click(center));
+        assert_eq!(iso.numeric_input_base(), Some(center));
+        assert_eq!(iso.ortho_origin(), None);
+
+        // 確定すると次の円の中心待ちに戻り、基点も無くなる。
+        let result = circle.on_input(&ctx, InputEvent::Click(Point2::new(13.0, 4.0)));
+        assert_eq!(
+            shape_of(result),
+            Shape::Circle(mcad_geom::Circle::new(center, 10.0))
+        );
+        assert_eq!(circle.numeric_input_base(), None);
+    }
+
+    #[test]
+    fn select_tool_takes_numeric_input_only_while_moving_or_duplicating() {
+        let mut doc = Document::new();
+        add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        assert_eq!(tool.numeric_input_kind(), None);
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+        assert_eq!(tool.numeric_input_kind(), None, "plain selection");
+
+        for (start, kind) in [
+            (
+                SelectTool::start_move as fn(&mut SelectTool) -> bool,
+                PlacementKind::Move,
+            ),
+            (SelectTool::start_duplicate, PlacementKind::Duplicate),
+        ] {
+            assert!(start(&mut tool));
+            assert_eq!(tool.numeric_input_kind(), Some(kind));
+            // 基準点を待つ間は基点が無い（絶対座標だけ）。
+            assert_eq!(tool.numeric_input_base(), None);
+            let base = Point2::new(2.0, 3.0);
+            assert_eq!(
+                tool.placement_click(&doc, base, 0.1),
+                PlacementOutcome::Continue
+            );
+            assert_eq!(tool.numeric_input_base(), Some(base));
+            tool.cancel_placement();
+            assert_eq!(tool.numeric_input_kind(), None);
+        }
+
+        for start in [SelectTool::start_rotate, SelectTool::start_mirror] {
+            assert!(start(&mut tool));
+            assert_eq!(tool.numeric_input_kind(), None);
+            let _ = tool.placement_click(&doc, Point2::new(2.0, 3.0), 0.1);
+            assert_eq!(tool.numeric_input_base(), None);
+            tool.cancel_placement();
+        }
+    }
+
+    #[test]
+    fn typed_placement_accepts_displacements_smaller_than_the_pick_tolerance() {
+        // 数値入力はゼロ変位の判定にスケール非依存の許容値（DIM_DEGENERATE_EPSILON）を渡す
+        // （main.rs の handle_placement_input）。縮小表示でピック許容量が大きくても、
+        // 打った小さな変位が捨てられないことを placement_click の契約として固定する。
+        let mut doc = Document::new();
+        let id = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+        assert!(tool.start_move());
+        let _ = tool.placement_click(&doc, Point2::ORIGIN, DIM_DEGENERATE_EPSILON);
+        let outcome = tool.placement_click(&doc, Point2::new(0.5, 0.0), DIM_DEGENERATE_EPSILON);
+        let PlacementOutcome::Commit { cmd, .. } = outcome else {
+            panic!("expected Commit, got {outcome:?}");
+        };
+        doc.apply(cmd).unwrap();
+        assert_eq!(
+            doc.entity(id).unwrap().geom,
+            EntityGeom::Shape(Shape::Line(LineSeg::new(
+                Point2::new(0.5, 0.0),
+                Point2::new(1.5, 0.0)
+            )))
+        );
     }
 }

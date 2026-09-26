@@ -16,6 +16,7 @@ use mcad_core::{Orientation, PaperSize, Scale, SheetMeta, TitleBlockKind};
 use serde::{Deserialize, Serialize};
 
 use crate::plot::PlotColorMode;
+use crate::snap::SnapKinds;
 
 /// 「最近使ったファイル」の保持件数上限。
 pub const MAX_RECENT_FILES: usize = 5;
@@ -99,6 +100,11 @@ pub struct Config {
     /// 作図グリッドの種別（矩形/等測。F5）。旧バージョンの config.json（このフィールドが
     /// 存在しない）は [`GridMode::default`]（`Rectangular`）へ補完される。
     pub grid_mode: GridMode,
+    /// スナップ種別ごとの ON/OFF（M12 タスク85、DESIGN.md M12 設計判断5）。旧バージョンの
+    /// config.json（このフィールドが存在しない）は [`SnapKinds::default`]（近接点のみ
+    /// OFF、他は ON）へ補完される。フィールド単位でも `#[serde(default)]` を持つため、
+    /// 種別が増えても同じ経路で前方互換になる（[`SnapKinds`] の doc 参照）。
+    pub snap_kinds: SnapKinds,
 }
 
 impl Default for Config {
@@ -116,6 +122,7 @@ impl Default for Config {
             recent_files: Vec::new(),
             plot_color_mode: PlotColorMode::default(),
             grid_mode: GridMode::default(),
+            snap_kinds: SnapKinds::default(),
         }
     }
 }
@@ -391,6 +398,7 @@ mod tests {
         assert_eq!(config.grid_mode, GridMode::Rectangular);
         assert!(!config.polar_enabled);
         assert_eq!(config.polar_step, PolarStep::Fifteen);
+        assert_eq!(config.snap_kinds, SnapKinds::default());
     }
 
     #[test]
@@ -408,6 +416,15 @@ mod tests {
             recent_files: vec![PathBuf::from("/tmp/a.mcad"), PathBuf::from("/tmp/b.mcad")],
             plot_color_mode: PlotColorMode::Blueprint,
             grid_mode: GridMode::Isometric,
+            snap_kinds: SnapKinds {
+                endpoint: true,
+                intersection: false,
+                midpoint: true,
+                center: false,
+                quadrant: false,
+                nearest: true,
+                grid: false,
+            },
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let parsed: Config = serde_json::from_str(&json).unwrap();
@@ -501,6 +518,48 @@ mod tests {
     fn invalid_polar_step_value_fails_to_load() {
         let path = unique_temp_path("invalid-polar-step");
         fs::write(&path, r#"{"polar_step": "Sixty"}"#).unwrap();
+        let result = load(&path);
+        assert!(result.is_err());
+    }
+
+    /// 旧バージョンの config.json（`snap_kinds` フィールドが存在しない）を読み込んだとき、
+    /// [`SnapKinds::default`]（近接点のみ OFF、他は ON）へ補完される（M12 タスク85）。
+    #[test]
+    fn missing_snap_kinds_field_defaults_to_all_on_except_nearest() {
+        let config: Config =
+            serde_json::from_str(r#"{"snap_enabled": false, "default_paper": "A1"}"#).unwrap();
+        assert_eq!(config.snap_kinds, SnapKinds::default());
+        assert!(config.snap_kinds.endpoint);
+        assert!(config.snap_kinds.intersection);
+        assert!(config.snap_kinds.midpoint);
+        assert!(config.snap_kinds.center);
+        assert!(config.snap_kinds.quadrant);
+        assert!(!config.snap_kinds.nearest);
+        assert!(config.snap_kinds.grid);
+    }
+
+    /// `snap_kinds` オブジェクト自体はあるが一部フィールドが欠けている場合も、
+    /// フィールド単位の `#[serde(default)]` により欠けたフィールドだけ既定値へ補完される
+    /// （種別が増えたときも同じ経路で前方互換になることの固定）。
+    #[test]
+    fn partial_snap_kinds_object_fills_missing_fields_with_defaults() {
+        let config: Config =
+            serde_json::from_str(r#"{"snap_kinds": {"nearest": true, "grid": false}}"#).unwrap();
+        assert!(config.snap_kinds.endpoint);
+        assert!(config.snap_kinds.intersection);
+        assert!(config.snap_kinds.midpoint);
+        assert!(config.snap_kinds.center);
+        assert!(config.snap_kinds.quadrant);
+        assert!(config.snap_kinds.nearest);
+        assert!(!config.snap_kinds.grid);
+    }
+
+    /// `snap_kinds.endpoint` に不正値（数値）が入っている config.json は、既存の
+    /// 「不正値で `load` が `Err` になる」規約に従う。
+    #[test]
+    fn invalid_snap_kinds_field_value_fails_to_load() {
+        let path = unique_temp_path("invalid-snap-kinds");
+        fs::write(&path, r#"{"snap_kinds": {"endpoint": "yes"}}"#).unwrap();
         let result = load(&path);
         assert!(result.is_err());
     }

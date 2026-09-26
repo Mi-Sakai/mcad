@@ -269,6 +269,21 @@ impl Circle {
         self.center + dir * (self.radius / len)
     }
 
+    /// 円周上のワールド軸方向 4 点（0°/90°/180°/270°、+X から CCW）。
+    ///
+    /// 四半円点スナップ（M12 タスク85、DESIGN.md M12 設計判断5）専用。円弧の四半円点は
+    /// この4点のうち [`Arc::contains_angle`] が真を返す角度のものだけを候補にする
+    /// （呼び出し側 `mcad-app` の `snap.rs` で行う）。
+    #[must_use]
+    pub fn quadrant_points(&self) -> [Point2; 4] {
+        [
+            self.point_at_angle(0.0),
+            self.point_at_angle(std::f64::consts::FRAC_PI_2),
+            self.point_at_angle(std::f64::consts::PI),
+            self.point_at_angle(3.0 * std::f64::consts::FRAC_PI_2),
+        ]
+    }
+
     /// 変位 `delta` だけ平行移動した新しい円（中心のみ動き、半径は不変）。
     #[inline]
     #[must_use]
@@ -1072,6 +1087,16 @@ mod tests {
         assert!((distance_to(&shape, Point2::new(10.0, 0.0)) - 5.0).abs() < T);
         // 内側の点も円周までの距離。
         assert!((distance_to(&shape, Point2::new(2.0, 0.0)) - 3.0).abs() < T);
+    }
+
+    #[test]
+    fn circle_quadrant_points_are_axis_aligned() {
+        let c = Circle::new(Point2::new(1.0, 2.0), 5.0);
+        let pts = c.quadrant_points();
+        assert!(approx(pts[0], Point2::new(6.0, 2.0)));
+        assert!(approx(pts[1], Point2::new(1.0, 7.0)));
+        assert!(approx(pts[2], Point2::new(-4.0, 2.0)));
+        assert!(approx(pts[3], Point2::new(1.0, -3.0)));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! スナップエンジン（DESIGN.md 3.4）。
+//! スナップエンジン（DESIGN.md 3.4、種別追加は M12 設計判断5）。
 //!
 //! カーソルのワールド座標とワールド単位の探索半径を受け取り、半径内のスナップ
 //! 候補点を種別付きで列挙して **1 点だけ** 返す。GUI（egui）には一切依存せず、
@@ -7,13 +7,26 @@
 //!
 //! # 優先度
 //!
-//! DESIGN.md 3.4 の優先順位に厳密に従う:
+//! DESIGN.md M12 設計判断5 の優先順位に厳密に従う:
 //!
-//! > 端点 > 交点 > 中点 > 中心 > グリッド
+//! > 端点 > 交点 > 中点 > 中心 = 四半円点 > 垂線 = 接線 > 仮想交点 > 近接点 > グリッド
+//!
+//! 中心と四半円点は同順位（[`SnapKind::priority`] が同じ値を返す）で、同順位内は
+//! カーソルとの距離で決める。垂線・接線（M12 タスク86）・仮想交点（M12 タスク87）は
+//! 本タスク（85）の時点では未実装だが、優先度の数値は先に空けてある
+//! （[`SnapKind::priority`] のコメント参照）。
 //!
 //! 半径内に複数種別の候補があれば **優先度が高い種別** を採用し、同種別内では
 //! カーソルに **最も近い** ものを選ぶ（[`Best::consider`]）。半径内に候補が
 //! 何も無ければ [`None`]（＝スナップなし。呼び出し側は素のカーソル位置を使う）。
+//!
+//! # 種別ごとの ON/OFF
+//!
+//! [`SnapKinds`] が種別ごとの有効/無効を持つ（`config.json` に永続化。
+//! [`crate::config::Config::snap_kinds`]）。無効な種別は [`Best::consider`] が
+//! 弾くため候補にすら上がらない。**近接点（[`SnapKind::Nearest`]）は既定 OFF**
+//! （常にどこかの図形に当たり、グリッドや他の候補を潰すため）。他は既定 ON。
+//! `F3`（`snap_enabled`）は全体スイッチのままで、これとは別の階層。
 //!
 //! # 交点候補の事前絞り込み（AABB カリング）
 //!
@@ -27,20 +40,33 @@
 //! 呼ばれる関数なので、画面内エンティティ数 k に対する O(k^2) をカーソル近傍の
 //! ごく少数に抑えることがフレームレート維持に効く。
 //!
-//! 一方、端点・中点・中心は 1 エンティティあたり定数個で列挙コストが O(n) に
-//! 収まるため、可視 AABB での事前絞り込みは行わず、可視レイヤーの全エンティティを
-//! 走査する（DESIGN.md が AABB 事前絞り込みを要求しているのは交点のみ）。半径内
-//! （数ピクセル相当）に入る端点・中点・中心は、オンスクリーンのカーソル近傍に
-//! ある以上その所属エンティティも実質的に画面内なので、絞り込みの有無で結果は
-//! 変わらない。
+//! 一方、端点・中点・中心・四半円点は 1 エンティティあたり定数個で列挙コストが
+//! O(n) に収まるため、可視 AABB での事前絞り込みは行わず、可視レイヤーの全
+//! エンティティを走査する（DESIGN.md が AABB 事前絞り込みを要求しているのは交点の
+//! み）。半径内（数ピクセル相当）に入る端点・中点・中心・四半円点は、オンスクリーンの
+//! カーソル近傍にある以上その所属エンティティも実質的に画面内なので、絞り込みの
+//! 有無で結果は変わらない。
+//!
+//! 近接点（[`SnapKind::Nearest`]、M12 タスク85）は交点と **同じカーソル近傍 AABB**
+//! （`near`）を再利用して絞り込む。無損失である理由も交点と同じ論法: カーソルから
+//! 半径内に最近点を持つ形状があれば、その最近点自体が半径内（＝カーソル近傍 AABB
+//! 内）にあり、かつ形状上の点は必ずその形状の AABB に含まれるため、形状の AABB は
+//! カーソル近傍 AABB と交差する。
 
 use mcad_core::{Document, Entity, EntityGeom, EntityId};
-use mcad_geom::{Aabb, Point2, Shape, intersect, point_tol};
+use mcad_geom::{Aabb, Point2, Shape, closest_point, intersect, point_tol};
+use serde::{Deserialize, Serialize};
+use std::f64::consts::{FRAC_PI_2, PI};
 
 use crate::config::GridMode;
 
-/// スナップ候補の種別。優先度は Endpoint > Intersection > Midpoint > Center > Grid
-/// （DESIGN.md 3.4）。数値優先度は [`SnapKind::priority`] が返す。
+/// 四半円点（[`SnapKind::Quadrant`]）の候補角（ラジアン。0°/90°/180°/270°、+X から CCW）。
+/// [`mcad_geom::Circle::quadrant_points`] と対応する。
+const QUADRANT_ANGLES: [f64; 4] = [0.0, FRAC_PI_2, PI, 3.0 * FRAC_PI_2];
+
+/// スナップ候補の種別。優先度は端点 > 交点 > 中点 > 中心 = 四半円点 > 垂線 = 接線 >
+/// 仮想交点 > 近接点 > グリッド（DESIGN.md M12 設計判断5）。数値優先度は
+/// [`SnapKind::priority`] が返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapKind {
     /// 端点（線分の端・ポリライン頂点・円弧の始終点・点エンティティ）。
@@ -51,12 +77,21 @@ pub enum SnapKind {
     Midpoint,
     /// 中心（円・円弧の中心）。
     Center,
+    /// 四半円点（円・円弧のワールド軸方向 0°/90°/180°/270° の点。円弧は弧の範囲内のみ。
+    /// M12 タスク85）。
+    Quadrant,
+    /// 近接点（可視 Shape 上でカーソルに最も近い点。既定 OFF。M12 タスク85）。
+    Nearest,
     /// グリッド交点。
     Grid,
 }
 
 impl SnapKind {
     /// 数値優先度（小さいほど高優先）。同順位内はカーソルとの距離で決める。
+    ///
+    /// `4`・`5` は M12 タスク86（垂線・接線）・タスク87（仮想交点）用に空けてある
+    /// （DESIGN.md M12 設計判断5: 端点 > 交点 > 中点 > 中心 = 四半円点 > 垂線 = 接線 >
+    /// 仮想交点 > 近接点 > グリッド）。
     #[must_use]
     fn priority(self) -> u8 {
         match self {
@@ -64,7 +99,78 @@ impl SnapKind {
             SnapKind::Intersection => 1,
             SnapKind::Midpoint => 2,
             SnapKind::Center => 3,
-            SnapKind::Grid => 4,
+            SnapKind::Quadrant => 3,
+            // 4, 5 は垂線・接線（タスク86）、仮想交点（タスク87）用に予約。
+            SnapKind::Nearest => 6,
+            SnapKind::Grid => 7,
+        }
+    }
+}
+
+/// スナップ種別ごとの ON/OFF（`config.json` に永続化。[`crate::config::Config::snap_kinds`]）。
+///
+/// `#[serde(default)]` によりフィールド単位で前方互換にする（新種別が増えても旧
+/// config.json には存在しないため、そのフィールドの [`Default`] 値へ補う）。**近接点
+/// （`nearest`）だけ既定 OFF**（常にどこかの図形に当たり、グリッドや他の候補を潰す
+/// ため）で、他は既定 ON（DESIGN.md M12 設計判断5）。`F3`（`snap_enabled`）は全体
+/// スイッチのままで、これとは別の階層。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapKinds {
+    /// 端点。既定 ON。
+    #[serde(default = "default_true")]
+    pub endpoint: bool,
+    /// 交点。既定 ON。
+    #[serde(default = "default_true")]
+    pub intersection: bool,
+    /// 中点。既定 ON。
+    #[serde(default = "default_true")]
+    pub midpoint: bool,
+    /// 中心。既定 ON。
+    #[serde(default = "default_true")]
+    pub center: bool,
+    /// 四半円点。既定 ON。
+    #[serde(default = "default_true")]
+    pub quadrant: bool,
+    /// 近接点。**既定 OFF**。
+    #[serde(default)]
+    pub nearest: bool,
+    /// グリッド。既定 ON。
+    #[serde(default = "default_true")]
+    pub grid: bool,
+}
+
+/// `#[serde(default = "default_true")]` 用のヘルパー（`bool` の `Default` は `false`
+/// なので、既定 ON のフィールドはこちらを使う）。
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SnapKinds {
+    fn default() -> Self {
+        Self {
+            endpoint: true,
+            intersection: true,
+            midpoint: true,
+            center: true,
+            quadrant: true,
+            nearest: false,
+            grid: true,
+        }
+    }
+}
+
+impl SnapKinds {
+    /// `kind` が有効か。
+    #[must_use]
+    pub fn enabled(&self, kind: SnapKind) -> bool {
+        match kind {
+            SnapKind::Endpoint => self.endpoint,
+            SnapKind::Intersection => self.intersection,
+            SnapKind::Midpoint => self.midpoint,
+            SnapKind::Center => self.center,
+            SnapKind::Quadrant => self.quadrant,
+            SnapKind::Nearest => self.nearest,
+            SnapKind::Grid => self.grid,
         }
     }
 }
@@ -152,6 +258,9 @@ pub fn iso_grid_snap(cursor: Point2, step: f64) -> Option<Point2> {
 /// - `radius`: 探索半径（ワールド単位。呼び出し側で `半径px / zoom` に換算済み）。
 /// - `grid`: グリッド間隔＋モード（[`GridSpec`]）。`step` が `0` 以下・非有限なら
 ///   モードによらずグリッド候補なし。
+/// - `kinds`: 種別ごとの ON/OFF（[`SnapKinds`]）。無効な種別は候補にならない
+///   （`extra_points` も [`SnapKind::Endpoint`] として扱われるため、`kinds.endpoint`
+///   が `false` なら出なくなる）。
 /// - `extra_points`: 作図中（未確定）ツールの頂点列（[`crate::tool::Tool::snap_points`]）。
 ///   `Document` にまだ存在しない点だが、[`SnapKind::Endpoint`]（最優先）候補として
 ///   他の端点と同じ優先度・最近傍規則で扱う。ポリライン作図中に自分自身の始点へ
@@ -162,13 +271,14 @@ pub fn snap(
     cursor: Point2,
     radius: f64,
     grid: GridSpec,
+    kinds: SnapKinds,
     extra_points: &[Point2],
 ) -> Option<SnapResult> {
     if !radius.is_finite() || radius <= 0.0 {
         return None;
     }
     let r2 = radius * radius;
-    let mut best = Best::default();
+    let mut best = Best::new(kinds);
 
     // 作図中(未確定)ツールの頂点: Document にはまだ無いが端点として最優先で扱う。
     for &p in extra_points {
@@ -196,20 +306,43 @@ pub fn snap(
 
     // 交点: カーソル近傍 AABB（カーソル±半径のボックス）と交差するエンティティのみを
     // 事前絞り込みし、その集合内の全ペアで交点を求める。絞り込みが無損失である理由は
-    // モジュール doc を参照。
+    // モジュール doc を参照。交点・近接点がともに無効なら集合自体を作らず、交点が無効なら
+    // O(k^2) の総当たりを走らせない（`Best::consider` で捨てるだけだとマウス移動ごとの
+    // 計算が残る。M12 タスク85 Codex adversarial review 指摘）。
     let cursor_box = Aabb::from_point(cursor).expanded(radius);
-    let near: Vec<&Shape> = document
-        .entities()
-        .filter(|(_, e)| layer_visible(document, e))
-        .filter(|(_, e)| e.geom.aabb().intersects(&cursor_box))
-        // M6: 交点計算は Shape 系のみを対象にする（寸法・テキストは交点源にしない）。
-        .filter_map(|(_, e)| e.geom.as_shape())
-        .collect();
-    for i in 0..near.len() {
-        for j in (i + 1)..near.len() {
-            for p in intersect(near[i], near[j]) {
-                best.consider(SnapKind::Intersection, p, cursor, r2);
+    let near: Vec<&Shape> = if kinds.intersection || kinds.nearest {
+        document
+            .entities()
+            .filter(|(_, e)| layer_visible(document, e))
+            .filter(|(_, e)| e.geom.aabb().intersects(&cursor_box))
+            // M6: 交点計算は Shape 系のみを対象にする（寸法・テキストは交点源にしない）。
+            .filter_map(|(_, e)| e.geom.as_shape())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if kinds.intersection {
+        for i in 0..near.len() {
+            for j in (i + 1)..near.len() {
+                for p in intersect(near[i], near[j]) {
+                    best.consider(SnapKind::Intersection, p, cursor, r2);
+                }
             }
+        }
+    }
+
+    // 近接点: 既定 OFF（モジュール doc）なので、無効なら計算自体を省く。有効なら
+    // 交点と同じ `near`（カーソル近傍 AABB で絞り込んだ Shape 集合。無損失である
+    // 理由はモジュール doc 参照）上でカーソルに最も近い点を候補にする。Point は
+    // 端点が既に拾うので対象外にする（DESIGN.md M12 設計判断5 の対象形状: Line・
+    // Circle・Arc・Polyline）。
+    if kinds.nearest {
+        for shape in &near {
+            if matches!(shape, Shape::Point(_)) {
+                continue;
+            }
+            let p = closest_point(shape, cursor);
+            best.consider(SnapKind::Nearest, p, cursor, r2);
         }
     }
 
@@ -256,6 +389,10 @@ pub fn snap(
 /// `target` が `mcad_geom::split` の `SplitError::Unsupported` を返す形状
 /// （[`Shape::Circle`]・閉じた [`Shape::Polyline`]・[`Shape::Point`]）の場合は候補列挙
 /// 自体を行わず `None` を返す（拒否確定の対象にマーカーを出さない）。
+///
+/// `kinds`（種別ごとの ON/OFF）は候補種別 Midpoint/Endpoint/Intersection にそのまま
+/// 従う（M12 タスク85）。四半円点・近接点は分割スナップには足さない
+/// （DESIGN.md M12 設計判断5: 分割スナップは対象上の点に限定する既存の設計を保つ）。
 // 「分割スナップ-2」で `SplitTool`（`Tool::snaps_shape_pick`）/`handle_tool_input`
 // （main.rs）へ配線済み（DESIGN.md 7章「分割ツールのスナップ対応」タスク分割）。
 #[must_use]
@@ -265,6 +402,7 @@ pub fn snap_split_position(
     target: &Shape,
     cursor: Point2,
     radius: f64,
+    kinds: SnapKinds,
 ) -> Option<SnapResult> {
     if !radius.is_finite() || radius <= 0.0 {
         return None;
@@ -277,7 +415,7 @@ pub fn snap_split_position(
     }
 
     let r2 = radius * radius;
-    let mut best = Best::default();
+    let mut best = Best::new(kinds);
 
     match target {
         Shape::Line(s) => {
@@ -320,7 +458,7 @@ pub fn snap_split_position(
     // 交点: target とカーソル近傍 AABB が交差する他エンティティのみを事前絞り込みし、
     // target_id 自身は除外する。絞り込みが無損失である理由は本モジュール doc を参照。
     let cursor_box = Aabb::from_point(cursor).expanded(radius);
-    if target.aabb().intersects(&cursor_box) {
+    if kinds.intersection && target.aabb().intersects(&cursor_box) {
         for (id, entity) in document.entities() {
             if id == target_id || !layer_visible(document, entity) {
                 continue;
@@ -343,13 +481,16 @@ pub fn snap_split_position(
     best.finish()
 }
 
-/// 1 エンティティの端点・中点・中心の候補を [`Best`] に投入する。
+/// 1 エンティティの端点・中点・中心・四半円点の候補を [`Best`] に投入する。
 ///
 /// 各種別の割り当て:
 /// - 点 [`Shape::Point`] は点そのものを端点として扱う。
 /// - 線分 [`Shape::Line`] は両端が端点、中点が中点。
-/// - 円 [`Shape::Circle`] は中心のみ（端点・中点は持たない）。
-/// - 円弧 [`Shape::Arc`] は始点・終点が端点、中心が中心（弧の中点は候補にしない）。
+/// - 円 [`Shape::Circle`] は中心に加え、[`mcad_geom::Circle::quadrant_points`] の
+///   ワールド軸方向 4 点が四半円点（端点・中点は持たない）。
+/// - 円弧 [`Shape::Arc`] は始点・終点が端点、中心が中心。四半円点は 4 候補角
+///   （[`QUADRANT_ANGLES`]）のうち [`mcad_geom::Arc::contains_angle`] が弧の範囲内と
+///   判定したものだけ（弧の中点は候補にしない）。
 /// - ポリライン [`Shape::Polyline`] は各頂点が端点、各辺（閉じている場合は閉じ辺も）の中点が中点。
 fn enumerate_features(shape: &Shape, cursor: Point2, r2: f64, best: &mut Best) {
     match shape {
@@ -359,11 +500,22 @@ fn enumerate_features(shape: &Shape, cursor: Point2, r2: f64, best: &mut Best) {
             best.consider(SnapKind::Endpoint, s.b, cursor, r2);
             best.consider(SnapKind::Midpoint, s.a.midpoint(s.b), cursor, r2);
         }
-        Shape::Circle(c) => best.consider(SnapKind::Center, c.center, cursor, r2),
+        Shape::Circle(c) => {
+            best.consider(SnapKind::Center, c.center, cursor, r2);
+            for p in c.quadrant_points() {
+                best.consider(SnapKind::Quadrant, p, cursor, r2);
+            }
+        }
         Shape::Arc(a) => {
             best.consider(SnapKind::Endpoint, a.start_point(), cursor, r2);
             best.consider(SnapKind::Endpoint, a.end_point(), cursor, r2);
             best.consider(SnapKind::Center, a.center, cursor, r2);
+            let circle = a.circle();
+            for &theta in &QUADRANT_ANGLES {
+                if a.contains_angle(theta) {
+                    best.consider(SnapKind::Quadrant, circle.point_at_angle(theta), cursor, r2);
+                }
+            }
         }
         Shape::Polyline(pl) => {
             for &v in &pl.vertices {
@@ -384,20 +536,30 @@ fn layer_visible(document: &Document, entity: &Entity) -> bool {
 
 /// これまでに見た候補のうち「最良」を保持するアキュムレータ。
 ///
-/// 最良の定義（DESIGN.md 3.4 の優先順位）:
+/// 最良の定義（DESIGN.md M12 設計判断5 の優先順位）:
 /// 1. 優先度（[`SnapKind::priority`]）が高い（数値が小さい）ものを優先。
 /// 2. 優先度が同じなら、カーソルとの距離（の 2 乗）が小さいものを優先。
 ///
-/// 半径外（`d2 > r2`）の候補は無視する。
-#[derive(Default)]
+/// 半径外（`d2 > r2`）の候補は無視する。無効な種別（[`SnapKinds::enabled`] が
+/// `false`）の候補も同様に無視する（M12 タスク85）。
 struct Best {
+    /// 種別ごとの ON/OFF。無効な種別は `consider` が弾く。
+    kinds: SnapKinds,
     /// `(優先度, カーソルとの距離^2, 結果)`。未確定なら `None`。
     found: Option<(u8, f64, SnapResult)>,
 }
 
 impl Best {
-    /// 候補 1 点を検討する。半径内かつ現状より良ければ採用する。
+    /// `kinds` を種別フィルタに使う空のアキュムレータを作る。
+    fn new(kinds: SnapKinds) -> Self {
+        Self { kinds, found: None }
+    }
+
+    /// 候補 1 点を検討する。有効な種別かつ半径内かつ現状より良ければ採用する。
     fn consider(&mut self, kind: SnapKind, point: Point2, cursor: Point2, r2: f64) {
+        if !self.kinds.enabled(kind) {
+            return;
+        }
         let d2 = cursor.distance_squared(point);
         if d2 > r2 {
             return;
@@ -455,13 +617,24 @@ mod tests {
         Shape::Line(LineSeg::new(Point2::new(ax, ay), Point2::new(bx, by)))
     }
 
-    /// グリッド無効（`grid_step = 0`）・`extra_points` 無しでスナップする短縮版。
+    /// グリッド無効（`grid_step = 0`）・`extra_points` 無し・全種別 ON でスナップする短縮版。
     fn snap_no_grid(doc: &Document, cursor: Point2, radius: f64) -> Option<SnapResult> {
+        snap_no_grid_with_kinds(doc, cursor, radius, SnapKinds::default())
+    }
+
+    /// [`snap_no_grid`] の種別指定版（種別 ON/OFF のテスト用）。
+    fn snap_no_grid_with_kinds(
+        doc: &Document,
+        cursor: Point2,
+        radius: f64,
+        kinds: SnapKinds,
+    ) -> Option<SnapResult> {
         snap(
             doc,
             cursor,
             radius,
             GridSpec::new(0.0, GridMode::Rectangular),
+            kinds,
             &[],
         )
     }
@@ -541,6 +714,7 @@ mod tests {
             Point2::new(0.1, 0.1),
             0.5,
             GridSpec::new(1.0, GridMode::Rectangular),
+            SnapKinds::default(),
             &[],
         )
         .unwrap();
@@ -557,6 +731,7 @@ mod tests {
             Point2::new(0.2, -0.1),
             0.5,
             GridSpec::new(1.0, GridMode::Rectangular),
+            SnapKinds::default(),
             &[],
         )
         .unwrap();
@@ -623,6 +798,7 @@ mod tests {
             cursor,
             3.0,
             GridSpec::new(0.0, GridMode::Rectangular),
+            SnapKinds::default(),
             &[],
         )
         .unwrap();
@@ -645,6 +821,7 @@ mod tests {
                 Point2::new(0.0, 0.0),
                 3.0,
                 GridSpec::new(0.0, GridMode::Rectangular),
+                SnapKinds::default(),
                 &[]
             ),
             None
@@ -662,6 +839,7 @@ mod tests {
             Point2::new(0.0, 0.0),
             0.5,
             GridSpec::new(1.0, GridMode::Rectangular),
+            SnapKinds::default(),
             &extra,
         )
         .unwrap();
@@ -702,6 +880,7 @@ mod tests {
             Point2::new(0.1, -0.1),
             0.5,
             GridSpec::new(1.0, GridMode::Rectangular),
+            SnapKinds::default(),
             &extra,
         )
         .unwrap();
@@ -717,7 +896,15 @@ mod tests {
         let shape = line(0.0, 0.0, 4.0, 0.0);
         let id = add_id(&mut doc, shape.clone());
 
-        let r = snap_split_position(&doc, id, &shape, Point2::new(2.1, 0.0), 0.5).unwrap();
+        let r = snap_split_position(
+            &doc,
+            id,
+            &shape,
+            Point2::new(2.1, 0.0),
+            0.5,
+            SnapKinds::default(),
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Midpoint);
         assert_eq!(r.point, Point2::new(2.0, 0.0));
     }
@@ -736,7 +923,15 @@ mod tests {
         let id = add_id(&mut doc, shape.clone());
 
         // 2 本目の辺 (4,0)-(4,4) の中点 (4,2)。
-        let r = snap_split_position(&doc, id, &shape, Point2::new(4.1, 2.0), 0.5).unwrap();
+        let r = snap_split_position(
+            &doc,
+            id,
+            &shape,
+            Point2::new(4.1, 2.0),
+            0.5,
+            SnapKinds::default(),
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Midpoint);
         assert_eq!(r.point, Point2::new(4.0, 2.0));
     }
@@ -755,7 +950,15 @@ mod tests {
         ));
         let id = add_id(&mut doc, shape.clone());
 
-        let r = snap_split_position(&doc, id, &shape, Point2::new(4.1, 0.1), 0.5).unwrap();
+        let r = snap_split_position(
+            &doc,
+            id,
+            &shape,
+            Point2::new(4.1, 0.1),
+            0.5,
+            SnapKinds::default(),
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Endpoint);
         assert_eq!(r.point, Point2::new(4.0, 0.0));
     }
@@ -768,7 +971,15 @@ mod tests {
         add(&mut doc, line(5.0, -5.0, 5.0, 5.0));
 
         // 交点 (5,0)。target の中点も (5,0) だが、優先度で交点(=端点相当の高優先度)が勝つ。
-        let r = snap_split_position(&doc, id, &target, Point2::new(5.1, 0.0), 0.5).unwrap();
+        let r = snap_split_position(
+            &doc,
+            id,
+            &target,
+            Point2::new(5.1, 0.0),
+            0.5,
+            SnapKinds::default(),
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Intersection);
         assert_eq!(r.point, Point2::new(5.0, 0.0));
     }
@@ -781,7 +992,15 @@ mod tests {
         let id = add_id(&mut doc, target.clone());
         add(&mut doc, line(5.0, 0.0, 5.0, 5.0));
 
-        let r = snap_split_position(&doc, id, &target, Point2::new(5.1, 0.0), 0.5).unwrap();
+        let r = snap_split_position(
+            &doc,
+            id,
+            &target,
+            Point2::new(5.1, 0.0),
+            0.5,
+            SnapKinds::default(),
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Intersection);
         assert_eq!(r.point, Point2::new(5.0, 0.0));
     }
@@ -798,7 +1017,14 @@ mod tests {
         add(&mut doc, line(0.0, 0.0, 0.0, 5.0));
 
         assert_eq!(
-            snap_split_position(&doc, id, &target, Point2::new(0.1, 0.0), 0.5),
+            snap_split_position(
+                &doc,
+                id,
+                &target,
+                Point2::new(0.1, 0.0),
+                0.5,
+                SnapKinds::default()
+            ),
             None
         );
     }
@@ -816,7 +1042,14 @@ mod tests {
         add(&mut doc, line(5.0, 0.0, 5.0, 5.0));
 
         assert_eq!(
-            snap_split_position(&doc, id, &shape, Point2::new(4.9, 0.0), 0.3),
+            snap_split_position(
+                &doc,
+                id,
+                &shape,
+                Point2::new(4.9, 0.0),
+                0.3,
+                SnapKinds::default()
+            ),
             None
         );
     }
@@ -837,7 +1070,14 @@ mod tests {
         add(&mut doc, line(0.0, 0.0, 0.0, 5.0));
 
         assert_eq!(
-            snap_split_position(&doc, id, &shape, Point2::new(0.1, 0.0), 0.5),
+            snap_split_position(
+                &doc,
+                id,
+                &shape,
+                Point2::new(0.1, 0.0),
+                0.5,
+                SnapKinds::default()
+            ),
             None
         );
     }
@@ -850,7 +1090,14 @@ mod tests {
 
         // 端点 (0,0) の近傍。線分全体の端点は候補にならない。
         assert_eq!(
-            snap_split_position(&doc, id, &shape, Point2::new(0.1, 0.0), 0.5),
+            snap_split_position(
+                &doc,
+                id,
+                &shape,
+                Point2::new(0.1, 0.0),
+                0.5,
+                SnapKinds::default()
+            ),
             None
         );
     }
@@ -867,7 +1114,14 @@ mod tests {
 
         // 弧の始点 (5,0) 近傍には、端点・中点候補が無い(弧は候補を持たない)。
         assert_eq!(
-            snap_split_position(&doc, id, &shape, Point2::new(4.9, 0.0), 0.3),
+            snap_split_position(
+                &doc,
+                id,
+                &shape,
+                Point2::new(4.9, 0.0),
+                0.3,
+                SnapKinds::default()
+            ),
             None
         );
     }
@@ -886,7 +1140,14 @@ mod tests {
             Shape::Circle(Circle::new(Point2::new(10.0, 10.0), 1.0)),
         );
 
-        let r = snap_split_position(&doc, id, &shape, Point2::new(10.0, 10.0), 0.5);
+        let r = snap_split_position(
+            &doc,
+            id,
+            &shape,
+            Point2::new(10.0, 10.0),
+            0.5,
+            SnapKinds::default(),
+        );
         assert_eq!(r, None);
     }
 
@@ -898,7 +1159,14 @@ mod tests {
 
         // 中点 (2,0) から半径 0.1 だけ離れた位置。半径 0.05 では届かない。
         assert_eq!(
-            snap_split_position(&doc, id, &shape, Point2::new(2.1, 0.0), 0.05),
+            snap_split_position(
+                &doc,
+                id,
+                &shape,
+                Point2::new(2.1, 0.0),
+                0.05,
+                SnapKinds::default()
+            ),
             None
         );
     }
@@ -936,7 +1204,15 @@ mod tests {
         // 距離差が出ない位置を選ぶ必要はなく、ここでは中点自体が候補として残る
         // (=Intersection でなく Midpoint になる、あるいは同一種別優先の中点が採用される)
         // ことを確認する。
-        let r = snap_split_position(&doc, id, &target, Point2::new(5.0, 0.0), 0.5).unwrap();
+        let r = snap_split_position(
+            &doc,
+            id,
+            &target,
+            Point2::new(5.0, 0.0),
+            0.5,
+            SnapKinds::default(),
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Midpoint);
         assert_eq!(r.point, Point2::new(5.0, 0.0));
     }
@@ -950,7 +1226,15 @@ mod tests {
         let id = add_id(&mut doc, target.clone());
 
         // 半径内には target 自身しかない(中点(5,0)のみが候補になるはず)。
-        let r = snap_split_position(&doc, id, &target, Point2::new(5.0, 0.0), 0.5).unwrap();
+        let r = snap_split_position(
+            &doc,
+            id,
+            &target,
+            Point2::new(5.0, 0.0),
+            0.5,
+            SnapKinds::default(),
+        )
+        .unwrap();
         assert_eq!(r.kind, SnapKind::Midpoint);
         assert_eq!(r.point, Point2::new(5.0, 0.0));
     }
@@ -962,14 +1246,28 @@ mod tests {
         let point_shape = Shape::Point(Point2::new(0.0, 0.0));
         let id = add_id(&mut doc, point_shape.clone());
         assert_eq!(
-            snap_split_position(&doc, id, &point_shape, Point2::new(0.0, 0.0), 1.0),
+            snap_split_position(
+                &doc,
+                id,
+                &point_shape,
+                Point2::new(0.0, 0.0),
+                1.0,
+                SnapKinds::default()
+            ),
             None
         );
 
         let circle_shape = Shape::Circle(Circle::new(Point2::new(0.0, 0.0), 1.0));
         let id = add_id(&mut doc, circle_shape.clone());
         assert_eq!(
-            snap_split_position(&doc, id, &circle_shape, Point2::new(1.0, 0.0), 1.0),
+            snap_split_position(
+                &doc,
+                id,
+                &circle_shape,
+                Point2::new(1.0, 0.0),
+                1.0,
+                SnapKinds::default()
+            ),
             None
         );
 
@@ -983,7 +1281,14 @@ mod tests {
         ));
         let id = add_id(&mut doc, closed_polyline.clone());
         assert_eq!(
-            snap_split_position(&doc, id, &closed_polyline, Point2::new(0.5, 0.0), 1.0),
+            snap_split_position(
+                &doc,
+                id,
+                &closed_polyline,
+                Point2::new(0.5, 0.0),
+                1.0,
+                SnapKinds::default()
+            ),
             None
         );
     }
@@ -1073,11 +1378,307 @@ mod tests {
             cursor,
             0.5,
             GridSpec::new(step, GridMode::Isometric),
+            SnapKinds::default(),
             &[],
         )
         .unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
         assert!((r.point.x - u.x).abs() < 1e-9);
         assert!((r.point.y - u.y).abs() < 1e-9);
+    }
+
+    // --- 四半円点（SnapKind::Quadrant、M12 タスク85） ---
+
+    #[test]
+    fn circle_quadrant_point_snaps_even_though_center_is_farther() {
+        // 円 中心 (0,0) 半径 5: 四半円点は (5,0),(0,5),(-5,0),(0,-5)。カーソルを
+        // (5,0) の近くに置くと、中心（距離 5.05）よりずっと近い四半円点（距離 0.05）が
+        // 半径内に入り、そちらへスナップする。
+        let mut doc = Document::new();
+        add(
+            &mut doc,
+            Shape::Circle(Circle::new(Point2::new(0.0, 0.0), 5.0)),
+        );
+
+        let r = snap_no_grid(&doc, Point2::new(5.05, 0.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Quadrant);
+        assert_eq!(r.point, Point2::new(5.0, 0.0));
+    }
+
+    #[test]
+    fn arc_quadrant_point_outside_sweep_is_not_a_candidate() {
+        // 円弧 中心 (0,0) 半径 5、掃引角 0°→90°（第1象限のみ）。180° の四半円点
+        // (-5,0) は弧の範囲外なので候補にならない。中心は遠いので他の候補もない。
+        use mcad_geom::Arc;
+        let mut doc = Document::new();
+        let arc = Arc::new(Point2::new(0.0, 0.0), 5.0, 0.0, FRAC_PI_2);
+        add(&mut doc, Shape::Arc(arc));
+
+        assert_eq!(snap_no_grid(&doc, Point2::new(-5.0, 0.0), 0.5), None);
+    }
+
+    #[test]
+    fn arc_quadrant_point_inside_sweep_is_a_candidate() {
+        // 弧の始終点を四半円角そのものからずらす（-10°→100°）ことで、0° の四半円点
+        // (5,0) が「掃引範囲内だが端点ではない」候補になることを確認する。
+        use mcad_geom::Arc;
+        let mut doc = Document::new();
+        let arc = Arc::new(
+            Point2::new(0.0, 0.0),
+            5.0,
+            -10f64.to_radians(),
+            100f64.to_radians(),
+        );
+        add(&mut doc, Shape::Arc(arc));
+
+        let r = snap_no_grid(&doc, Point2::new(5.05, 0.0), 0.5).unwrap();
+        assert_eq!(r.kind, SnapKind::Quadrant);
+        assert!(r.point.distance(Point2::new(5.0, 0.0)) < 1e-9);
+    }
+
+    #[test]
+    fn center_and_quadrant_are_same_priority_nearer_one_wins() {
+        // 円 中心 (0,0) 半径 5。中心と四半円点 (5,0) は同順位（3）なので、
+        // カーソルに近い方が勝つ。
+        let mut doc = Document::new();
+        add(
+            &mut doc,
+            Shape::Circle(Circle::new(Point2::new(0.0, 0.0), 5.0)),
+        );
+
+        // カーソル (2.4,0): 中心まで 2.4、四半円点(5,0)まで 2.6 → 中心が勝つ。
+        let r = snap_no_grid(&doc, Point2::new(2.4, 0.0), 3.0).unwrap();
+        assert_eq!(r.kind, SnapKind::Center);
+        assert_eq!(r.point, Point2::new(0.0, 0.0));
+
+        // カーソル (2.6,0): 中心まで 2.6、四半円点(5,0)まで 2.4 → 四半円点が勝つ。
+        let r = snap_no_grid(&doc, Point2::new(2.6, 0.0), 3.0).unwrap();
+        assert_eq!(r.kind, SnapKind::Quadrant);
+        assert_eq!(r.point, Point2::new(5.0, 0.0));
+    }
+
+    // --- 近接点（SnapKind::Nearest、M12 タスク85） ---
+
+    /// 近接点のみを有効にした [`SnapKinds`]（他の候補と混ざらないよう分離するテスト用）。
+    fn nearest_only() -> SnapKinds {
+        SnapKinds {
+            endpoint: false,
+            intersection: false,
+            midpoint: false,
+            center: false,
+            quadrant: false,
+            nearest: true,
+            grid: false,
+        }
+    }
+
+    #[test]
+    fn nearest_point_on_line_is_a_candidate() {
+        // 線分 (0,0)-(10,0) の中間あたり、端点でも中点でもない位置に垂線の足が立つ。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+
+        let r = snap_no_grid_with_kinds(&doc, Point2::new(3.0, 0.2), 0.5, nearest_only()).unwrap();
+        assert_eq!(r.kind, SnapKind::Nearest);
+        assert_eq!(r.point, Point2::new(3.0, 0.0));
+    }
+
+    #[test]
+    fn nearest_point_on_circle_is_a_candidate() {
+        // 円 中心 (0,0) 半径 5 の円周上、四半円点でも中心でもない角度の点。
+        let mut doc = Document::new();
+        add(
+            &mut doc,
+            Shape::Circle(Circle::new(Point2::new(0.0, 0.0), 5.0)),
+        );
+
+        let cursor = Point2::new(4.0, 3.2); // (4,3) は円周上（3-4-5）のすぐ外側。
+        let r = snap_no_grid_with_kinds(&doc, cursor, 0.5, nearest_only()).unwrap();
+        assert_eq!(r.kind, SnapKind::Nearest);
+        assert!((r.point.distance(Point2::new(0.0, 0.0)) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn nearest_point_on_polyline_edge_is_a_candidate() {
+        // ポリライン (0,0)-(4,0)-(4,4) の2本目の辺上、端点でも中点でもない位置。
+        let mut doc = Document::new();
+        add(
+            &mut doc,
+            Shape::Polyline(Polyline::new(
+                vec![
+                    Point2::new(0.0, 0.0),
+                    Point2::new(4.0, 0.0),
+                    Point2::new(4.0, 4.0),
+                ],
+                false,
+            )),
+        );
+
+        let r = snap_no_grid_with_kinds(&doc, Point2::new(4.2, 3.0), 0.5, nearest_only()).unwrap();
+        assert_eq!(r.kind, SnapKind::Nearest);
+        assert_eq!(r.point, Point2::new(4.0, 3.0));
+    }
+
+    #[test]
+    fn nearest_is_off_by_default_and_on_when_enabled() {
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        let cursor = Point2::new(3.0, 0.2);
+
+        // 既定（SnapKinds::default）では近接点は出ない。他候補も無ければ None。
+        assert_eq!(snap_no_grid(&doc, cursor, 0.5), None);
+
+        // 明示的に有効化すると近接点が出る。
+        let r = snap_no_grid_with_kinds(&doc, cursor, 0.5, nearest_only()).unwrap();
+        assert_eq!(r.kind, SnapKind::Nearest);
+    }
+
+    #[test]
+    fn endpoint_beats_nearest_when_both_enabled() {
+        // 線分 (0,0)-(10,0)。カーソルを端点 (10,0) のすぐ内側に置くと、垂線の足
+        // （近接点候補、線分上そのもの＝カーソルの直下）より端点が優先される。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        let kinds = SnapKinds {
+            nearest: true,
+            ..SnapKinds::default()
+        };
+
+        let r = snap_no_grid_with_kinds(&doc, Point2::new(9.9, 0.05), 0.5, kinds).unwrap();
+        assert_eq!(r.kind, SnapKind::Endpoint);
+        assert_eq!(r.point, Point2::new(10.0, 0.0));
+    }
+
+    // --- 種別ごとの ON/OFF（SnapKinds、M12 タスク85） ---
+
+    #[test]
+    fn disabled_endpoint_kind_hides_extra_points_too() {
+        // extra_points（作図中ツールの未確定頂点）も Endpoint 種別として扱われるため、
+        // endpoint を無効化すると出なくなる（他候補も無ければ None）。
+        let doc = Document::new();
+        let extra = [Point2::new(0.05, 0.0)];
+        let kinds = SnapKinds {
+            endpoint: false,
+            ..SnapKinds::default()
+        };
+        let r = snap(
+            &doc,
+            Point2::new(0.0, 0.0),
+            0.5,
+            GridSpec::new(0.0, GridMode::Rectangular),
+            kinds,
+            &extra,
+        );
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn disabled_grid_kind_removes_grid_fallback() {
+        // グリッドを無効化すると、他に候補が無いときのフォールバックも働かない。
+        let doc = Document::new();
+        let kinds = SnapKinds {
+            grid: false,
+            ..SnapKinds::default()
+        };
+        let r = snap(
+            &doc,
+            Point2::new(0.2, -0.1),
+            0.5,
+            GridSpec::new(1.0, GridMode::Rectangular),
+            kinds,
+            &[],
+        );
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn split_snap_obeys_disabled_kinds() {
+        // 分割スナップ（Midpoint/Endpoint/Intersection）も設定に従う。中点を無効化
+        // すると、中点候補だった位置はスナップしなくなる。
+        let mut doc = Document::new();
+        let shape = line(0.0, 0.0, 4.0, 0.0);
+        let id = add_id(&mut doc, shape.clone());
+        let kinds = SnapKinds {
+            midpoint: false,
+            ..SnapKinds::default()
+        };
+
+        assert_eq!(
+            snap_split_position(&doc, id, &shape, Point2::new(2.1, 0.0), 0.5, kinds),
+            None
+        );
+
+        // 全部無効化すれば、交点があっても拾わない。
+        let mut doc2 = Document::new();
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let id2 = add_id(&mut doc2, target.clone());
+        add(&mut doc2, line(5.0, -5.0, 5.0, 5.0));
+        let all_off = SnapKinds {
+            endpoint: false,
+            intersection: false,
+            midpoint: false,
+            center: false,
+            quadrant: false,
+            nearest: false,
+            grid: false,
+        };
+        assert_eq!(
+            snap_split_position(&doc2, id2, &target, Point2::new(5.1, 0.0), 0.5, all_off),
+            None
+        );
+    }
+
+    // --- SnapKinds ---
+
+    #[test]
+    fn snap_kinds_default_has_only_nearest_off() {
+        let kinds = SnapKinds::default();
+        assert!(kinds.endpoint);
+        assert!(kinds.intersection);
+        assert!(kinds.midpoint);
+        assert!(kinds.center);
+        assert!(kinds.quadrant);
+        assert!(!kinds.nearest);
+        assert!(kinds.grid);
+    }
+
+    #[test]
+    fn snap_kinds_enabled_matches_each_field() {
+        let kinds = SnapKinds {
+            endpoint: true,
+            intersection: false,
+            midpoint: true,
+            center: false,
+            quadrant: true,
+            nearest: false,
+            grid: true,
+        };
+        assert!(kinds.enabled(SnapKind::Endpoint));
+        assert!(!kinds.enabled(SnapKind::Intersection));
+        assert!(kinds.enabled(SnapKind::Midpoint));
+        assert!(!kinds.enabled(SnapKind::Center));
+        assert!(kinds.enabled(SnapKind::Quadrant));
+        assert!(!kinds.enabled(SnapKind::Nearest));
+        assert!(kinds.enabled(SnapKind::Grid));
+    }
+
+    #[test]
+    fn snap_kinds_serde_round_trip_and_missing_fields_default() {
+        let kinds = SnapKinds {
+            endpoint: false,
+            intersection: true,
+            midpoint: false,
+            center: true,
+            quadrant: false,
+            nearest: true,
+            grid: false,
+        };
+        let json = serde_json::to_string(&kinds).unwrap();
+        let parsed: SnapKinds = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, kinds);
+
+        // 空オブジェクトは各フィールドの既定値（nearest だけ false）へ補完される。
+        let empty: SnapKinds = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, SnapKinds::default());
     }
 }

@@ -2584,6 +2584,23 @@ impl eframe::App for McadApp {
                             "OFF"
                         }
                     ));
+                    // 種別ごとの ON/OFF（M12 タスク85、DESIGN.md M12 設計判断5）。ON/OFF に
+                    // 関わらず常設（Polar のコンボと同じ「常に見える」流儀）。変更したら
+                    // その場で `config.json` へ保存する。
+                    let mut snap_kinds = self.config.snap_kinds;
+                    ui.menu_button("Snap types", |ui| {
+                        ui.checkbox(&mut snap_kinds.endpoint, "Endpoint");
+                        ui.checkbox(&mut snap_kinds.intersection, "Intersection");
+                        ui.checkbox(&mut snap_kinds.midpoint, "Midpoint");
+                        ui.checkbox(&mut snap_kinds.center, "Center");
+                        ui.checkbox(&mut snap_kinds.quadrant, "Quadrant");
+                        ui.checkbox(&mut snap_kinds.nearest, "Nearest");
+                        ui.checkbox(&mut snap_kinds.grid, "Grid");
+                    });
+                    if snap_kinds != self.config.snap_kinds {
+                        self.config.snap_kinds = snap_kinds;
+                        self.persist_config(now);
+                    }
                     ui.separator();
                     ui.label(format!(
                         "Ortho: {}",
@@ -2894,6 +2911,7 @@ impl eframe::App for McadApp {
                         &mut self.document,
                         &mut self.select_tool,
                         self.config.snap_enabled,
+                        self.config.snap_kinds,
                         &mut self.snap_marker,
                         self.config.grid_mode,
                         &mut self.status,
@@ -2916,6 +2934,7 @@ impl eframe::App for McadApp {
                         &mut self.tool,
                         &mut self.select_tool,
                         self.config.snap_enabled,
+                        self.config.snap_kinds,
                         &mut self.snap_marker,
                         self.config.ortho_enabled,
                         self.config.polar_enabled,
@@ -3519,6 +3538,7 @@ fn handle_tool_input(
     tool: &mut Option<Box<dyn Tool>>,
     select_tool: &mut SelectTool,
     snap_enabled: bool,
+    snap_kinds: snap::SnapKinds,
     snap_marker: &mut Option<snap::SnapResult>,
     ortho_enabled: bool,
     polar_enabled: bool,
@@ -3583,7 +3603,7 @@ fn handle_tool_input(
             // 無変更）。
             *snap_marker = if snap_enabled && active.snaps_shape_pick() {
                 tool::pick_shape_entity(document, raw, pick_tol).and_then(|hit| {
-                    snap::snap_split_position(document, hit.id, &hit.shape, raw, radius)
+                    snap::snap_split_position(document, hit.id, &hit.shape, raw, radius, snap_kinds)
                 })
             } else {
                 None
@@ -3596,7 +3616,15 @@ fn handle_tool_input(
             let _ = active.on_input(&ctx, InputEvent::Move(raw));
         } else {
             let extra_points = active.snap_points();
-            let (_, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &extra_points);
+            let (_, marker) = apply_snap(
+                document,
+                snap_enabled,
+                raw,
+                radius,
+                grid,
+                snap_kinds,
+                &extra_points,
+            );
             *snap_marker = marker;
             *polar_marker = polar_marker_for(
                 marker,
@@ -3671,8 +3699,9 @@ fn handle_tool_input(
                 Some(mut hit) => {
                     if snap_enabled
                         && active.snaps_shape_pick()
-                        && let Some(snapped) =
-                            snap::snap_split_position(document, hit.id, &hit.shape, raw, radius)
+                        && let Some(snapped) = snap::snap_split_position(
+                            document, hit.id, &hit.shape, raw, radius, snap_kinds,
+                        )
                     {
                         hit.click = snapped.point;
                     }
@@ -3686,7 +3715,15 @@ fn handle_tool_input(
             }
         } else {
             let extra_points = active.snap_points();
-            let (_, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &extra_points);
+            let (_, marker) = apply_snap(
+                document,
+                snap_enabled,
+                raw,
+                radius,
+                grid,
+                snap_kinds,
+                &extra_points,
+            );
             let world = resolve_click_point(
                 marker,
                 raw,
@@ -7306,6 +7343,7 @@ fn apply_sheet_change(
 /// 素のカーソル位置 `raw` にスナップを掛ける。有効かつ候補が見つかれば
 /// `(スナップ先, Some(結果))`、無効または候補なしなら `(raw, None)` を返す。
 ///
+/// `kinds` は種別ごとの ON/OFF（M12 タスク85、`self.config.snap_kinds`）。
 /// `extra_points` はアクティブな作図ツールの未確定頂点（[`Tool::snap_points`]）。
 /// 作図中ツールを持たない呼び出し箇所（選択・配置モード等）は `&[]` を渡す。
 fn apply_snap(
@@ -7314,12 +7352,13 @@ fn apply_snap(
     raw: Point2,
     radius: f64,
     grid: snap::GridSpec,
+    kinds: snap::SnapKinds,
     extra_points: &[Point2],
 ) -> (Point2, Option<snap::SnapResult>) {
     if !enabled {
         return (raw, None);
     }
-    match snap::snap(document, raw, radius, grid, extra_points) {
+    match snap::snap(document, raw, radius, grid, kinds, extra_points) {
         Some(result) => (result.point, Some(result)),
         None => (raw, None),
     }
@@ -7676,6 +7715,7 @@ fn handle_select_input(
     document: &mut Document,
     select_tool: &mut SelectTool,
     snap_enabled: bool,
+    snap_kinds: snap::SnapKinds,
     snap_marker: &mut Option<snap::SnapResult>,
     grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
@@ -7697,6 +7737,7 @@ fn handle_select_input(
             document,
             select_tool,
             snap_enabled,
+            snap_kinds,
             snap_marker,
             grid_mode,
             status,
@@ -7716,6 +7757,7 @@ fn handle_select_input(
             document,
             select_tool,
             snap_enabled,
+            snap_kinds,
             snap_marker,
             grid_mode,
             status,
@@ -7869,8 +7911,15 @@ fn handle_select_input(
                 // グリップドラッグはスナップを効かせる（DESIGN.md タスク75「ドラッグ中」）。
                 // 直交モード（F8）は基準点が定まらないので効かせない（既存の作図ツールの
                 // ortho とは別経路であり、ここでは合成しない）。
-                let (snapped, marker) =
-                    apply_snap(document, snap_enabled, world, snap_radius, grid, &[]);
+                let (snapped, marker) = apply_snap(
+                    document,
+                    snap_enabled,
+                    world,
+                    snap_radius,
+                    grid,
+                    snap_kinds,
+                    &[],
+                );
                 *snap_marker = marker;
                 select_tool.on_grip_drag(snapped);
             } else {
@@ -7880,8 +7929,15 @@ fn handle_select_input(
             if select_tool.is_grip_dragging() {
                 // 最後の移動と解放が同じフレームに届くと `dragged_by` 分岐を通らないため、
                 // 解放位置にもスナップを掛けてから確定する（直前フレームの位置で確定しない）。
-                let (snapped, _) =
-                    apply_snap(document, snap_enabled, world, snap_radius, grid, &[]);
+                let (snapped, _) = apply_snap(
+                    document,
+                    snap_enabled,
+                    world,
+                    snap_radius,
+                    grid,
+                    snap_kinds,
+                    &[],
+                );
                 select_tool.on_grip_drag(snapped);
                 *snap_marker = None;
                 match select_tool.end_grip_drag(document, tol) {
@@ -7938,6 +7994,7 @@ fn handle_placement_input(
     document: &mut Document,
     select_tool: &mut SelectTool,
     snap_enabled: bool,
+    snap_kinds: snap::SnapKinds,
     snap_marker: &mut Option<snap::SnapResult>,
     grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
@@ -7964,7 +8021,8 @@ fn handle_placement_input(
     // カーソル追従（プレビュー用）とスナップマーカー更新。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
+        let (world, marker) =
+            apply_snap(document, snap_enabled, raw, radius, grid, snap_kinds, &[]);
         *snap_marker = marker;
         // 数値入力の `L` の方向（配置は直交を掛けないので、スナップ後の点）。
         numeric.set_cursor(world);
@@ -7992,7 +8050,7 @@ fn handle_placement_input(
         // マウスのクリックは数値入力より優先する（打ちかけの文字列は捨てる）。
         numeric.close();
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
+        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, snap_kinds, &[]);
         Some((world, tol))
     } else if numeric_submit {
         match numeric.resolve(select_tool.numeric_input_base()) {
@@ -8129,6 +8187,7 @@ fn handle_offset_input(
     document: &mut Document,
     select_tool: &mut SelectTool,
     snap_enabled: bool,
+    snap_kinds: snap::SnapKinds,
     snap_marker: &mut Option<snap::SnapResult>,
     grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
@@ -8159,7 +8218,8 @@ fn handle_offset_input(
     // カーソル追従（プレビュー用ゴースト）とスナップマーカー更新。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
+        let (world, marker) =
+            apply_snap(document, snap_enabled, raw, radius, grid, snap_kinds, &[]);
         *snap_marker = marker;
         select_tool.offset_move(world);
     } else {
@@ -8176,7 +8236,7 @@ fn handle_offset_input(
         && let Some(pos) = response.interact_pointer_pos()
     {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, &[]);
+        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, snap_kinds, &[]);
         match select_tool.offset_click(document, world, tol, offset_distance) {
             OffsetOutcome::Cancelled(msg) => {
                 *snap_marker = None;
@@ -9245,7 +9305,8 @@ fn numeric_input_box_rect(canvas: Rect, anchor: Pos2, size: egui::Vec2) -> Rect 
 }
 
 /// スナップ先にマーカーを描画する。候補種別ごとに形を変えて、どの種別に吸着したか
-/// が一目で分かるようにする（端点=□、交点=×、中点=△、中心=○、グリッド=＋）。
+/// が一目で分かるようにする（端点=□、交点=×、中点=△、中心=○、四半円点=◇、
+/// 近接点=⧗（砂時計）、グリッド=＋。M12 タスク85で四半円点・近接点を追加）。
 fn draw_snap_marker(
     painter: &egui::Painter,
     rect: Rect,
@@ -9285,6 +9346,28 @@ fn draw_snap_marker(
         SnapKind::Center => {
             // 円。
             painter.circle_stroke(c, s, stroke);
+        }
+        SnapKind::Quadrant => {
+            // ひし形（◇。4 辺を線分で描く）。
+            let top = c + egui::vec2(0.0, -s);
+            let right = c + egui::vec2(s, 0.0);
+            let bottom = c + egui::vec2(0.0, s);
+            let left = c + egui::vec2(-s, 0.0);
+            seg(top, right);
+            seg(right, bottom);
+            seg(bottom, left);
+            seg(left, top);
+        }
+        SnapKind::Nearest => {
+            // 砂時計（⧗。上下の水平線 + 対角線2本）。
+            let top_left = c + egui::vec2(-s, -s);
+            let top_right = c + egui::vec2(s, -s);
+            let bottom_left = c + egui::vec2(-s, s);
+            let bottom_right = c + egui::vec2(s, s);
+            seg(top_left, top_right);
+            seg(bottom_left, bottom_right);
+            seg(top_left, bottom_right);
+            seg(top_right, bottom_left);
         }
         SnapKind::Grid => {
             // ＋。
@@ -11795,6 +11878,7 @@ mod tests {
                 recent_files: Vec::new(),
                 plot_color_mode: plot::PlotColorMode::default(),
                 grid_mode: config::GridMode::default(),
+                snap_kinds: snap::SnapKinds::default(),
             },
             path: Some(PathBuf::from("/tmp/mcad-app-test/config.json")),
             warning: Some("something went wrong".to_owned()),

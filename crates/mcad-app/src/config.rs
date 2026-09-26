@@ -72,6 +72,13 @@ pub struct Config {
     pub snap_enabled: bool,
     /// 直交モードの有効/無効（F8）。
     pub ortho_enabled: bool,
+    /// 極トラッキングの有効/無効（F10、M12 タスク84、DESIGN.md M12 設計判断4）。
+    /// 直交モード（`ortho_enabled`）とは排他 — F8/F10 トグルは互いを OFF にし、
+    /// 両方 `true` の config.json（手編集）を読んだ場合は [`Config::normalize_exclusive_modes`]
+    /// が直交優先で正規化する。
+    pub polar_enabled: bool,
+    /// 極トラッキングの刻み角（F10 有効時、上部パネルのコンボで選ぶ。既定 15°）。
+    pub polar_step: PolarStep,
     /// 紙基準表示の有効/無効（F9）。
     pub paper_display_enabled: bool,
     /// 新規文書の既定用紙サイズ。
@@ -99,6 +106,8 @@ impl Default for Config {
         Self {
             snap_enabled: true,
             ortho_enabled: false,
+            polar_enabled: false,
+            polar_step: PolarStep::default(),
             paper_display_enabled: false,
             default_paper: PaperSize::default(),
             default_orientation: Orientation::default(),
@@ -127,7 +136,68 @@ pub enum GridMode {
     Isometric,
 }
 
+/// 極トラッキングの刻み角（F10、M12 タスク84）。`config.json` に永続化される。
+///
+/// 旧バージョンの config.json（このフィールドが存在しない）はコンテナの
+/// `#[serde(default)]` により [`PolarStep::default`]（`Fifteen`）へ補完される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PolarStep {
+    /// 15°刻み（既定）。
+    #[default]
+    Fifteen,
+    /// 30°刻み。
+    Thirty,
+    /// 45°刻み。
+    FortyFive,
+    /// 90°刻み。
+    Ninety,
+}
+
+impl PolarStep {
+    /// 刻み角を度で返す（[`crate::ortho::polar_track`] へそのまま渡す）。
+    #[must_use]
+    pub fn degrees(self) -> f64 {
+        match self {
+            PolarStep::Fifteen => 15.0,
+            PolarStep::Thirty => 30.0,
+            PolarStep::FortyFive => 45.0,
+            PolarStep::Ninety => 90.0,
+        }
+    }
+
+    /// 上部パネルのコンボボックスに並べる順（刻みの細かい順）。
+    pub const ALL: [PolarStep; 4] = [
+        PolarStep::Fifteen,
+        PolarStep::Thirty,
+        PolarStep::FortyFive,
+        PolarStep::Ninety,
+    ];
+
+    /// コンボボックスの表示ラベル（英語。ステータス表示・上部パネルは未日本語化領域）。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            PolarStep::Fifteen => "15°",
+            PolarStep::Thirty => "30°",
+            PolarStep::FortyFive => "45°",
+            PolarStep::Ninety => "90°",
+        }
+    }
+}
+
 impl Config {
+    /// 直交モードと極トラッキングの排他を保証する（直交優先）。
+    ///
+    /// F8/F10 トグル自体は互いを OFF にするので通常は両方 `true` になり得ないが、
+    /// 手編集した config.json は両方 `true` でも構文上は正当なため、読込時にここで
+    /// 正規化する（直交優先 = 既存の直交の挙動を変えない側。DESIGN.md M12 設計判断4
+    /// 実装時追記）。
+    fn normalize_exclusive_modes(&mut self) {
+        if self.ortho_enabled && self.polar_enabled {
+            self.polar_enabled = false;
+        }
+    }
+
     /// 新規文書用の [`SheetMeta`] を組み立てる。
     ///
     /// `fields`（表題欄記入内容）は空、`frame_visible` は `false`、`unit` は
@@ -212,8 +282,9 @@ pub fn load(path: &Path) -> Result<Option<Config>, String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    let config: Config = serde_json::from_str(&text)
+    let mut config: Config = serde_json::from_str(&text)
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    config.normalize_exclusive_modes();
     Ok(Some(config))
 }
 
@@ -318,6 +389,8 @@ mod tests {
         assert!(config.recent_files.is_empty());
         assert_eq!(config.plot_color_mode, PlotColorMode::Monochrome);
         assert_eq!(config.grid_mode, GridMode::Rectangular);
+        assert!(!config.polar_enabled);
+        assert_eq!(config.polar_step, PolarStep::Fifteen);
     }
 
     #[test]
@@ -325,6 +398,8 @@ mod tests {
         let config = Config {
             snap_enabled: false,
             ortho_enabled: true,
+            polar_enabled: false,
+            polar_step: PolarStep::Thirty,
             paper_display_enabled: true,
             default_paper: PaperSize::A2,
             default_orientation: Orientation::Portrait,
@@ -408,6 +483,62 @@ mod tests {
         fs::write(&path, r#"{"grid_mode": "Perspective"}"#).unwrap();
         let result = load(&path);
         assert!(result.is_err());
+    }
+
+    /// 旧バージョンの config.json（`polar_enabled`/`polar_step` フィールドが存在しない）を
+    /// 読み込んだとき、既定値（OFF・15°）へ補完される（M12 タスク84）。
+    #[test]
+    fn missing_polar_fields_default_to_off_and_fifteen_degrees() {
+        let config: Config =
+            serde_json::from_str(r#"{"snap_enabled": false, "default_paper": "A1"}"#).unwrap();
+        assert!(!config.polar_enabled);
+        assert_eq!(config.polar_step, PolarStep::Fifteen);
+    }
+
+    /// `polar_step` に存在しない値（不正値）が入っている config.json は、既存の
+    /// 「不正値で `load` が `Err` になる」規約に従う。
+    #[test]
+    fn invalid_polar_step_value_fails_to_load() {
+        let path = unique_temp_path("invalid-polar-step");
+        fs::write(&path, r#"{"polar_step": "Sixty"}"#).unwrap();
+        let result = load(&path);
+        assert!(result.is_err());
+    }
+
+    /// `polar_step` の全ラベル・度数の対応を固定する（上部パネルのコンボボックス用）。
+    #[test]
+    fn polar_step_all_labels_and_degrees() {
+        assert_eq!(PolarStep::Fifteen.degrees(), 15.0);
+        assert_eq!(PolarStep::Thirty.degrees(), 30.0);
+        assert_eq!(PolarStep::FortyFive.degrees(), 45.0);
+        assert_eq!(PolarStep::Ninety.degrees(), 90.0);
+        assert_eq!(PolarStep::Fifteen.label(), "15°");
+        assert_eq!(PolarStep::Thirty.label(), "30°");
+        assert_eq!(PolarStep::FortyFive.label(), "45°");
+        assert_eq!(PolarStep::Ninety.label(), "90°");
+        assert_eq!(PolarStep::ALL.len(), 4);
+    }
+
+    /// 直交・極トラッキングが両方 `true` の config.json（手編集を想定）は、`load` で
+    /// 直交優先へ正規化される（極が OFF になる。DESIGN.md M12 設計判断4 実装時追記）。
+    #[test]
+    fn load_normalizes_both_ortho_and_polar_enabled_to_ortho_only() {
+        let path = unique_temp_path("both-ortho-and-polar-enabled");
+        fs::write(&path, r#"{"ortho_enabled": true, "polar_enabled": true}"#).unwrap();
+        let config = load(&path).unwrap().expect("file exists");
+        assert!(config.ortho_enabled);
+        assert!(!config.polar_enabled);
+    }
+
+    /// 正規化は直交側の値を変えない（`ortho_enabled` が `false` のときは
+    /// `polar_enabled: true` をそのまま通す）。
+    #[test]
+    fn load_leaves_polar_enabled_alone_when_ortho_is_off() {
+        let path = unique_temp_path("polar-enabled-ortho-off");
+        fs::write(&path, r#"{"ortho_enabled": false, "polar_enabled": true}"#).unwrap();
+        let config = load(&path).unwrap().expect("file exists");
+        assert!(!config.ortho_enabled);
+        assert!(config.polar_enabled);
     }
 
     #[test]

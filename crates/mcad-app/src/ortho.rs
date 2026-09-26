@@ -14,6 +14,14 @@
 //! グリッドモードが `Isometric` のときは [`ISO_AXES`]、`Rectangular` のときは
 //! [`RECT_AXES`]（＝[`constrain`]）を使う（DESIGN.md 7章「アイソメ図・アクソメ図の
 //! 作図補助」アイソメ-2 設計確定）。
+//!
+//! # 極トラッキング（[`polar_track`]、M12 タスク84）
+//!
+//! 直交拘束（軸集合への投影）とは別の純関数として持つ。直交は「線」（向きを区別
+//! しない）へ拘束するが、極トラッキングは「半直線」（0°と180°は別候補、AutoCAD の
+//! POLARANG と同じ）へ拘束する。`resolve_click_point`（`main.rs`）が「スナップ >
+//! 直交 > 極」の優先で合成し、直交と極は `config.rs` の `Config` 上で排他にする
+//! （F8/F10 トグルが互いを OFF にする）ため、両方を同時に呼ぶことはない。
 
 use mcad_geom::Point2;
 
@@ -77,6 +85,70 @@ pub fn constrain_to_axes(origin: Point2, raw: Point2, axes: &[(f64, f64)]) -> Po
 #[must_use]
 pub fn constrain(origin: Point2, raw: Point2) -> Point2 {
     constrain_to_axes(origin, raw, &RECT_AXES)
+}
+
+/// 極トラッキング（[`polar_track`]）の捕捉結果。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PolarSnap {
+    /// `raw` を捕捉した半直線へ直交射影した点。
+    pub point: Point2,
+    /// 捕捉した半直線の角度（度、+X から CCW、`[0, 360)`。`step_deg` の倍数）。
+    pub angle_deg: f64,
+}
+
+/// 極トラッキングの捕捉角（画面角度、度）。ワールドとスクリーンは一様ズーム + y反転
+/// なので角度の大きさは変わらず、この定数はどちらの空間でも同じ値で使える。
+/// AutoCAD の既定 `POLARANG` トラッキングより気持ち狭く、3° を初期値にする
+/// （過敏に吸着しない程度。実機のスモークテストで調整しうる）。
+pub const POLAR_CATCH_DEG: f64 = 3.0;
+
+/// `origin` から見て `raw` の方向が、`step_deg`（度）の倍数（+X から CCW、0° 基準）の
+/// うちどれかから `catch_deg`（度）以内なら、その方向の半直線へ `raw` を直交射影した
+/// 点と角度を返す。外れていれば（`raw == origin` の退化ケース、`step_deg <= 0.0` を
+/// 含む）`None`。
+///
+/// [`constrain_to_axes`] の「線」（向きを区別しない）拘束と違い、**候補は「半直線」**
+/// （0°と180°は別候補）にする。極トラッキングは向きを持つため（AutoCAD の POLARANG と
+/// 同じ）。射影長は `catch_deg < 90°` の間は必ず非負になる（`raw` と最寄り候補方向の
+/// なす角が90°未満なら内積は正）。刻みの基準軸は常に +X（グリッドが等測でも変えない。
+/// DESIGN.md M12 設計判断4）。
+#[must_use]
+pub fn polar_track(
+    origin: Point2,
+    raw: Point2,
+    step_deg: f64,
+    catch_deg: f64,
+) -> Option<PolarSnap> {
+    let dx = raw.x - origin.x;
+    let dy = raw.y - origin.y;
+    if (dx == 0.0 && dy == 0.0) || step_deg <= 0.0 {
+        return None;
+    }
+
+    let raw_deg = dy.atan2(dx).to_degrees().rem_euclid(360.0);
+    let mut candidate_deg = ((raw_deg / step_deg).round() * step_deg).rem_euclid(360.0);
+    if candidate_deg >= 360.0 {
+        candidate_deg = 0.0;
+    }
+    if angle_diff(raw_deg, candidate_deg) > catch_deg {
+        return None;
+    }
+
+    // 単位ベクトル化は `numeric_input::unit_from_degrees` を再利用する（90°の倍数を
+    // 厳密な軸にする丸め方針を二重実装しないため。M12 タスク83 の実装時追記参照）。
+    let unit = crate::numeric_input::unit_from_degrees(candidate_deg);
+    let dot = dx * unit.x + dy * unit.y;
+    let point = Point2::new(origin.x + dot * unit.x, origin.y + dot * unit.y);
+    Some(PolarSnap {
+        point,
+        angle_deg: candidate_deg,
+    })
+}
+
+/// 2つの角度（度）の円環上の差分（`[0, 180]`）。
+fn angle_diff(a: f64, b: f64) -> f64 {
+    let d = (a - b).rem_euclid(360.0);
+    d.min(360.0 - d)
 }
 
 #[cfg(test)]
@@ -236,5 +308,80 @@ mod tests {
     fn iso_axes_raw_equal_to_origin_is_degenerate_but_does_not_panic() {
         let origin = Point2::new(1.0, 2.0);
         assert_eq!(constrain_to_axes(origin, origin, &ISO_AXES), origin);
+    }
+
+    #[test]
+    fn polar_track_within_catch_snaps_to_nearest_step() {
+        // 46° は 45°刻みの 45° 候補から 1° しか離れておらず、捕捉角 3° 以内。
+        let origin = Point2::new(0.0, 0.0);
+        let raw = point_at_degrees(origin, 46.0, 10.0);
+        let snap = polar_track(origin, raw, 45.0, 3.0).expect("should snap");
+        assert_eq!(snap.angle_deg, 45.0);
+        assert_direction(origin, snap.point, 45.0);
+    }
+
+    #[test]
+    fn polar_track_outside_catch_returns_none() {
+        // 50° は 45°刻みの最寄り候補（45°）から 5° 離れており、捕捉角 3° の外。
+        let origin = Point2::new(0.0, 0.0);
+        let raw = point_at_degrees(origin, 50.0, 10.0);
+        assert_eq!(polar_track(origin, raw, 45.0, 3.0), None);
+    }
+
+    #[test]
+    fn polar_track_catch_boundary_is_inclusive_and_exclusive_just_outside() {
+        // 「以内」は境界を含む（`diff > catch_deg` の判定は超過のみ拒否）。角度の
+        // 往復丸め（度→ラジアン→度）で「ちょうど」の角度差を厳密には作れないため、
+        // 実際の角度差を測ってからその値のわずか上/下で捕捉角を比較する。
+        let origin = Point2::new(0.0, 0.0);
+        let raw_deg = 18.0;
+        let raw = point_at_degrees(origin, raw_deg, 10.0);
+        let actual_diff = angle_diff(raw_deg.rem_euclid(360.0), 15.0);
+        assert!(polar_track(origin, raw, 15.0, actual_diff + 1e-9).is_some());
+        assert!(polar_track(origin, raw, 15.0, actual_diff - 1e-9).is_none());
+    }
+
+    #[test]
+    fn polar_track_raw_equal_to_origin_returns_none() {
+        let origin = Point2::new(3.0, -2.0);
+        assert_eq!(polar_track(origin, origin, 15.0, 3.0), None);
+    }
+
+    #[test]
+    fn polar_track_wraps_across_0_360_boundary() {
+        // 359° は 0°刻みの候補 0°（=360°）から 1° しか離れていない。
+        let origin = Point2::new(0.0, 0.0);
+        let raw = point_at_degrees(origin, 359.0, 10.0);
+        let snap = polar_track(origin, raw, 15.0, 3.0).expect("should wrap-snap to 0deg");
+        assert_eq!(snap.angle_deg, 0.0);
+        assert_direction(origin, snap.point, 0.0);
+    }
+
+    #[test]
+    fn polar_track_treats_opposite_directions_as_distinct_candidates() {
+        // 直交（constrain_to_axes）は「線」拘束で 0°/180° を区別しないが、極トラッキングは
+        // 「半直線」拘束なので 182° は 180° 候補へ捕捉し、0° 側へは倒れない。
+        let origin = Point2::new(0.0, 0.0);
+        let raw = point_at_degrees(origin, 182.0, 10.0);
+        let snap = polar_track(origin, raw, 90.0, 3.0).expect("should snap to 180deg");
+        assert_eq!(snap.angle_deg, 180.0);
+        assert_direction(origin, snap.point, 180.0);
+    }
+
+    #[test]
+    fn polar_track_projection_preserves_distance_when_raw_is_on_axis() {
+        // ちょうど軸上（45°、45°刻み）なら射影で長さが変わらない。
+        let origin = Point2::new(1.0, -1.0);
+        let raw = point_at_degrees(origin, 45.0, 7.0);
+        let snap = polar_track(origin, raw, 45.0, 3.0).expect("on-axis should snap");
+        assert_close(snap.point, raw);
+    }
+
+    #[test]
+    fn polar_track_zero_or_negative_step_returns_none() {
+        let origin = Point2::new(0.0, 0.0);
+        let raw = point_at_degrees(origin, 45.0, 10.0);
+        assert_eq!(polar_track(origin, raw, 0.0, 3.0), None);
+        assert_eq!(polar_track(origin, raw, -15.0, 3.0), None);
     }
 }

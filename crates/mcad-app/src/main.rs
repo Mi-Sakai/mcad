@@ -92,6 +92,14 @@ const SNAP_MARKER_COLOR: Color32 = Color32::from_rgb(60, 255, 120);
 /// スナップマーカーの基準サイズ（スクリーンピクセル。中心からの半幅相当）。
 const SNAP_MARKER_SIZE: f32 = 6.0;
 
+/// 極トラッキング（F10、M12 タスク84）のマーカー色。スナップマーカーの緑・数値入力欄の
+/// 暖色（[`NUMERIC_INPUT_ACCENT_COLOR`]）のどちらとも区別できる薄い水色にする。
+const POLAR_MARKER_COLOR: Color32 = Color32::from_rgb(120, 200, 255);
+/// 極トラッキングの点線のダッシュ長（スクリーンピクセル）。
+const POLAR_MARKER_DASH_PX: f32 = 5.0;
+/// 極トラッキングの点線のギャップ長（スクリーンピクセル）。
+const POLAR_MARKER_GAP_PX: f32 = 4.0;
+
 /// 数値入力欄（M12 タスク83）の文字色。
 const NUMERIC_INPUT_TEXT_COLOR: Color32 = Color32::from_rgb(240, 240, 240);
 /// 数値入力欄の背景（キャンバスの図形の上でも読めるよう不透明に近い暗色）。
@@ -766,6 +774,11 @@ struct McadApp {
     /// 直近フレームで作図ツールのカーソルがスナップした先。マーカー描画に使う。
     /// スナップしていない・作図ツール非アクティブ・スナップ無効のときは `None`。
     snap_marker: Option<snap::SnapResult>,
+    /// 直近フレームで極トラッキング（F10、M12 タスク84）が捕捉した方向。マーカー描画
+    /// （`draw_polar_marker`）に使う。スナップが当たった・直交モード中・極が無効・
+    /// 基点が無い・捕捉角の外・ホバーしていないのいずれかなら `None`
+    /// （`handle_tool_input` の `polar_marker_for` 参照）。
+    polar_marker: Option<PolarMarker>,
     /// ステータスバーに一時表示するメッセージ（主にコア操作のエラー通知）。
     /// メッセージごとに保持している表示時間（[`StatusMessage::duration_secs`]、通常は
     /// [`STATUS_MESSAGE_SECS`]、ファイル入出力の結果は [`STATUS_MESSAGE_SECS_IMPORTANT`]）
@@ -982,6 +995,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "F5=Iso Grid",
     "F8=Ortho",
     "F9=Paper View",
+    "F10=Polar",
     "Ctrl+Z=Undo",
     "Ctrl+Y=Redo",
     "Ctrl+N=New",
@@ -1158,6 +1172,7 @@ impl McadApp {
             config: startup.config,
             config_path: startup.path,
             snap_marker: None,
+            polar_marker: None,
             status: None,
             current_path: None,
             confirm_state: ConfirmState::Idle,
@@ -1215,6 +1230,37 @@ impl McadApp {
     ///
     /// キャンバス入力・ショートカット（F3/F8/F9/Home 含む）のゲートをこの1関数へ
     /// 集約する（M8タスク38。旧 `confirm_state != ConfirmState::Idle` 直書きの集約先）。
+    /// モーダル表示中に毎フレーム呼び、作図・配置の途中状態と表示中のマーカーを畳む
+    /// （DESIGN.md M7 設計判断6 の共通規約: モーダル表示は初期状態へ戻す）。
+    ///
+    /// マーカー（スナップ・極トラッキング）は選択ツールの状態に関係なく消す。モーダル中は
+    /// `handle_tool_input` が呼ばれず更新も消去もされないため、残すと古い吸着先が有効な
+    /// ガイドとしてモーダルの背後に出続ける（M12 タスク84、Codex adversarial review [medium]）。
+    fn reset_transient_state_for_modal(&mut self) {
+        if self.select_tool.is_placing()
+            || self.select_tool.is_offsetting()
+            || self.select_tool.is_grip_dragging()
+        {
+            self.select_tool.cancel_placement();
+            self.select_tool.cancel_offset();
+            self.select_tool.cancel_text_drag();
+            self.select_tool.cancel_grip_drag();
+        }
+        self.clear_markers_if_modal();
+        // トリム・延長の途中状態（採取済みの境界）もモーダル表示で畳む。
+        self.reset_picked_shape_tool();
+    }
+
+    /// モーダル表示中なら、スナップ・極トラッキングのマーカーを消す。モーダル中は
+    /// `handle_tool_input` が呼ばれず更新も消去もされないため、描画の直前にも呼んで、
+    /// モーダルを開いたフレーム（右パネル起点のダイアログ）でも古いマーカーを出さない。
+    fn clear_markers_if_modal(&mut self) {
+        if self.modal_open() {
+            self.snap_marker = None;
+            self.polar_marker = None;
+        }
+    }
+
     fn modal_open(&self) -> bool {
         self.confirm_state != ConfirmState::Idle
             || self.sheet_dialog.is_some()
@@ -1244,6 +1290,7 @@ impl McadApp {
         self.text_height_input = DEFAULT_TEXT_HEIGHT.to_owned();
         self.text_field_shown = false;
         self.snap_marker = None;
+        self.polar_marker = None;
         // 表題欄編集ダイアログ・尺度カスタム入力も別図面へ持ち越さない。
         self.sheet_dialog = None;
         self.scale_custom_selected = false;
@@ -1369,6 +1416,7 @@ impl McadApp {
         self.select_tool.cancel_text_drag();
         self.select_tool.cancel_grip_drag();
         self.snap_marker = None;
+        self.polar_marker = None;
         // 右パネル「寸法」の入力バッファは選択 ID 集合を鮮度キーにしているが、undo/redo は
         // 選択を変えずに注記の中身だけを変える。そのままだと undo で戻した値がバッファに
         // 残り、「確定」で undo を打ち消す新コマンドになる（M9 タスク50 Codex 指摘）。
@@ -1405,6 +1453,7 @@ impl McadApp {
         self.select_tool.cancel_grip_drag();
         self.reset_picked_shape_tool();
         self.snap_marker = None;
+        self.polar_marker = None;
     }
 
     /// ヒットテスト結果をスナップショットとして抱えるツール（トリム・延長・フィレット）を
@@ -2300,19 +2349,7 @@ impl eframe::App for McadApp {
         // Ctrl+N/Ctrl+O 等でモーダルを開いたのがこのフレームでも、上のショートカット処理で
         // `confirm_state` が更新済みなので同フレームで確実に解除できる。
         if self.modal_open() {
-            if self.select_tool.is_placing()
-                || self.select_tool.is_offsetting()
-                || self.select_tool.is_grip_dragging()
-            {
-                self.select_tool.cancel_placement();
-                self.select_tool.cancel_offset();
-                self.select_tool.cancel_text_drag();
-                self.select_tool.cancel_grip_drag();
-                self.snap_marker = None;
-            }
-            // トリム・延長の途中状態（採取済みの境界）もモーダル表示で畳む
-            // （DESIGN.md M7 設計判断6 の共通規約: モーダル表示は初期状態へ戻す）。
-            self.reset_picked_shape_tool();
+            self.reset_transient_state_for_modal();
         }
 
         // ウィンドウを閉じる操作（OSの閉じるボタン等）を検出する。未保存の変更が
@@ -2413,9 +2450,28 @@ impl eframe::App for McadApp {
 
         // F8 で直交モード（ortho）の有効/無効をトグルする。F3 と同じガード条件
         // （モーダル非表示中は常に効く）。ortho は専用マーカーを持たない設計
-        // （`ortho.rs` doc 参照）なので、トグル自体はフラグの反転のみでよい。
+        // （`ortho.rs` doc 参照）なので、トグル自体はフラグの反転のみでよい。直交と
+        // 極トラッキング（F10）は排他（DESIGN.md M12 設計判断4）なので、ONにする側で
+        // 他方をOFFにする。
         if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F8)) {
             self.config.ortho_enabled = !self.config.ortho_enabled;
+            if self.config.ortho_enabled {
+                self.config.polar_enabled = false;
+                self.polar_marker = None;
+            }
+            self.persist_config(now);
+        }
+
+        // F10 で極トラッキング（M12 タスク84）の有効/無効をトグルする。F8 と同じ排他・
+        // ガード条件。マーカーは `handle_tool_input` が毎フレーム更新するが、OFFへ
+        // 切り替えた瞬間に前の点線を1フレーム残さないようここでも消す。
+        if !self.modal_open() && ui.input(|i| i.key_pressed(Key::F10)) {
+            self.config.polar_enabled = !self.config.polar_enabled;
+            if self.config.polar_enabled {
+                self.config.ortho_enabled = false;
+            } else {
+                self.polar_marker = None;
+            }
             self.persist_config(now);
         }
 
@@ -2537,6 +2593,26 @@ impl eframe::App for McadApp {
                             "OFF"
                         }
                     ));
+                    ui.separator();
+                    // 極トラッキング（F10、M12 タスク84）。刻み角のコンボは ON/OFF に関わらず
+                    // 常設する（グリッド表示・Ortho ラベルと同じ「常に見える」流儀）。
+                    ui.label(if self.config.polar_enabled {
+                        format!("Polar: ON ({})", self.config.polar_step.label())
+                    } else {
+                        "Polar: OFF".to_owned()
+                    });
+                    let mut selected_step = self.config.polar_step;
+                    egui::ComboBox::from_id_salt("polar_step_combo")
+                        .selected_text(selected_step.label())
+                        .show_ui(ui, |ui| {
+                            for step in config::PolarStep::ALL {
+                                ui.selectable_value(&mut selected_step, step, step.label());
+                            }
+                        });
+                    if selected_step != self.config.polar_step {
+                        self.config.polar_step = selected_step;
+                        self.persist_config(now);
+                    }
                     ui.separator();
                     ui.label(format!(
                         "Paper view: {}",
@@ -2807,6 +2883,9 @@ impl eframe::App for McadApp {
             if !self.modal_open() {
                 if self.tool_kind == ToolKind::Select {
                     let dim_scale_k = self.document.sheet().scale.world_mm_per_paper_mm();
+                    // 選択・編集モードは極トラッキングの対象外（設計判断は
+                    // `polar_marker_for` の doc 参照）。前のツールのマーカーを持ち越さない。
+                    self.polar_marker = None;
                     handle_select_input(
                         ui,
                         &response,
@@ -2839,6 +2918,9 @@ impl eframe::App for McadApp {
                         self.config.snap_enabled,
                         &mut self.snap_marker,
                         self.config.ortho_enabled,
+                        self.config.polar_enabled,
+                        self.config.polar_step.degrees(),
+                        &mut self.polar_marker,
                         self.config.grid_mode,
                         &mut self.status,
                         now,
@@ -2935,8 +3017,14 @@ impl eframe::App for McadApp {
                     TEXT_PREVIEW_COLOR,
                 );
             }
+            // 右パネル（表題欄・寸法スタイル・表の各ダイアログ）はフレームの冒頭の
+            // `reset_transient_state_for_modal` より後で開くので、開いたフレームのためにここでも消す。
+            self.clear_markers_if_modal();
             if let Some(marker) = &self.snap_marker {
                 draw_snap_marker(&painter, rect, &self.viewport, marker);
+            }
+            if let Some(marker) = &self.polar_marker {
+                draw_polar_marker(&painter, rect, &self.viewport, marker);
             }
             // 数値入力欄とその確定先のプレビュー点（M12 タスク83）。最前面に描く。キャンバスの
             // 入力処理でツールが終わった（開始キーより前の `Esc` 等）なら、描く前に閉じる。
@@ -3433,6 +3521,9 @@ fn handle_tool_input(
     snap_enabled: bool,
     snap_marker: &mut Option<snap::SnapResult>,
     ortho_enabled: bool,
+    polar_enabled: bool,
+    polar_step_deg: f64,
+    polar_marker: &mut Option<PolarMarker>,
     grid_mode: config::GridMode,
     status: &mut Option<StatusMessage>,
     now: f64,
@@ -3497,6 +3588,9 @@ fn handle_tool_input(
             } else {
                 None
             };
+            // 図形ピック系ツールは基点を持たない（極トラッキングの対象外。設計判断は
+            // `polar_marker_for` の doc 参照）ので、マーカーも消す。
+            *polar_marker = None;
             // Move は Move(_) を無視する仕様（tool.rs 各ツールの on_input 参照）なので
             // raw をそのまま渡してよい。
             let _ = active.on_input(&ctx, InputEvent::Move(raw));
@@ -3504,22 +3598,40 @@ fn handle_tool_input(
             let extra_points = active.snap_points();
             let (_, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &extra_points);
             *snap_marker = marker;
-            let world =
-                resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin(), grid_mode);
+            *polar_marker = polar_marker_for(
+                marker,
+                raw,
+                ortho_enabled,
+                polar_enabled,
+                polar_step_deg,
+                active.ortho_origin(),
+            );
+            let world = resolve_click_point(
+                marker,
+                raw,
+                ortho_enabled,
+                polar_enabled,
+                polar_step_deg,
+                active.ortho_origin(),
+                grid_mode,
+            );
             // 数値入力の `L`（長さのみ）の方向は、いまツールがラバーバンドを引いている先
-            // （スナップ > 直交 > 素のカーソル）。入力欄が閉じていても覚えておく（M12 タスク83）。
+            // （スナップ > 直交 > 極 > 素のカーソル）。入力欄が閉じていても覚えておく
+            // （M12 タスク83、タスク84 で極を合成に追加）。
             numeric.set_cursor(world);
             let _ = active.on_input(&ctx, InputEvent::Move(world));
         }
     } else {
         *snap_marker = None;
+        *polar_marker = None;
     }
 
     // 数値入力欄（M12 タスク83）が開いていて、いまの文字列が点になるなら、プレビューを
-    // その点へ寄せる（確定と同じ点を見せる）。スナップは掛からないのでマーカーは消す。
-    // 解釈できない途中の文字列では従来どおりカーソルに追従する。
+    // その点へ寄せる（確定と同じ点を見せる）。スナップ・極トラッキングは掛からないので
+    // マーカーは消す。解釈できない途中の文字列では従来どおりカーソルに追従する。
     if let Some(point) = numeric.refresh_preview(active.numeric_input_base()) {
         *snap_marker = None;
+        *polar_marker = None;
         let _ = active.on_input(&ctx, InputEvent::Move(point));
     }
 
@@ -3575,8 +3687,15 @@ fn handle_tool_input(
         } else {
             let extra_points = active.snap_points();
             let (_, marker) = apply_snap(document, snap_enabled, raw, radius, grid, &extra_points);
-            let world =
-                resolve_click_point(marker, raw, ortho_enabled, active.ortho_origin(), grid_mode);
+            let world = resolve_click_point(
+                marker,
+                raw,
+                ortho_enabled,
+                polar_enabled,
+                polar_step_deg,
+                active.ortho_origin(),
+                grid_mode,
+            );
             result = active.on_input(&ctx, InputEvent::Click(world));
         }
     } else if numeric_submit {
@@ -7206,20 +7325,28 @@ fn apply_snap(
     }
 }
 
-/// スナップと直交モード（ortho、v0.7.1。アイソメ-2でグリッドモードに応じた軸切替に
-/// 対応）を「スナップ優先」で合成する（`ortho.rs` §2）。
+/// スナップ・直交モード（ortho、v0.7.1。アイソメ-2でグリッドモードに応じた軸切替に
+/// 対応）・極トラッキング（M12 タスク84）を「スナップ > 直交 > 極」の優先で合成する
+/// （`ortho.rs` §2）。
 ///
 /// `snap_result` が `Some`（スナップ候補が見つかった）ならその座標をそのまま使い、
-/// ortho は適用しない。`None`（候補なし）のときだけ、`ortho_enabled` かつ
+/// 直交・極のどちらも適用しない。`None`（候補なし）のときだけ、`ortho_enabled` かつ
 /// `origin`（[`tool::Tool::ortho_origin`]）が `Some` であれば `raw` を軸拘束する。
 /// 軸集合は `grid_mode` で切り替える: `Isometric` なら [`ortho::ISO_AXES`]
 /// （30°/90°/150°）、`Rectangular` なら水平・垂直（[`ortho::constrain`]）。
+/// 直交が効かない（`ortho_enabled` が `false`）ときだけ、`polar_enabled` かつ
+/// `origin` が `Some` であれば [`ortho::polar_track`] を試す（直交と極は
+/// `config.json` 上で排他なので両方 `true` にはならないが、関数としては直交を
+/// 先に見る）。刻みの基準軸は `grid_mode` に関わらず常に +X（グリッドが等測でも
+/// 変えない。DESIGN.md M12 設計判断4）。
 /// `Move`/`Click` の両経路が同じこの関数を通ることで、プレビューと確定がずれない。
 #[must_use]
 fn resolve_click_point(
     snap_result: Option<snap::SnapResult>,
     raw: Point2,
     ortho_enabled: bool,
+    polar_enabled: bool,
+    polar_step_deg: f64,
     origin: Option<Point2>,
     grid_mode: config::GridMode,
 ) -> Point2 {
@@ -7229,13 +7356,58 @@ fn resolve_click_point(
             config::GridMode::Rectangular => ortho::constrain(o, raw),
             config::GridMode::Isometric => ortho::constrain_to_axes(o, raw, &ortho::ISO_AXES),
         }),
+        None if polar_enabled => origin
+            .and_then(|o| ortho::polar_track(o, raw, polar_step_deg, ortho::POLAR_CATCH_DEG))
+            .map_or(raw, |snap| snap.point),
         None => raw,
     }
+}
+
+/// 極トラッキング（F10、M12 タスク84）が捕捉した方向の表示情報。`draw_polar_marker`
+/// 専用（点線 + 角度ラベル）で、`resolve_click_point` の点そのものとは別に持つ
+/// （ラベルは捕捉した点の近く、線は基点からキャンバス端まで、という描画の都合）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PolarMarker {
+    /// 点線の起点（`Tool::ortho_origin()`）。
+    origin: Point2,
+    /// 捕捉した半直線へ投影した点（カーソルの近く。角度ラベルをここへ添える）。
+    point: Point2,
+    /// 捕捉した半直線の角度（度、+X から CCW）。
+    angle_deg: f64,
+}
+
+/// `resolve_click_point` と同じ「スナップ > 直交 > 極」の優先順で、実際に極
+/// トラッキングが効いたときだけマーカー情報を返す（スナップが当たった・直交が
+/// 有効・極が無効・基点が無い・捕捉角の外はいずれも `None`）。値の計算そのものは
+/// `resolve_click_point` と別関数だが、判定条件は同じにする（呼び出し側は両方を
+/// 同じ引数で呼ぶ）。
+#[must_use]
+fn polar_marker_for(
+    snap_result: Option<snap::SnapResult>,
+    raw: Point2,
+    ortho_enabled: bool,
+    polar_enabled: bool,
+    polar_step_deg: f64,
+    origin: Option<Point2>,
+) -> Option<PolarMarker> {
+    if snap_result.is_some() || ortho_enabled || !polar_enabled {
+        return None;
+    }
+    let o = origin?;
+    let snap = ortho::polar_track(o, raw, polar_step_deg, ortho::POLAR_CATCH_DEG)?;
+    Some(PolarMarker {
+        origin: o,
+        point: snap.point,
+        angle_deg: snap.angle_deg,
+    })
 }
 
 #[cfg(test)]
 mod resolve_click_point_tests {
     use super::*;
+
+    /// 極トラッキングを使わないケース用のデフォルト刻み角（15°、他の項目には無関係）。
+    const NO_POLAR: (bool, f64) = (false, 15.0);
 
     #[test]
     fn snap_wins_over_ortho() {
@@ -7250,6 +7422,31 @@ mod resolve_click_point_tests {
                 snap_result,
                 raw,
                 true,
+                NO_POLAR.0,
+                NO_POLAR.1,
+                origin,
+                config::GridMode::Rectangular
+            ),
+            Point2::new(9.0, 9.0)
+        );
+    }
+
+    #[test]
+    fn snap_wins_over_polar() {
+        // スナップが当たっていれば、直交と同じく極トラッキングも掛けない。
+        let snap_result = Some(snap::SnapResult {
+            kind: snap::SnapKind::Endpoint,
+            point: Point2::new(9.0, 9.0),
+        });
+        let raw = Point2::new(10.0, 0.1); // ほぼ 0° 方向 = 15°刻みに捕捉されうる位置
+        let origin = Some(Point2::new(0.0, 0.0));
+        assert_eq!(
+            resolve_click_point(
+                snap_result,
+                raw,
+                false,
+                true,
+                15.0,
                 origin,
                 config::GridMode::Rectangular
             ),
@@ -7262,7 +7459,34 @@ mod resolve_click_point_tests {
         let raw = Point2::new(10.0, 0.5);
         let origin = Some(Point2::new(0.0, 0.0));
         assert_eq!(
-            resolve_click_point(None, raw, true, origin, config::GridMode::Rectangular),
+            resolve_click_point(
+                None,
+                raw,
+                true,
+                NO_POLAR.0,
+                NO_POLAR.1,
+                origin,
+                config::GridMode::Rectangular
+            ),
+            Point2::new(10.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn ortho_wins_over_polar_when_both_somehow_enabled() {
+        // 通常は config.json 上で排他だが、関数としては直交を先に見る（doc の優先順）。
+        let raw = Point2::new(10.0, 0.5);
+        let origin = Some(Point2::new(0.0, 0.0));
+        assert_eq!(
+            resolve_click_point(
+                None,
+                raw,
+                true,
+                true,
+                15.0,
+                origin,
+                config::GridMode::Rectangular
+            ),
             Point2::new(10.0, 0.0)
         );
     }
@@ -7272,7 +7496,15 @@ mod resolve_click_point_tests {
         let raw = Point2::new(10.0, 0.5);
         let origin = Some(Point2::new(0.0, 0.0));
         assert_eq!(
-            resolve_click_point(None, raw, false, origin, config::GridMode::Rectangular),
+            resolve_click_point(
+                None,
+                raw,
+                false,
+                NO_POLAR.0,
+                NO_POLAR.1,
+                origin,
+                config::GridMode::Rectangular
+            ),
             raw
         );
     }
@@ -7282,7 +7514,15 @@ mod resolve_click_point_tests {
         // 1点目のクリック待ちなど、基準点がまだ無い局面。
         let raw = Point2::new(10.0, 0.5);
         assert_eq!(
-            resolve_click_point(None, raw, true, None, config::GridMode::Rectangular),
+            resolve_click_point(
+                None,
+                raw,
+                true,
+                NO_POLAR.0,
+                NO_POLAR.1,
+                None,
+                config::GridMode::Rectangular
+            ),
             raw
         );
     }
@@ -7294,9 +7534,111 @@ mod resolve_click_point_tests {
         let origin = Some(Point2::new(0.0, 0.0));
         let expected = ortho::constrain_to_axes(Point2::new(0.0, 0.0), raw, &ortho::ISO_AXES);
         assert_eq!(
-            resolve_click_point(None, raw, true, origin, config::GridMode::Isometric),
+            resolve_click_point(
+                None,
+                raw,
+                true,
+                NO_POLAR.0,
+                NO_POLAR.1,
+                origin,
+                config::GridMode::Isometric
+            ),
             expected
         );
+    }
+
+    #[test]
+    fn polar_on_within_catch_snaps_to_step() {
+        // origin=(0,0)、raw は 1° 方向（15°刻みの 0° 候補から 1° = 捕捉角 3° 以内）。
+        let origin = Point2::new(0.0, 0.0);
+        let raw = origin
+            + mcad_geom::Vec2::new(1.0_f64.to_radians().cos(), 1.0_f64.to_radians().sin()) * 10.0;
+        let result = resolve_click_point(
+            None,
+            raw,
+            false,
+            true,
+            15.0,
+            Some(origin),
+            config::GridMode::Rectangular,
+        );
+        // 0° 軸（+X）上に乗る。
+        assert!((result.y - origin.y).abs() < 1e-9);
+        assert!(result.x > origin.x);
+    }
+
+    #[test]
+    fn polar_on_outside_catch_returns_raw() {
+        // 8° 方向は 15°刻みの最寄り候補（0°）から 8° 離れており、捕捉角 3° の外。
+        let origin = Point2::new(0.0, 0.0);
+        let raw = origin
+            + mcad_geom::Vec2::new(8.0_f64.to_radians().cos(), 8.0_f64.to_radians().sin()) * 10.0;
+        let result = resolve_click_point(
+            None,
+            raw,
+            false,
+            true,
+            15.0,
+            Some(origin),
+            config::GridMode::Rectangular,
+        );
+        assert_eq!(result, raw);
+    }
+
+    #[test]
+    fn polar_off_returns_raw_even_with_origin() {
+        let origin = Point2::new(0.0, 0.0);
+        let raw = Point2::new(10.0, 0.1);
+        assert_eq!(
+            resolve_click_point(
+                None,
+                raw,
+                false,
+                false,
+                15.0,
+                Some(origin),
+                config::GridMode::Rectangular
+            ),
+            raw
+        );
+    }
+
+    #[test]
+    fn polar_on_without_origin_returns_raw() {
+        // 基点がまだ無い局面では極トラッキングも直交と同じく効かない。
+        let raw = Point2::new(10.0, 0.1);
+        assert_eq!(
+            resolve_click_point(
+                None,
+                raw,
+                false,
+                true,
+                15.0,
+                None,
+                config::GridMode::Rectangular
+            ),
+            raw
+        );
+    }
+
+    #[test]
+    fn polar_step_basis_axis_is_always_plus_x_even_in_isometric_grid() {
+        // グリッドが等測でも、極トラッキングの刻みの基準軸は常に +X のまま
+        // （直交と違い ISO_AXES へは切り替えない。DESIGN.md M12 設計判断4）。
+        let origin = Point2::new(0.0, 0.0);
+        let raw = origin
+            + mcad_geom::Vec2::new(1.0_f64.to_radians().cos(), 1.0_f64.to_radians().sin()) * 10.0;
+        let result = resolve_click_point(
+            None,
+            raw,
+            false,
+            true,
+            15.0,
+            Some(origin),
+            config::GridMode::Isometric,
+        );
+        assert!((result.y - origin.y).abs() < 1e-9);
+        assert!(result.x > origin.x);
     }
 }
 
@@ -8952,6 +9294,51 @@ fn draw_snap_marker(
     }
 }
 
+/// 極トラッキング（F10、M12 タスク84）の捕捉方向を描画する: 基点からカーソル側へ
+/// キャンバス端まで伸びる点線と、捕捉点の近くへ角度ラベル。スナップマーカーの緑・
+/// 数値入力欄の暖色のいずれとも区別できる色（[`POLAR_MARKER_COLOR`]）にする。
+///
+/// 点線は基点（ワールド）→捕捉点（ワールド）の向きをスクリーン空間で求め直してから
+/// [`clip_segment_to_rect`] で可視区間へ落とす（ワールド→スクリーンは一様スケール +
+/// y反転なので、2点をスクリーンへ変換するだけで向きを正しく引き継げる。ワールド距離
+/// を別途計算する必要がない）。基点と捕捉点がスクリーン上でほぼ重なる退化ケース
+/// （ズームが極端に小さい等）では線を省き、ラベルだけ描く。
+fn draw_polar_marker(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    marker: &PolarMarker,
+) {
+    let origin_screen = viewport.world_to_screen(rect, marker.origin);
+    let point_screen = viewport.world_to_screen(rect, marker.point);
+    let stroke = Stroke::new(1.0, POLAR_MARKER_COLOR);
+
+    let delta = point_screen - origin_screen;
+    let len = delta.length();
+    if len > f32::EPSILON {
+        let dir = delta / len;
+        // 基点が画面外の遠方にあっても画面端を越えるよう、捕捉点までの距離に画面の
+        // 幅+高さを足した長さまで伸ばす（捕捉点はカーソル付近 = 画面内）。
+        let far = origin_screen + dir * (len + rect.width() + rect.height());
+        if let Some((from, to)) = clip_segment_to_rect(origin_screen, far, rect) {
+            painter.extend(egui::Shape::dashed_line(
+                &[from, to],
+                stroke,
+                POLAR_MARKER_DASH_PX,
+                POLAR_MARKER_GAP_PX,
+            ));
+        }
+    }
+
+    painter.text(
+        point_screen + egui::vec2(10.0, -10.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("{:.0}°", marker.angle_deg),
+        egui::FontId::proportional(12.0),
+        POLAR_MARKER_COLOR,
+    );
+}
+
 /// 選択中の寸法のグリップ（スクリーン固定サイズの正方形）を描く（M11 タスク75、
 /// DESIGN.md「タスク75の着手時設計」(1)）。可視レイヤーの寸法にのみ描く（非表示
 /// レイヤーは描画・ヒットテストの対象外という既存規約と同じ）。ロック中のレイヤーの
@@ -9647,6 +10034,36 @@ mod tests {
         assert!(app.modal_open());
         app.sheet_dialog = None;
         assert!(!app.modal_open());
+    }
+
+    #[test]
+    fn modal_reset_clears_markers_even_while_drawing() {
+        // 通常の作図ツール（選択ツールは配置・オフセット・グリップ操作のいずれでもない）で
+        // 極トラッキングとスナップのマーカーが出ている状態からモーダルを開いても、両方消える
+        // （M12 タスク84、Codex adversarial review [medium]）。
+        let mut app = McadApp::new();
+        app.snap_marker = Some(snap::SnapResult {
+            kind: snap::SnapKind::Endpoint,
+            point: Point2::new(1.0, 2.0),
+        });
+        app.polar_marker = Some(PolarMarker {
+            origin: Point2::new(0.0, 0.0),
+            point: Point2::new(10.0, 0.0),
+            angle_deg: 0.0,
+        });
+        assert!(!app.select_tool.is_placing());
+
+        // モーダルが無ければ消さない（通常の作図中の表示）。
+        app.clear_markers_if_modal();
+        assert!(app.snap_marker.is_some());
+        assert!(app.polar_marker.is_some());
+
+        // 右パネルから開くダイアログと同じく、フレームの途中でモーダル状態になった場合。
+        app.sheet_dialog = Some(TitleBlockDialogState::from_sheet(app.document.sheet()));
+        app.clear_markers_if_modal();
+
+        assert!(app.snap_marker.is_none());
+        assert!(app.polar_marker.is_none());
     }
 
     #[test]
@@ -11368,6 +11785,8 @@ mod tests {
             config: config::Config {
                 snap_enabled: false,
                 ortho_enabled: true,
+                polar_enabled: false,
+                polar_step: config::PolarStep::default(),
                 paper_display_enabled: true,
                 default_paper: PaperSize::A1,
                 default_orientation: Orientation::Portrait,

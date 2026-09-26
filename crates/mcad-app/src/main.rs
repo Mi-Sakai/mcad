@@ -92,6 +92,16 @@ const SNAP_MARKER_COLOR: Color32 = Color32::from_rgb(60, 255, 120);
 /// スナップマーカーの基準サイズ（スクリーンピクセル。中心からの半幅相当）。
 const SNAP_MARKER_SIZE: f32 = 6.0;
 
+/// 仮想交点（M12 タスク87）の延長部分ガイドの点線ダッシュ長（スクリーンピクセル）。
+const SNAP_GUIDE_DASH_PX: f32 = 4.0;
+/// 仮想交点ガイドの点線ギャップ長（スクリーンピクセル）。
+const SNAP_GUIDE_GAP_PX: f32 = 3.0;
+/// 仮想交点の円弧ガイドを折れ線近似するときの、全周（TAU）あたりの分割数。
+const SNAP_GUIDE_ARC_STEPS: u32 = 48;
+/// 仮想交点ガイドを切り取る矩形（キャンバス `rect`）の拡張幅（スクリーンピクセル）。
+/// 縁ちょうどでダッシュが途切れて見えないよう、少し広げてから切る。
+const SNAP_GUIDE_CLIP_MARGIN_PX: f32 = 4.0;
+
 /// 極トラッキング（F10、M12 タスク84）のマーカー色。スナップマーカーの緑・数値入力欄の
 /// 暖色（[`NUMERIC_INPUT_ACCENT_COLOR`]）のどちらとも区別できる薄い水色にする。
 const POLAR_MARKER_COLOR: Color32 = Color32::from_rgb(120, 200, 255);
@@ -2596,6 +2606,7 @@ impl eframe::App for McadApp {
                         ui.checkbox(&mut snap_kinds.quadrant, "Quadrant");
                         ui.checkbox(&mut snap_kinds.perpendicular, "Perpendicular");
                         ui.checkbox(&mut snap_kinds.tangent, "Tangent");
+                        ui.checkbox(&mut snap_kinds.virtual_intersection, "Virtual intersection");
                         ui.checkbox(&mut snap_kinds.nearest, "Nearest");
                         ui.checkbox(&mut snap_kinds.grid, "Grid");
                     });
@@ -7462,6 +7473,7 @@ mod resolve_click_point_tests {
         let snap_result = Some(snap::SnapResult {
             kind: snap::SnapKind::Endpoint,
             point: Point2::new(9.0, 9.0),
+            guides: [None, None],
         });
         let raw = Point2::new(10.0, 0.5);
         let origin = Some(Point2::new(0.0, 0.0));
@@ -7485,6 +7497,7 @@ mod resolve_click_point_tests {
         let snap_result = Some(snap::SnapResult {
             kind: snap::SnapKind::Endpoint,
             point: Point2::new(9.0, 9.0),
+            guides: [None, None],
         });
         let raw = Point2::new(10.0, 0.1); // ほぼ 0° 方向 = 15°刻みに捕捉されうる位置
         let origin = Some(Point2::new(0.0, 0.0));
@@ -9417,6 +9430,17 @@ fn draw_snap_marker(
             painter.circle_stroke(circle_center, r, stroke);
             seg(Pos2::new(c.x - s, line_y), Pos2::new(c.x + s, line_y));
         }
+        SnapKind::VirtualIntersection => {
+            // × を □ で囲む（既存の端点=□・交点=×と見分けられる形。M12 タスク87）。
+            let r = Rect::from_center_size(c, egui::vec2(s * 2.0, s * 2.0));
+            seg(r.left_top(), r.right_top());
+            seg(r.right_top(), r.right_bottom());
+            seg(r.right_bottom(), r.left_bottom());
+            seg(r.left_bottom(), r.left_top());
+            let xs = s * 0.7;
+            seg(c + egui::vec2(-xs, -xs), c + egui::vec2(xs, xs));
+            seg(c + egui::vec2(-xs, xs), c + egui::vec2(xs, -xs));
+        }
         SnapKind::Nearest => {
             // 砂時計（⧗。上下の水平線 + 対角線2本）。
             let top_left = c + egui::vec2(-s, -s);
@@ -9432,6 +9456,73 @@ fn draw_snap_marker(
             // ＋。
             seg(c + egui::vec2(-s, 0.0), c + egui::vec2(s, 0.0));
             seg(c + egui::vec2(0.0, -s), c + egui::vec2(0.0, s));
+        }
+    }
+
+    // 仮想交点の延長部分ガイド（点線）。他の種別は guides が [None, None] なので何もしない。
+    for guide in marker.guides.iter().flatten() {
+        draw_snap_guide(painter, rect, viewport, guide);
+    }
+}
+
+/// [`draw_snap_marker`] から呼ぶ、仮想交点（M12 タスク87）の延長部分ガイドの描画。
+/// 直線部分は始点・終点を結ぶ点線、円弧部分は角度を `SNAP_GUIDE_ARC_STEPS` 分割した
+/// 折れ線を点線で近似する。色・線幅は他のスナップマーカーと共通（[`SNAP_MARKER_COLOR`]）。
+///
+/// 仮想交点の候補（延長側の実体側端点）は文書全体の直線から出るため、`rect`（キャンバス）
+/// のはるか外にありうる。各区間を [`clip_segment_to_rect`]（Liang–Barsky、`rect` を
+/// [`SNAP_GUIDE_CLIP_MARGIN_PX`] だけ広げた矩形）で可視部分へ切ってから
+/// `dashed_line` へ渡す: 切らずに渡すとスクリーン距離に比例した数のダッシュが毎フレーム
+/// 生成され（例: 端点が画面から 1e6px 離れていれば約14万本）、フレームレートを落とす
+/// （一次レビュー指摘、2026-09-26）。矩形と交わらない区間は描かない。
+fn draw_snap_guide(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    guide: &snap::SnapGuide,
+) {
+    let stroke = Stroke::new(1.0, SNAP_MARKER_COLOR);
+    let clip_rect = rect.expand(SNAP_GUIDE_CLIP_MARGIN_PX);
+    let draw_clipped = |a: Pos2, b: Pos2| {
+        if let Some((ca, cb)) = clip_segment_to_rect(a, b, clip_rect) {
+            painter.extend(egui::Shape::dashed_line(
+                &[ca, cb],
+                stroke,
+                SNAP_GUIDE_DASH_PX,
+                SNAP_GUIDE_GAP_PX,
+            ));
+        }
+    };
+    match *guide {
+        snap::SnapGuide::Segment { from, to } => {
+            let a = viewport.world_to_screen(rect, from);
+            let b = viewport.world_to_screen(rect, to);
+            draw_clipped(a, b);
+        }
+        snap::SnapGuide::Arc {
+            center,
+            radius,
+            start_angle,
+            sweep,
+        } => {
+            let steps = ((sweep.abs() / std::f64::consts::TAU) * SNAP_GUIDE_ARC_STEPS as f64)
+                .ceil()
+                .max(1.0) as usize;
+            let pts: Vec<Pos2> = (0..=steps)
+                .map(|i| {
+                    let theta = start_angle + sweep * (i as f64 / steps as f64);
+                    let p = Point2::new(
+                        center.x + radius * theta.cos(),
+                        center.y + radius * theta.sin(),
+                    );
+                    viewport.world_to_screen(rect, p)
+                })
+                .collect();
+            // 円弧の折れ線も区間ごとに切る（大半径の円弧も画面外まで伸びうるため、
+            // 直線と同じ理由でダッシュ数が爆発しうる）。
+            for pair in pts.windows(2) {
+                draw_clipped(pair[0], pair[1]);
+            }
         }
     }
 }
@@ -10187,6 +10278,7 @@ mod tests {
         app.snap_marker = Some(snap::SnapResult {
             kind: snap::SnapKind::Endpoint,
             point: Point2::new(1.0, 2.0),
+            guides: [None, None],
         });
         app.polar_marker = Some(PolarMarker {
             origin: Point2::new(0.0, 0.0),

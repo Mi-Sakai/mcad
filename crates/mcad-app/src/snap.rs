@@ -12,9 +12,7 @@
 //! > 端点 > 交点 > 中点 > 中心 = 四半円点 > 垂線 = 接線 > 仮想交点 > 近接点 > グリッド
 //!
 //! 中心と四半円点は同順位（[`SnapKind::priority`] が同じ値を返す）で、同順位内は
-//! カーソルとの距離で決める。垂線・接線（M12 タスク86）・仮想交点（M12 タスク87）は
-//! 本タスク（85）の時点では未実装だが、優先度の数値は先に空けてある
-//! （[`SnapKind::priority`] のコメント参照）。
+//! カーソルとの距離で決める。
 //!
 //! 半径内に複数種別の候補があれば **優先度が高い種別** を採用し、同種別内では
 //! カーソルに **最も近い** ものを選ぶ（[`Best::consider`]）。半径内に候補が
@@ -65,11 +63,84 @@
 //! base.is_some()` を足し、無効な種別・基点の無い呼び出しでは集合の構築自体を省く
 //! （M12 タスク85 Codex adversarial review の「無効な種別は計算自体を省く」方針を
 //! そのまま踏襲）。
+//!
+//! # 仮想交点の絞り込み（M12 タスク87）
+//!
+//! 仮想交点（[`SnapKind::VirtualIntersection`]）は線分・ポリラインの辺の **延長どうし**、
+//! および延長と円・円弧の交点を候補にする。交点は延長線上（両エンティティの AABB の
+//! 外）にありうるため、交点用の `near`（カーソル近傍 AABB との交差）は使えない
+//! （延長線上の交点を持つ図形の AABB がカーソル近傍 AABB と交差する保証がない）。
+//!
+//! 代わりに、可視 Shape を全走査して次のどちらかに当たるものだけを集める:
+//!
+//! - 線要素（[`Shape::Line`]・[`Shape::Polyline`] の各辺）: **無限直線とカーソルの
+//!   距離が探索半径以内**。
+//! - 円要素（[`Shape::Circle`]・[`Shape::Arc`] を台円とみなしたもの）:
+//!   **`|カーソル-中心間距離 − 半径| が探索半径以内**。
+//!
+//! この絞り込みは無損失: 交点 `p` がカーソルから半径 `r` 以内にあるとき、
+//! - 直線については、点と直線の距離は `p` を含む直線上の任意の点までの距離以下なので、
+//!   直線とカーソルの距離は `|cursor - p| ≤ r` 以下になる。
+//! - 円については、三角不等式より `|cursor-center| ≤ |cursor-p| + |p-center| ≤ r + 半径`、
+//!   かつ `|cursor-center| ≥ |p-center| - |cursor-p| ≥ 半径 - r` なので、
+//!   `| |cursor-center| - 半径 | ≤ r` が成り立つ。
+//!
+//! 集めた線要素・円要素どうしの組（線×線、線×円のみ。円×円は設計判断5の対象外）を
+//! 総当たりし、[`mcad_geom::line_line_intersection`]・[`mcad_geom::line_circle_intersection`]
+//! （どちらも無限直線とみなす）で交点を求める。交点が両方の実体上（線分の区間内、
+//! かつ円上／円弧の掃引範囲内）にある場合は**真の交点**として [`SnapKind::Intersection`]
+//! の担当に譲り、仮想交点の候補にはしない（重複は優先度で解ける）。少なくとも片方が
+//! 延長側なら仮想交点の候補にし、延長側にだけ [`SnapGuide`] を添える。
+//! `kinds.virtual_intersection` が `false` なら、この走査自体を行わない
+//! （M12 タスク85 Codex adversarial review の「無効な種別は計算自体を省く」方針を
+//! そのまま踏襲）。
+//!
+//! ## 同一直線上の線要素のグループ化と上限（Codex adversarial review [high]、2026-09-26）
+//!
+//! 上記の絞り込みだけでは、「カーソルの行・列上に同じ無限直線の線分が数千本ある図面」
+//! （例: 同じ y=0 上に短い線分が5000本並ぶ）で総当たりが本数の2乗に爆発し、既定 ON の
+//! まま毎マウス移動で固まる。これを避けるため、収集した線要素を
+//! [`group_collinear_lines`] で「同一の無限直線とみなせるもの」ごとに1つの
+//! [`LineGroup`]（支持直線）へまとめてから総当たりする（交点計算はグループの代表
+//! 線分どうし・代表と円で行い、実体上の判定〔[`group_contains_point`]〕・ガイドの
+//! `from`〔[`nearest_group_endpoint`]〕はグループの**全メンバー**を見る）。これにより
+//! 「同じ無限直線上に大量の線分」というケースの計算量は本数ではなくグループ数（≒
+//! 図面中の異なる直線の本数）に依存するようになる。
+//!
+//! 一方、グループ化しても「放射状に多数の非平行な直線がカーソル近傍を通る」病的な
+//! ケースは残る。**当初はグループ化後の線グループ数・円要素数を本数で切り詰めていたが
+//! （`VIRTUAL_INTERSECTION_MAX_LINES`・`VIRTUAL_INTERSECTION_MAX_CIRCLES`）、
+//! Codex adversarial review [medium] の再指摘（2026-09-26）でこの方式の欠陥が判明した**:
+//! 本数の切り詰めは「交わるかどうか」を見ないため、カーソル半径内に異なる平行線
+//! （ハッチング等）が上限本数以上あると、枠が平行線だけで埋まってしまい、少し遠い
+//! 交差線（実際に仮想交点を作る相手）が切り捨てられて交点そのものが消える。
+//!
+//! 対応として、**本数の上限を「実際に計算する組の数」の予算へ置き換え**、あわせて
+//! **平行なグループどうしは組を作らない**ようにした（[`group_collinear_lines`] の
+//! 段階1で採番する [`LineGroup::angle_cluster`] が同じグループどうしはスキップする。
+//! ハッチングのような平行線がいくら多くても組の数を増やさない）。線グループ・円要素は
+//! どちらもカーソルとの距離で昇順に並べておき、組は「距離順に並べた添字 `i` の昇順、
+//! 各 `i` に対し `j < i` の昇順」で処理する（先に処理される組ほど両方がカーソルに
+//! 近い）。**線×線（[`VIRTUAL_INTERSECTION_MAX_LINE_PAIRS`]）と線×円
+//! （[`VIRTUAL_INTERSECTION_MAX_LINE_CIRCLE_PAIRS`]）は独立した予算**を持つ（単一の
+//! 共有予算だと、線×線を先に処理する実装順序の都合で、非平行な線グループが予算本数
+//! 近くカーソル近傍にあるだけで線×円が1組も調べられなくなるため。Codex adversarial
+//! review [medium] 再々指摘、2026-09-26）。**既知の制約**（打ち切りが無損失でなくなる
+//! 唯一の例外）は DESIGN.md タスク87の実装時追記を参照。
+//!
+//! 副作用として、**同一直線上の別の線分の延長が真の交点上で仮想交点として出ることは
+//! なくなった**: グループ化前は同一直線上の線分ごとに独立して真偽を判定していたため、
+//! ある線分では延長（虚）でも同じグループの別の線分では区間内（実）という場合に、
+//! 前者を仮想交点として提示してしまっていた。グループ化後は「グループ内のいずれかの
+//! メンバー上にあれば実体上」という判定になり、この不整合が解消された。
 
 use mcad_core::{Document, Entity, EntityGeom, EntityId};
-use mcad_geom::{Aabb, Point2, Shape, closest_point, intersect, point_tol};
+use mcad_geom::{
+    Aabb, Arc, Circle, LineSeg, Point2, Shape, Vec2, closest_point, intersect,
+    line_circle_intersection, line_line_intersection, point_tol,
+};
 use serde::{Deserialize, Serialize};
-use std::f64::consts::{FRAC_PI_2, PI};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::config::GridMode;
 
@@ -99,6 +170,10 @@ pub enum SnapKind {
     /// 接線の接点（基点から円・円弧への接線の接点。円弧は弧の範囲内のみ。基点が要る。
     /// M12 タスク86）。
     Tangent,
+    /// 仮想交点（線分・ポリラインの辺の延長どうし、および延長と円・円弧の交点。
+    /// 実体上にある交点（真の交点）は [`SnapKind::Intersection`] の担当なので候補にしない。
+    /// M12 タスク87）。
+    VirtualIntersection,
     /// 近接点（可視 Shape 上でカーソルに最も近い点。既定 OFF。M12 タスク85）。
     Nearest,
     /// グリッド交点。
@@ -108,8 +183,8 @@ pub enum SnapKind {
 impl SnapKind {
     /// 数値優先度（小さいほど高優先）。同順位内はカーソルとの距離で決める。
     ///
-    /// `5` は M12 タスク87（仮想交点）用に空けてある（DESIGN.md M12 設計判断5:
-    /// 端点 > 交点 > 中点 > 中心 = 四半円点 > 垂線 = 接線 > 仮想交点 > 近接点 > グリッド）。
+    /// DESIGN.md M12 設計判断5: 端点 > 交点 > 中点 > 中心 = 四半円点 > 垂線 = 接線 >
+    /// 仮想交点 > 近接点 > グリッド。
     #[must_use]
     fn priority(self) -> u8 {
         match self {
@@ -120,7 +195,7 @@ impl SnapKind {
             SnapKind::Quadrant => 3,
             SnapKind::Perpendicular => 4,
             SnapKind::Tangent => 4,
-            // 5 は仮想交点（タスク87）用に予約。
+            SnapKind::VirtualIntersection => 5,
             SnapKind::Nearest => 6,
             SnapKind::Grid => 7,
         }
@@ -157,6 +232,9 @@ pub struct SnapKinds {
     /// 接線の接点。既定 ON。M12 タスク86。
     #[serde(default = "default_true")]
     pub tangent: bool,
+    /// 仮想交点。既定 ON。M12 タスク87。
+    #[serde(default = "default_true")]
+    pub virtual_intersection: bool,
     /// 近接点。**既定 OFF**。
     #[serde(default)]
     pub nearest: bool,
@@ -181,6 +259,7 @@ impl Default for SnapKinds {
             quadrant: true,
             perpendicular: true,
             tangent: true,
+            virtual_intersection: true,
             nearest: false,
             grid: true,
         }
@@ -199,10 +278,42 @@ impl SnapKinds {
             SnapKind::Quadrant => self.quadrant,
             SnapKind::Perpendicular => self.perpendicular,
             SnapKind::Tangent => self.tangent,
+            SnapKind::VirtualIntersection => self.virtual_intersection,
             SnapKind::Nearest => self.nearest,
             SnapKind::Grid => self.grid,
         }
     }
+}
+
+/// 仮想交点（[`SnapKind::VirtualIntersection`]）の延長部分を示すガイド（点線で描く）。
+///
+/// 実体上（線分の区間内・円上・円弧の掃引範囲内）にある側にはガイドが無い
+/// （[`SnapResult::guides`] が `None` になる）。`Copy` を保つため配列 2 要素で持つ
+/// （組は線×線・線×円の 2 者間なので最大 2 本）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SnapGuide {
+    /// 線要素（線分・ポリラインの辺）の延長部分。`from` は実体側の近い方の端点、
+    /// `to` は仮想交点。
+    Segment {
+        /// ガイドの起点（実体側の近い方の端点）。
+        from: Point2,
+        /// ガイドの終点（仮想交点）。
+        to: Point2,
+    },
+    /// 円弧の掃引範囲外（延長側）の円周に沿ったガイド。近い方の弧端点
+    /// （`start_angle`）から仮想交点まで、弧の外側（掃引範囲の無い側）を回る向きに
+    /// `sweep` ラジアン進む（負なら時計回り）。完全な円（[`Shape::Circle`]）は
+    /// 掃引の概念が無くこのバリアントを使わない（常にガイド無し）。
+    Arc {
+        /// 台円の中心。
+        center: Point2,
+        /// 台円の半径。
+        radius: f64,
+        /// ガイドの開始角（ラジアン。近い方の弧端点の角度）。
+        start_angle: f64,
+        /// ガイドの掃引角（ラジアン、符号付き。正が CCW、負が CW）。
+        sweep: f64,
+    },
 }
 
 /// スナップ結果。採用した候補の種別と、スナップ先のワールド座標。
@@ -212,6 +323,9 @@ pub struct SnapResult {
     pub kind: SnapKind,
     /// スナップ先のワールド座標。
     pub point: Point2,
+    /// 仮想交点（[`SnapKind::VirtualIntersection`]）の延長部分ガイド。組んだ 2
+    /// エンティティぶん（線×線・線×円）。実体上にある側・他の種別は `None`。
+    pub guides: [Option<SnapGuide>; 2],
 }
 
 /// グリッドスナップのパラメータ（刻み幅＋モード）。DESIGN.md 7章「随時対応」
@@ -410,6 +524,14 @@ pub fn snap(
                 }
             }
         }
+    }
+
+    // 仮想交点: 交点用の `near`（カーソル近傍 AABB で絞り込んだ Shape 集合）は延長線上の
+    // 交点を取りこぼすため使えない。専用の絞り込み（無限直線・円とカーソルの距離。
+    // 無損失である理由はモジュール doc 参照）で線要素・円要素を集め、組（線×線・線×円）を
+    // 総当たりする。種別が無効なら走査自体を行わない。
+    if kinds.virtual_intersection {
+        collect_virtual_intersections(document, cursor, radius, &mut best, r2);
     }
 
     // 近接点: 既定 OFF（モジュール doc）なので、無効なら計算自体を省く。有効なら
@@ -635,6 +757,431 @@ fn layer_visible(document: &Document, entity: &Entity) -> bool {
     document.layer(entity.layer).is_some_and(|l| l.visible)
 }
 
+/// 仮想交点（[`SnapKind::VirtualIntersection`]、M12 タスク87）用の円要素。
+/// 完全な円は `arc` が `None`、円弧は `Some`（掃引範囲の判定に使う）。
+struct CircleCandidate {
+    circle: Circle,
+    arc: Option<Arc>,
+}
+
+/// 点 `p` から無限直線 `seg`（`LineSeg` を通る直線とみなす）への距離。
+/// `seg` が退化（長さが [`point_tol`] 以下）していれば `f64::INFINITY`
+/// （距離が定まらないので絶対に絞り込みへ入らないようにする）。
+fn distance_to_infinite_line(seg: &LineSeg, p: Point2) -> f64 {
+    let d = seg.direction();
+    let len = d.length();
+    if len <= point_tol(seg.a, seg.b) {
+        return f64::INFINITY;
+    }
+    (p - seg.a).cross(d).abs() / len
+}
+
+/// 線分 `seg` 上での点 `p` の無次元パラメータ `t`（`p` は `seg` の乗る直線上にある前提）。
+/// `t ∈ [0, 1]` なら線分の区間内（境界は [`crate::EPS`] 込み）。
+fn line_param(seg: &LineSeg, p: Point2) -> f64 {
+    let d = seg.direction();
+    (p - seg.a).dot(d) / d.length_squared()
+}
+
+/// `line_param` が返す `t` が線分の区間内（境界含む）か。
+fn t_on_segment(t: f64) -> bool {
+    (-mcad_geom::EPS..=1.0 + mcad_geom::EPS).contains(&t)
+}
+
+/// 仮想交点（M12 タスク87）の候補列挙で実際に計算する「線×線」の組の数の予算。
+/// 平行なグループどうしは組にしない絞り込み（[`LineGroup::angle_cluster`]）のあとも、
+/// 非平行な直線が数十本以上カーソル近傍を通る病的な図面では組合せが爆発しうるため、
+/// 線グループの**本数**ではなく実際に**計算する組の数**に上限を設ける（Codex
+/// adversarial review [medium] 再指摘、2026-09-26。モジュール doc「同一直線上の線要素の
+/// グループ化と上限」・DESIGN.md タスク87の実装時追記「既知の制約」参照）。カーソルに
+/// 近いものから順に組を処理するため、打ち切りが起きても近傍の組は先に調べ終えている。
+///
+/// **[`VIRTUAL_INTERSECTION_MAX_LINE_CIRCLE_PAIRS`] とは独立の予算**（Codex
+/// adversarial review [medium] 再々指摘、2026-09-26）: 単一の共有予算だと、線×線を
+/// 先に処理する実装順序の都合で、非平行な線グループが予算本数近くカーソル近傍にあると
+/// 線×線だけで予算を使い切り、線×円の組が1つも調べられなくなる（有効な線×円の仮想
+/// 交点が消える）。
+const VIRTUAL_INTERSECTION_MAX_LINE_PAIRS: usize = 4096;
+/// 仮想交点（M12 タスク87）の候補列挙で実際に計算する「線×円」の組の数の予算。
+/// 理由・打ち切りの性質は [`VIRTUAL_INTERSECTION_MAX_LINE_PAIRS`] と同じだが、
+/// **独立したカウンタ**を持つ（同上）。
+const VIRTUAL_INTERSECTION_MAX_LINE_CIRCLE_PAIRS: usize = 4096;
+
+/// 仮想交点（M12 タスク87）の同一直線グループ（「支持直線」）。
+///
+/// `representative` は交点計算に使う無限直線（メンバーのうち最初の1本）。`members`
+/// はグループに属する線要素そのもので、実体上の判定（[`group_contains_point`]）・
+/// ガイドの最近端点探索（[`nearest_group_endpoint`]）で全メンバーを見る。`angle_cluster`
+/// は [`group_collinear_lines`] の段階1（角度クラスタ化）で採番したクラスタ番号で、
+/// 同じ番号どうし（＝平行なグループどうし）は [`collect_virtual_intersections`] が
+/// 組を作らない（Codex adversarial review [medium]、2026-09-26。モジュール doc
+/// 「同一直線上の線要素のグループ化と上限」参照）。
+struct LineGroup {
+    representative: LineSeg,
+    members: Vec<LineSeg>,
+    angle_cluster: usize,
+}
+
+/// 線要素 `lines` を、同一の無限直線とみなせるもの同士でグループ化する（純関数。
+/// カーソル位置に依存しない。モジュール doc「同一直線上の線要素のグループ化と上限」
+/// 参照）。
+///
+/// **2段階**でまとめる（一次レビュー後の Codex adversarial review [high] 再指摘への
+/// 対応、2026-09-26）:
+///
+/// 1. **角度クラスタ化**: 各線分を「方向角（`y > 0`、または `y == 0` かつ `x > 0` に
+///    なるよう正規化した向きの角度、範囲 `[0, π)`）」だけでソートし、グループの
+///    最初のメンバー（代表）を基準に [`mcad_geom::EPS`] 以内なら同じ角度クラスタへ
+///    まとめる（ラジアンは無次元なので直接比較する、`mcad-geom` の許容量ポリシー）。
+///    **`0` と `π` の境界は同じ角度として扱う**: 回転・鏡映を経た図形は `y` 成分の
+///    符号がわずかな浮動小数の揺れ（例: `1e-17`）で反転しうるため、正規化後の角度が
+///    `0` 付近と `π` 付近に分かれてしまうことがある（同一直線上の線分どうしでも）。
+///    ソート後の最初のクラスタ（`0` 付近）と最後のクラスタ（`π` 付近）の角度差が
+///    `EPS` 以内なら、この2クラスタを1つに統合する。
+/// 2. **距離クラスタ化**: 各角度クラスタの中で、原点からの符号付き距離でソートし、
+///    やはり代表基準で [`mcad_geom::rel_tol`]（[`mcad_geom::line_line_intersection`]
+///    の平行判定〔`EPS * |r| * |s|`〕と矛盾しない、座標スケールに対する相対許容量）
+///    以内なら同じ距離クラスタ（＝最終的な [`LineGroup`]）へまとめる。**距離は
+///    角度クラスタの代表（最初のメンバー）の法線を使って全メンバー分を計算し直す**
+///    （メンバーごとに個別計算した法線のわずかな違いに左右されないようにするため。
+///    段階1で `0`/`π` 境界をまたいで統合したクラスタは、メンバーによって正規化後の
+///    向きが逆転しているため、これをしないと距離の符号がメンバーごとにばらつく）。
+///
+/// どちらの段階も比較は常にクラスタの最初のメンバー（代表）を基準にする（直前の
+/// 要素との連鎖比較だと、閾値以下の差が積み重なって実際には閾値を超える2線分が
+/// 同じクラスタへ入りかねない）。
+fn group_collinear_lines(lines: &[LineSeg]) -> Vec<LineGroup> {
+    /// 正規化した向き（`y > 0`、または `y == 0` かつ `x > 0`）とその角度。
+    fn canonical_direction_and_angle(seg: &LineSeg) -> (Vec2, f64) {
+        let d = seg.direction();
+        let canonical = if d.y > 0.0 || (d.y == 0.0 && d.x > 0.0) {
+            d
+        } else {
+            Vec2::new(-d.x, -d.y)
+        };
+        (canonical, canonical.angle())
+    }
+
+    // 段階1: 角度だけでソートしてクラスタ化。
+    struct AngleKeyed {
+        seg: LineSeg,
+        angle: f64,
+    }
+    let mut angle_keyed: Vec<AngleKeyed> = lines
+        .iter()
+        .map(|&seg| {
+            let (_, angle) = canonical_direction_and_angle(&seg);
+            AngleKeyed { seg, angle }
+        })
+        .collect();
+    angle_keyed.sort_by(|a, b| {
+        a.angle
+            .partial_cmp(&b.angle)
+            .expect("角度は非有限にならない（degenerate は呼び出し側で除外済み）")
+    });
+
+    struct AngleCluster {
+        repr_angle: f64,
+        members: Vec<LineSeg>,
+    }
+    let mut angle_clusters: Vec<AngleCluster> = Vec::new();
+    for k in angle_keyed {
+        if let Some(last) = angle_clusters.last_mut()
+            && (k.angle - last.repr_angle).abs() <= mcad_geom::EPS
+        {
+            last.members.push(k.seg);
+            continue;
+        }
+        angle_clusters.push(AngleCluster {
+            repr_angle: k.angle,
+            members: vec![k.seg],
+        });
+    }
+
+    // `0` と `π` の境界: 最初（`0` 付近）と最後（`π` 付近）のクラスタが実質同じ角度
+    // （`π` だけ向きがずれているだけ）なら1つに統合する。統合後の代表（先頭）は常に
+    // 「`0` 付近」クラスタの先頭メンバーのままなので、段階2で使う法線は向きの揺れに
+    // 左右されない。
+    if angle_clusters.len() >= 2 {
+        let first_angle = angle_clusters[0].repr_angle;
+        let last_angle = angle_clusters[angle_clusters.len() - 1].repr_angle;
+        if (PI - last_angle) + first_angle <= mcad_geom::EPS {
+            let wrapped = angle_clusters.pop().expect("len >= 2 を確認済み");
+            angle_clusters[0].members.extend(wrapped.members);
+        }
+    }
+
+    // 段階2: 各角度クラスタの中で距離クラスタ化（クラスタ代表の法線で距離を再計算）。
+    // 角度クラスタ番号（`angle_cluster`）はこの段階の添字でそのまま採番する
+    // （0/π 境界統合後の最終的な角度クラスタ一覧に対する番号）。
+    let mut groups: Vec<LineGroup> = Vec::new();
+    for (angle_cluster, cluster) in angle_clusters.into_iter().enumerate() {
+        let (repr_dir, _) = canonical_direction_and_angle(&cluster.members[0]);
+        let normal = (repr_dir / repr_dir.length()).perp();
+
+        struct DistKeyed {
+            seg: LineSeg,
+            dist: f64,
+        }
+        let mut dist_keyed: Vec<DistKeyed> = cluster
+            .members
+            .iter()
+            .map(|&seg| DistKeyed {
+                seg,
+                dist: seg.a.to_vec2().dot(normal),
+            })
+            .collect();
+        dist_keyed.sort_by(|a, b| a.dist.partial_cmp(&b.dist).expect("距離は非有限にならない"));
+
+        let mut local: Vec<(f64, LineGroup)> = Vec::new();
+        for k in dist_keyed {
+            if let Some((ref_dist, group)) = local.last_mut() {
+                let dist_close = (k.dist - *ref_dist).abs()
+                    <= mcad_geom::rel_tol(ref_dist.abs().max(k.dist.abs()));
+                if dist_close {
+                    group.members.push(k.seg);
+                    continue;
+                }
+            }
+            local.push((
+                k.dist,
+                LineGroup {
+                    representative: k.seg,
+                    members: vec![k.seg],
+                    angle_cluster,
+                },
+            ));
+        }
+        groups.extend(local.into_iter().map(|(_, g)| g));
+    }
+
+    groups
+}
+
+/// グループ `group` のいずれかのメンバー線分の区間内（[`t_on_segment`]、`p` は
+/// グループの無限直線上にある前提）に点 `p` があるか。1本でも区間内なら実体上とみなす
+/// （同一直線上の他の線分が延長側でも、このグループ全体としては「実体上」になる）。
+fn group_contains_point(group: &LineGroup, p: Point2) -> bool {
+    group
+        .members
+        .iter()
+        .any(|seg| t_on_segment(line_param(seg, p)))
+}
+
+/// グループ `group` の全メンバーの端点のうち、`p`（仮想交点）に最も近いもの。
+/// ガイド（[`SnapGuide::Segment`]）の `from` に使う。
+fn nearest_group_endpoint(group: &LineGroup, p: Point2) -> Point2 {
+    group
+        .members
+        .iter()
+        .flat_map(|seg| [seg.a, seg.b])
+        .min_by(|x, y| {
+            p.distance_squared(*x)
+                .partial_cmp(&p.distance_squared(*y))
+                .expect("距離の2乗は非有限にならない")
+        })
+        .expect("group_collinear_lines は空グループを作らない")
+}
+
+/// `[0, TAU)` へ正規化する（`Arc::contains_angle` 等と同じ規約）。
+fn wrap_2pi(theta: f64) -> f64 {
+    let r = theta % TAU;
+    if r < 0.0 { r + TAU } else { r }
+}
+
+/// 円弧 `a` の掃引範囲外にある角度 `theta` の点への [`SnapGuide::Arc`] を作る。
+/// 近い方の弧端点（始点 or 終点）から `theta` まで、掃引範囲の無い側（外側）を
+/// 回る向きに符号付き `sweep` で表す（DESIGN.md M12 設計判断5 の実装時追記）。
+fn arc_guide_for(a: &Arc, theta: f64) -> SnapGuide {
+    let dist_from_end = wrap_2pi(theta - a.end_angle);
+    let dist_from_start = wrap_2pi(a.start_angle - theta);
+    if dist_from_end <= dist_from_start {
+        SnapGuide::Arc {
+            center: a.center,
+            radius: a.radius,
+            start_angle: a.end_angle,
+            sweep: dist_from_end,
+        }
+    } else {
+        SnapGuide::Arc {
+            center: a.center,
+            radius: a.radius,
+            start_angle: a.start_angle,
+            sweep: -dist_from_start,
+        }
+    }
+}
+
+/// 仮想交点（[`SnapKind::VirtualIntersection`]、M12 タスク87）の候補を列挙する。
+///
+/// 絞り込みが無損失である理由はモジュール doc（「仮想交点の絞り込み」節）を参照。
+/// 組は (線要素, 線要素)・(線要素, 円要素) のみ（円要素どうしは設計判断5の対象外）。
+/// 真の交点（両実体上）は [`SnapKind::Intersection`] の担当なので候補にしない。
+fn collect_virtual_intersections(
+    document: &Document,
+    cursor: Point2,
+    radius: f64,
+    best: &mut Best,
+    r2: f64,
+) {
+    let mut lines: Vec<LineSeg> = Vec::new();
+    // (|カーソル-中心間距離 − 半径|, 候補) の組で集め、後で上限まで切り詰める。
+    let mut circles: Vec<(f64, CircleCandidate)> = Vec::new();
+
+    for (_, entity) in document.entities() {
+        if !layer_visible(document, entity) {
+            continue;
+        }
+        let EntityGeom::Shape(shape) = &entity.geom else {
+            continue;
+        };
+        match shape {
+            Shape::Line(s) => {
+                if distance_to_infinite_line(s, cursor) <= radius {
+                    lines.push(*s);
+                }
+            }
+            Shape::Polyline(pl) => {
+                for seg in pl.segments() {
+                    if distance_to_infinite_line(&seg, cursor) <= radius {
+                        lines.push(seg);
+                    }
+                }
+            }
+            Shape::Circle(c) => {
+                let d = (cursor.distance(c.center) - c.radius).abs();
+                if d <= radius {
+                    circles.push((
+                        d,
+                        CircleCandidate {
+                            circle: *c,
+                            arc: None,
+                        },
+                    ));
+                }
+            }
+            Shape::Arc(a) => {
+                let circle = a.circle();
+                let d = (cursor.distance(circle.center) - circle.radius).abs();
+                if d <= radius {
+                    circles.push((
+                        d,
+                        CircleCandidate {
+                            circle,
+                            arc: Some(*a),
+                        },
+                    ));
+                }
+            }
+            Shape::Point(_) => {}
+        }
+    }
+
+    // 同一直線上の線要素を1本の支持直線へまとめ、O(本数^2) の爆発を避ける
+    // （Codex adversarial review [high]、2026-09-26。モジュール doc参照）。
+    // 線グループ・円要素とも本数そのものは切り詰めず、カーソルに近い順に並べておく
+    // （近い順に組を処理するため。Codex adversarial review [medium] 再指摘、
+    // 2026-09-26: 本数で切り詰めると「平行線ばかりが近くにあり、少し遠い交差相手が
+    // 切り捨てられる」ケースで仮想交点が消えるため、本数の上限はやめた）。
+    let mut groups = group_collinear_lines(&lines);
+    groups.sort_by(|a, b| {
+        let da = distance_to_infinite_line(&a.representative, cursor);
+        let db = distance_to_infinite_line(&b.representative, cursor);
+        da.partial_cmp(&db)
+            .expect("距離は非有限にならない（near 収集条件で保証済み）")
+    });
+
+    circles.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .expect("距離は非有限にならない（near 収集条件で保証済み）")
+    });
+    let circles: Vec<CircleCandidate> = circles.into_iter().map(|(_, c)| c).collect();
+
+    // 実際に計算する組の数を、線×線・線×円それぞれ独立の予算で管理する
+    // （[`VIRTUAL_INTERSECTION_MAX_LINE_PAIRS`]・[`VIRTUAL_INTERSECTION_MAX_LINE_CIRCLE_PAIRS`]。
+    // 共有の単一予算だと線×線を先に処理する都合上、非平行な線グループが予算本数近く
+    // カーソル近傍にあるだけで線×円が1組も調べられなくなる。Codex adversarial review
+    // [medium] 再々指摘、2026-09-26）。
+    let mut line_pairs_computed: usize = 0;
+
+    // 線 × 線（グループの代表直線どうし）。距離順に並んだ添字 i の昇順、各 i に対し
+    // j < i の昇順で組を作る（先に処理される組ほど両方がカーソルに近い）。
+    // 同じ角度クラスタ（平行なグループ）どうしは組にしない（ハッチングのような平行線が
+    // いくら多くても組を増やさない）。予算に達したら打ち切る。
+    'line_pairs: for i in 0..groups.len() {
+        for j in 0..i {
+            if groups[i].angle_cluster == groups[j].angle_cluster {
+                continue; // 平行（同一角度クラスタ）は組にしない。
+            }
+            if line_pairs_computed >= VIRTUAL_INTERSECTION_MAX_LINE_PAIRS {
+                break 'line_pairs;
+            }
+            line_pairs_computed += 1;
+
+            // ガイド配列の並びは添字の昇順（`j < i`）に揃える（走査順序自体は
+            // カーソルに近い方を先に処理するため i の昇順・j<i だが、結果の
+            // `guides` の意味は「小さい添字側→大きい添字側」で一貫させる）。
+            let Some(p) =
+                line_line_intersection(&groups[j].representative, &groups[i].representative)
+            else {
+                continue;
+            };
+            let on_lo = group_contains_point(&groups[j], p);
+            let on_hi = group_contains_point(&groups[i], p);
+            if on_lo && on_hi {
+                continue; // 真の交点（両グループのいずれかのメンバー上）: Intersection の担当。
+            }
+            let g_lo = (!on_lo).then(|| SnapGuide::Segment {
+                from: nearest_group_endpoint(&groups[j], p),
+                to: p,
+            });
+            let g_hi = (!on_hi).then(|| SnapGuide::Segment {
+                from: nearest_group_endpoint(&groups[i], p),
+                to: p,
+            });
+            best.consider_guided(SnapKind::VirtualIntersection, p, [g_lo, g_hi], cursor, r2);
+        }
+    }
+
+    // 線 × 円（グループの代表直線 × 円）。円は距離順、各円に対し線も距離順に処理する
+    // （どちらも近いものから優先）。**線×線とは別の独立した予算**を持つ（線×線の
+    // 消費状況に関わらず、線×円の組は必ず一定数まで調べられる）。
+    let mut circle_pairs_computed: usize = 0;
+    'circle_pairs: for cand in &circles {
+        for group in &groups {
+            if circle_pairs_computed >= VIRTUAL_INTERSECTION_MAX_LINE_CIRCLE_PAIRS {
+                break 'circle_pairs;
+            }
+            circle_pairs_computed += 1;
+
+            for p in line_circle_intersection(&group.representative, &cand.circle) {
+                let on_line = group_contains_point(group, p);
+                let theta = (p - cand.circle.center).angle();
+                let on_circle = cand.arc.is_none_or(|a| a.contains_angle(theta));
+                if on_line && on_circle {
+                    continue; // 真の交点: Intersection の担当。
+                }
+                let line_guide = (!on_line).then(|| SnapGuide::Segment {
+                    from: nearest_group_endpoint(group, p),
+                    to: p,
+                });
+                let circle_guide = if on_circle {
+                    None
+                } else {
+                    cand.arc.as_ref().map(|a| arc_guide_for(a, theta))
+                };
+                best.consider_guided(
+                    SnapKind::VirtualIntersection,
+                    p,
+                    [line_guide, circle_guide],
+                    cursor,
+                    r2,
+                );
+            }
+        }
+    }
+}
+
 /// これまでに見た候補のうち「最良」を保持するアキュムレータ。
 ///
 /// 最良の定義（DESIGN.md M12 設計判断5 の優先順位）:
@@ -657,7 +1204,20 @@ impl Best {
     }
 
     /// 候補 1 点を検討する。有効な種別かつ半径内かつ現状より良ければ採用する。
+    /// ガイドを持たない種別用（[`SnapResult::guides`] は `[None, None]`）。
     fn consider(&mut self, kind: SnapKind, point: Point2, cursor: Point2, r2: f64) {
+        self.consider_guided(kind, point, [None, None], cursor, r2);
+    }
+
+    /// [`consider`](Self::consider) のガイド指定版（仮想交点用、M12 タスク87）。
+    fn consider_guided(
+        &mut self,
+        kind: SnapKind,
+        point: Point2,
+        guides: [Option<SnapGuide>; 2],
+        cursor: Point2,
+        r2: f64,
+    ) {
         if !self.kinds.enabled(kind) {
             return;
         }
@@ -673,7 +1233,15 @@ impl Best {
             }
         };
         if better {
-            self.found = Some((rank, d2, SnapResult { kind, point }));
+            self.found = Some((
+                rank,
+                d2,
+                SnapResult {
+                    kind,
+                    point,
+                    guides,
+                },
+            ));
         }
     }
 
@@ -1590,6 +2158,7 @@ mod tests {
             quadrant: false,
             perpendicular: true,
             tangent: false,
+            virtual_intersection: false,
             nearest: false,
             grid: false,
         }
@@ -1605,6 +2174,7 @@ mod tests {
             quadrant: false,
             perpendicular: false,
             tangent: true,
+            virtual_intersection: false,
             nearest: false,
             grid: false,
         }
@@ -1784,6 +2354,7 @@ mod tests {
             quadrant: false,
             perpendicular: true,
             tangent: false,
+            virtual_intersection: false,
             nearest: true,
             grid: false,
         };
@@ -1820,6 +2391,7 @@ mod tests {
             quadrant: false,
             perpendicular: false,
             tangent: false,
+            virtual_intersection: false,
             nearest: true,
             grid: false,
         }
@@ -1902,6 +2474,519 @@ mod tests {
         assert_eq!(r.point, Point2::new(10.0, 0.0));
     }
 
+    // --- 仮想交点（SnapKind::VirtualIntersection、M12 タスク87） ---
+
+    /// 仮想交点のみを有効にした [`SnapKinds`]。
+    fn virtual_intersection_only() -> SnapKinds {
+        SnapKinds {
+            endpoint: false,
+            intersection: false,
+            midpoint: false,
+            center: false,
+            quadrant: false,
+            perpendicular: false,
+            tangent: false,
+            virtual_intersection: true,
+            nearest: false,
+            grid: false,
+        }
+    }
+
+    #[test]
+    fn virtual_intersection_of_two_line_extensions_is_a_candidate() {
+        // 線分 a (0,0)-(1,1)、線分 b (0,10)-(1,9)。どちらも延長した無限直線は
+        // (5,5) で交わるが、両方とも区間の外（延長線上）。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 1.0, 1.0));
+        add(&mut doc, line(0.0, 10.0, 1.0, 9.0));
+
+        let r = snap_no_grid_with_kinds(
+            &doc,
+            Point2::new(5.0, 5.0),
+            1.0,
+            virtual_intersection_only(),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!(r.point.distance(Point2::new(5.0, 5.0)) < 1e-9);
+
+        // 両方延長側なので、ガイドは両方 Some。from は実体の近い方の端点
+        // （a は (1,1)、b は (1,9)）。
+        match r.guides[0] {
+            Some(SnapGuide::Segment { from, to }) => {
+                assert_eq!(from, Point2::new(1.0, 1.0));
+                assert!(to.distance(Point2::new(5.0, 5.0)) < 1e-9);
+            }
+            other => panic!("線分 a 側は Segment ガイドを期待: {other:?}"),
+        }
+        match r.guides[1] {
+            Some(SnapGuide::Segment { from, .. }) => {
+                assert_eq!(from, Point2::new(1.0, 9.0));
+            }
+            other => panic!("線分 b 側は Segment ガイドを期待: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn virtual_intersection_parallel_lines_is_not_a_candidate() {
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        add(&mut doc, line(0.0, 1.0, 10.0, 1.0));
+
+        assert_eq!(
+            snap_no_grid_with_kinds(
+                &doc,
+                Point2::new(5.0, 0.5),
+                1.0,
+                virtual_intersection_only()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn virtual_intersection_excludes_real_intersections_even_when_intersection_disabled() {
+        // 交点(5,0)は両線分の区間内(真の交点)。仮想交点のみ有効でも候補にしない
+        // （SnapKind::Intersection の担当。交点スナップが OFF でも仮想交点として
+        // 出てはいけない）。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        add(&mut doc, line(5.0, -5.0, 5.0, 5.0));
+
+        assert_eq!(
+            snap_no_grid_with_kinds(
+                &doc,
+                Point2::new(5.1, 0.0),
+                1.0,
+                virtual_intersection_only()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn virtual_intersection_line_extension_with_circle() {
+        // 線分区間 (-10,0)-(-8,0) は円から離れているが、延長した直線は円
+        // 中心(0,0) 半径5 と (5,0)/(-5,0) で交わる。完全な円はガイド無し。
+        let mut doc = Document::new();
+        add(&mut doc, line(-10.0, 0.0, -8.0, 0.0));
+        add(&mut doc, Shape::Circle(Circle::new(Point2::ORIGIN, 5.0)));
+
+        let r = snap_no_grid_with_kinds(
+            &doc,
+            Point2::new(5.05, 0.0),
+            0.5,
+            virtual_intersection_only(),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!(r.point.distance(Point2::new(5.0, 0.0)) < 1e-9);
+        match r.guides[0] {
+            Some(SnapGuide::Segment { from, .. }) => assert_eq!(from, Point2::new(-8.0, 0.0)),
+            other => panic!("線分側は Segment ガイドを期待: {other:?}"),
+        }
+        assert_eq!(r.guides[1], None, "完全な円はガイド無し");
+    }
+
+    #[test]
+    fn virtual_intersection_arc_extension_produces_arc_guide() {
+        // 円弧 中心(0,0) 半径5、掃引 0°→90°。線分 (-10,0)-(-7,0) の延長は
+        // 180°方向の (-5,0) で台円と交わるが、掃引範囲外（延長側）なので
+        // 円弧側のガイドは Arc になる。
+        use mcad_geom::Arc;
+        let mut doc = Document::new();
+        add(&mut doc, line(-10.0, 0.0, -7.0, 0.0));
+        add(
+            &mut doc,
+            Shape::Arc(Arc::new(Point2::ORIGIN, 5.0, 0.0, FRAC_PI_2)),
+        );
+
+        let r = snap_no_grid_with_kinds(
+            &doc,
+            Point2::new(-5.0, 0.0),
+            0.5,
+            virtual_intersection_only(),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!(r.point.distance(Point2::new(-5.0, 0.0)) < 1e-9);
+        match r.guides[1] {
+            Some(SnapGuide::Arc {
+                center,
+                radius,
+                start_angle,
+                sweep,
+            }) => {
+                assert!(center.distance(Point2::ORIGIN) < 1e-9);
+                assert!((radius - 5.0).abs() < 1e-9);
+                assert!((start_angle - FRAC_PI_2).abs() < 1e-9);
+                assert!((sweep - FRAC_PI_2).abs() < 1e-9);
+            }
+            other => panic!("円弧側は Arc ガイドを期待: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_endpoint_beats_virtual_intersection_at_the_same_point() {
+        // 線分 a・b の延長交点 (5,5) ちょうどに点エンティティを置くと、既定設定
+        // （端点・仮想交点ともに ON）では端点(優先度0)が仮想交点(優先度5)に勝つ。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 1.0, 1.0));
+        add(&mut doc, line(0.0, 10.0, 1.0, 9.0));
+        add(&mut doc, Shape::Point(Point2::new(5.0, 5.0)));
+
+        let r = snap_no_grid(&doc, Point2::new(5.0, 5.0), 1.0).unwrap();
+        assert_eq!(r.kind, SnapKind::Endpoint);
+        assert_eq!(r.point, Point2::new(5.0, 5.0));
+    }
+
+    #[test]
+    fn virtual_intersection_disabled_kind_hides_candidate() {
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 1.0, 1.0));
+        add(&mut doc, line(0.0, 10.0, 1.0, 9.0));
+        let kinds = SnapKinds {
+            virtual_intersection: false,
+            ..SnapKinds::default()
+        };
+
+        // 他の候補（端点・中点等）は (5,5) から遠いので None になる。
+        assert_eq!(
+            snap_no_grid_with_kinds(&doc, Point2::new(5.0, 5.0), 1.0, kinds),
+            None
+        );
+    }
+
+    #[test]
+    fn virtual_intersection_priority_is_below_perpendicular_and_above_nearest() {
+        // 線分 a (0,0)-(1,1)・b (0,10)-(1,9)（延長交点 (5,5)）に加え、
+        // 線分 Lp (0,5)-(10,5) を置く。Lp 上では (5,5) は区間内の実点なので、
+        // 基点(5,10) からの垂線の足・カーソルの最近接点としても (5,5) が得られる。
+        // 同じ点に複数種別の候補が重なる状況で、優先度だけで勝敗が決まることを確認する。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 1.0, 1.0));
+        add(&mut doc, line(0.0, 10.0, 1.0, 9.0));
+        add(&mut doc, line(0.0, 5.0, 10.0, 5.0));
+
+        // 垂線(優先度4) vs 仮想交点(優先度5): 垂線が勝つ。
+        let kinds = SnapKinds {
+            endpoint: false,
+            intersection: false,
+            midpoint: false,
+            center: false,
+            quadrant: false,
+            perpendicular: true,
+            tangent: false,
+            virtual_intersection: true,
+            nearest: false,
+            grid: false,
+        };
+        let r = snap_no_grid_with_kinds_and_base(
+            &doc,
+            Point2::new(5.0, 4.99),
+            0.5,
+            kinds,
+            Some(Point2::new(5.0, 10.0)),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::Perpendicular);
+        assert_eq!(r.point, Point2::new(5.0, 5.0));
+
+        // 仮想交点(優先度5) vs 近接点(優先度6): 仮想交点が勝つ。
+        let kinds2 = SnapKinds {
+            endpoint: false,
+            intersection: false,
+            midpoint: false,
+            center: false,
+            quadrant: false,
+            perpendicular: false,
+            tangent: false,
+            virtual_intersection: true,
+            nearest: true,
+            grid: false,
+        };
+        let r2 = snap_no_grid_with_kinds(&doc, Point2::new(5.0, 4.99), 0.5, kinds2).unwrap();
+        assert_eq!(r2.kind, SnapKind::VirtualIntersection);
+        assert!(r2.point.distance(Point2::new(5.0, 5.0)) < 1e-9);
+    }
+
+    // --- 同一直線グループ化と上限（Codex adversarial review [high]、2026-09-26） ---
+
+    #[test]
+    fn group_collinear_lines_merges_thousands_of_segments_into_two_groups() {
+        // 同じ無限直線 y=0 上に5000本、x=10 上に5000本の短い線分を並べる。グループ化が
+        // 無ければ総当たりが本数の2乗（=1000万ペア）に爆発する状況で、純関数
+        // `group_collinear_lines` だけで2本の支持直線へ縮むことを確認する
+        // （所要時間はアサーションしない）。
+        let mut lines: Vec<LineSeg> = Vec::new();
+        for k in 0..5000 {
+            let x = f64::from(k) * 0.001;
+            lines.push(LineSeg::new(
+                Point2::new(x, 0.0),
+                Point2::new(x + 0.0005, 0.0),
+            ));
+        }
+        for k in 0..5000 {
+            let y = f64::from(k) * 0.001;
+            lines.push(LineSeg::new(
+                Point2::new(10.0, y),
+                Point2::new(10.0, y + 0.0005),
+            ));
+        }
+
+        let groups = group_collinear_lines(&lines);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups.iter().map(|g| g.members.len()).sum::<usize>(),
+            10_000
+        );
+
+        // グループ化後も `snap()` が正しく仮想交点を返すこと（実際にドキュメントへ
+        // 1万エンティティを追加して確認する）。
+        let mut doc = Document::new();
+        for seg in &lines {
+            add(&mut doc, Shape::Line(*seg));
+        }
+        let r = snap_no_grid_with_kinds(
+            &doc,
+            Point2::new(10.0, 0.0),
+            1.0,
+            virtual_intersection_only(),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!(r.point.distance(Point2::new(10.0, 0.0)) < 1e-6);
+    }
+
+    #[test]
+    fn group_collinear_lines_merges_angle_wobble_across_two_parallel_rows() {
+        // 2本の平行な水平線（y=0 と y=5）を、それぞれ200本の短い線分で表現する。各線分の
+        // 終点 y をわずかに ±1e-15 だけ揺らし、正規化後の方向角が 0 付近・π 付近に
+        // 交互に振れるようにする（回転・鏡映を経た図形で実際に起こりうる揺れの再現。
+        // 一次修正後の Codex adversarial review [high] 再指摘、2026-09-26）。この揺れが
+        // あっても行ごとに正しく1グループへまとまり、2グループ（2行）に分かれることを
+        // 確認する。
+        let mut lines: Vec<LineSeg> = Vec::new();
+        for k in 0..200 {
+            let x = f64::from(k) * 0.01;
+            let eps_a = if k % 2 == 0 { 1e-15 } else { -1e-15 };
+            lines.push(LineSeg::new(
+                Point2::new(x, 0.0),
+                Point2::new(x + 0.005, eps_a),
+            ));
+            let eps_b = if k % 2 == 0 { -1e-15 } else { 1e-15 };
+            lines.push(LineSeg::new(
+                Point2::new(x, 5.0),
+                Point2::new(x + 0.005, 5.0 + eps_b),
+            ));
+        }
+
+        let groups = group_collinear_lines(&lines);
+        assert_eq!(groups.len(), 2);
+        let mut sizes: Vec<usize> = groups.iter().map(|g| g.members.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![200, 200]);
+    }
+
+    #[test]
+    fn group_collinear_lines_merges_boundary_direction_wobble() {
+        // 方向 (1, -1e-17) は正規化で (-1, 1e-17) へ反転され、角度は π 付近になる。
+        // 方向 (1, 0) は角度 0。どちらも同じ無限直線（y=0）上の向きの揺れにすぎないので
+        // 同じグループにまとまるべき（0 と π の境界の統合、Codex adversarial review
+        // [high] 再指摘、2026-09-26）。
+        let a = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, -1e-17));
+        let b = LineSeg::new(Point2::new(2.0, 0.0), Point2::new(3.0, 0.0));
+
+        let groups = group_collinear_lines(&[a, b]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members.len(), 2);
+    }
+
+    #[test]
+    fn virtual_intersection_survives_cap_when_wobbly_row_is_grouped_properly() {
+        // 揺れのある行（5000本、上記と同じ ±1e-15 の交互パターン）を正しく1グループへ
+        // まとめられないと、多数の小グループに分裂し、線×線の組の数が本来の
+        // 「行×列」の数をはるかに超えて膨らむ（Codex adversarial review [high] 再指摘、
+        // 2026-09-26）。グループ化が正しく機能していれば、行は少数のグループへ縮み、
+        // 列との仮想交点を検出できる。
+        let mut doc = Document::new();
+        for k in 0..5000 {
+            let x = f64::from(k) * 0.001;
+            let eps = if k % 2 == 0 { 1e-15 } else { -1e-15 };
+            add(&mut doc, line(x, 0.0, x + 0.0005, eps));
+        }
+        add(&mut doc, line(10.0, -1.0, 10.0, 1.0));
+
+        let r = snap_no_grid_with_kinds(
+            &doc,
+            Point2::new(10.0, 0.0),
+            1.0,
+            virtual_intersection_only(),
+        )
+        .expect("行のグループ化が壊れていなければ列との仮想交点が見つかるはず");
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!(r.point.distance(Point2::new(10.0, 0.0)) < 1e-6);
+    }
+
+    #[test]
+    fn virtual_intersection_group_containing_a_real_intersection_member_is_not_virtual() {
+        // 同一直線 y=0 上の2線分: segA1 (0,0)-(10,0) は交点(5,0)を含む（実体上）。
+        // segA2 (20,0)-(30,0) は同じ無限直線上だが交点(5,0)を含まない（延長）。
+        // グループ化前は segA2 側を独立に「延長＝仮想」と誤判定しうるが、グループ化後は
+        // 「グループ内のいずれかのメンバー上にあれば実体上」なので、この点は仮想交点に
+        // ならない（SnapKind::Intersection の担当）。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        add(&mut doc, line(20.0, 0.0, 30.0, 0.0));
+        add(&mut doc, line(5.0, -5.0, 5.0, 5.0));
+
+        assert_eq!(
+            snap_no_grid_with_kinds(
+                &doc,
+                Point2::new(5.1, 0.0),
+                1.0,
+                virtual_intersection_only()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn virtual_intersection_guide_uses_nearest_endpoint_across_the_whole_group() {
+        // 同一直線 y=0 上の2線分: segA1 (0,0)-(1,0)・segA2 (100,0)-(101,0)。どちらも
+        // 交点(5,0)を含まない（延長）。ガイドの from はグループ全体の端点のうち
+        // 最も近いもの（(1,0)）であるべきで、たまたま最初に見つかったメンバーの端点
+        // （(0,0)）ではない。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 1.0, 0.0));
+        add(&mut doc, line(100.0, 0.0, 101.0, 0.0));
+        add(&mut doc, line(5.0, -5.0, 5.0, 5.0));
+
+        let r = snap_no_grid_with_kinds(
+            &doc,
+            Point2::new(5.0, 0.5),
+            1.0,
+            virtual_intersection_only(),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        // 垂直線 B 側は交点(5,0)を区間内に含む（実体上）のでガイド無し。y=0 グループ側
+        // だけがガイドを持つ。
+        let guide = r
+            .guides
+            .into_iter()
+            .flatten()
+            .next()
+            .expect("y=0 グループ側のガイドがあるはず");
+        match guide {
+            SnapGuide::Segment { from, to } => {
+                assert_eq!(from, Point2::new(1.0, 0.0));
+                assert!(to.distance(Point2::new(5.0, 0.0)) < 1e-9);
+            }
+            other => panic!("Segment ガイドを期待: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn virtual_intersection_pair_budget_truncates_without_panicking_for_many_radiating_lines() {
+        // 互いに平行でない直線を、線×線の組の予算（`VIRTUAL_INTERSECTION_MAX_LINE_PAIRS`
+        // = 4096）を超える組合せ数になる本数（200本、角度がすべて異なる放射状）だけ
+        // 配置しても panic せず、打ち切りが起きても最初に処理される（カーソルに最も
+        // 近い）仮想交点は返ること（Codex adversarial review [medium] 再指摘、
+        // 2026-09-26。角度がすべて異なるため平行グループのスキップは効かず、
+        // 200*199/2=19,900 組が本来必要になるが、予算 4096 で打ち切られる）。
+        let mut doc = Document::new();
+        let n: usize = 200;
+        for k in 0..n {
+            let theta = (k as f64) * std::f64::consts::PI / (n as f64);
+            let (s, c) = theta.sin_cos();
+            add(&mut doc, line(5.0 * c, 5.0 * s, 6.0 * c, 6.0 * s));
+        }
+
+        let r = snap_no_grid_with_kinds(&doc, Point2::ORIGIN, 1.0, virtual_intersection_only())
+            .expect("予算で打ち切られても仮想交点の候補が見つかるはず");
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!(r.point.distance(Point2::ORIGIN) < 1e-6);
+    }
+
+    #[test]
+    fn virtual_intersection_parallel_lines_do_not_crowd_out_a_crossing_line() {
+        // カーソル近傍に平行な水平線が100本（ハッチングのような状況）あっても、
+        // 少し離れた交差する垂直線1本との仮想交点が失われないこと（Codex adversarial
+        // review [medium] 再指摘の再現例、2026-09-26。本数の上限だった旧実装では、
+        // カーソルとの距離で近い順に切り詰めると平行線ばかりが残り、垂直線が
+        // 切り捨てられて交点が消えていた）。平行などうしは組にしないため、水平線が
+        // 何本あっても垂直線との組合せ自体は変わらない。
+        let mut doc = Document::new();
+        for k in 0..100 {
+            let y = f64::from(k) * 0.0001;
+            add(&mut doc, line(0.0, y, 1.0, y));
+        }
+        // 垂直線はカーソルから見て水平線群よりわずかに遠い（x オフセット 0.5）。
+        add(&mut doc, line(50.5, -1.0, 50.5, 1.0));
+
+        let r = snap_no_grid_with_kinds(
+            &doc,
+            Point2::new(50.0, 0.0),
+            0.52,
+            virtual_intersection_only(),
+        )
+        .expect("平行な水平線に埋もれても垂直線との仮想交点が見つかるはず");
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!((r.point.x - 50.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn virtual_intersection_finds_match_among_many_concentric_circles() {
+        // 同心円50個（半径がわずかに異なるだけ）と交差する直線1本でも、半径内の交点が
+        // 返ること（Codex adversarial review [medium] 再指摘、2026-09-26: 円要素の
+        // 本数上限32も同じ欠陥を持っていたため、本数の上限自体をやめたことの確認）。
+        let mut doc = Document::new();
+        for k in 0..50 {
+            let radius = 10.0 + f64::from(k) * 0.001;
+            add(&mut doc, Shape::Circle(Circle::new(Point2::ORIGIN, radius)));
+        }
+        // 直線は円との交点（半径10.000〜10.049付近）から離れた区間にあるので、
+        // 延長側になる。
+        add(&mut doc, line(-5.0, 0.0, -4.0, 0.0));
+
+        let cursor = Point2::new(10.049, 0.0);
+        let r = snap_no_grid_with_kinds(&doc, cursor, 0.06, virtual_intersection_only())
+            .expect("多数の同心円があっても交点が見つかるはず");
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!(r.point.distance(cursor) <= 0.06 + 1e-9);
+    }
+
+    #[test]
+    fn virtual_intersection_line_circle_budget_is_independent_of_line_pair_budget() {
+        // 原点を起点とする放射状の線分200本を配置する。互いに非平行なので角度クラスタの
+        // スキップは効かず、線×線の組の予算（`VIRTUAL_INTERSECTION_MAX_LINE_PAIRS` =
+        // 4096）を使い切る（200*199/2=19,900組）。各線分の始点が原点そのものなので、
+        // どの2本の交点（＝原点）も両方の区間内（実交点）となり、Intersection の担当
+        // としてスキップされる（＝線×線からは仮想交点候補が一切出ない）。
+        //
+        // 原点中心・半径0.5の円を1個置くと、各線分は無限直線として円と2点で交わる:
+        // 線分の向きの側（パラメータ0.5、区間[0,1]内＝実交点）と、その逆側
+        // （パラメータ-0.5、区間外＝仮想交点）。後者は200本すべての線分について
+        // 仮想交点になる。線×円は**独立した予算**
+        // （`VIRTUAL_INTERSECTION_MAX_LINE_CIRCLE_PAIRS`）を持つため、線×線の組の予算が
+        // 尽きていてもこの仮想交点が見つかることを確認する（Codex adversarial review
+        // [medium] 再々指摘、2026-09-26）。
+        let mut doc = Document::new();
+        let n: usize = 200;
+        for k in 0..n {
+            let theta = (k as f64) * std::f64::consts::PI / (n as f64);
+            let (s, c) = theta.sin_cos();
+            add(&mut doc, line(0.0, 0.0, c, s));
+        }
+        add(&mut doc, Shape::Circle(Circle::new(Point2::ORIGIN, 0.5)));
+
+        let r = snap_no_grid_with_kinds(&doc, Point2::ORIGIN, 1.0, virtual_intersection_only())
+            .expect("線×線の予算を使い切っても線×円の仮想交点は見つかるはず");
+        assert_eq!(r.kind, SnapKind::VirtualIntersection);
+        assert!((r.point.distance(Point2::ORIGIN) - 0.5).abs() < 1e-6);
+    }
+
     // --- 種別ごとの ON/OFF（SnapKinds、M12 タスク85） ---
 
     #[test]
@@ -1976,6 +3061,7 @@ mod tests {
             quadrant: false,
             perpendicular: false,
             tangent: false,
+            virtual_intersection: false,
             nearest: false,
             grid: false,
         };
@@ -1997,6 +3083,7 @@ mod tests {
         assert!(kinds.quadrant);
         assert!(kinds.perpendicular);
         assert!(kinds.tangent);
+        assert!(kinds.virtual_intersection);
         assert!(!kinds.nearest);
         assert!(kinds.grid);
     }
@@ -2011,6 +3098,7 @@ mod tests {
             quadrant: true,
             perpendicular: false,
             tangent: true,
+            virtual_intersection: false,
             nearest: false,
             grid: true,
         };
@@ -2021,6 +3109,7 @@ mod tests {
         assert!(kinds.enabled(SnapKind::Quadrant));
         assert!(!kinds.enabled(SnapKind::Perpendicular));
         assert!(kinds.enabled(SnapKind::Tangent));
+        assert!(!kinds.enabled(SnapKind::VirtualIntersection));
         assert!(!kinds.enabled(SnapKind::Nearest));
         assert!(kinds.enabled(SnapKind::Grid));
     }
@@ -2035,6 +3124,7 @@ mod tests {
             quadrant: false,
             perpendicular: true,
             tangent: false,
+            virtual_intersection: true,
             nearest: true,
             grid: false,
         };

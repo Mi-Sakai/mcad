@@ -34,7 +34,7 @@ mod vec2;
 
 pub use aabb::Aabb;
 pub use fillet::{FilletError, FilletResult, fillet_lines};
-pub use intersect::intersect;
+pub use intersect::{intersect, line_circle_intersection, line_line_intersection};
 pub use point::Point2;
 pub use primitives::{
     Arc, Circle, LineSeg, OffsetError, Polyline, Shape, circumcircle, closest_point, distance_to,

@@ -424,6 +424,7 @@ mod tests {
                 quadrant: false,
                 perpendicular: true,
                 tangent: false,
+                virtual_intersection: true,
                 nearest: true,
                 grid: false,
             },
@@ -538,6 +539,7 @@ mod tests {
         assert!(config.snap_kinds.quadrant);
         assert!(config.snap_kinds.perpendicular);
         assert!(config.snap_kinds.tangent);
+        assert!(config.snap_kinds.virtual_intersection);
         assert!(!config.snap_kinds.nearest);
         assert!(config.snap_kinds.grid);
     }
@@ -556,6 +558,7 @@ mod tests {
         assert!(config.snap_kinds.quadrant);
         assert!(config.snap_kinds.perpendicular);
         assert!(config.snap_kinds.tangent);
+        assert!(config.snap_kinds.virtual_intersection);
         assert!(config.snap_kinds.nearest);
         assert!(!config.snap_kinds.grid);
     }

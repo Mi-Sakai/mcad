@@ -132,6 +132,69 @@ fn prim_contains_point(prim: &Prim, p: Point2) -> bool {
     p.distance(cp) <= point_tol(p, cp)
 }
 
+/// 無限直線 `a`・`b`（`LineSeg` を通る直線とみなす）どうしの交点。
+///
+/// 区間 `[0, 1]` へのクランプを行わない点だけが [`seg_seg`] と異なる（延長線上の
+/// 交点も返す）。仮想交点スナップ（M12 タスク87、DESIGN.md M12 設計判断5）専用。
+///
+/// 平行・同一直線（重複判定）、またはどちらかの線分が退化（長さが
+/// [`crate::point_tol`] 以下）していれば `None`。
+#[must_use]
+pub fn line_line_intersection(a: &LineSeg, b: &LineSeg) -> Option<Point2> {
+    let r = a.direction();
+    let s = b.direction();
+    let rl = r.length();
+    let sl = s.length();
+    if rl <= point_tol(a.a, a.b) || sl <= point_tol(b.a, b.b) {
+        return None;
+    }
+    let denom = r.cross(s);
+    // 平行判定: 角の sin が EPS 未満（|cross| = |r||s|sin θ）。同一直線もここで弾く。
+    if denom.abs() <= EPS * rl * sl {
+        return None;
+    }
+    let diff = b.a - a.a;
+    let t = diff.cross(s) / denom;
+    Some(a.a + r * t)
+}
+
+/// 無限直線 `line`（`LineSeg` を通る直線とみなす）と円 `c` の交点（0〜2 点）。
+///
+/// 区間 `[0, 1]` へのクランプを行わない点だけが [`seg_circle`] と異なる（延長線上の
+/// 交点も返す）。仮想交点スナップ（M12 タスク87、DESIGN.md M12 設計判断5）専用。
+///
+/// 線分が退化（長さが [`crate::point_tol`] 以下）、または半径が非正・非有限なら空を返す
+/// （退化した直線・円は「無限直線」の前提を満たさない）。接する場合は 1 点。
+#[must_use]
+pub fn line_circle_intersection(line: &LineSeg, c: &Circle) -> Vec<Point2> {
+    let mut out = Vec::new();
+    if line.length() <= point_tol(line.a, line.b) {
+        return out;
+    }
+    if !c.radius.is_finite() || c.radius <= 0.0 {
+        return out;
+    }
+    let d = line.direction();
+    let len = d.length();
+    let tol = rel_tol(c.center.to_vec2().length() + c.radius);
+    let u = d / len; // 単位方向。
+    let along_foot = (c.center - line.a).dot(u);
+    let foot = line.a + u * along_foot;
+    let dist = foot.distance(c.center);
+    if dist > c.radius + tol {
+        return out; // 交わらない。
+    }
+    let half2 = c.radius * c.radius - dist * dist;
+    let half = if half2 <= 0.0 { 0.0 } else { half2.sqrt() };
+    if half == 0.0 {
+        out.push(foot);
+    } else {
+        out.push(line.a + u * (along_foot - half));
+        out.push(line.a + u * (along_foot + half));
+    }
+    out
+}
+
 /// 線分 × 線分の真の交点（1 点）。平行・共線・区間重なりは `None`。
 fn seg_seg(s1: &LineSeg, s2: &LineSeg) -> Option<Point2> {
     let r = s1.direction();
@@ -418,6 +481,89 @@ mod tests {
         let pts = intersect(&pl, &line);
         assert_eq!(pts.len(), 1);
         assert!(contains_approx(&pts, Point2::new(5.0, 0.0)));
+    }
+
+    // --- line_line_intersection / line_circle_intersection（M12 タスク87、仮想交点用） ---
+
+    #[test]
+    fn line_line_intersection_typical_crossing() {
+        let a = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
+        let b = LineSeg::new(Point2::new(0.0, 10.0), Point2::new(10.0, 0.0));
+        let p = line_line_intersection(&a, &b).unwrap();
+        assert!(p.distance(Point2::new(5.0, 5.0)) < 1e-9);
+    }
+
+    #[test]
+    fn line_line_intersection_finds_extension_point() {
+        // 両線分の区間の外（延長線上）で交わる。seg_seg なら None だが、
+        // 無限直線とみなす line_line_intersection は交点を返す。
+        let a = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 1.0));
+        let b = LineSeg::new(Point2::new(0.0, 10.0), Point2::new(1.0, 9.0));
+        let p = line_line_intersection(&a, &b).unwrap();
+        assert!(p.distance(Point2::new(5.0, 5.0)) < 1e-9);
+    }
+
+    #[test]
+    fn line_line_intersection_parallel_is_none() {
+        let a = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let b = LineSeg::new(Point2::new(0.0, 1.0), Point2::new(10.0, 1.0));
+        assert_eq!(line_line_intersection(&a, &b), None);
+    }
+
+    #[test]
+    fn line_line_intersection_collinear_is_none() {
+        let a = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let b = LineSeg::new(Point2::new(20.0, 0.0), Point2::new(30.0, 0.0));
+        assert_eq!(line_line_intersection(&a, &b), None);
+    }
+
+    #[test]
+    fn line_line_intersection_degenerate_segment_is_none() {
+        let degenerate = LineSeg::new(Point2::new(1.0, 1.0), Point2::new(1.0, 1.0));
+        let normal = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 10.0));
+        assert_eq!(line_line_intersection(&degenerate, &normal), None);
+        assert_eq!(line_line_intersection(&normal, &degenerate), None);
+    }
+
+    #[test]
+    fn line_circle_intersection_two_points_on_extension() {
+        // 線分区間は円から離れているが、延長した直線は円と2点で交わる。
+        let line = LineSeg::new(Point2::new(-10.0, 0.0), Point2::new(-8.0, 0.0));
+        let circ = Circle::new(Point2::ORIGIN, 5.0);
+        let pts = line_circle_intersection(&line, &circ);
+        assert_eq!(pts.len(), 2);
+        assert!(contains_approx(&pts, Point2::new(5.0, 0.0)));
+        assert!(contains_approx(&pts, Point2::new(-5.0, 0.0)));
+    }
+
+    #[test]
+    fn line_circle_intersection_tangent_one_point() {
+        let line = LineSeg::new(Point2::new(-10.0, 5.0), Point2::new(10.0, 5.0));
+        let circ = Circle::new(Point2::ORIGIN, 5.0);
+        let pts = line_circle_intersection(&line, &circ);
+        assert_eq!(pts.len(), 1);
+        assert!(contains_approx(&pts, Point2::new(0.0, 5.0)));
+    }
+
+    #[test]
+    fn line_circle_intersection_miss_is_empty() {
+        let line = LineSeg::new(Point2::new(-10.0, 6.0), Point2::new(10.0, 6.0));
+        let circ = Circle::new(Point2::ORIGIN, 5.0);
+        assert!(line_circle_intersection(&line, &circ).is_empty());
+    }
+
+    #[test]
+    fn line_circle_intersection_degenerate_line_is_empty() {
+        let line = LineSeg::new(Point2::new(1.0, 1.0), Point2::new(1.0, 1.0));
+        let circ = Circle::new(Point2::ORIGIN, 5.0);
+        assert!(line_circle_intersection(&line, &circ).is_empty());
+    }
+
+    #[test]
+    fn line_circle_intersection_non_positive_radius_is_empty() {
+        let line = LineSeg::new(Point2::new(-10.0, 0.0), Point2::new(10.0, 0.0));
+        assert!(line_circle_intersection(&line, &Circle::new(Point2::ORIGIN, 0.0)).is_empty());
+        assert!(line_circle_intersection(&line, &Circle::new(Point2::ORIGIN, -1.0)).is_empty());
     }
 
     #[test]

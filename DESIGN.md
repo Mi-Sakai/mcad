@@ -1594,6 +1594,58 @@ release ビルド): 右パネル「表」の種類別の表示とボタン(汎�
   吸着も消えること、Grid OFF、再起動後の設定保持、`F3` の全体 OFF、分割ツールが種別設定に従うこと、上部パネルの
   レイアウト。Codex adversarial review は 2 回目で approve。
 
+#### タスク86 の実装時追記(2026-09-26、implement-sonnet の判断を采配役が検算のうえ採用)
+
+- **`mcad-geom` に純関数を2つ追加**（既存 API は変更せず追加のみ。tcad が `mcad-geom` に
+  path 依存しているため）: `LineSeg::foot_of_perpendicular(p) -> Option<Point2>`（足の
+  パラメータ `t ∈ [0, 1]`、境界許容は `crate::EPS` を直接使用。無次元パラメータ空間の
+  境界許容は `EPS` を直接使う、という `lib.rs` の許容量ポリシーに従った）。線分が退化
+  （`crate::point_tol` 以下）していれば `None`。`Circle::tangent_points(p) -> Option<[Point2; 2]>`
+  （`p` が中心から `radius + point_tol(p, center)` 以下なら接線が存在しないため `None`。
+  半径が非正・非有限でも `None`）。どちらも`mcad-geom` の単体テストを4件ずつ追加
+  （直交する典型例・延長上で `None`・端点ちょうどで `Some`・退化で `None` / 直角三角形の
+  接点2つが半径に直交・円周上で `None`・内部で `None`・退化半径で `None`）。
+- **`snap.rs` の優先度**: `SnapKind::Perpendicular`・`SnapKind::Tangent` をともに優先度
+  **4** に追加（タスク85 時点で予約していた番号をそのまま使用）。`5` は仮想交点
+  （タスク87）用に空けたまま。
+- **`SnapKinds`**: `perpendicular`・`tangent` を `quadrant` の直後・`nearest` の直前に追加
+  （優先度順の並びを保つ。既定 ON、`#[serde(default = "default_true")]`）。上部パネルの
+  「Snap types」メニューもこの並びでチェックボックスを追加。
+- **`snap()` に `base: Option<Point2>` 引数を追加**（末尾）。`None` なら垂線・接線の候補を
+  一切出さない。呼び出し側（`main.rs`）は `apply_snap` にも同じ末尾引数を追加し、
+  `handle_tool_input` の2箇所（Move・Click、いずれも作図ツール経路）だけ
+  `active.ortho_origin()` を渡す。選択モードの配置（`handle_placement_input`）・
+  グリップドラッグ・オフセット（`handle_offset_input`）は基点という概念を持たないため
+  `None` を渡す（`snap_split_position` は対象外のまま、引数も変えていない）。
+- **`near`（カーソル近傍 AABB で絞り込んだ Shape 集合）を再利用**: 構築条件に
+  `(kinds.perpendicular || kinds.tangent) && base.is_some()` を足した。無損失である理由は
+  近接点（タスク85）と同じ論法で、モジュール doc に追記した。垂線は `near` 内の
+  `Shape::Line`・`Shape::Polyline`（各辺、閉じ辺含む）だけを対象にし、円・円弧への垂線は
+  設計外なので出さない。接線は `Shape::Circle`・`Shape::Arc`（`Arc::contains_angle` で
+  弧の範囲内の接点だけ）を対象にする。
+- **基点＝足になる縮退の除外**: 垂線の足が基点そのものと一致する（距離が
+  `mcad_geom::point_tol(foot, origin)` 未満）候補は投入しない。長さ0の垂線は意味を
+  持たないため（依頼の「距離 < EPS」を、座標スケールに対する相対許容量である
+  `point_tol` として実装した。他の縮退判定と同じ相対許容量ポリシーに揃えるため、
+  絶対 `EPS` ではなくこちらを選んだ）。
+- **マーカー**: 垂線は「⊥」（下辺の水平線 + 中央から上への縦線）、接線は「小円 + その
+  下端に接する水平線」。色・線幅は既存のスナップマーカーと共通（`SNAP_MARKER_COLOR`）で、
+  既存の形（□×△○◇⧗＋）と見分けられる。
+- **`snap_split_position` は対象外のまま**（設計判断5どおり、分割スナップは対象上の点に
+  限定する既存設計を保つ）。
+- テストは `mcad-geom` に8件（上記）、`snap.rs` に9件（垂線の足への吸着・延長上で出ない・
+  base 無しで出ない・円の接点2つ〔カーソルに近い方〕・円弧の範囲外の接点が出ない・
+  基点が円の内部で出ない・種別 OFF で両方出ない・優先度が中心/四半円点より低く近接点より
+  高いこと〔2アサーション〕）、`config.rs` の既存2件（欠落補完・部分欠落補完）に
+  `perpendicular`・`tangent` の既定値検証を追加。
+- `../tcad` の `cargo test --workspace` は無変更で通過（`mcad-geom` の追加は既存 API に
+  影響しない）。
+  **→ 手動スモークテスト実施済み(2026-09-26、ユーザー実施、release ビルド、12 項目すべて合格)**: 線分ツールの 2 点目で
+  垂線の足(⊥)への吸着、延長上で出ないこと、1 点目の前は出ないこと、円の近い方の接点への吸着、基点が円の内部で
+  出ないこと、円弧の範囲外の接点が出ないこと、ポリライン作図中(最後の頂点が基点・閉じ辺を含む)、円弧ツールの
+  2・3 点目、端点・中点の優先、「Snap types」の Perpendicular・Tangent の OFF と再起動後の保持、選択モードの配置・
+  グリップドラッグで出ないこと、マーカーの見分け。Codex adversarial review は 1 回目で approve(指摘なし)。
+
 #### タスク分割
 
 | # | タスク | 内容 | 担当 | 依存 |
@@ -1605,7 +1657,7 @@ release ビルド): 右パネル「表」の種類別の表示とボタン(汎�
 | 83 | app: 数値入力 **(完了 2026-09-25)** | 設計判断3。書式の純関数と headless テスト、入力欄の表示、キーの振り分け(数字キーとツール切替)、`Enter`/`Esc` の段階、選択モードの移動・複製への適用。手動スモーク | implement-opus | 94 |
 | 84 | app: 極トラッキング **(完了 2026-09-26)** | 設計判断4。吸着の純関数(`ortho.rs` 近傍)・`F10`・刻み角の `config.json`・直交との排他・表示。数値入力 `L` の方向への反映。手動スモーク | implement-sonnet | 83 |
 | 85 | geom+app: 四半円点・近接点と種別 ON/OFF **(完了 2026-09-26)** | 設計判断5 のうち基点不要のもの。`SnapKind` 追加・優先度・`config.json`・上部パネル。手動スモーク | implement-sonnet | 84 |
-| 86 | geom+app: 垂線・接線スナップ | 設計判断5。geom に点 → 線分の垂線の足・点 → 円の接点の純関数、基点の受け渡し。手動スモーク | implement-sonnet | 85 |
+| 86 | geom+app: 垂線・接線スナップ **(完了 2026-09-26)** | 設計判断5。geom に点 → 線分の垂線の足・点 → 円の接点の純関数、基点の受け渡し。手動スモーク | implement-sonnet | 85 |
 | 87 | geom+app: 仮想交点スナップ | 設計判断5。無限直線・円の交点の純関数と無損失な絞り込みのテスト、点線マーカー。手動スモーク | implement-sonnet | 86 |
 | 88 | geom+app: 面取り | 設計判断6。`chamfer_lines`(proptest を含む)・ツール・`Shift+F`。`../tcad` 通過。手動スモーク | implement-sonnet | 83 |
 | 89 | app: 矩形・正多角形 | 設計判断7。頂点計算の純関数とテスト・ツール 2 つ・キー。手動スモーク | implement-sonnet | 83 |

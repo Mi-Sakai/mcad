@@ -2594,6 +2594,8 @@ impl eframe::App for McadApp {
                         ui.checkbox(&mut snap_kinds.midpoint, "Midpoint");
                         ui.checkbox(&mut snap_kinds.center, "Center");
                         ui.checkbox(&mut snap_kinds.quadrant, "Quadrant");
+                        ui.checkbox(&mut snap_kinds.perpendicular, "Perpendicular");
+                        ui.checkbox(&mut snap_kinds.tangent, "Tangent");
                         ui.checkbox(&mut snap_kinds.nearest, "Nearest");
                         ui.checkbox(&mut snap_kinds.grid, "Grid");
                     });
@@ -3624,6 +3626,7 @@ fn handle_tool_input(
                 grid,
                 snap_kinds,
                 &extra_points,
+                active.ortho_origin(),
             );
             *snap_marker = marker;
             *polar_marker = polar_marker_for(
@@ -3723,6 +3726,7 @@ fn handle_tool_input(
                 grid,
                 snap_kinds,
                 &extra_points,
+                active.ortho_origin(),
             );
             let world = resolve_click_point(
                 marker,
@@ -7346,6 +7350,10 @@ fn apply_sheet_change(
 /// `kinds` は種別ごとの ON/OFF（M12 タスク85、`self.config.snap_kinds`）。
 /// `extra_points` はアクティブな作図ツールの未確定頂点（[`Tool::snap_points`]）。
 /// 作図中ツールを持たない呼び出し箇所（選択・配置モード等）は `&[]` を渡す。
+/// `base` は垂線・接線（M12 タスク86）の基点。作図ツールの経路は
+/// `active.ortho_origin()` を渡し、それ以外（選択モードの配置・グリップドラッグ・
+/// オフセット等、基点を持たない経路）は `None` を渡す。
+#[allow(clippy::too_many_arguments)]
 fn apply_snap(
     document: &Document,
     enabled: bool,
@@ -7354,11 +7362,12 @@ fn apply_snap(
     grid: snap::GridSpec,
     kinds: snap::SnapKinds,
     extra_points: &[Point2],
+    base: Option<Point2>,
 ) -> (Point2, Option<snap::SnapResult>) {
     if !enabled {
         return (raw, None);
     }
-    match snap::snap(document, raw, radius, grid, kinds, extra_points) {
+    match snap::snap(document, raw, radius, grid, kinds, extra_points, base) {
         Some(result) => (result.point, Some(result)),
         None => (raw, None),
     }
@@ -7919,6 +7928,7 @@ fn handle_select_input(
                     grid,
                     snap_kinds,
                     &[],
+                    None,
                 );
                 *snap_marker = marker;
                 select_tool.on_grip_drag(snapped);
@@ -7937,6 +7947,7 @@ fn handle_select_input(
                     grid,
                     snap_kinds,
                     &[],
+                    None,
                 );
                 select_tool.on_grip_drag(snapped);
                 *snap_marker = None;
@@ -8021,8 +8032,16 @@ fn handle_placement_input(
     // カーソル追従（プレビュー用）とスナップマーカー更新。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, marker) =
-            apply_snap(document, snap_enabled, raw, radius, grid, snap_kinds, &[]);
+        let (world, marker) = apply_snap(
+            document,
+            snap_enabled,
+            raw,
+            radius,
+            grid,
+            snap_kinds,
+            &[],
+            None,
+        );
         *snap_marker = marker;
         // 数値入力の `L` の方向（配置は直交を掛けないので、スナップ後の点）。
         numeric.set_cursor(world);
@@ -8050,7 +8069,16 @@ fn handle_placement_input(
         // マウスのクリックは数値入力より優先する（打ちかけの文字列は捨てる）。
         numeric.close();
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, snap_kinds, &[]);
+        let (world, _) = apply_snap(
+            document,
+            snap_enabled,
+            raw,
+            radius,
+            grid,
+            snap_kinds,
+            &[],
+            None,
+        );
         Some((world, tol))
     } else if numeric_submit {
         match numeric.resolve(select_tool.numeric_input_base()) {
@@ -8218,8 +8246,16 @@ fn handle_offset_input(
     // カーソル追従（プレビュー用ゴースト）とスナップマーカー更新。
     if let Some(pos) = response.hover_pos() {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, marker) =
-            apply_snap(document, snap_enabled, raw, radius, grid, snap_kinds, &[]);
+        let (world, marker) = apply_snap(
+            document,
+            snap_enabled,
+            raw,
+            radius,
+            grid,
+            snap_kinds,
+            &[],
+            None,
+        );
         *snap_marker = marker;
         select_tool.offset_move(world);
     } else {
@@ -8236,7 +8272,16 @@ fn handle_offset_input(
         && let Some(pos) = response.interact_pointer_pos()
     {
         let raw = viewport.screen_to_world(rect, pos);
-        let (world, _) = apply_snap(document, snap_enabled, raw, radius, grid, snap_kinds, &[]);
+        let (world, _) = apply_snap(
+            document,
+            snap_enabled,
+            raw,
+            radius,
+            grid,
+            snap_kinds,
+            &[],
+            None,
+        );
         match select_tool.offset_click(document, world, tol, offset_distance) {
             OffsetOutcome::Cancelled(msg) => {
                 *snap_marker = None;
@@ -9306,7 +9351,8 @@ fn numeric_input_box_rect(canvas: Rect, anchor: Pos2, size: egui::Vec2) -> Rect 
 
 /// スナップ先にマーカーを描画する。候補種別ごとに形を変えて、どの種別に吸着したか
 /// が一目で分かるようにする（端点=□、交点=×、中点=△、中心=○、四半円点=◇、
-/// 近接点=⧗（砂時計）、グリッド=＋。M12 タスク85で四半円点・近接点を追加）。
+/// 垂線=⊥、接線=接する小円+水平線、近接点=⧗（砂時計）、グリッド=＋。M12 タスク85で
+/// 四半円点・近接点を、タスク86で垂線・接線を追加）。
 fn draw_snap_marker(
     painter: &egui::Painter,
     rect: Rect,
@@ -9357,6 +9403,19 @@ fn draw_snap_marker(
             seg(right, bottom);
             seg(bottom, left);
             seg(left, top);
+        }
+        SnapKind::Perpendicular => {
+            // ⊥（下辺の水平線 + 中央から上への縦線）。
+            seg(c + egui::vec2(-s, s), c + egui::vec2(s, s));
+            seg(c + egui::vec2(0.0, s), c + egui::vec2(0.0, -s));
+        }
+        SnapKind::Tangent => {
+            // 小円 + その下端に接する水平線。
+            let line_y = c.y + s;
+            let r = s * 0.6;
+            let circle_center = Pos2::new(c.x, line_y - r);
+            painter.circle_stroke(circle_center, r, stroke);
+            seg(Pos2::new(c.x - s, line_y), Pos2::new(c.x + s, line_y));
         }
         SnapKind::Nearest => {
             // 砂時計（⧗。上下の水平線 + 対角線2本）。

@@ -422,6 +422,8 @@ mod tests {
                 midpoint: true,
                 center: false,
                 quadrant: false,
+                perpendicular: true,
+                tangent: false,
                 nearest: true,
                 grid: false,
             },
@@ -534,6 +536,8 @@ mod tests {
         assert!(config.snap_kinds.midpoint);
         assert!(config.snap_kinds.center);
         assert!(config.snap_kinds.quadrant);
+        assert!(config.snap_kinds.perpendicular);
+        assert!(config.snap_kinds.tangent);
         assert!(!config.snap_kinds.nearest);
         assert!(config.snap_kinds.grid);
     }
@@ -550,6 +554,8 @@ mod tests {
         assert!(config.snap_kinds.midpoint);
         assert!(config.snap_kinds.center);
         assert!(config.snap_kinds.quadrant);
+        assert!(config.snap_kinds.perpendicular);
+        assert!(config.snap_kinds.tangent);
         assert!(config.snap_kinds.nearest);
         assert!(!config.snap_kinds.grid);
     }

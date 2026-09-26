@@ -159,6 +159,27 @@ impl LineSeg {
         self.a + d * t
     }
 
+    /// 点 `p` から線分（の乗る直線）への垂線の足。
+    ///
+    /// 足が線分上（パラメータ `t ∈ [0, 1]`、端点を含む）にあるときだけ `Some` を返す。
+    /// 延長上（`t < 0` または `t > 1`）にできる足は `None`（垂線スナップ、M12 タスク86、
+    /// DESIGN.md M12 設計判断5: 「垂線の足は線分上、延長上は出さない」）。線分が退化
+    /// （長さが [`crate::point_tol`] 以下）していれば方向が定まらないため `None`。
+    #[must_use]
+    pub fn foot_of_perpendicular(&self, p: Point2) -> Option<Point2> {
+        if seg_is_degenerate(self) {
+            return None;
+        }
+        let d = self.direction();
+        let t = (p - self.a).dot(d) / d.length_squared();
+        // t はパラメータ [0, 1] 空間の値なので、境界許容は crate::EPS を直接使う
+        // （crate::lib.rs の許容量ポリシー参照）。
+        if !(-crate::EPS..=1.0 + crate::EPS).contains(&t) {
+            return None;
+        }
+        Some(self.a + d * t.clamp(0.0, 1.0))
+    }
+
     /// 変位 `delta` だけ平行移動した新しい線分。
     #[inline]
     #[must_use]
@@ -282,6 +303,33 @@ impl Circle {
             self.point_at_angle(std::f64::consts::PI),
             self.point_at_angle(3.0 * std::f64::consts::FRAC_PI_2),
         ]
+    }
+
+    /// 円外部の点 `p` から円への接線の接点2つ。
+    ///
+    /// `p` が円の内部または円周上（中心からの距離が `radius + point_tol(p, center)`
+    /// 以下）なら接線が存在しないため `None`。半径が非正・非有限（退化円）でも
+    /// `None`（接線スナップ、M12 タスク86、DESIGN.md M12 設計判断5）。
+    ///
+    /// 幾何: 中心 `C`・接点 `T`・外部点 `P` は `∠CTP = 90°` の直角三角形をなすため、
+    /// `∠TCP = acos(radius / |CP|)`。`C→P` の方位角 `theta` に対し、2 接点は
+    /// `theta ± ∠TCP` の方向に半径分進んだ点。
+    #[must_use]
+    pub fn tangent_points(&self, p: Point2) -> Option<[Point2; 2]> {
+        if !self.radius.is_finite() || self.radius <= 0.0 {
+            return None;
+        }
+        let d = p - self.center;
+        let dist = d.length();
+        if !dist.is_finite() || dist <= self.radius + point_tol(p, self.center) {
+            return None;
+        }
+        let theta = d.y.atan2(d.x);
+        let angle = (self.radius / dist).acos();
+        Some([
+            self.point_at_angle(theta + angle),
+            self.point_at_angle(theta - angle),
+        ])
     }
 
     /// 変位 `delta` だけ平行移動した新しい円（中心のみ動き、半径は不変）。
@@ -1097,6 +1145,78 @@ mod tests {
         assert!(approx(pts[1], Point2::new(1.0, 7.0)));
         assert!(approx(pts[2], Point2::new(-4.0, 2.0)));
         assert!(approx(pts[3], Point2::new(1.0, -3.0)));
+    }
+
+    #[test]
+    fn foot_of_perpendicular_typical_orthogonal_case() {
+        // 線分 (0,0)-(10,0)、点 (3,5) → 足 (3,0)（線分上）。
+        let s = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let foot = s.foot_of_perpendicular(Point2::new(3.0, 5.0)).unwrap();
+        assert!(approx(foot, Point2::new(3.0, 0.0)));
+    }
+
+    #[test]
+    fn foot_of_perpendicular_out_of_range_is_none() {
+        // 足が t=1.5 相当（延長上）になる点。
+        let s = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        assert_eq!(s.foot_of_perpendicular(Point2::new(15.0, 5.0)), None);
+        assert_eq!(s.foot_of_perpendicular(Point2::new(-5.0, 5.0)), None);
+    }
+
+    #[test]
+    fn foot_of_perpendicular_exactly_at_endpoint_is_some() {
+        // 足がちょうど端点(t=0, t=1)に一致するケースは線分上として許容する。
+        let s = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        assert!(approx(
+            s.foot_of_perpendicular(Point2::new(0.0, 5.0)).unwrap(),
+            Point2::new(0.0, 0.0)
+        ));
+        assert!(approx(
+            s.foot_of_perpendicular(Point2::new(10.0, 5.0)).unwrap(),
+            Point2::new(10.0, 0.0)
+        ));
+    }
+
+    #[test]
+    fn foot_of_perpendicular_degenerate_segment_is_none() {
+        let s = LineSeg::new(Point2::new(1.0, 1.0), Point2::new(1.0, 1.0));
+        assert_eq!(s.foot_of_perpendicular(Point2::new(5.0, 5.0)), None);
+    }
+
+    #[test]
+    fn circle_tangent_points_are_perpendicular_to_radius() {
+        // 中心(0,0)半径5、外部点(13,0)（距離13）→ 接点2つ。
+        let c = Circle::new(Point2::ORIGIN, 5.0);
+        let p = Point2::new(13.0, 0.0);
+        let [t1, t2] = c.tangent_points(p).unwrap();
+        for t in [t1, t2] {
+            // |CT| = radius。
+            assert!((t.distance(c.center) - c.radius).abs() < 1e-9);
+            // 基点→接点の向きは半径ベクトルと直交する（P→T と C→T の内積が 0）。
+            let ct = t - c.center;
+            let pt = t - p;
+            assert!(ct.dot(pt).abs() < 1e-6);
+        }
+        // 2 接点は異なる。
+        assert!(t1.distance(t2) > 1e-6);
+    }
+
+    #[test]
+    fn circle_tangent_points_on_circumference_is_none() {
+        let c = Circle::new(Point2::ORIGIN, 5.0);
+        assert_eq!(c.tangent_points(Point2::new(5.0, 0.0)), None);
+    }
+
+    #[test]
+    fn circle_tangent_points_inside_circle_is_none() {
+        let c = Circle::new(Point2::ORIGIN, 5.0);
+        assert_eq!(c.tangent_points(Point2::new(1.0, 0.0)), None);
+    }
+
+    #[test]
+    fn circle_tangent_points_degenerate_radius_is_none() {
+        let c = Circle::new(Point2::ORIGIN, 0.0);
+        assert_eq!(c.tangent_points(Point2::new(5.0, 0.0)), None);
     }
 
     #[test]

@@ -20,6 +20,11 @@
 //! カーソルに **最も近い** ものを選ぶ（[`Best::consider`]）。半径内に候補が
 //! 何も無ければ [`None`]（＝スナップなし。呼び出し側は素のカーソル位置を使う）。
 //!
+//! 垂線・接線（[`SnapKind::Perpendicular`]・[`SnapKind::Tangent`]、M12 タスク86）は
+//! **基点が要る**（[`snap`] の `base` 引数）。作図ツールの2点目以降で
+//! `Tool::ortho_origin()` が渡されたときだけ候補になり、基点の無い段階・ツールでは
+//! 計算自体を行わない。
+//!
 //! # 種別ごとの ON/OFF
 //!
 //! [`SnapKinds`] が種別ごとの有効/無効を持つ（`config.json` に永続化。
@@ -52,6 +57,14 @@
 //! 半径内に最近点を持つ形状があれば、その最近点自体が半径内（＝カーソル近傍 AABB
 //! 内）にあり、かつ形状上の点は必ずその形状の AABB に含まれるため、形状の AABB は
 //! カーソル近傍 AABB と交差する。
+//!
+//! 垂線・接線（M12 タスク86）も **同じ `near` を再利用する**。無損失の理由は近接点と
+//! 全く同じ論法（候補点がカーソル半径内にあれば、その候補点を含む図形の AABB は
+//! カーソル近傍 AABB と交わる）で、垂線の足・接点も形状上の点である以上この論法が
+//! そのまま成り立つ。`near` を作る条件へ `(kinds.perpendicular || kinds.tangent) &&
+//! base.is_some()` を足し、無効な種別・基点の無い呼び出しでは集合の構築自体を省く
+//! （M12 タスク85 Codex adversarial review の「無効な種別は計算自体を省く」方針を
+//! そのまま踏襲）。
 
 use mcad_core::{Document, Entity, EntityGeom, EntityId};
 use mcad_geom::{Aabb, Point2, Shape, closest_point, intersect, point_tol};
@@ -80,6 +93,12 @@ pub enum SnapKind {
     /// 四半円点（円・円弧のワールド軸方向 0°/90°/180°/270° の点。円弧は弧の範囲内のみ。
     /// M12 タスク85）。
     Quadrant,
+    /// 垂線の足（基点から線分・ポリラインの辺への垂線の足。線分上のみ、延長上は
+    /// 出さない。基点が要る。M12 タスク86）。
+    Perpendicular,
+    /// 接線の接点（基点から円・円弧への接線の接点。円弧は弧の範囲内のみ。基点が要る。
+    /// M12 タスク86）。
+    Tangent,
     /// 近接点（可視 Shape 上でカーソルに最も近い点。既定 OFF。M12 タスク85）。
     Nearest,
     /// グリッド交点。
@@ -89,9 +108,8 @@ pub enum SnapKind {
 impl SnapKind {
     /// 数値優先度（小さいほど高優先）。同順位内はカーソルとの距離で決める。
     ///
-    /// `4`・`5` は M12 タスク86（垂線・接線）・タスク87（仮想交点）用に空けてある
-    /// （DESIGN.md M12 設計判断5: 端点 > 交点 > 中点 > 中心 = 四半円点 > 垂線 = 接線 >
-    /// 仮想交点 > 近接点 > グリッド）。
+    /// `5` は M12 タスク87（仮想交点）用に空けてある（DESIGN.md M12 設計判断5:
+    /// 端点 > 交点 > 中点 > 中心 = 四半円点 > 垂線 = 接線 > 仮想交点 > 近接点 > グリッド）。
     #[must_use]
     fn priority(self) -> u8 {
         match self {
@@ -100,7 +118,9 @@ impl SnapKind {
             SnapKind::Midpoint => 2,
             SnapKind::Center => 3,
             SnapKind::Quadrant => 3,
-            // 4, 5 は垂線・接線（タスク86）、仮想交点（タスク87）用に予約。
+            SnapKind::Perpendicular => 4,
+            SnapKind::Tangent => 4,
+            // 5 は仮想交点（タスク87）用に予約。
             SnapKind::Nearest => 6,
             SnapKind::Grid => 7,
         }
@@ -131,6 +151,12 @@ pub struct SnapKinds {
     /// 四半円点。既定 ON。
     #[serde(default = "default_true")]
     pub quadrant: bool,
+    /// 垂線の足。既定 ON。M12 タスク86。
+    #[serde(default = "default_true")]
+    pub perpendicular: bool,
+    /// 接線の接点。既定 ON。M12 タスク86。
+    #[serde(default = "default_true")]
+    pub tangent: bool,
     /// 近接点。**既定 OFF**。
     #[serde(default)]
     pub nearest: bool,
@@ -153,6 +179,8 @@ impl Default for SnapKinds {
             midpoint: true,
             center: true,
             quadrant: true,
+            perpendicular: true,
+            tangent: true,
             nearest: false,
             grid: true,
         }
@@ -169,6 +197,8 @@ impl SnapKinds {
             SnapKind::Midpoint => self.midpoint,
             SnapKind::Center => self.center,
             SnapKind::Quadrant => self.quadrant,
+            SnapKind::Perpendicular => self.perpendicular,
+            SnapKind::Tangent => self.tangent,
             SnapKind::Nearest => self.nearest,
             SnapKind::Grid => self.grid,
         }
@@ -265,6 +295,10 @@ pub fn iso_grid_snap(cursor: Point2, step: f64) -> Option<Point2> {
 ///   `Document` にまだ存在しない点だが、[`SnapKind::Endpoint`]（最優先）候補として
 ///   他の端点と同じ優先度・最近傍規則で扱う。ポリライン作図中に自分自身の始点へ
 ///   スナップして自動クローズできるようにするための拡張。
+/// - `base`: 垂線・接線（[`SnapKind::Perpendicular`]・[`SnapKind::Tangent`]、M12
+///   タスク86）の基点。`None` なら垂線・接線の候補を一切出さない（計算自体を省く）。
+///   作図ツールの経路では `Tool::ortho_origin()` を渡す（選択モードの配置・グリップ
+///   ドラッグ等、基点を持たない呼び出しは `None`）。
 #[must_use]
 pub fn snap(
     document: &Document,
@@ -273,6 +307,7 @@ pub fn snap(
     grid: GridSpec,
     kinds: SnapKinds,
     extra_points: &[Point2],
+    base: Option<Point2>,
 ) -> Option<SnapResult> {
     if !radius.is_finite() || radius <= 0.0 {
         return None;
@@ -310,7 +345,8 @@ pub fn snap(
     // O(k^2) の総当たりを走らせない（`Best::consider` で捨てるだけだとマウス移動ごとの
     // 計算が残る。M12 タスク85 Codex adversarial review 指摘）。
     let cursor_box = Aabb::from_point(cursor).expanded(radius);
-    let near: Vec<&Shape> = if kinds.intersection || kinds.nearest {
+    let wants_perp_or_tangent = base.is_some() && (kinds.perpendicular || kinds.tangent);
+    let near: Vec<&Shape> = if kinds.intersection || kinds.nearest || wants_perp_or_tangent {
         document
             .entities()
             .filter(|(_, e)| layer_visible(document, e))
@@ -326,6 +362,51 @@ pub fn snap(
             for j in (i + 1)..near.len() {
                 for p in intersect(near[i], near[j]) {
                     best.consider(SnapKind::Intersection, p, cursor, r2);
+                }
+            }
+        }
+    }
+
+    // 垂線・接線: 基点が要る（M12 タスク86、DESIGN.md M12 設計判断5）。基点が無い、
+    // または種別が両方とも無効なら `near` 自体が空（構築を省いている）なのでこの
+    // ループは何もしない。基点があるときだけ `near` 上の Line/Polyline（垂線）・
+    // Circle/Arc（接線）を走査する。
+    if let Some(origin) = base {
+        for shape in &near {
+            if kinds.perpendicular {
+                match shape {
+                    Shape::Line(s) => {
+                        consider_perpendicular_foot(s, origin, cursor, r2, &mut best);
+                    }
+                    Shape::Polyline(pl) => {
+                        for seg in pl.segments() {
+                            consider_perpendicular_foot(&seg, origin, cursor, r2, &mut best);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if kinds.tangent {
+                match shape {
+                    Shape::Circle(c) => {
+                        if let Some(pts) = c.tangent_points(origin) {
+                            for p in pts {
+                                best.consider(SnapKind::Tangent, p, cursor, r2);
+                            }
+                        }
+                    }
+                    Shape::Arc(a) => {
+                        let circle = a.circle();
+                        if let Some(pts) = circle.tangent_points(origin) {
+                            for p in pts {
+                                let theta = (p.y - circle.center.y).atan2(p.x - circle.center.x);
+                                if a.contains_angle(theta) {
+                                    best.consider(SnapKind::Tangent, p, cursor, r2);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -528,6 +609,26 @@ fn enumerate_features(shape: &Shape, cursor: Point2, r2: f64, best: &mut Best) {
     }
 }
 
+/// 基点 `origin` から線分 `seg` への垂線の足を候補に投入する（M12 タスク86）。
+///
+/// 足が線分上に無ければ（延長上）[`LineSeg::foot_of_perpendicular`] が `None` を
+/// 返すので何もしない。足が `origin` そのものと一致する（距離が [`point_tol`] 未満）
+/// 場合も投入しない: `origin` は基点であり、そこへ「基点自身への垂線」を候補にすると
+/// 長さ 0 の線になって意味がないため（DESIGN.md M12 設計判断5 の実装時追記）。
+fn consider_perpendicular_foot(
+    seg: &mcad_geom::LineSeg,
+    origin: Point2,
+    cursor: Point2,
+    r2: f64,
+    best: &mut Best,
+) {
+    if let Some(foot) = seg.foot_of_perpendicular(origin)
+        && foot.distance(origin) >= point_tol(foot, origin)
+    {
+        best.consider(SnapKind::Perpendicular, foot, cursor, r2);
+    }
+}
+
 /// エンティティの所属レイヤーが可視か（非表示レイヤーはスナップ対象外。
 /// `SelectTool` のヒットテストが非表示レイヤーを除外するのと同じ方針）。
 fn layer_visible(document: &Document, entity: &Entity) -> bool {
@@ -617,17 +718,29 @@ mod tests {
         Shape::Line(LineSeg::new(Point2::new(ax, ay), Point2::new(bx, by)))
     }
 
-    /// グリッド無効（`grid_step = 0`）・`extra_points` 無し・全種別 ON でスナップする短縮版。
+    /// グリッド無効（`grid_step = 0`）・`extra_points` 無し・基点無し・全種別 ON で
+    /// スナップする短縮版。
     fn snap_no_grid(doc: &Document, cursor: Point2, radius: f64) -> Option<SnapResult> {
         snap_no_grid_with_kinds(doc, cursor, radius, SnapKinds::default())
     }
 
-    /// [`snap_no_grid`] の種別指定版（種別 ON/OFF のテスト用）。
+    /// [`snap_no_grid`] の種別指定版（種別 ON/OFF のテスト用）。基点は無し。
     fn snap_no_grid_with_kinds(
         doc: &Document,
         cursor: Point2,
         radius: f64,
         kinds: SnapKinds,
+    ) -> Option<SnapResult> {
+        snap_no_grid_with_kinds_and_base(doc, cursor, radius, kinds, None)
+    }
+
+    /// [`snap_no_grid_with_kinds`] の基点指定版（垂線・接線のテスト用、M12 タスク86）。
+    fn snap_no_grid_with_kinds_and_base(
+        doc: &Document,
+        cursor: Point2,
+        radius: f64,
+        kinds: SnapKinds,
+        base: Option<Point2>,
     ) -> Option<SnapResult> {
         snap(
             doc,
@@ -636,6 +749,7 @@ mod tests {
             GridSpec::new(0.0, GridMode::Rectangular),
             kinds,
             &[],
+            base,
         )
     }
 
@@ -716,6 +830,7 @@ mod tests {
             GridSpec::new(1.0, GridMode::Rectangular),
             SnapKinds::default(),
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(r.kind, SnapKind::Center);
@@ -733,6 +848,7 @@ mod tests {
             GridSpec::new(1.0, GridMode::Rectangular),
             SnapKinds::default(),
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
@@ -800,6 +916,7 @@ mod tests {
             GridSpec::new(0.0, GridMode::Rectangular),
             SnapKinds::default(),
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(r.kind, SnapKind::Intersection);
@@ -822,7 +939,8 @@ mod tests {
                 3.0,
                 GridSpec::new(0.0, GridMode::Rectangular),
                 SnapKinds::default(),
-                &[]
+                &[],
+                None
             ),
             None
         );
@@ -841,6 +959,7 @@ mod tests {
             GridSpec::new(1.0, GridMode::Rectangular),
             SnapKinds::default(),
             &extra,
+            None,
         )
         .unwrap();
         assert_eq!(r.kind, SnapKind::Endpoint);
@@ -882,6 +1001,7 @@ mod tests {
             GridSpec::new(1.0, GridMode::Rectangular),
             SnapKinds::default(),
             &extra,
+            None,
         )
         .unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
@@ -1380,6 +1500,7 @@ mod tests {
             GridSpec::new(step, GridMode::Isometric),
             SnapKinds::default(),
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(r.kind, SnapKind::Grid);
@@ -1457,6 +1578,236 @@ mod tests {
         assert_eq!(r.point, Point2::new(5.0, 0.0));
     }
 
+    // --- 垂線・接線（SnapKind::Perpendicular / SnapKind::Tangent、M12 タスク86） ---
+
+    /// 垂線のみを有効にした [`SnapKinds`]。
+    fn perpendicular_only() -> SnapKinds {
+        SnapKinds {
+            endpoint: false,
+            intersection: false,
+            midpoint: false,
+            center: false,
+            quadrant: false,
+            perpendicular: true,
+            tangent: false,
+            nearest: false,
+            grid: false,
+        }
+    }
+
+    /// 接線のみを有効にした [`SnapKinds`]。
+    fn tangent_only() -> SnapKinds {
+        SnapKinds {
+            endpoint: false,
+            intersection: false,
+            midpoint: false,
+            center: false,
+            quadrant: false,
+            perpendicular: false,
+            tangent: true,
+            nearest: false,
+            grid: false,
+        }
+    }
+
+    #[test]
+    fn perpendicular_foot_on_line_is_a_candidate() {
+        // 線分 (0,0)-(10,0)、基点 (3,5) → 足 (3,0)。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+
+        let r = snap_no_grid_with_kinds_and_base(
+            &doc,
+            Point2::new(3.05, 0.0),
+            0.5,
+            perpendicular_only(),
+            Some(Point2::new(3.0, 5.0)),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::Perpendicular);
+        assert_eq!(r.point, Point2::new(3.0, 0.0));
+    }
+
+    #[test]
+    fn perpendicular_foot_on_extension_is_not_a_candidate() {
+        // 線分 (0,0)-(10,0)、基点 (15,5) → 足は t=1.5（延長上）なので候補にならない。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+
+        assert_eq!(
+            snap_no_grid_with_kinds_and_base(
+                &doc,
+                Point2::new(15.0, 0.0),
+                1.0,
+                perpendicular_only(),
+                Some(Point2::new(15.0, 5.0)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn perpendicular_and_tangent_disabled_kinds_hide_candidates_even_with_base() {
+        // base があっても種別が OFF なら候補にならない（垂線・接線それぞれ）。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        add(
+            &mut doc,
+            Shape::Circle(Circle::new(Point2::new(20.0, 0.0), 5.0)),
+        );
+        let base = Some(Point2::new(3.0, 5.0));
+
+        // 垂線を無効化: 線分への垂線候補(3,0)近傍でも出ない。
+        let kinds = SnapKinds {
+            perpendicular: false,
+            ..perpendicular_only()
+        };
+        assert_eq!(
+            snap_no_grid_with_kinds_and_base(&doc, Point2::new(3.05, 0.0), 0.5, kinds, base),
+            None
+        );
+
+        // 接線を無効化: 円への接線候補近傍でも出ない。
+        let tangent_base = Some(Point2::new(28.0, 0.0));
+        let kinds = SnapKinds {
+            tangent: false,
+            ..tangent_only()
+        };
+        assert_eq!(
+            snap_no_grid_with_kinds_and_base(
+                &doc,
+                Point2::new(20.0, 4.0),
+                3.0,
+                kinds,
+                tangent_base
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn perpendicular_without_base_is_not_a_candidate() {
+        // base が None なら、同じ状況（線分と近傍カーソル）でも垂線候補は出ない。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+
+        assert_eq!(
+            snap_no_grid_with_kinds(&doc, Point2::new(3.05, 0.0), 0.5, perpendicular_only()),
+            None
+        );
+    }
+
+    #[test]
+    fn circle_tangent_points_are_candidates_nearest_cursor_wins() {
+        // 円 中心(0,0) 半径5、基点(13,0)（5-12-13 の直角三角形）。接点は
+        // (25/13, 60/13) と (25/13, -60/13)。カーソルを上側の接点近くに置くと
+        // そちらが選ばれる。
+        let mut doc = Document::new();
+        add(
+            &mut doc,
+            Shape::Circle(Circle::new(Point2::new(0.0, 0.0), 5.0)),
+        );
+
+        let expected = Point2::new(25.0 / 13.0, 60.0 / 13.0);
+        let r = snap_no_grid_with_kinds_and_base(
+            &doc,
+            Point2::new(expected.x, expected.y + 0.05),
+            0.5,
+            tangent_only(),
+            Some(Point2::new(13.0, 0.0)),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::Tangent);
+        assert!(r.point.distance(expected) < 1e-9);
+    }
+
+    #[test]
+    fn arc_tangent_point_outside_sweep_is_not_a_candidate() {
+        // 円弧 中心(0,0) 半径5、掃引 0°→90°。基点(13,0) の接点のうち下側
+        // (25/13,-60/13) は弧の範囲外なので候補にならない。
+        use mcad_geom::Arc;
+        let mut doc = Document::new();
+        let arc = Arc::new(Point2::new(0.0, 0.0), 5.0, 0.0, FRAC_PI_2);
+        add(&mut doc, Shape::Arc(arc));
+
+        let below = Point2::new(25.0 / 13.0, -60.0 / 13.0);
+        assert_eq!(
+            snap_no_grid_with_kinds_and_base(
+                &doc,
+                Point2::new(below.x, below.y - 0.05),
+                0.5,
+                tangent_only(),
+                Some(Point2::new(13.0, 0.0)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tangent_point_when_base_inside_circle_is_not_a_candidate() {
+        // 基点(1,0)は円 中心(0,0) 半径5 の内部なので接線が存在しない。
+        let mut doc = Document::new();
+        add(
+            &mut doc,
+            Shape::Circle(Circle::new(Point2::new(0.0, 0.0), 5.0)),
+        );
+
+        assert_eq!(
+            snap_no_grid_with_kinds_and_base(
+                &doc,
+                Point2::new(5.0, 0.0),
+                1.0,
+                tangent_only(),
+                Some(Point2::new(1.0, 0.0)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn perpendicular_priority_is_below_center_and_above_nearest() {
+        // 円 中心(0,3) 半径0.05（実質、中心のごく近くにしか候補が無い曲線）と
+        // 線分 (0,0)-(10,0) を同じ場に置く。基点(5,5) からの垂線の足は (5,0)。
+        // カーソル (5,0.05) 付近では中心(0,3)は遠いため候補外だが、垂線と近接点は
+        // ともに射程内。中心・四半円点(優先度3)は垂線(優先度4)より高優先、
+        // 近接点(優先度6)は垂線より低優先であることを確認する。
+        let mut doc = Document::new();
+        add(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        let base = Some(Point2::new(5.0, 5.0));
+
+        // 垂線と近接点をともに有効にすると、垂線(優先度4)が近接点(優先度6)に勝つ。
+        let kinds = SnapKinds {
+            endpoint: false,
+            intersection: false,
+            midpoint: false,
+            center: false,
+            quadrant: false,
+            perpendicular: true,
+            tangent: false,
+            nearest: true,
+            grid: false,
+        };
+        let r = snap_no_grid_with_kinds_and_base(&doc, Point2::new(5.0, 0.05), 0.5, kinds, base)
+            .unwrap();
+        assert_eq!(r.kind, SnapKind::Perpendicular);
+        assert_eq!(r.point, Point2::new(5.0, 0.0));
+
+        // 中心を同じ半径内に置くと、中心(優先度3)が垂線(優先度4)に勝つ。
+        let mut doc2 = Document::new();
+        add(&mut doc2, line(0.0, 0.0, 10.0, 0.0));
+        add(
+            &mut doc2,
+            Shape::Circle(Circle::new(Point2::new(5.2, 0.05), 0.01)),
+        );
+        let kinds2 = SnapKinds {
+            center: true,
+            ..perpendicular_only()
+        };
+        let r = snap_no_grid_with_kinds_and_base(&doc2, Point2::new(5.1, 0.05), 0.5, kinds2, base)
+            .unwrap();
+        assert_eq!(r.kind, SnapKind::Center);
+    }
+
     // --- 近接点（SnapKind::Nearest、M12 タスク85） ---
 
     /// 近接点のみを有効にした [`SnapKinds`]（他の候補と混ざらないよう分離するテスト用）。
@@ -1467,6 +1818,8 @@ mod tests {
             midpoint: false,
             center: false,
             quadrant: false,
+            perpendicular: false,
+            tangent: false,
             nearest: true,
             grid: false,
         }
@@ -1568,6 +1921,7 @@ mod tests {
             GridSpec::new(0.0, GridMode::Rectangular),
             kinds,
             &extra,
+            None,
         );
         assert_eq!(r, None);
     }
@@ -1587,6 +1941,7 @@ mod tests {
             GridSpec::new(1.0, GridMode::Rectangular),
             kinds,
             &[],
+            None,
         );
         assert_eq!(r, None);
     }
@@ -1619,6 +1974,8 @@ mod tests {
             midpoint: false,
             center: false,
             quadrant: false,
+            perpendicular: false,
+            tangent: false,
             nearest: false,
             grid: false,
         };
@@ -1638,6 +1995,8 @@ mod tests {
         assert!(kinds.midpoint);
         assert!(kinds.center);
         assert!(kinds.quadrant);
+        assert!(kinds.perpendicular);
+        assert!(kinds.tangent);
         assert!(!kinds.nearest);
         assert!(kinds.grid);
     }
@@ -1650,6 +2009,8 @@ mod tests {
             midpoint: true,
             center: false,
             quadrant: true,
+            perpendicular: false,
+            tangent: true,
             nearest: false,
             grid: true,
         };
@@ -1658,6 +2019,8 @@ mod tests {
         assert!(kinds.enabled(SnapKind::Midpoint));
         assert!(!kinds.enabled(SnapKind::Center));
         assert!(kinds.enabled(SnapKind::Quadrant));
+        assert!(!kinds.enabled(SnapKind::Perpendicular));
+        assert!(kinds.enabled(SnapKind::Tangent));
         assert!(!kinds.enabled(SnapKind::Nearest));
         assert!(kinds.enabled(SnapKind::Grid));
     }
@@ -1670,6 +2033,8 @@ mod tests {
             midpoint: false,
             center: true,
             quadrant: false,
+            perpendicular: true,
+            tangent: false,
             nearest: true,
             grid: false,
         };

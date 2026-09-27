@@ -21,6 +21,8 @@
 //!   7 種の矢先形状を「塗る多角形＋描く線分」で生成し、画面と SVG/PDF で同一の形を保つ）
 //! - ジオメトリ検証: [`Shape::validate`]（非有限座標・負半径・空ポリラインなどを検出）
 //! - 数値許容量: [`EPS`] と、その相対化ヘルパ [`rel_tol`] / [`point_tol`]
+//! - 幾何拘束の汎用ソルバー: [`solve`] モジュール（エンティティを知らない非線形方程式系の
+//!   最小ノルム型減衰ガウス・ニュートン法、自由度、ヤコビアンの数値微分照合。M13）
 //!
 //! すべての形状は [`Shape::aabb`]（および各プリミティブの `aabb` メソッド）で
 //! 軸並行境界ボックスを算出でき、ビューポートカリング・矩形選択に使う。
@@ -32,6 +34,7 @@ mod intersect;
 pub mod join;
 mod point;
 mod primitives;
+pub mod solve;
 pub mod split;
 pub mod symbol;
 pub mod trim_extend;

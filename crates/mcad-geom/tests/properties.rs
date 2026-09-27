@@ -16,6 +16,8 @@
 //!   トリム済み線分の切断端に一致し、掃引が π 以下に収まる。
 //! - 面取り: 2 つの面取り点がそれぞれコーナーから要求距離にあり、bevel の両端が
 //!   トリム済み線分の切断端に一致する。
+//! - 結合: ランダムな開ポリラインを 2 ピースへ分割し、シャッフル・向き反転してから
+//!   結合すると元の頂点列（前後どちらかの向き）に戻る。
 //! - **スケール不変性**（M8 タスク43）: 図面全体を 1e-6〜1e6 倍しても、交点・最近点・
 //!   分割・トリム・フィレットの結果が同じだけ拡大縮小され、退化判定の結論も変わらない。
 //!   相対 EPS（[`mcad_geom::rel_tol`] / [`mcad_geom::point_tol`]）が横断的に効いているか
@@ -23,7 +25,8 @@
 
 use mcad_geom::{
     Aabb, Arc, Circle, LineSeg, OffsetError, Point2, Polyline, Shape, Vec2, chamfer_lines,
-    closest_point, extend, extend_reach, fillet_lines, intersect, point_tol, split, trim,
+    closest_point, extend, extend_reach, fillet_lines, intersect, join_chain, point_tol, split,
+    trim,
 };
 use proptest::prelude::*;
 
@@ -602,6 +605,46 @@ proptest! {
                 [trimmed.a, trimmed.b].iter().any(|p| ends.iter().any(|e| approx_pt(*p, *e))),
                 "{trimmed:?} does not meet the arc ends {ends:?}");
         }
+    }
+}
+
+proptest! {
+    /// 結合の往復性（M12 タスク90）: ランダムな開ポリラインを 2 ピースへ分割し、
+    /// 各ピースを独立にシャッフル・向き反転してから `join_chain` へ渡すと、元の
+    /// 頂点列（前から読むか後ろから読むか、どちらか）に戻る。
+    #[test]
+    fn join_chain_roundtrips_a_split_open_polyline(
+        verts in prop::collection::vec(point(), 3..8),
+        split_at in 1usize..7,
+        swap_order in prop::bool::ANY,
+        reverse_a in prop::bool::ANY,
+        reverse_b in prop::bool::ANY,
+    ) {
+        // 連続頂点間の距離が実質ゼロだと退化ピースになりテストの前提が壊れるため除外。
+        prop_assume!(verts.windows(2).all(|w| w[0].distance(w[1]) > 1.0));
+        let split_at = split_at.min(verts.len() - 2);
+        prop_assume!(split_at >= 1 && split_at < verts.len() - 1);
+
+        let mut piece_a = verts[..=split_at].to_vec();
+        let mut piece_b = verts[split_at..].to_vec();
+        if reverse_a {
+            piece_a.reverse();
+        }
+        if reverse_b {
+            piece_b.reverse();
+        }
+        let pieces = if swap_order {
+            vec![piece_b, piece_a]
+        } else {
+            vec![piece_a, piece_b]
+        };
+
+        let res = join_chain(&pieces).expect("split pieces must rejoin");
+        prop_assert!(!res.closed);
+        prop_assert_eq!(res.vertices.len(), verts.len());
+        let forward = res.vertices.iter().zip(&verts).all(|(a, b)| a.distance(*b) < TOL);
+        let backward = res.vertices.iter().rev().zip(&verts).all(|(a, b)| a.distance(*b) < TOL);
+        prop_assert!(forward || backward, "{:?} vs original {:?}", res.vertices, verts);
     }
 }
 

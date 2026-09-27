@@ -7985,6 +7985,42 @@ fn handle_select_input(
         }
     }
 
+    // J（Ctrl・Shift なし）: 選択中の線分・開ポリラインを結合する。1 バッチで
+    // 削除+追加するので undo は 1 回。拒否理由（幾何混在・レイヤー/スタイル不一致・
+    // 分岐/離れ/退化）は SelectTool::join_command 側で判定し、ここは結果を
+    // ステータスへ出すだけ。Delete と同じくテキスト入力欄フォーカス中は無効。
+    if canvas_key_shortcuts_enabled
+        && ui.input(|i| !i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::J))
+    {
+        match select_tool.join_command(document) {
+            Ok(cmd) => match document.apply(cmd) {
+                Ok(new_ids) => select_tool.set_selection(new_ids.entities),
+                Err(err) => set_status(status, now, format!("Join failed: {err}")),
+            },
+            Err(reject) => set_status(status, now, reject.to_string()),
+        }
+        return;
+    }
+
+    // Shift+J（Ctrl なし）: 選択中のポリライン（開・閉とも）を辺ごとの線分へ分解する。
+    // ポリライン以外は無視して選択に残す。対象（ポリライン）が選択に無ければ案内を出す。
+    if canvas_key_shortcuts_enabled
+        && ui.input(|i| !i.modifiers.command && i.modifiers.shift && i.key_pressed(Key::J))
+    {
+        match select_tool.explode_command(document) {
+            Some((cmd, retained)) => match document.apply(cmd) {
+                Ok(new_ids) => {
+                    let mut selection = retained;
+                    selection.extend(new_ids.entities);
+                    select_tool.set_selection(selection);
+                }
+                Err(err) => set_status(status, now, format!("Explode failed: {err}")),
+            },
+            None => set_status(status, now, "Select a polyline to explode"),
+        }
+        return;
+    }
+
     // Esc: 進行中のドラッグがあればそれだけ破棄（選択維持）、無ければ選択を全解除する
     // （2段階挙動は SelectTool::on_cancel 側に集約）。テキスト入力欄フォーカス中は
     // 欄側のフォーカス解除に譲る（[`handle_offset_input`] と同じ方針）。
@@ -15995,5 +16031,98 @@ mod numeric_input_app_tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    /// `J`（結合・M12 タスク90）のキー経路。判定・コマンド組み立ては
+    /// `tool::tests::join_command_*` で固定済みなので、ここではキーが正しく
+    /// `SelectTool::join_command` へ届き、選択が結合後の 1 エンティティへ
+    /// 変わることだけを確かめる。
+    #[test]
+    fn j_key_joins_the_selected_lines_and_selects_the_result() {
+        let mut h = Harness::new();
+        let layer = h.app.document.current_layer();
+        let a = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                line((0.0, 0.0), (10.0, 0.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let b = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                line((10.0, 0.0), (10.0, 10.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        h.app.select_tool.set_selection(vec![a, b]);
+
+        h.press(Key::J);
+
+        assert!(h.app.document.entity(a).is_none());
+        assert!(h.app.document.entity(b).is_none());
+        let shapes = h.shapes();
+        let [Shape::Polyline(pl)] = shapes.as_slice() else {
+            panic!("expected one polyline, got {shapes:?}");
+        };
+        assert!(!pl.closed);
+        assert_eq!(h.app.select_tool.selection().len(), 1);
+    }
+
+    /// `Shift+J`（分解）のキー経路。無視した要素は選択に残り、新しい線分が
+    /// 追加される（`tool::tests::explode_command_*` が判定・Command 組み立てを
+    /// 固定している）。
+    #[test]
+    fn shift_j_key_explodes_the_selected_polyline_and_keeps_others_selected() {
+        let mut h = Harness::new();
+        let layer = h.app.document.current_layer();
+        let poly = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Polyline(mcad_geom::Polyline::new(
+                    vec![
+                        Point2::new(0.0, 0.0),
+                        Point2::new(10.0, 0.0),
+                        Point2::new(10.0, 10.0),
+                    ],
+                    false,
+                )),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let other = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                line((20.0, 0.0), (30.0, 0.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        h.app.select_tool.set_selection(vec![poly, other]);
+
+        h.press_shift(Key::J);
+
+        assert!(h.app.document.entity(poly).is_none());
+        assert!(h.app.document.entity(other).is_some());
+        let lines = h.shapes();
+        assert_eq!(
+            lines.len(),
+            3,
+            "other + the polyline's 2 edges became 2 lines"
+        );
+        let selection = h.app.select_tool.selection();
+        assert!(selection.contains(&other));
+        assert_eq!(selection.len(), 3, "other + the 2 new line entities");
     }
 }

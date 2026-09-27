@@ -26,6 +26,7 @@ mod aabb;
 pub mod chamfer;
 pub mod fillet;
 mod intersect;
+pub mod join;
 mod point;
 mod primitives;
 pub mod split;
@@ -37,6 +38,7 @@ pub use aabb::Aabb;
 pub use chamfer::{ChamferError, ChamferResult, chamfer_lines};
 pub use fillet::{FilletError, FilletResult, fillet_lines};
 pub use intersect::{intersect, line_circle_intersection, line_line_intersection};
+pub use join::{JoinError, join_chain};
 pub use point::Point2;
 pub use primitives::{
     Arc, Circle, LineSeg, OffsetError, Polyline, Shape, circumcircle, closest_point, distance_to,

@@ -4783,6 +4783,58 @@ pub(crate) fn layer_visible(document: &Document, entity: &Entity) -> bool {
     document.layer(entity.layer).is_some_and(|l| l.visible)
 }
 
+/// [`SelectTool::join_command`] が結合コマンドを作れない理由。
+///
+/// ステータスバー向けの英語メッセージを [`std::fmt::Display`] で直接持つ
+/// （AGENTS.md: ステータスバーの既存メッセージは英語）。geom 側の [`mcad_geom::JoinError`]
+/// は GUI 非依存のバリアントのみを持つので、ここで包んで文言を足す
+/// （[`mcad_geom::ChamferError`] を app 層が包まず直接 `{err}` 表示している既存パターンとは
+/// 違い、拒否理由に「選択の中身」由来のもの（幾何種別混在・レイヤー/スタイル不一致）が
+/// 加わるため、この型に統一する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinReject {
+    /// 選択が 2 未満（対象幾何かどうかを見る前の生の選択数）。
+    TooFewPieces,
+    /// 線分・開いたポリライン以外（円弧・円・閉ポリライン・点・テキスト・寸法・表等）を
+    /// 1 つでも含む。
+    UnsupportedGeometry,
+    /// レイヤーかスタイルが選択内で揃っていない。
+    MixedLayerOrStyle,
+    /// 端点のつながりが 1 本の鎖にならない（分岐・離れ・退化）。
+    Chain(mcad_geom::JoinError),
+}
+
+impl std::fmt::Display for JoinReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinReject::TooFewPieces => {
+                write!(f, "Select at least two lines or open polylines to join")
+            }
+            JoinReject::UnsupportedGeometry => {
+                write!(f, "Join supports lines and open polylines only")
+            }
+            JoinReject::MixedLayerOrStyle => {
+                write!(f, "Join requires the same layer and style")
+            }
+            JoinReject::Chain(mcad_geom::JoinError::TooFewPieces) => {
+                write!(f, "Select at least two lines or open polylines to join")
+            }
+            JoinReject::Chain(mcad_geom::JoinError::DegeneratePiece) => {
+                write!(f, "One of the selected pieces has zero length")
+            }
+            JoinReject::Chain(mcad_geom::JoinError::Branching) => {
+                write!(f, "Selected pieces branch - not a single chain")
+            }
+            JoinReject::Chain(mcad_geom::JoinError::Disconnected) => {
+                write!(f, "Selected pieces are not connected")
+            }
+            JoinReject::Chain(mcad_geom::JoinError::DegenerateResult) => {
+                write!(f, "Join result is degenerate")
+            }
+        }
+    }
+}
+
 impl SelectTool {
     /// 現在の選択集合。
     #[must_use]
@@ -5107,6 +5159,112 @@ impl SelectTool {
                 .map(|&id| Command::RemoveEntity(id))
                 .collect(),
         ))
+    }
+
+    /// J: 選択中の線分・開いたポリラインを 1 本のポリラインへ結合する [`Command`]。
+    ///
+    /// 対象は選択集合の**全エンティティ**が `Shape::Line` か閉じていない
+    /// `Shape::Polyline` であること。1 つでも他の種類（円弧・円・閉ポリライン・点・
+    /// テキスト・寸法・表）を含めば [`JoinReject::UnsupportedGeometry`] で拒否する。
+    /// レイヤー・スタイルは選択内で完全に揃っている必要があり、1 つでも異なれば
+    /// [`JoinReject::MixedLayerOrStyle`]（どれかへ黙って揃えない。DESIGN.md M12
+    /// 設計判断8）。端点のつながりの判定は [`mcad_geom::join_chain`] に委ねる。
+    ///
+    /// 成功したら `Command::Batch([RemoveEntity(各選択エンティティ) ..,
+    /// AddEntity(結合後のポリライン)])` を返す。新しいポリラインのレイヤー・スタイルは
+    /// 選択（共通の値）から引き継ぐ。呼び出し側（`main.rs`）が `Document::apply` し、
+    /// 成功したら返る `NewIds.entities`（要素は 1 個）を新しい選択にする。
+    ///
+    /// # Errors
+    ///
+    /// 拒否理由は [`JoinReject`]（ステータスバー向けの英語メッセージを持つ）。
+    pub fn join_command(&self, document: &Document) -> Result<Command, JoinReject> {
+        if self.selection.len() < 2 {
+            return Err(JoinReject::TooFewPieces);
+        }
+
+        let mut pieces: Vec<Vec<Point2>> = Vec::with_capacity(self.selection.len());
+        let mut common: Option<(LayerId, Style)> = None;
+        for &id in &self.selection {
+            let entity = document.entity(id).ok_or(JoinReject::UnsupportedGeometry)?;
+            let points = match &entity.geom {
+                EntityGeom::Shape(Shape::Line(seg)) => vec![seg.a, seg.b],
+                EntityGeom::Shape(Shape::Polyline(pl)) if !pl.closed => pl.vertices.clone(),
+                _ => return Err(JoinReject::UnsupportedGeometry),
+            };
+            match common {
+                None => common = Some((entity.layer, entity.style)),
+                Some((layer, style)) if layer == entity.layer && style == entity.style => {}
+                Some(_) => return Err(JoinReject::MixedLayerOrStyle),
+            }
+            pieces.push(points);
+        }
+        let (layer, style) = common.expect("selection.len() >= 2 was checked above");
+
+        let joined = mcad_geom::join_chain(&pieces).map_err(JoinReject::Chain)?;
+
+        let mut subs: Vec<Command> = self
+            .selection
+            .iter()
+            .map(|&id| Command::RemoveEntity(id))
+            .collect();
+        subs.push(Command::AddEntity(Entity::new(
+            Shape::Polyline(joined),
+            layer,
+            style,
+        )));
+        Ok(Command::Batch(subs))
+    }
+
+    /// Shift+J: 選択中のポリライン（開・閉とも）を辺ごとの線分へ分解する [`Command`]。
+    ///
+    /// 閉じたポリラインの閉じ辺も分解対象に含める（[`mcad_geom::Polyline::segments`] が
+    /// 閉じ辺を返す仕様のまま）。ポリライン以外（線分・円弧・点・テキスト・寸法・表等）は
+    /// 対象外として無視し、選択にはそのまま残す（削除も変更もしない）。
+    ///
+    /// 実質長さ 0 の辺（[`mcad_geom::point_tol`]。core の `Shape::Line::validate` は
+    /// ゼロ長を拒否しないが、無意味な線分を増やさないためここで作らない。DESIGN.md M12
+    /// タスク90 実装時追記）は線分にしない。
+    ///
+    /// 選択にポリラインが 1 つも無ければ `None`（呼び出し側がステータスへ出す）。
+    /// それ以外は `(Command::Batch([RemoveEntity(各ポリライン), AddEntity(各辺の線分)
+    /// ..]), 分解しなかった選択 ID)` を返す。新しい線分のレイヤー・スタイルは元の
+    /// ポリラインから引き継ぐ。呼び出し側は `Document::apply` 成功後、戻り値の
+    /// 「分解しなかった選択 ID」と `NewIds.entities`（新しい線分、コマンド順）を
+    /// 合わせて新しい選択にする。
+    #[must_use]
+    pub fn explode_command(&self, document: &Document) -> Option<(Command, Vec<EntityId>)> {
+        let mut subs: Vec<Command> = Vec::new();
+        let mut retained: Vec<EntityId> = Vec::new();
+        let mut exploded_any = false;
+        for &id in &self.selection {
+            let Some(entity) = document.entity(id) else {
+                continue;
+            };
+            let EntityGeom::Shape(Shape::Polyline(pl)) = &entity.geom else {
+                retained.push(id);
+                continue;
+            };
+            let lines: Vec<Command> = pl
+                .segments()
+                .filter(|seg| seg.length() > mcad_geom::point_tol(seg.a, seg.b))
+                .map(|seg| {
+                    Command::AddEntity(Entity::new(Shape::Line(seg), entity.layer, entity.style))
+                })
+                .collect();
+            // 全辺が零長なら分解すると図形が消えるだけになるので、対象外として残す。
+            if lines.is_empty() {
+                retained.push(id);
+                continue;
+            }
+            exploded_any = true;
+            subs.push(Command::RemoveEntity(id));
+            subs.extend(lines);
+        }
+        if !exploded_any {
+            return None;
+        }
+        Some((Command::Batch(subs), retained))
     }
 
     /// 選択集合を丸ごと置き換える。複製確定後に `NewIds.entities`（コマンド順）を
@@ -11990,5 +12148,271 @@ mod tests {
                 Point2::new(1.5, 0.0)
             )))
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 結合・分解（M12 タスク90、`J`/`Shift+J`）
+    // -----------------------------------------------------------------
+
+    /// `(a.x, a.y)-(b.x, b.y)` の線分をカレントレイヤーへ追加する。
+    fn add_line(doc: &mut Document, a: Point2, b: Point2) -> EntityId {
+        let layer = doc.current_layer();
+        let entity = Entity::new(Shape::Line(LineSeg::new(a, b)), layer, Style::inherited());
+        doc.apply(Command::AddEntity(entity)).unwrap().entities[0]
+    }
+
+    /// カレントレイヤーへ開いたポリラインを追加する。
+    fn add_open_polyline(doc: &mut Document, vertices: Vec<Point2>) -> EntityId {
+        let layer = doc.current_layer();
+        let entity = Entity::new(
+            Shape::Polyline(Polyline::new(vertices, false)),
+            layer,
+            Style::inherited(),
+        );
+        doc.apply(Command::AddEntity(entity)).unwrap().entities[0]
+    }
+
+    #[test]
+    fn join_command_merges_two_lines_into_one_polyline() {
+        let mut doc = Document::new();
+        let a = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let b = add_line(&mut doc, Point2::new(10.0, 0.0), Point2::new(10.0, 10.0));
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a, b]);
+
+        let cmd = tool.join_command(&doc).expect("should join");
+        let new_ids = doc.apply(cmd).unwrap();
+        assert_eq!(new_ids.entities.len(), 1);
+        assert!(doc.entity(a).is_none());
+        assert!(doc.entity(b).is_none());
+        let EntityGeom::Shape(Shape::Polyline(pl)) = &doc.entity(new_ids.entities[0]).unwrap().geom
+        else {
+            panic!("expected a polyline");
+        };
+        assert_eq!(
+            pl.vertices,
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+                Point2::new(10.0, 10.0)
+            ]
+        );
+        assert!(!pl.closed);
+    }
+
+    #[test]
+    fn join_command_rejects_a_single_selection() {
+        let mut doc = Document::new();
+        let a = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a]);
+        assert_eq!(tool.join_command(&doc), Err(JoinReject::TooFewPieces));
+    }
+
+    #[test]
+    fn join_command_rejects_unsupported_geometry() {
+        let mut doc = Document::new();
+        let a = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let arc = add_arc(&mut doc, Point2::new(10.0, 0.0), 5.0, 0.0, 1.0);
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a, arc]);
+        assert_eq!(
+            tool.join_command(&doc),
+            Err(JoinReject::UnsupportedGeometry)
+        );
+    }
+
+    #[test]
+    fn join_command_rejects_a_closed_polyline() {
+        let mut doc = Document::new();
+        let a = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let layer = doc.current_layer();
+        let closed = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Polyline(Polyline::new(
+                    vec![
+                        Point2::new(10.0, 0.0),
+                        Point2::new(10.0, 10.0),
+                        Point2::new(0.0, 10.0),
+                    ],
+                    true,
+                )),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a, closed]);
+        assert_eq!(
+            tool.join_command(&doc),
+            Err(JoinReject::UnsupportedGeometry)
+        );
+    }
+
+    #[test]
+    fn join_command_rejects_mixed_layers() {
+        let mut doc = Document::new();
+        let a = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let other_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "other",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let b = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(
+                    Point2::new(10.0, 0.0),
+                    Point2::new(10.0, 10.0),
+                )),
+                other_layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a, b]);
+        assert_eq!(tool.join_command(&doc), Err(JoinReject::MixedLayerOrStyle));
+    }
+
+    #[test]
+    fn join_command_rejects_mixed_style() {
+        let mut doc = Document::new();
+        let a = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let layer = doc.current_layer();
+        let b = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(
+                    Point2::new(10.0, 0.0),
+                    Point2::new(10.0, 10.0),
+                )),
+                layer,
+                Style {
+                    linetype: Some(Linetype::Dashed),
+                    ..Style::inherited()
+                },
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a, b]);
+        assert_eq!(tool.join_command(&doc), Err(JoinReject::MixedLayerOrStyle));
+    }
+
+    #[test]
+    fn join_command_rejects_a_branching_chain() {
+        let mut doc = Document::new();
+        let a = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let b = add_line(&mut doc, Point2::new(10.0, 0.0), Point2::new(10.0, 10.0));
+        let c = add_line(&mut doc, Point2::new(10.0, 0.0), Point2::new(20.0, 0.0));
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![a, b, c]);
+        assert_eq!(
+            tool.join_command(&doc),
+            Err(JoinReject::Chain(mcad_geom::JoinError::Branching))
+        );
+    }
+
+    #[test]
+    fn join_command_mixes_a_line_and_an_open_polyline() {
+        let mut doc = Document::new();
+        let line = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(5.0, 0.0));
+        let poly = add_open_polyline(
+            &mut doc,
+            vec![
+                Point2::new(5.0, 0.0),
+                Point2::new(5.0, 5.0),
+                Point2::new(10.0, 5.0),
+            ],
+        );
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![line, poly]);
+        let cmd = tool.join_command(&doc).expect("should join");
+        let new_ids = doc.apply(cmd).unwrap();
+        let EntityGeom::Shape(Shape::Polyline(pl)) = &doc.entity(new_ids.entities[0]).unwrap().geom
+        else {
+            panic!("expected a polyline");
+        };
+        assert_eq!(pl.vertices.len(), 4);
+    }
+
+    #[test]
+    fn explode_command_splits_a_closed_polyline_into_lines_including_the_closing_edge() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let pl_id = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Polyline(Polyline::new(
+                    vec![
+                        Point2::new(0.0, 0.0),
+                        Point2::new(10.0, 0.0),
+                        Point2::new(10.0, 10.0),
+                    ],
+                    true,
+                )),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![pl_id]);
+
+        let (cmd, retained) = tool.explode_command(&doc).expect("should explode");
+        assert!(retained.is_empty());
+        let new_ids = doc.apply(cmd).unwrap();
+        assert_eq!(
+            new_ids.entities.len(),
+            3,
+            "3 edges including the closing one"
+        );
+        assert!(doc.entity(pl_id).is_none());
+        let mut lines: Vec<LineSeg> = new_ids
+            .entities
+            .iter()
+            .map(|&id| match &doc.entity(id).unwrap().geom {
+                EntityGeom::Shape(Shape::Line(seg)) => *seg,
+                other => panic!("expected a line, got {other:?}"),
+            })
+            .collect();
+        lines.sort_by(|a, b| a.a.x.partial_cmp(&b.a.x).unwrap());
+        assert_eq!(
+            lines,
+            vec![
+                LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0)),
+                LineSeg::new(Point2::new(10.0, 0.0), Point2::new(10.0, 10.0)),
+                LineSeg::new(Point2::new(10.0, 10.0), Point2::new(0.0, 0.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn explode_command_ignores_other_kinds_and_keeps_them_selected() {
+        let mut doc = Document::new();
+        let poly = add_open_polyline(
+            &mut doc,
+            vec![Point2::new(0.0, 0.0), Point2::new(10.0, 0.0)],
+        );
+        let line = add_line(&mut doc, Point2::new(20.0, 0.0), Point2::new(30.0, 0.0));
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![poly, line]);
+
+        let (cmd, retained) = tool.explode_command(&doc).expect("should explode");
+        assert_eq!(retained, vec![line]);
+        let new_ids = doc.apply(cmd).unwrap();
+        assert_eq!(new_ids.entities.len(), 1);
+        assert!(doc.entity(poly).is_none());
+        assert!(doc.entity(line).is_some());
+    }
+
+    #[test]
+    fn explode_command_is_none_when_selection_has_no_polyline() {
+        let mut doc = Document::new();
+        let line = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![line]);
+        assert!(tool.explode_command(&doc).is_none());
     }
 }

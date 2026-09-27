@@ -2,7 +2,7 @@
 //!
 //! # 設計方針（DESIGN.md 3.3）
 //!
-//! `dxf` クレート（v0.6.1）で LINE / CIRCLE / ARC / LWPOLYLINE / POINT / TEXT と
+//! `dxf` クレート（v0.6.1）で LINE / CIRCLE / ARC / LWPOLYLINE / POINT / TEXT / XLINE と
 //! レイヤーテーブルを相互変換する。未対応エンティティは読み飛ばし、無視した件数を
 //! [`ImportSummary::skipped_entities`] として返す（エラーにしない）。
 //!
@@ -77,6 +77,28 @@
 //!   [`ImportSummary::skipped_entities`] に出る（回帰は
 //!   `reimporting_exported_centre_and_right_aligned_cell_text_skips_it`）。左揃えの列は
 //!   従来どおり `Text` として取り込まれる。
+//!
+//! # 構築線（XLINE、M12 タスク91）
+//!
+//! 構築線（[`mcad_core::EntityGeom::XLine`]）は `XLINE` と**対称に往復する**（表・寸法の
+//! ような分解はしない）。`dxf` 0.6.1 の `dxf::entities::XLine` は `first_point`
+//! （group 10/20/30）と `unit_direction_vector`（group 11/21/31）の 2 フィールドだけを持ち、
+//! R13 以降ではサブクラスマーカー `AcDbXline` を書く（実測。回帰は
+//! `tests::xline_round_trips_through_the_dxf_file`）。
+//!
+//! - **export**（[`xline_to_dxf_entity`]）: 基点と単位方向をそのまま書く（z = 0）。
+//!   レイヤー・色・線種・線幅は Shape と同じ経路。クレートは f64 を**小数 12 桁**で
+//!   書くので、方向（例: 1/√2）は 1e-12 程度丸められる。
+//! - **import**（[`dxf_xline_to_geom`]）: 方向の XY 成分を**正規化して**取り込む（上の
+//!   丸めと他 CAD・手編集の値を受け入れるため。`.mcad` 読込は正規化せず拒否する点が
+//!   違う）。z 成分は捨てる。XY 成分が零（z 軸に平行を含む）・非有限なら取り込まず
+//!   [`ImportSummary::skipped_entities`] へ計上する。**group 11 を欠く `XLINE` は
+//!   クレートの既定値 `Vector::x_axis()` が残るため +X 方向として読まれる**（欠落を
+//!   区別できない。実測。回帰は `tests::xline_import_normalizes_and_skips_zero_directions`）。
+//! - **`RAY`（半直線）は non-goal**（DESIGN.md M12 設計判断10）。クレートは
+//!   `EntityType::Ray` として返すので、他の未対応種別と同じく
+//!   [`ImportSummary::skipped_entities`] へ計上される（無言では消えない。回帰は
+//!   `tests::ray_is_skipped_and_counted`）。
 //!
 //! # DIMENSION の import（M11 タスク67・タスク69）
 //!
@@ -467,20 +489,21 @@ use dxf::entities::{
     AngularThreePointDimension, Arc as DxfArc, Circle as DxfCircle, DiameterDimension,
     DimensionBase, Entity as DxfEntity, EntityType, Line as DxfLine, LwPolyline, ModelPoint,
     OrdinateDimension, RadialDimension, RotatedDimension, Solid as DxfSolid, Text as DxfText,
+    XLine as DxfXLine,
 };
 use dxf::enums::{
     DimensionType, HorizontalTextJustification, Units as DxfUnits, VerticalTextJustification,
 };
 use dxf::tables::{Layer as DxfLayer, LineType as DxfLineType};
-use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint};
+use dxf::{Color, Drawing, LwPolylineVertex, Point as DxfPoint, Vector as DxfVector};
 
 use mcad_core::{
     Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimOrdinate,
     DimRadial, DimRender, Document, Entity, EntityGeom, HorizontalAlign, Layer, LayerId, Linetype,
-    OrdinateAxis, Rgb, Style, TableCellText, TableGeom, TextGeom, WidthMm, expand_dim,
+    OrdinateAxis, Rgb, Style, TableCellText, TableGeom, TextGeom, WidthMm, XLineGeom, expand_dim,
     expand_table,
 };
-use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape};
+use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape, Vec2};
 
 use crate::IoError;
 
@@ -1461,6 +1484,7 @@ enum DxfImportSkip {
 ///
 /// Shape 系（POINT / LINE / CIRCLE / ARC / LWPOLYLINE）に加え、TEXT を
 /// [`EntityGeom::Text`] へ変換する（タスク25b、[`text_to_dxf_entity`] の逆写像）。
+/// XLINE は [`EntityGeom::XLine`] へ変換する（M12 タスク91、[`dxf_xline_to_geom`]）。
 /// TEXT のうち位置基準が Left/Baseline 以外のものは変換せず
 /// `Err(DxfImportSkip::UnsupportedOrInvalid)` を返す（理由は
 /// [`is_text_justification_supported`] の doc）。
@@ -1539,8 +1563,14 @@ fn dxf_entity_to_geom(specific: &EntityType) -> Result<ImportedGeom, DxfImportSk
             }
             EntityType::OrdinateDimension(d) => ordinate_dimension_to_geom(d, &mut dropped_detail)
                 .ok_or(DxfImportSkip::Dimension)?,
+            // 構築線（M12 タスク91）。方向は正規化して取り込み、零・非有限はスキップする
+            // （[`dxf_xline_to_geom`] の doc）。
+            EntityType::XLine(x) => {
+                EntityGeom::XLine(dxf_xline_to_geom(x).ok_or(DxfImportSkip::UnsupportedOrInvalid)?)
+            }
             // 2 直線角度寸法・弧長寸法はそもそもクレートが返さない。SPLINE・ELLIPSE 等
-            // 非対応の種別はここへ来る。
+            // 非対応の種別はここへ来る。`RAY`（半直線）も non-goal（DESIGN.md M12
+            // 設計判断10）なのでここでスキップ件数に計上される。
             _ => return Err(DxfImportSkip::UnsupportedOrInvalid),
         };
     if geom.validate().is_ok() {
@@ -1563,6 +1593,32 @@ fn dxf_entity_to_geom(specific: &EntityType) -> Result<ImportedGeom, DxfImportSk
     } else {
         Err(DxfImportSkip::UnsupportedOrInvalid)
     }
+}
+
+/// 構築線を DXF `XLINE` へ変換する（M12 タスク91。モジュール doc「構築線（XLINE）」）。
+///
+/// group 10 = 基点、group 11 = 単位方向（`z` はどちらも 0）。方向は保存値のまま書く
+/// （向きを揃えない）。
+fn xline_to_dxf_entity(xline: &XLineGeom) -> DxfEntity {
+    DxfEntity::new(EntityType::XLine(DxfXLine {
+        first_point: to_dxf_point(xline.base),
+        unit_direction_vector: DxfVector::new(xline.dir.x, xline.dir.y, 0.0),
+    }))
+}
+
+/// DXF `XLINE` を構築線へ変換する（M12 タスク91、[`xline_to_dxf_entity`] の逆写像）。
+///
+/// - 方向（group 11/21）は **XY 成分を正規化して**取り込む（`dxf` 0.6.1 は小数 12 桁で
+///   書くので、mcad が書いた単位ベクトルでも長さは 1 から 1e-12 程度ずれる。他 CAD の
+///   出力や手編集も考えて、長さを問わず向きだけを使う）。z 成分は捨てる（基点の z を
+///   捨てるのは他のエンティティと同じ。3D の直線を XY 平面へ投影した直線になる）。
+/// - XY 成分が零（z 軸に平行な構築線を含む）・非有限なら `None`（呼び出し側がスキップ
+///   件数に計上する）。
+/// - group 11 を欠く `XLINE` は、クレートの既定値 `Vector::x_axis()` が残るため
+///   **+X 方向の構築線として読まれる**（欠落と明示の (1,0,0) を区別できない。実測）。
+fn dxf_xline_to_geom(x: &DxfXLine) -> Option<XLineGeom> {
+    let dir = Vec2::new(x.unit_direction_vector.x, x.unit_direction_vector.y);
+    XLineGeom::from_base_dir(from_dxf_point(&x.first_point), dir)
 }
 
 /// [`TextGeom`] を DXF `TEXT` エンティティへ変換する（タスク25、高さの尺度契約は
@@ -1942,6 +1998,8 @@ pub fn export_dxf(doc: &Document) -> ExportSummary {
             | EntityGeom::DimDiameter(_)
             | EntityGeom::DimAngular(_)
             | EntityGeom::DimOrdinate(_) => (dim_to_dxf_entities(&entity.geom, dim_render), true),
+            // 構築線（M12 タスク91）は `XLINE` 1 つ。線種・色・線幅は Shape と同じ経路。
+            EntityGeom::XLine(xline) => (vec![xline_to_dxf_entity(xline)], false),
             _ => {
                 skipped_entities += 1;
                 continue;
@@ -2141,7 +2199,6 @@ pub fn load_dxf(path: impl AsRef<Path>) -> Result<ImportSummary, IoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dxf::Vector as DxfVector;
     use dxf::entities::Ellipse;
     use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2};
     use std::fs;
@@ -4137,6 +4194,159 @@ mod tests {
         assert_eq!(summary.document.entity_count(), 1);
         // 実測どおり、この経路では skipped_entities は増えない（doc 参照）。
         assert_eq!(summary.skipped_entities, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // 構築線（XLINE、M12 タスク91）
+    // -----------------------------------------------------------------
+
+    /// レイヤー "construction"（色 3 = 緑）に構築線を 2 本持つ文書。1 本は線種上書き付き。
+    fn xline_document() -> (Document, [XLineGeom; 2]) {
+        let mut doc = Document::new();
+        let layer = doc
+            .apply(Command::AddLayer(Layer::new(
+                "construction",
+                Rgb::new(0, 255, 0),
+            )))
+            .unwrap()
+            .layers[0];
+        let xlines = [
+            XLineGeom::through(Point2::new(10.0, 20.0), Point2::new(13.0, 24.0)).unwrap(),
+            XLineGeom::through(Point2::new(-5.0, 7.5), Point2::new(-6.0, 6.5)).unwrap(),
+        ];
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::XLine(xlines[0]),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::XLine(xlines[1]),
+            layer,
+            Style {
+                linetype: Some(Linetype::DashDot),
+                ..Style::inherited()
+            },
+        )))
+        .unwrap();
+        (doc, xlines)
+    }
+
+    /// 構築線は `XLINE`（group 10 = 基点、11 = 単位方向）として書かれ、ファイルへ書いて
+    /// 読み直すと構築線へ戻る（対称往復。M12 タスク91）。`dxf` 0.6.1 の書き出し・読込を
+    /// 両方通し、書かれた group code もテキストで確かめる。
+    #[test]
+    fn xline_round_trips_through_the_dxf_file() {
+        let (doc, xlines) = xline_document();
+        let export = export_dxf(&doc);
+        assert_eq!(export.skipped_entities, 0);
+        let mut buf = Vec::new();
+        export.drawing.save(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf).replace("\r\n", "\n");
+        // エンティティ種別とサブクラスマーカー（R13 以降で書かれる）。
+        assert_eq!(text.matches("\nXLINE\n").count(), 2, "{text}");
+        assert!(text.contains("\nAcDbXline\n"), "{text}");
+        // 1 本目: 基点 (10, 20)、方向 (0.6, 0.8)。小数 12 桁で丸めて書かれる。
+        assert!(text.contains(" 10\n10.0\n 20\n20.0\n 30\n0.0\n"), "{text}");
+        assert!(text.contains(" 11\n0.6\n 21\n0.8\n 31\n0.0\n"), "{text}");
+        // 2 本目: 方向 (-1/√2, -1/√2) は 12 桁に丸められる。
+        assert!(
+            text.contains(" 11\n-0.707106781187\n 21\n-0.707106781187\n"),
+            "{text}"
+        );
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let summary = import_dxf(&Drawing::load(&mut cursor).unwrap()).unwrap();
+        assert_eq!(summary.skipped_entities, 0);
+        let imported: Vec<(XLineGeom, Style, String)> = summary
+            .document
+            .entities()
+            .map(|(_, e)| match &e.geom {
+                EntityGeom::XLine(x) => (
+                    *x,
+                    e.style,
+                    summary.document.layer(e.layer).unwrap().name.clone(),
+                ),
+                other => panic!("構築線以外が読まれた: {other:?}"),
+            })
+            .collect();
+        assert_eq!(imported.len(), 2);
+        for ((actual, style, layer), expected) in imported.iter().zip(xlines) {
+            approx_point(actual.base, expected.base);
+            // 12 桁で丸めた方向を読込側が正規化し直す。元の方向とは 1e-12 程度の差。
+            assert!(
+                (actual.dir - expected.dir).length() < 1e-11,
+                "{actual:?} vs {expected:?}"
+            );
+            assert!(EntityGeom::XLine(*actual).validate().is_ok());
+            assert_eq!(layer, "construction");
+            assert_eq!(style.color, None);
+        }
+        assert_eq!(imported[0].1.linetype, None);
+        assert_eq!(imported[1].1.linetype, Some(Linetype::DashDot));
+    }
+
+    /// 他 CAD が書いた `XLINE` の読込（M12 タスク91、実測）。
+    ///
+    /// - 単位でない方向は正規化して取り込む（長さは問わず向きだけを使う）。
+    /// - 方向の z 成分は捨てる（3D の直線を XY へ投影した直線）。
+    /// - group 11 を欠く `XLINE` はクレートの既定値 `Vector::x_axis()` が残り、+X 方向の
+    ///   構築線として読まれる（欠落と明示の (1,0,0) を区別できない）。
+    /// - XY 成分が零（z 軸に平行を含む）の方向はスキップして件数に計上する。
+    #[test]
+    fn xline_import_normalizes_and_skips_zero_directions() {
+        let xline = |body: &str| format!("0\nXLINE\n8\n0\n100\nAcDbEntity\n100\nAcDbXline\n{body}");
+        let entities = [
+            xline("10\n1.0\n20\n2.0\n30\n0.0\n11\n3.0\n21\n4.0\n31\n0.0\n"),
+            xline("10\n0.0\n20\n0.0\n30\n5.0\n11\n0.0\n21\n0.6\n31\n0.8\n"),
+            xline("10\n7.0\n20\n8.0\n30\n0.0\n"),
+            xline("10\n0.0\n20\n0.0\n30\n0.0\n11\n0.0\n21\n0.0\n31\n0.0\n"),
+            xline("10\n0.0\n20\n0.0\n30\n0.0\n11\n0.0\n21\n0.0\n31\n1.0\n"),
+        ]
+        .concat();
+        let dxf_text = format!("0\nSECTION\n2\nENTITIES\n{entities}0\nENDSEC\n0\nEOF\n");
+        let mut cursor = std::io::Cursor::new(dxf_text.as_bytes());
+        let drawing = Drawing::load(&mut cursor).unwrap();
+        assert_eq!(
+            drawing.entities().count(),
+            5,
+            "クレートは 5 本とも XLINE として返す"
+        );
+        let summary = import_dxf(&drawing).unwrap();
+        assert_eq!(summary.skipped_entities, 2, "零方向の 2 本だけスキップ");
+        let read: Vec<XLineGeom> = summary
+            .document
+            .entities()
+            .map(|(_, e)| match &e.geom {
+                EntityGeom::XLine(x) => *x,
+                other => panic!("構築線以外が読まれた: {other:?}"),
+            })
+            .collect();
+        assert_eq!(read.len(), 3);
+        approx_point(read[0].base, Point2::new(1.0, 2.0));
+        approx_point(Point2::from_vec2(read[0].dir), Point2::new(0.6, 0.8));
+        approx_point(read[1].base, Point2::new(0.0, 0.0));
+        approx_point(Point2::from_vec2(read[1].dir), Point2::new(0.0, 1.0));
+        approx_point(read[2].base, Point2::new(7.0, 8.0));
+        assert_eq!(read[2].dir, Vec2::new(1.0, 0.0), "group 11 欠落は +X");
+    }
+
+    /// `RAY`（半直線）は non-goal（DESIGN.md M12 設計判断10）。クレートは `EntityType::Ray`
+    /// として返すが、取り込まずスキップ件数に計上する（無言では消えない）。
+    #[test]
+    fn ray_is_skipped_and_counted() {
+        let dxf_text = "0\nSECTION\n2\nENTITIES\n0\nRAY\n8\n0\n100\nAcDbEntity\n100\nAcDbRay\n10\n1.0\n20\n2.0\n30\n0.0\n11\n1.0\n21\n0.0\n31\n0.0\n0\nLINE\n8\n0\n10\n0.0\n20\n0.0\n30\n0.0\n11\n1.0\n21\n0.0\n31\n0.0\n0\nENDSEC\n0\nEOF\n";
+        let mut cursor = std::io::Cursor::new(dxf_text.as_bytes());
+        let drawing = Drawing::load(&mut cursor).unwrap();
+        assert!(
+            drawing
+                .entities()
+                .any(|e| matches!(e.specific, EntityType::Ray(_))),
+            "クレートは RAY を EntityType::Ray として返す"
+        );
+        let summary = import_dxf(&drawing).unwrap();
+        assert_eq!(summary.skipped_entities, 1);
+        assert_eq!(summary.document.entity_count(), 1, "LINE だけが読まれる");
     }
 
     #[test]

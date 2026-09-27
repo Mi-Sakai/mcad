@@ -30,6 +30,8 @@
 //!   種別ごとの表を持たずに済ませるためのディスパッチ。pick 版は [`dim_distance`]）。
 //!   ヒットテスト用の線分は [`linear_pick_segments`] 等、
 //!   値の組版は [`layout_dim_label`]。**画面・SVG/PDF・DXF export の唯一の出所**
+//! - 構築線: [`XLineGeom`]（[`EntityGeom::XLine`] の中身。基点と単位方向の無限直線。
+//!   `aabb` は基点だけの箱。M12 タスク91）
 //! - ドキュメント: [`Document`]（エンティティ・レイヤー・カレントレイヤー・
 //!   図面メタデータと履歴を保持）
 //! - 変更: [`Command`] を [`Document::apply`] に渡す。戻り値の [`NewIds`] で
@@ -73,7 +75,8 @@ pub use entity::Entity;
 pub use entity_geom::{
     DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimDiameter, DimDirection, DimLinear, DimOrdinate,
     DimRadial, EntityGeom, HorizontalAlign, MAX_TABLE_COLS, MAX_TABLE_MM, MAX_TABLE_ROWS,
-    OrdinateAxis, TableGeom, TableKind, TextGeom, approx_text_width,
+    OrdinateAxis, TableGeom, TableKind, TextGeom, XLINE_DIR_TOLERANCE, XLineGeom,
+    approx_text_width,
 };
 pub use error::CoreError;
 pub use expand::{

@@ -10,7 +10,10 @@
 //! - プリミティブ: [`LineSeg`], [`Circle`], [`Arc`], [`Polyline`]
 //! - それらをまとめる列挙型 [`Shape`]（mcad-core の `Entity { geom: Shape, .. }` が使う）
 //! - 幾何クエリ: [`closest_point`], [`distance_to`], [`intersect`], [`circumcircle`]
-//! - 修正系演算: [`trim`], [`extend`]（[`trim_extend`] モジュール）、
+//! - 無限直線（`LineSeg` を通る直線とみなす）: [`line_line_intersection`],
+//!   [`line_circle_intersection`], [`line_shape_intersection`], [`clip_line_to_aabb`]
+//! - 修正系演算: [`trim`], [`extend`]（無限直線の境界は [`trim_by_line`], [`extend_to_line`]。
+//!   [`trim_extend`] モジュール）、
 //!   [`fillet_lines`]（[`fillet`] モジュール）
 //! - 寸法記号: [`DimSymbol`], [`dim_symbol_glyph`]（[`symbol`] モジュール。φ・□ の
 //!   ジオメトリを生成し、他の記号はフォント文字として組版する側に委ねる）
@@ -37,7 +40,10 @@ mod vec2;
 pub use aabb::Aabb;
 pub use chamfer::{ChamferError, ChamferResult, chamfer_lines};
 pub use fillet::{FilletError, FilletResult, fillet_lines};
-pub use intersect::{intersect, line_circle_intersection, line_line_intersection};
+pub use intersect::{
+    clip_line_to_aabb, intersect, line_circle_intersection, line_line_intersection,
+    line_shape_intersection,
+};
 pub use join::{JoinError, join_chain};
 pub use point::Point2;
 pub use primitives::{
@@ -45,7 +51,9 @@ pub use primitives::{
 };
 pub use split::{SplitError, split};
 pub use symbol::{ArrowGlyph, ArrowKind, DimSymbol, SymbolGlyph, arrow_glyph, dim_symbol_glyph};
-pub use trim_extend::{TrimExtendError, TrimResult, extend, extend_reach, trim};
+pub use trim_extend::{
+    TrimExtendError, TrimResult, extend, extend_reach, extend_to_line, trim, trim_by_line,
+};
 pub use vec2::Vec2;
 
 /// 幾何述語で用いる基準となる相対イプシロン。

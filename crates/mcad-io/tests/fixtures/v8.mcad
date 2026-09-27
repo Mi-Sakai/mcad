@@ -46,7 +46,9 @@
        "col_aligns": ["Center", "Right"],
        "row_heights_mm": [8.0, 8.0],
        "text_height_mm": 3.5,
-       "cells": ["改訂", "内容", "A", "初版"]}}}
+       "cells": ["改訂", "内容", "A", "初版"]}}},
+    {"layer": 0, "style": {"color": null, "width_mm": null, "linetype": "DashDot"},
+     "geom": {"XLine": {"base": {"x": 10.0, "y": 20.0}, "dir": {"x": 0.6, "y": 0.8}}}}
   ],
   "dim_style": {
     "text_height_mm": 3.5,

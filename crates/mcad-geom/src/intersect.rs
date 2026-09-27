@@ -17,7 +17,7 @@
 //! - パラメータ `[0, 1]` の境界は無次元なので `EPS` を直接使う。
 
 use crate::primitives::{Arc, Circle, LineSeg, Shape};
-use crate::{EPS, Point2, point_tol, rel_tol};
+use crate::{Aabb, EPS, Point2, point_tol, rel_tol};
 
 /// 2 つの形状の交点を列挙する。
 ///
@@ -193,6 +193,125 @@ pub fn line_circle_intersection(line: &LineSeg, c: &Circle) -> Vec<Point2> {
         out.push(line.a + u * (along_foot + half));
     }
     out
+}
+
+/// 無限直線 `line`（`LineSeg` を通る直線とみなす）と有限の形状 `shape` の交点。
+///
+/// 直線側は区間 `[0, 1]` へクランプせず、**`shape` 側だけ**実体の範囲（線分の区間・
+/// 円弧の掃引範囲）で絞る。構築線（M12 タスク91、DESIGN.md M12 設計判断9）の交点
+/// スナップ専用。ポリラインは構成線分ごとに求める。点は直線上に（[`crate::point_tol`]
+/// 以内で）載っていれば交点とする。
+///
+/// 平行・同一直線の線分（重なり区間のような無限交点）は [`intersect`] と同じく
+/// 列挙しない。`line` が退化（長さが [`crate::point_tol`] 以下）していれば空を返す。
+/// 重複点は除去する。
+#[must_use]
+pub fn line_shape_intersection(line: &LineSeg, shape: &Shape) -> Vec<Point2> {
+    let mut out = Vec::new();
+    if line.length() <= point_tol(line.a, line.b) {
+        return out;
+    }
+    for prim in to_prims(shape) {
+        match prim {
+            Prim::Point(p) => {
+                // 無限直線への射影（`LineSeg::closest_point` は区間へクランプするため
+                // 使えない）。
+                let d = line.direction();
+                let t = (p - line.a).dot(d) / d.length_squared();
+                let foot = line.a + d * t;
+                if p.distance(foot) <= point_tol(p, foot) {
+                    out.push(p);
+                }
+            }
+            Prim::Seg(s) => {
+                if let Some(p) = line_seg(line, &s) {
+                    out.push(p);
+                }
+            }
+            Prim::Circle(c) => out.extend(line_circle_intersection(line, &c)),
+            Prim::Arc(a) => {
+                let tmp = line_circle_intersection(line, &a.circle());
+                retain_on_arc(&tmp, &a, &mut out);
+            }
+        }
+    }
+    dedup_points(&mut out);
+    out
+}
+
+/// 無限直線 `line`（`LineSeg` を通る直線とみなす）を矩形 `rect` で切り取った線分。
+///
+/// 構築線（M12 タスク91、DESIGN.md M12 設計判断9）の描画・出力・範囲判定の共通部品。
+/// 画面描画は表示範囲、SVG/PDF は用紙の範囲、カリングとスナップの前段絞り込みは
+/// 「`Some` かどうか」だけを使う。
+///
+/// - 矩形は境界を含む閉領域として扱う。辺の上を通る直線・角だけに触れる直線も
+///   `Some` を返す（角だけに触れる場合は長さ 0 の線分）。
+/// - 返す線分の向きは `line` と同じ（`a` → `b` の向きに進む）。端点は矩形の境界上にある
+///   （丸め誤差の範囲で）。
+/// - 矩形と交わらない、`line` が退化している（長さが [`crate::point_tol`] 以下）、
+///   `line` か `rect` に非有限値が含まれる場合は `None`。
+///
+/// 実装は Liang–Barsky のパラメータ切り取りで、直線のパラメータ範囲を `(-∞, ∞)` から
+/// 始める（線分の切り取りとの違いはこれだけ）。
+#[must_use]
+pub fn clip_line_to_aabb(line: &LineSeg, rect: &Aabb) -> Option<LineSeg> {
+    let finite = |p: Point2| p.x.is_finite() && p.y.is_finite();
+    if !(finite(line.a) && finite(line.b) && finite(rect.min) && finite(rect.max)) {
+        return None;
+    }
+    let d = line.direction();
+    if d.length() <= point_tol(line.a, line.b) {
+        return None;
+    }
+    let mut t0 = f64::NEG_INFINITY;
+    let mut t1 = f64::INFINITY;
+    for (origin, delta, lo, hi) in [
+        (line.a.x, d.x, rect.min.x, rect.max.x),
+        (line.a.y, d.y, rect.min.y, rect.max.y),
+    ] {
+        if delta == 0.0 {
+            // 軸に平行: その軸の範囲内を通るかだけで決まる（0 除算を避ける）。
+            if origin < lo || origin > hi {
+                return None;
+            }
+        } else {
+            let ta = (lo - origin) / delta;
+            let tb = (hi - origin) / delta;
+            t0 = t0.max(ta.min(tb));
+            t1 = t1.min(ta.max(tb));
+        }
+    }
+    // 退化していないので少なくとも一方の軸が有限の範囲を与える。極端に小さい成分の
+    // 除算で ±∞ が出ても、交わらない場合は t0 > t1 になって弾かれる。
+    if !(t0 <= t1 && t0.is_finite() && t1.is_finite()) {
+        return None;
+    }
+    Some(LineSeg::new(line.a + d * t0, line.a + d * t1))
+}
+
+/// 無限直線 `line` × 線分 `seg` の交点。[`seg_seg`] から直線側（`t`）の区間判定を
+/// 外したもの。平行・共線・`seg` の退化は `None`。
+fn line_seg(line: &LineSeg, seg: &LineSeg) -> Option<Point2> {
+    let r = line.direction();
+    let s = seg.direction();
+    let rl = r.length();
+    let sl = s.length();
+    if rl <= point_tol(line.a, line.b) || sl <= point_tol(seg.a, seg.b) {
+        return None;
+    }
+    let denom = r.cross(s);
+    if denom.abs() <= EPS * rl * sl {
+        return None;
+    }
+    let diff = seg.a - line.a;
+    let u = diff.cross(r) / denom;
+    if (-EPS..=1.0 + EPS).contains(&u) {
+        // 線分側のパラメータで位置を決める（数値誤差で区間外へ僅かに出た u は寄せる）。
+        Some(seg.a + s * u.clamp(0.0, 1.0))
+    } else {
+        None
+    }
 }
 
 /// 線分 × 線分の真の交点（1 点）。平行・共線・区間重なりは `None`。
@@ -564,6 +683,176 @@ mod tests {
         let line = LineSeg::new(Point2::new(-10.0, 0.0), Point2::new(10.0, 0.0));
         assert!(line_circle_intersection(&line, &Circle::new(Point2::ORIGIN, 0.0)).is_empty());
         assert!(line_circle_intersection(&line, &Circle::new(Point2::ORIGIN, -1.0)).is_empty());
+    }
+
+    // --- line_shape_intersection（M12 タスク91、構築線用） ---
+
+    #[test]
+    fn line_shape_intersection_finds_segment_crossing_outside_line_interval() {
+        // 直線側の定義区間（0..1）の遥か外でも、線分側の区間内なら交点になる。
+        let line = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0));
+        let seg = shape_line(100.0, -5.0, 100.0, 5.0);
+        let pts = line_shape_intersection(&line, &seg);
+        assert_eq!(pts.len(), 1);
+        assert!(contains_approx(&pts, Point2::new(100.0, 0.0)));
+    }
+
+    #[test]
+    fn line_shape_intersection_rejects_crossing_outside_segment() {
+        // 直線と線分の延長は (100, 0) で交わるが、線分の区間外なので交点なし。
+        let line = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0));
+        let seg = shape_line(100.0, 1.0, 100.0, 5.0);
+        assert!(line_shape_intersection(&line, &seg).is_empty());
+    }
+
+    #[test]
+    fn line_shape_intersection_parallel_and_collinear_are_empty() {
+        let line = LineSeg::new(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0));
+        assert!(line_shape_intersection(&line, &shape_line(0.0, 1.0, 5.0, 1.0)).is_empty());
+        assert!(line_shape_intersection(&line, &shape_line(3.0, 0.0, 5.0, 0.0)).is_empty());
+    }
+
+    #[test]
+    fn line_shape_intersection_circle_arc_polyline_and_point() {
+        let line = LineSeg::new(Point2::new(-1.0, 0.0), Point2::new(0.0, 0.0));
+        let circle = Shape::Circle(Circle::new(Point2::new(20.0, 0.0), 5.0));
+        let pts = line_shape_intersection(&line, &circle);
+        assert_eq!(pts.len(), 2);
+        assert!(contains_approx(&pts, Point2::new(15.0, 0.0)));
+        assert!(contains_approx(&pts, Point2::new(25.0, 0.0)));
+
+        // 上半円の弧（0..π）は両端 (15,0)・(25,0) を含む。第 1 象限だけなら (25,0) のみ。
+        let quarter = Shape::Arc(Arc::new(Point2::new(20.0, 0.0), 5.0, 0.0, FRAC_PI_2));
+        let pts = line_shape_intersection(&line, &quarter);
+        assert_eq!(pts.len(), 1);
+        assert!(contains_approx(&pts, Point2::new(25.0, 0.0)));
+
+        let pl = Shape::Polyline(Polyline::new(
+            vec![
+                Point2::new(30.0, -1.0),
+                Point2::new(30.0, 1.0),
+                Point2::new(32.0, 1.0),
+                Point2::new(32.0, -1.0),
+            ],
+            false,
+        ));
+        let pts = line_shape_intersection(&line, &pl);
+        assert_eq!(pts.len(), 2);
+        assert!(contains_approx(&pts, Point2::new(30.0, 0.0)));
+        assert!(contains_approx(&pts, Point2::new(32.0, 0.0)));
+
+        let on = Shape::Point(Point2::new(-50.0, 0.0));
+        let off = Shape::Point(Point2::new(-50.0, 0.5));
+        assert_eq!(line_shape_intersection(&line, &on).len(), 1);
+        assert!(line_shape_intersection(&line, &off).is_empty());
+    }
+
+    // --- clip_line_to_aabb（M12 タスク91、構築線の描画・出力の切り取り） ---
+
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Aabb {
+        Aabb::from_corners(Point2::new(x0, y0), Point2::new(x1, y1))
+    }
+
+    fn seg_approx(s: &LineSeg, a: Point2, b: Point2) -> bool {
+        s.a.distance(a) < 1e-9 && s.b.distance(b) < 1e-9
+    }
+
+    #[test]
+    fn clip_line_horizontal_and_vertical_span_the_rect() {
+        let r = rect(0.0, 0.0, 10.0, 5.0);
+        // 基点が矩形の外（左）でも、直線が横切れば矩形の幅いっぱいの線分になる。
+        let h = LineSeg::new(Point2::new(-100.0, 2.0), Point2::new(-99.0, 2.0));
+        let s = clip_line_to_aabb(&h, &r).unwrap();
+        assert!(
+            seg_approx(&s, Point2::new(0.0, 2.0), Point2::new(10.0, 2.0)),
+            "{s:?}"
+        );
+        // 向きは入力の直線に従う（-x 向きなら右端 → 左端）。
+        let h_rev = LineSeg::new(Point2::new(3.0, 2.0), Point2::new(2.0, 2.0));
+        let s = clip_line_to_aabb(&h_rev, &r).unwrap();
+        assert!(
+            seg_approx(&s, Point2::new(10.0, 2.0), Point2::new(0.0, 2.0)),
+            "{s:?}"
+        );
+        let v = LineSeg::new(Point2::new(4.0, 50.0), Point2::new(4.0, 51.0));
+        let s = clip_line_to_aabb(&v, &r).unwrap();
+        assert!(
+            seg_approx(&s, Point2::new(4.0, 0.0), Point2::new(4.0, 5.0)),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn clip_line_diagonal_and_miss() {
+        let r = rect(0.0, 0.0, 10.0, 10.0);
+        // 対角線はちょうど 2 つの角を通る。
+        let diag = LineSeg::new(Point2::new(20.0, 20.0), Point2::new(21.0, 21.0));
+        let s = clip_line_to_aabb(&diag, &r).unwrap();
+        assert!(
+            seg_approx(&s, Point2::new(0.0, 0.0), Point2::new(10.0, 10.0)),
+            "{s:?}"
+        );
+        // 斜めの直線が矩形の 2 辺を横切る。
+        let slope = LineSeg::new(Point2::new(0.0, 5.0), Point2::new(2.0, 6.0));
+        let s = clip_line_to_aabb(&slope, &r).unwrap();
+        assert!(
+            seg_approx(&s, Point2::new(0.0, 5.0), Point2::new(10.0, 10.0)),
+            "{s:?}"
+        );
+        // 矩形の外を通る直線は None（軸平行・斜めとも）。
+        let above = LineSeg::new(Point2::new(0.0, 11.0), Point2::new(1.0, 11.0));
+        assert_eq!(clip_line_to_aabb(&above, &r), None);
+        let far = LineSeg::new(Point2::new(0.0, 25.0), Point2::new(1.0, 24.0));
+        assert_eq!(clip_line_to_aabb(&far, &r), None);
+    }
+
+    #[test]
+    fn clip_line_touching_boundary_is_closed() {
+        let r = rect(0.0, 0.0, 10.0, 10.0);
+        // 辺の上を通る直線は辺そのもの。
+        let edge = LineSeg::new(Point2::new(0.0, 10.0), Point2::new(1.0, 10.0));
+        let s = clip_line_to_aabb(&edge, &r).unwrap();
+        assert!(
+            seg_approx(&s, Point2::new(0.0, 10.0), Point2::new(10.0, 10.0)),
+            "{s:?}"
+        );
+        // 角 (10, 0) だけに触れる直線は長さ 0 の線分。
+        let corner = LineSeg::new(Point2::new(10.0, 0.0), Point2::new(11.0, 1.0));
+        let s = clip_line_to_aabb(&corner, &r).unwrap();
+        assert!(
+            seg_approx(&s, Point2::new(10.0, 0.0), Point2::new(10.0, 0.0)),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn clip_line_degenerate_or_non_finite_is_none() {
+        let r = rect(0.0, 0.0, 10.0, 10.0);
+        let degenerate = LineSeg::new(Point2::new(5.0, 5.0), Point2::new(5.0, 5.0));
+        assert_eq!(clip_line_to_aabb(&degenerate, &r), None);
+        let nan = LineSeg::new(Point2::new(f64::NAN, 5.0), Point2::new(1.0, 5.0));
+        assert_eq!(clip_line_to_aabb(&nan, &r), None);
+        let inf_rect = rect(0.0, 0.0, f64::INFINITY, 10.0);
+        let h = LineSeg::new(Point2::new(0.0, 5.0), Point2::new(1.0, 5.0));
+        assert_eq!(clip_line_to_aabb(&h, &inf_rect), None);
+    }
+
+    #[test]
+    fn clip_line_nearly_axis_parallel_stays_finite() {
+        // 回転の丸めで x 成分が極小になった「ほぼ鉛直」の直線。
+        let r = rect(-10.0, -10.0, 10.0, 10.0);
+        let almost = LineSeg::new(Point2::new(1.0, 0.0), Point2::new(1.0 + 1e-17, 1.0));
+        let s = clip_line_to_aabb(&almost, &r).unwrap();
+        assert!(
+            seg_approx(&s, Point2::new(1.0, -10.0), Point2::new(1.0, 10.0)),
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn line_shape_intersection_degenerate_line_is_empty() {
+        let line = LineSeg::new(Point2::new(1.0, 1.0), Point2::new(1.0, 1.0));
+        assert!(line_shape_intersection(&line, &shape_line(0.0, 0.0, 2.0, 2.0)).is_empty());
     }
 
     #[test]

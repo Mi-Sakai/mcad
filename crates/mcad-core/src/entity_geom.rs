@@ -17,10 +17,13 @@
 //!
 //! **表（[`TableGeom`]、M10）はさらに割り切って、平行移動・回転・鏡映のいずれでも
 //! アンカーだけを変換する**（回転角フィールドを持たない。DESIGN.md M10 設計方針3）。
+//!
+//! **構築線（[`XLineGeom`]、M12 タスク91）は基点と方向を変換し、方向は回転・鏡映の
+//! たびに単位長へ正規化し直す**（[`XLineGeom`] の不変条件。DESIGN.md M12 設計判断9）。
 
 use serde::{Deserialize, Serialize};
 
-use mcad_geom::{Aabb, Point2, Shape, Vec2};
+use mcad_geom::{Aabb, LineSeg, Point2, Shape, Vec2};
 
 use crate::dim::{DimAnnotation, DimKind};
 
@@ -614,6 +617,115 @@ impl TableGeom {
     }
 }
 
+/// 構築線の方向ベクトル（[`XLineGeom::dir`]）の長さが 1 から外れてよい許容量
+/// （M12 タスク91、DESIGN.md M12 設計判断9「着手時の決定」）。
+///
+/// 生成側（[`XLineGeom::through`] / [`XLineGeom::from_base_dir`]・回転・鏡映）は必ず
+/// 正規化してから作るので、正規の値の誤差は数 ULP（1e-16 程度）に収まる。許容量を
+/// それより大きく取るのは、手編集や他ツールが書いた `.mcad`・JSON の 10 進表現の
+/// 丸めを受け入れるため。
+pub const XLINE_DIR_TOLERANCE: f64 = 1e-9;
+
+/// 構築線（両方向へ無限に延びる直線。M12 タスク91、DESIGN.md M12 設計判断9）。
+///
+/// # 不変条件
+///
+/// [`dir`](Self::dir) は**単位ベクトル**（長さが 1 から [`XLINE_DIR_TOLERANCE`] 以内）。
+/// [`EntityGeom::validate`] が非有限・零・長さが外れたものを拒否し、生成側は
+/// [`XLineGeom::through`] / [`XLineGeom::from_base_dir`] で正規化してから作る
+/// （回転・鏡映も結果を正規化し直す）。`dir` と `-dir` は同じ直線を表すが、**向きは
+/// 揃えない**（保存値をそのまま往復させる。作図時のクリック順がそのまま残る）。
+///
+/// # 無限長の扱い
+///
+/// [`EntityGeom::aabb`] は**基点 1 点の退化した箱**を返す（`Aabb` は有限の箱しか
+/// 表せず、戻り値の型を変えると tcad を含む利用者が壊れるため）。ズームフィットは
+/// この箱のまま基点だけを含め、表示上の範囲判定（カリング・スナップの前段絞り込み）は
+/// app 層が直線として扱う（[`mcad_geom::clip_line_to_aabb`]）。
+///
+/// [`mcad_geom::Shape`] には足さない（tcad が網羅 match しているため。
+/// [`EntityGeom::as_shape`] は `None` を返す）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct XLineGeom {
+    /// 基点（直線上の 1 点。作図時の 1 クリック目）。ワールド座標。
+    pub base: Point2,
+    /// 方向（単位ベクトル。上の「不変条件」）。
+    pub dir: Vec2,
+}
+
+impl XLineGeom {
+    /// 基点 `base` と通過点 `through` から作る（作図ツールの 2 クリック）。
+    ///
+    /// 2 点が一致する（距離が [`mcad_geom::point_tol`] 以下）・非有限なら `None`。
+    #[must_use]
+    pub fn through(base: Point2, through: Point2) -> Option<Self> {
+        let finite = |p: Point2| p.x.is_finite() && p.y.is_finite();
+        if !(finite(base) && finite(through)) {
+            return None;
+        }
+        let delta = through - base;
+        let len = delta.length();
+        if len <= mcad_geom::point_tol(base, through) {
+            return None;
+        }
+        Self::from_base_dir(base, delta / len)
+    }
+
+    /// 基点 `base` と方向 `dir`（正規化前でよい）から作る。
+    ///
+    /// `dir` を正規化する。基点・方向が非有限、方向が零（[`Vec2::normalize`] が
+    /// `None` を返す長さ）なら `None`。DXF 読込が使う（`XLINE` の group 11 は
+    /// 単位ベクトルのはずだが、12 桁で丸めて書かれるうえ手編集もありうる）。
+    #[must_use]
+    pub fn from_base_dir(base: Point2, dir: Vec2) -> Option<Self> {
+        let finite = [base.x, base.y, dir.x, dir.y].iter().all(|v| v.is_finite());
+        if !finite {
+            return None;
+        }
+        // 成分が大きいと `length()` が無限大へ溢れ、`normalize` が零ベクトルを返す
+        // （例: `(1e308, 1e308)`）。最大成分で割ってから正規化して溢れを避け、
+        // 結果が単位長であることも確かめる。
+        let scale = dir.x.abs().max(dir.y.abs());
+        if scale == 0.0 {
+            return None;
+        }
+        let dir = (dir / scale).normalize()?;
+        if (dir.length() - 1.0).abs() > XLINE_DIR_TOLERANCE {
+            return None;
+        }
+        Some(Self { base, dir })
+    }
+
+    /// 直線を `LineSeg(base, base + dir)` として返す。`mcad_geom` の無限直線関数
+    /// （[`mcad_geom::line_line_intersection`]・[`mcad_geom::line_shape_intersection`]・
+    /// [`mcad_geom::clip_line_to_aabb`]。いずれも「`LineSeg` を通る直線」とみなす）へ
+    /// 渡すための形。線分としての長さ（1）には意味が無い。
+    #[must_use]
+    pub fn line(&self) -> LineSeg {
+        LineSeg::new(self.base, self.base + self.dir)
+    }
+
+    /// 直線上で `p` に最も近い点（`p` から直線への垂線の足。区間の制約は無い）。
+    #[must_use]
+    pub fn closest_point(&self, p: Point2) -> Point2 {
+        self.base + self.dir * (p - self.base).dot(self.dir)
+    }
+
+    /// 点 `p` から直線までの距離（垂直距離）。
+    #[must_use]
+    pub fn distance_to(&self, p: Point2) -> f64 {
+        (p - self.base).cross(self.dir).abs()
+    }
+}
+
+/// 回転・鏡映した方向ベクトルを単位長へ戻す（[`XLineGeom`] の不変条件を保つ）。
+/// 入力は単位ベクトルなので正規化は必ず成功するが、万一退化していたら変換前の
+/// 方向 `fallback` を保つ（変換で非有限値を作らない）。
+#[inline]
+fn renormalized(v: Vec2, fallback: Vec2) -> Vec2 {
+    v.normalize().unwrap_or(fallback)
+}
+
 /// エンティティの幾何。[`Shape`]（既存プリミティブ）を包含しつつ、テキスト・寸法・表を
 /// 追加する。
 ///
@@ -645,6 +757,9 @@ pub enum EntityGeom {
     DimAngular(DimAngular),
     /// 座標寸法（M11 タスク69）。
     DimOrdinate(DimOrdinate),
+    /// 構築線（M12 タスク91、DESIGN.md M12 設計判断9）。無限長の直線で、
+    /// [`EntityGeom::aabb`] は基点だけの箱を返す（[`XLineGeom`] の doc）。
+    XLine(XLineGeom),
 }
 
 /// 点 `p` を `pivot` を中心に CCW へ `angle` ラジアン回転する（公開 Vec2/Point2 API で組む）。
@@ -752,6 +867,11 @@ impl EntityGeom {
     /// `text_world_aabb` が、この AABB を anchor 基準に `k` 倍する相似拡大として提供する
     /// （DESIGN.md M8 タスク37 実装時追記。tcad が本メソッドへ path 依存しているため、
     /// シグネチャ・実装ともここでは変更しない）。
+    ///
+    /// **構築線（[`EntityGeom::XLine`]）は基点 1 点の退化した箱を返す。無限長は表さない。**
+    /// 表示上の範囲判定（カリング・スナップの前段絞り込み）は app 層が直線として扱う
+    /// （M12 タスク91、DESIGN.md M12 設計判断9「着手時の決定」）。ズームフィットはこの箱の
+    /// まま基点だけを含める。
     #[must_use]
     pub fn aabb(&self) -> Aabb {
         match self {
@@ -790,6 +910,7 @@ impl EntityGeom {
             EntityGeom::DimOrdinate(dim) => {
                 Aabb::from_corners(dim.origin, dim.feature).extended(dim.leader_end)
             }
+            EntityGeom::XLine(xline) => Aabb::from_point(xline.base),
         }
     }
 
@@ -850,6 +971,11 @@ impl EntityGeom {
                 leader_end: dim.leader_end + delta,
                 axis: dim.axis,
                 annotation: transform_annotation(&dim.annotation, |p| p + delta),
+            }),
+            // 構築線は基点だけを動かす（方向は平行移動で変わらない）。
+            EntityGeom::XLine(xline) => EntityGeom::XLine(XLineGeom {
+                base: xline.base + delta,
+                dir: xline.dir,
             }),
         }
     }
@@ -949,6 +1075,12 @@ impl EntityGeom {
                     |p| rotate_point(p, pivot, angle),
                     |theta| theta + angle,
                 ),
+            }),
+            // 構築線は基点を回し、方向も同じ角だけ回して単位長へ戻す（丸めで長さが 1 から
+            // ずれ続けないように。[`XLineGeom`] の不変条件）。
+            EntityGeom::XLine(xline) => EntityGeom::XLine(XLineGeom {
+                base: rotate_point(xline.base, pivot, angle),
+                dir: renormalized(xline.dir.rotated(angle), xline.dir),
             }),
         }
     }
@@ -1082,6 +1214,13 @@ impl EntityGeom {
                     |theta| mirror_angle(axis_a, axis_b, theta),
                 ),
             }),
+            // 構築線は基点を鏡映し、方向を軸に対して反射して単位長へ戻す。退化軸では
+            // [`Vec2::reflected`] が恒等写像を返すので、基点（`mirror_point` も恒等）と
+            // 合わせて元の直線のまま残る。
+            EntityGeom::XLine(xline) => EntityGeom::XLine(XLineGeom {
+                base: mirror_point(xline.base, axis_a, axis_b),
+                dir: renormalized(xline.dir.reflected(axis_b - axis_a), xline.dir),
+            }),
         }
     }
 
@@ -1093,6 +1232,9 @@ impl EntityGeom {
     ///
     /// **表は行列数・寸法（個々の値と合計）・セル数・文字高さ・セル文字列を検証する**
     /// （DESIGN.md M10 詳細設計1。条件の一覧は本モジュールの `validate_table`）。
+    ///
+    /// **構築線は基点・方向の有限性と、方向が単位ベクトル（長さが 1 から
+    /// [`XLINE_DIR_TOLERANCE`] 以内）であることを検証する**（M12 タスク91）。
     ///
     /// **寸法は加えて [`DimAnnotation::validate`] を通す**（M9 設計判断2）。これが
     /// 「種別に許されない記号・`upper < lower`・不正なはめあい記号・非有限値を
@@ -1213,6 +1355,23 @@ impl EntityGeom {
                 // 引かずにラベルだけを置く（`expand_ordinate`）。3 点が一致していても
                 // 「原点そのものを指す座標寸法（値 0）」として意味が通る。
                 check_annotation(&dim.annotation, DimKind::Ordinate)
+            }
+            // 構築線（M12 タスク91）。方向は単位ベクトルであることまで検査する
+            // （[`XLineGeom`] の不変条件）。零は長さ 0 として同じ条件で落ちる。
+            EntityGeom::XLine(xline) => {
+                if !finite_pt(xline.base) {
+                    return Err("non-finite construction line base point".into());
+                }
+                if !(xline.dir.x.is_finite() && xline.dir.y.is_finite()) {
+                    return Err("non-finite construction line direction".into());
+                }
+                let len = xline.dir.length();
+                if (len - 1.0).abs() > XLINE_DIR_TOLERANCE {
+                    return Err(format!(
+                        "construction line direction must be a unit vector (length {len})"
+                    ));
+                }
+                Ok(())
             }
         }
     }
@@ -2803,5 +2962,139 @@ mod tests {
         ] {
             assert!(moved.is_bom(), "種類が変わった: {moved:?}");
         }
+    }
+
+    // --- 構築線（M12 タスク91、DESIGN.md M12 設計判断9） ---
+
+    fn xline(base: Point2, dir: Vec2) -> EntityGeom {
+        EntityGeom::XLine(XLineGeom { base, dir })
+    }
+
+    fn unwrap_xline(geom: &EntityGeom) -> XLineGeom {
+        match geom {
+            EntityGeom::XLine(x) => *x,
+            other => panic!("expected XLine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xline_constructors_normalize_and_reject_degenerate_input() {
+        let x = XLineGeom::through(Point2::new(1.0, 1.0), Point2::new(4.0, 5.0)).unwrap();
+        assert_eq!(x.base, Point2::new(1.0, 1.0));
+        assert!((x.dir.x - 0.6).abs() < 1e-15 && (x.dir.y - 0.8).abs() < 1e-15);
+        // 基点と同じ点・非有限は作れない。
+        assert_eq!(
+            XLineGeom::through(Point2::new(1.0, 1.0), Point2::new(1.0, 1.0)),
+            None
+        );
+        assert_eq!(
+            XLineGeom::through(Point2::new(f64::NAN, 0.0), Point2::new(1.0, 1.0)),
+            None
+        );
+        // 方向は正規化前でよい（DXF 読込の経路）。零・非有限は None。
+        let y = XLineGeom::from_base_dir(Point2::ORIGIN, Vec2::new(0.0, -3.0)).unwrap();
+        assert_eq!(y.dir, Vec2::new(0.0, -1.0));
+        assert_eq!(XLineGeom::from_base_dir(Point2::ORIGIN, Vec2::ZERO), None);
+        assert_eq!(
+            XLineGeom::from_base_dir(Point2::ORIGIN, Vec2::new(f64::INFINITY, 0.0)),
+            None
+        );
+        assert_eq!(
+            XLineGeom::from_base_dir(Point2::new(0.0, f64::NAN), Vec2::new(1.0, 0.0)),
+            None
+        );
+        // 有限でも長さが溢れる大きな成分は、溢れずに単位ベクトルへ正規化する
+        // （Codex レビュー指摘。素朴な `normalize` は零ベクトルを返していた）。
+        let big = XLineGeom::from_base_dir(Point2::ORIGIN, Vec2::new(1e308, 1e308)).unwrap();
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        assert!((big.dir.x - h).abs() < 1e-15 && (big.dir.y - h).abs() < 1e-15);
+        assert!(EntityGeom::XLine(big).validate().is_ok());
+        // 非常に小さい成分（非正規化数）も同様。
+        let tiny = XLineGeom::from_base_dir(Point2::ORIGIN, Vec2::new(0.0, -5e-324)).unwrap();
+        assert_eq!(tiny.dir, Vec2::new(0.0, -1.0));
+    }
+
+    #[test]
+    fn xline_validate_requires_a_finite_unit_direction() {
+        assert!(
+            xline(Point2::new(3.0, 4.0), Vec2::new(0.6, 0.8))
+                .validate()
+                .is_ok()
+        );
+        // 許容量（1e-9）以内のずれは受理、超えたら拒否。
+        let slightly = Vec2::new(1.0 + 0.5 * XLINE_DIR_TOLERANCE, 0.0);
+        assert!(xline(Point2::ORIGIN, slightly).validate().is_ok());
+        for bad in [
+            Vec2::ZERO,
+            Vec2::new(2.0, 0.0),
+            Vec2::new(1.0 + 10.0 * XLINE_DIR_TOLERANCE, 0.0),
+            Vec2::new(f64::NAN, 0.0),
+            Vec2::new(0.0, f64::INFINITY),
+        ] {
+            assert!(
+                xline(Point2::ORIGIN, bad).validate().is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        assert!(
+            xline(Point2::new(f64::NAN, 0.0), Vec2::new(1.0, 0.0))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn xline_transforms_move_the_base_and_keep_a_unit_direction() {
+        let g = xline(Point2::new(1.0, 0.0), Vec2::new(1.0, 0.0));
+        let moved = unwrap_xline(&g.translated(Vec2::new(2.0, 3.0)));
+        assert_eq!(moved.base, Point2::new(3.0, 3.0));
+        assert_eq!(moved.dir, Vec2::new(1.0, 0.0));
+
+        let rotated = unwrap_xline(&g.rotated(Point2::ORIGIN, FRAC_PI_2));
+        assert!(approx(rotated.base, Point2::new(0.0, 1.0)));
+        assert!((rotated.dir - Vec2::new(0.0, 1.0)).length() < 1e-12);
+
+        // y 軸での鏡映: 基点は (-1, 0)、方向 (1, 0) は (-1, 0) に反射する
+        // （向きは揃えない。DESIGN.md「dir の不変条件」）。
+        let mirrored = unwrap_xline(&g.mirrored(Point2::ORIGIN, Point2::new(0.0, 5.0)));
+        assert!(approx(mirrored.base, Point2::new(-1.0, 0.0)));
+        assert!((mirrored.dir - Vec2::new(-1.0, 0.0)).length() < 1e-12);
+
+        // 回転を何度繰り返しても単位長から外れない（毎回正規化し直す）。
+        let mut cur = xline(Point2::new(5.0, 7.0), Vec2::new(0.6, 0.8));
+        for i in 0..1000 {
+            cur = cur.rotated(Point2::new(1.0, 2.0), 0.1 + f64::from(i) * 1e-3);
+            cur = cur.mirrored(Point2::new(0.3, 0.1), Point2::new(2.0, 9.0));
+        }
+        assert!(cur.validate().is_ok(), "{cur:?}");
+
+        // 退化軸の鏡映は恒等（基点・方向とも変わらない）。
+        let same = unwrap_xline(&g.mirrored(Point2::new(2.0, 2.0), Point2::new(2.0, 2.0)));
+        assert_eq!(same.dir, Vec2::new(1.0, 0.0));
+    }
+
+    #[test]
+    fn xline_aabb_is_the_degenerate_box_at_the_base_and_it_is_not_a_shape() {
+        let g = xline(Point2::new(3.0, -2.0), Vec2::new(0.0, 1.0));
+        assert_eq!(g.aabb(), Aabb::from_point(Point2::new(3.0, -2.0)));
+        assert!(g.as_shape().is_none());
+        assert!(!g.is_bom());
+    }
+
+    #[test]
+    fn xline_distance_and_closest_point_use_the_infinite_line() {
+        let x = XLineGeom {
+            base: Point2::new(0.0, 1.0),
+            dir: Vec2::new(1.0, 0.0),
+        };
+        // 基点から遠く離れた位置でも直線への垂直距離（区間の制約は無い）。
+        assert!((x.distance_to(Point2::new(1.0e4, 4.0)) - 3.0).abs() < 1e-9);
+        assert!(approx(
+            x.closest_point(Point2::new(-500.0, -2.0)),
+            Point2::new(-500.0, 1.0)
+        ));
+        let line = x.line();
+        assert_eq!(line.a, Point2::new(0.0, 1.0));
+        assert_eq!(line.b, Point2::new(1.0, 1.0));
     }
 }

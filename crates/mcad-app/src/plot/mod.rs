@@ -62,7 +62,10 @@
 //!   **用紙縁**（`main.rs` の `draw_paper_edge`。印刷対象でない画面専用ヒントとして
 //!   タスク38 が意図的に [`crate::frame::FrameLayout`] の外へ置いた）。
 //! - 用紙外の図形も **クリップせずデータとして書く**（はみ出しは作図者の責任。判断7）。
-//!   カリングもしない。
+//!   カリングもしない。**例外は構築線**（[`EntityGeom::XLine`]、M12 タスク91）: 無限長で
+//!   データとしては書けないので、**用紙の範囲で切った線分**として書き、用紙と交わらなければ
+//!   出さない（[`xline_paper_segment`]。DESIGN.md M12 設計判断9、2026-09-23 ユーザー確定。
+//!   出したくなければレイヤーを非表示にする）。
 //!
 //! # 色
 //!
@@ -90,9 +93,9 @@ use std::f64::consts::FRAC_PI_2;
 
 use mcad_core::{
     DimExpansion, DimRender, Document, Entity, EntityGeom, Layer, Linetype, Rgb, TableCellText,
-    TableGeom, TextGeom, expand_dim, expand_table,
+    TableGeom, TextGeom, XLineGeom, expand_dim, expand_table,
 };
-use mcad_geom::{Arc, Point2, Polyline, Shape, Vec2};
+use mcad_geom::{Aabb, Arc, LineSeg, Point2, Polyline, Shape, Vec2, clip_line_to_aabb};
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{FrameLayout, frame_layout};
@@ -328,6 +331,8 @@ pub fn plot_page(document: &Document, mode: PlotColorMode) -> PlotPage {
         arrow_len_world: dim_style.arrow_len_mm * k,
         text_height_world: dim_style.text_height_mm * k,
     };
+    // 用紙の範囲（紙 mm）。構築線を切る範囲（[`xline_paper_segment`]）。
+    let paper = Aabb::from_corners(Point2::ORIGIN, Point2::new(width_mm, height_mm));
     for (entity, layer) in entities_in_plot_order(document) {
         push_entity(
             &mut paths,
@@ -337,6 +342,7 @@ pub fn plot_page(document: &Document, mode: PlotColorMode) -> PlotPage {
             outliner.as_ref(),
             mode,
             dim_render,
+            &paper,
         );
     }
 
@@ -400,6 +406,16 @@ fn entities_in_plot_order(document: &Document) -> Vec<(&Entity, &Layer)> {
     drawable
 }
 
+/// 構築線を用紙の範囲 `paper`（紙 mm の `(0,0)`〜`(W,H)`）で切った線分（紙 mm）。用紙と
+/// 交わらなければ `None`（M12 タスク91、モジュール doc「出力に含める / 含めない」）。
+///
+/// 切り取りは紙 mm 座標で行う（基点を `÷ k` し、方向は `k > 0` なので向きが変わらない）。
+/// 線分の向きは構築線の `dir` と同じで、破線の位相はこの線分の始点（用紙の縁）から 0。
+fn xline_paper_segment(xline: &XLineGeom, k: f64, paper: &Aabb) -> Option<LineSeg> {
+    let base = world_to_paper(xline.base, k);
+    clip_line_to_aabb(&LineSeg::new(base, base + xline.dir), paper)
+}
+
 /// エンティティ 1 つをパスへ展開して `paths` へ追加する。
 #[allow(clippy::too_many_arguments)]
 fn push_entity(
@@ -410,6 +426,7 @@ fn push_entity(
     outliner: Option<&GlyphOutliner>,
     mode: PlotColorMode,
     dim_render: DimRender<'_>,
+    paper: &Aabb,
 ) {
     let color = plot_color(mode, entity.style.effective_color(layer.color));
     let width_mm = entity.style.effective_width(layer.width_mm).mm();
@@ -440,6 +457,18 @@ fn push_entity(
         // 表の罫線は幅も線種も固定の定数（表題欄と同じ。core の `expand` が持つ）なので、`width_mm` も
         // `linetype` も使わない。色だけスタイルに従う（M10 詳細設計1）。
         EntityGeom::Table(table) => push_table(paths, table, color, k, outliner),
+        // 構築線（M12 タスク91）は用紙の範囲で切った線分。線種・線幅は形状と同じ。
+        EntityGeom::XLine(xline) => {
+            if let Some(seg) = xline_paper_segment(xline, k, paper) {
+                let stroke = PlotStroke {
+                    width_mm,
+                    color,
+                    dash_mm: dash_pattern_mm(linetype),
+                };
+                let cmds = vec![PathCmd::MoveTo(seg.a), PathCmd::LineTo(seg.b)];
+                paths.push(PlotPath::stroked(cmds, stroke));
+            }
+        }
         // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は出力しない。
         _ => {}
     }
@@ -2216,5 +2245,70 @@ mod tests {
             unreachable!()
         };
         close_to(start.distance(center), f64::from(WidthMm::DEFAULT.mm()));
+    }
+
+    // ---- 構築線（M12 タスク91、DESIGN.md M12 設計判断9） ----
+
+    fn xline(base: Point2, through: Point2) -> EntityGeom {
+        EntityGeom::XLine(XLineGeom::through(base, through).expect("distinct points"))
+    }
+
+    #[test]
+    fn xline_is_written_as_the_segment_clipped_to_the_paper() {
+        // 1:2（k=2）。水平な構築線 y_world = 50 は紙 y = 25 で、用紙（A4 横 297×210）の
+        // 左端から右端まで。基点は用紙の外（x_world = -5000）でもよい。
+        let mut document = document_with_scale(1, 2);
+        let (w, h) = document.sheet().paper_extent_mm();
+        add(
+            &mut document,
+            xline(Point2::new(-5000.0, 50.0), Point2::new(-4999.0, 50.0)),
+        );
+        // 斜めの構築線（紙座標で (0,0) を通る 45°）は用紙の対角ではなく、短辺で切れる。
+        add(&mut document, xline(Point2::ORIGIN, Point2::new(1.0, 1.0)));
+        let page = plot_page(&document, PlotColorMode::Monochrome);
+        let lines = stroked(&page);
+        assert_eq!(lines.len(), 2);
+
+        let (a, b) = endpoints(lines[0]);
+        assert!(a.distance(Point2::new(0.0, 25.0)) < T, "{a:?}");
+        assert!(b.distance(Point2::new(w, 25.0)) < T, "{b:?}");
+        let (a, b) = endpoints(lines[1]);
+        assert!(a.distance(Point2::new(0.0, 0.0)) < T, "{a:?}");
+        assert!(b.distance(Point2::new(h, h)) < T, "{b:?}");
+        // 線種・線幅は形状と同じ経路（既定レイヤーは実線 0.35mm）。
+        let stroke = lines[0].stroke.expect("stroked");
+        assert_eq!(stroke.dash_mm, None);
+        assert!((f64::from(stroke.width_mm) - 0.35).abs() < 1e-6);
+    }
+
+    #[test]
+    fn xline_off_the_paper_is_not_written_and_keeps_its_linetype() {
+        let mut document = document_with_scale(1, 1);
+        // 用紙の上（y = 1000 > 210）を水平に通る構築線は出さない。
+        add(
+            &mut document,
+            xline(Point2::new(0.0, 1000.0), Point2::new(1.0, 1000.0)),
+        );
+        assert!(stroked(&plot_page(&document, PlotColorMode::Monochrome)).is_empty());
+
+        // 線種の上書きは破線パターンとして出る（位相は線分の始点 = 用紙の縁から）。
+        add_styled(
+            &mut document,
+            xline(Point2::new(100.0, 0.0), Point2::new(100.0, 1.0)),
+            Style {
+                linetype: Some(Linetype::DashDot),
+                ..Style::inherited()
+            },
+        );
+        let page = plot_page(&document, PlotColorMode::Monochrome);
+        let lines = stroked(&page);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].stroke.unwrap().dash_mm,
+            dash_pattern_mm(Linetype::DashDot)
+        );
+        let (a, b) = endpoints(lines[0]);
+        assert!(a.distance(Point2::new(100.0, 0.0)) < T, "{a:?}");
+        assert!(b.distance(Point2::new(100.0, 210.0)) < T, "{b:?}");
     }
 }

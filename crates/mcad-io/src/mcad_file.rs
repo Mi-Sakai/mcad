@@ -26,7 +26,7 @@
 //! | 5 | 寸法注記（[`mcad_core::DimAnnotation`]）・文書単位の寸法スタイル（`dim_style`）を永続化（M9 タスク48） | `arrow_kind = ClosedFilled`。表（[`EntityGeom::Table`]）は概念自体が無いため、凍結 DTO（[`EntityGeomV5`]）が `Table` タグを拒否する |
 //! | 6 | 汎用テーブル（[`EntityGeom::Table`]、M10）・[`mcad_core::DimStyle::arrow_kind`]（矢先種別。M10 タスク57で `.mcad` へ導入、形状生成は M10 タスク63）を追加 | `direction = Aligned`（凍結 DTO [`DimLinearV6`] が `direction` キーを拒否する） |
 //! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）、長さ寸法の補助線の傾き（`DimLinear::ext_angle`。M11 タスク78）を追加 | `kind = Table`・`col_aligns = すべて Left`・`use_bom = true`（凍結 DTO [`TableGeomV7`] / [`SheetMetaV7`] が 3 キーを拒否する。**中身から部品表を推測しない**） |
-//! | 8 | 表の種類 [`TableKind`]（`TableGeom::kind`。表 / 部品表）・図面の「部品表を使う」（`SheetMeta::use_bom`）を追加（M12 タスク81）、表の列ごとの揃え（`TableGeom::col_aligns`。M12 タスク93）を追加。現行 | なし |
+//! | 8 | 表の種類 [`TableKind`]（`TableGeom::kind`。表 / 部品表）・図面の「部品表を使う」（`SheetMeta::use_bom`）を追加（M12 タスク81）、表の列ごとの揃え（`TableGeom::col_aligns`。M12 タスク93）、構築線 [`EntityGeom::XLine`]（M12 タスク91）を追加。現行 | なし |
 //!
 //! **v7 は M11-1 の中で 3 度拡張した（タスク68 → 69 → 78）が、版は上げていない。**
 //! タスク68 の v7 は未リリースで、同じマイルストーンの中で版を刻む意味がないため
@@ -290,6 +290,25 @@
 //!   見え方が変わらない）。凍結 DTO [`TableGeomV7`] は `deny_unknown_fields` なので、
 //!   **v7 以前と自称するファイルに `col_aligns` を混ぜると読込ごと失敗する**（`kind` と
 //!   同じ防御。回帰は `v7_file_with_col_aligns_is_rejected`）。
+//!
+//! # 構築線（v8 に相乗り・M12 タスク91）
+//!
+//! M12 タスク91 で [`EntityGeom`] へ構築線（[`EntityGeom::XLine`]。基点 `base` と単位方向
+//! `dir`）を足した（DESIGN.md M12 設計判断9）。v8 は未リリースなので**版は上げずに v8 へ
+//! 相乗りする**（タスク81・93 と同じ運用）。
+//!
+//! - [`FileEntity::geom`] が現行の [`EntityGeom`] をそのまま serde するので、タグ `XLine` が
+//!   増えるだけで追加の型は要らない。方向は保存値のまま書き、`dir` と `-dir` の向きも
+//!   揃えない（回帰は `v8_round_trip_is_lossless_for_construction_lines`）。
+//! - **読込で方向を正規化しない**。単位ベクトルでない方向（長さが 1 から
+//!   [`mcad_core::XLINE_DIR_TOLERANCE`] を超えて外れる・零）は
+//!   [`mcad_core::EntityGeom::validate`] が拒否し [`IoError::InvalidGeometry`] になる
+//!   （値が変わる取り込みはしない。回帰は `v8_rejects_a_non_unit_construction_line_direction`）。
+//!   正規化して受け入れるのは DXF 読込だけ（`XLINE` は 12 桁で丸めて書かれるため。
+//!   `dxf_file` モジュール doc）。
+//! - **v7 以前は凍結 enum がタグごと拒否する**（[`EntityGeomV7`] 以前は閉じた enum。
+//!   角度寸法を v6 以前が拒否するのと同じ構造で、新しい凍結 DTO は要らない。回帰は
+//!   `v7_file_with_construction_line_is_rejected`）。
 
 use std::fs;
 use std::path::Path;
@@ -319,8 +338,8 @@ use crate::IoError;
 /// - v7（M11 タスク68）で長さ寸法の向き（[`mcad_core::DimDirection`]。回転寸法）を追加。
 /// - v8（M12 タスク81）で表の種類（[`TableKind`]）と図面の「部品表を使う」
 ///   （[`SheetMeta::use_bom`]）を追加。同じ v8 に表の列ごとの揃え
-///   （`TableGeom::col_aligns`。M12 タスク93）が相乗りした（v8 は未リリースのため版を
-///   上げていない）。
+///   （`TableGeom::col_aligns`。M12 タスク93）と構築線（[`EntityGeom::XLine`]。
+///   M12 タスク91）が相乗りした（v8 は未リリースのため版を上げていない）。
 ///
 /// 書き出しは常に v8。v1〜v7 のファイルは [`from_json`] が後方互換で読み込む
 /// （[`FileDocumentV1`] / [`FileDocumentV2`] / [`FileDocumentV3`] / [`FileDocumentV4`] /
@@ -1523,7 +1542,7 @@ mod tests {
         MAX_TITLE_BLOCK_CELLS_PER_ROW, MAX_TITLE_BLOCK_ROWS, Orientation, PaperSize,
         ProjectionMethod, Rgb, Scale, TitleBlockFields, TitleBlockKind, TitleBlockTemplate,
     };
-    use mcad_geom::{Arc, ArrowKind, Circle, LineSeg, Point2, Polyline};
+    use mcad_geom::{Arc, ArrowKind, Circle, LineSeg, Point2, Polyline, Vec2};
 
     /// [`from_json`] の戻り値からドキュメントだけを取り出す（クランプ件数を検証
     /// しないテスト用。件数を見るテストは [`from_json`] を直接呼ぶ）。
@@ -3189,6 +3208,88 @@ mod tests {
         );
         assert_ne!(replaced, json, "テスト前提: 置換が効いている");
         replaced
+    }
+
+    // -----------------------------------------------------------------
+    // v8（M12 タスク91）: 構築線（版は上げず v8 へ相乗り）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn v8_round_trip_is_lossless_for_construction_lines() {
+        // 方向の向き（`dir` と `-dir`）は揃えず保存値のまま往復する（DESIGN.md M12
+        // 設計判断9「dir の不変条件」）。割り切れない方向（1/√2 等）もビット一致で戻る。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        let xlines = [
+            mcad_core::XLineGeom::through(Point2::new(1.0, 2.0), Point2::new(4.0, 6.0)).unwrap(),
+            mcad_core::XLineGeom::through(Point2::new(0.0, 0.0), Point2::new(-1.0, -1.0)).unwrap(),
+            mcad_core::XLineGeom::through(Point2::new(-5.5, 3.25), Point2::new(-5.5, -100.0))
+                .unwrap(),
+        ];
+        for xline in xlines {
+            doc.apply(Command::AddEntity(Entity::new(
+                EntityGeom::XLine(xline),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        }
+        let json = to_json(&doc).unwrap();
+        assert!(
+            json.contains(r#""XLine""#),
+            "v8 は構築線を書き出すべき: {json}"
+        );
+        let loaded = load(&json).unwrap();
+        assert_eq!(export_document(&loaded), export_document(&doc));
+        let read: Vec<EntityGeom> = loaded.entities().map(|(_, e)| e.geom.clone()).collect();
+        let expected: Vec<EntityGeom> = xlines.into_iter().map(EntityGeom::XLine).collect();
+        assert_eq!(read, expected);
+    }
+
+    #[test]
+    fn v8_rejects_a_non_unit_construction_line_direction() {
+        // JSON で書ける不正値（長さ 5 の方向・零方向）は読込境界の validate で拒否する
+        // （黙って正規化しない。値が変わる取り込みはしない）。
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::XLine(mcad_core::XLineGeom {
+                base: Point2::ORIGIN,
+                dir: Vec2::new(1.0, 0.0),
+            }),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        let json = to_json(&doc).unwrap();
+        assert!(load(&json).is_ok(), "テスト前提: 単位方向は読める");
+        for (x, y) in [(3.0, 4.0), (0.0, 0.0)] {
+            let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            value["entities"][0]["geom"]["XLine"]["dir"] = serde_json::json!({"x": x, "y": y});
+            let broken = serde_json::to_string(&value).unwrap();
+            assert!(
+                matches!(load(&broken), Err(IoError::InvalidGeometry { .. })),
+                "単位でない方向は拒否されるべき: {broken}"
+            );
+        }
+    }
+
+    #[test]
+    fn v7_file_with_construction_line_is_rejected() {
+        // 構築線は v8 で足した（M12 タスク91）。凍結 enum（`EntityGeomV7` / `EntityGeomV6` /
+        // `EntityGeomV5`）は閉じているので、v7 以前と自称するファイルに混ぜると未知の
+        // バリアントとして読込ごと失敗する（新しい凍結 DTO は要らない）。
+        let geom = r#"{"XLine": {"base": {"x": 0.0, "y": 0.0}, "dir": {"x": 1.0, "y": 0.0}}}"#;
+        for json in [
+            v7_json_with_geom(geom),
+            v6_json_with_dimension(geom),
+            v5_json_with_dimension(geom),
+        ] {
+            assert!(
+                matches!(from_json(&json), Err(IoError::Json(_))),
+                "構築線を持つ旧版ファイルは拒否されるべき: {json}"
+            );
+        }
     }
 
     #[test]

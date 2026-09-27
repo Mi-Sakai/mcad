@@ -14,11 +14,42 @@
 //! [`crate::rel_tol`] による相対許容量を使う。境界を「無限に伸ばした対象」で切る
 //! 必要がある延長だけは、[`extend_reach`] で求めた **幾何的に正当な上界** まで
 //! 対象を一時的に伸ばした線分を作って [`crate::intersect`] へ渡す。
+//!
+//! # 無限直線の境界（M12 タスク91）
+//!
+//! 構築線（両方向へ無限に延びる直線）を境界にするため、[`trim_by_line`] と
+//! [`extend_to_line`] を足した。境界を「`LineSeg` を通る無限直線」とみなすだけで、
+//! 対象側の規則（パラメータ空間の区間分割・自由端の選び方・弧の角度差）は [`trim`] /
+//! [`extend`] と完全に同じ内部実装を通る（境界との交点の求め方だけを
+//! [`crate::line_shape_intersection`] に差し替える）。延長の探索線分の長さは、対象の
+//! 直線と境界の直線の交点までの距離から決める（境界 AABB が無限なので
+//! [`extend_reach`] は使えない）。
 
 use std::f64::consts::TAU;
 
 use crate::primitives::wrap_2pi;
-use crate::{Aabb, Arc, EPS, LineSeg, Point2, Shape, intersect, point_tol, rel_tol};
+use crate::{
+    Aabb, Arc, EPS, LineSeg, Point2, Shape, intersect, line_line_intersection,
+    line_shape_intersection, point_tol, rel_tol,
+};
+
+/// トリム・延長の境界。有限の [`Shape`] か、無限直線（`LineSeg` を通る直線）。
+#[derive(Clone, Copy)]
+enum Boundary<'a> {
+    Shape(&'a Shape),
+    Line(&'a LineSeg),
+}
+
+impl Boundary<'_> {
+    /// 曲線 `curve`（対象そのもの・延長の探索線分・弧の台円）と境界の交点。
+    /// `curve` 側は実体の範囲で絞る（境界が無限直線なら直線側は絞らない）。
+    fn hits(self, curve: &Shape) -> Vec<Point2> {
+        match self {
+            Boundary::Shape(boundary) => intersect(curve, boundary),
+            Boundary::Line(line) => line_shape_intersection(line, curve),
+        }
+    }
+}
 
 /// 弧が退化しているか（半径が中心の座標スケールに対する相対許容量以下か）。
 ///
@@ -97,6 +128,32 @@ pub fn trim(
     if matches!(boundary, Shape::Point(_)) {
         return Err(TrimExtendError::Unsupported);
     }
+    trim_impl(target, Boundary::Shape(boundary), click)
+}
+
+/// [`trim`] の境界を**無限直線** `line`（`LineSeg` を通る直線とみなす）にしたもの
+/// （M12 タスク91、構築線を境界にするトリム）。対象・`click`・結果の規則は [`trim`] と同じ。
+///
+/// # Errors
+///
+/// [`trim`] と同じ。加えて `line` が退化している（長さが [`crate::point_tol`] 以下）
+/// なら [`TrimExtendError::Degenerate`]。
+pub fn trim_by_line(
+    target: &Shape,
+    line: &LineSeg,
+    click: Point2,
+) -> Result<TrimResult, TrimExtendError> {
+    if line.length() <= point_tol(line.a, line.b) {
+        return Err(TrimExtendError::Degenerate);
+    }
+    trim_impl(target, Boundary::Line(line), click)
+}
+
+fn trim_impl(
+    target: &Shape,
+    boundary: Boundary<'_>,
+    click: Point2,
+) -> Result<TrimResult, TrimExtendError> {
     match target {
         Shape::Line(seg) => trim_line(seg, boundary, click),
         Shape::Arc(arc) => trim_arc(arc, boundary, click),
@@ -128,6 +185,33 @@ pub fn extend(target: &Shape, boundary: &Shape, click: Point2) -> Result<Shape, 
     if matches!(boundary, Shape::Point(_)) {
         return Err(TrimExtendError::Unsupported);
     }
+    extend_impl(target, Boundary::Shape(boundary), click)
+}
+
+/// [`extend`] の境界を**無限直線** `line`（`LineSeg` を通る直線とみなす）にしたもの
+/// （M12 タスク91、構築線まで延ばす延長）。対象・`click`・結果の規則は [`extend`] と同じ。
+///
+/// # Errors
+///
+/// [`extend`] と同じ。加えて `line` が退化している（長さが [`crate::point_tol`] 以下）
+/// なら [`TrimExtendError::Degenerate`]。線分の対象が境界と平行なら
+/// [`TrimExtendError::NoIntersection`]。
+pub fn extend_to_line(
+    target: &Shape,
+    line: &LineSeg,
+    click: Point2,
+) -> Result<Shape, TrimExtendError> {
+    if line.length() <= point_tol(line.a, line.b) {
+        return Err(TrimExtendError::Degenerate);
+    }
+    extend_impl(target, Boundary::Line(line), click)
+}
+
+fn extend_impl(
+    target: &Shape,
+    boundary: Boundary<'_>,
+    click: Point2,
+) -> Result<Shape, TrimExtendError> {
     match target {
         Shape::Line(seg) => extend_line(seg, boundary, click),
         Shape::Arc(arc) => extend_arc(arc, boundary, click),
@@ -223,7 +307,7 @@ fn click_interval(sorted: &[f64], click: f64, param_max: f64) -> (f64, f64) {
 
 fn trim_line(
     seg: &LineSeg,
-    boundary: &Shape,
+    boundary: Boundary<'_>,
     click: Point2,
 ) -> Result<TrimResult, TrimExtendError> {
     let Some(t_click) = line_param(seg, click) else {
@@ -231,7 +315,7 @@ fn trim_line(
     };
     let t_click = t_click.clamp(0.0, 1.0);
 
-    let hits = intersect(&Shape::Line(*seg), boundary);
+    let hits = boundary.hits(&Shape::Line(*seg));
     if hits.is_empty() {
         return Err(TrimExtendError::NoIntersection);
     }
@@ -289,7 +373,11 @@ fn arc_click_param(arc: &Arc, click: Point2) -> f64 {
     }
 }
 
-fn trim_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<TrimResult, TrimExtendError> {
+fn trim_arc(
+    arc: &Arc,
+    boundary: Boundary<'_>,
+    click: Point2,
+) -> Result<TrimResult, TrimExtendError> {
     if arc_is_degenerate(arc) {
         return Err(TrimExtendError::Degenerate);
     }
@@ -299,7 +387,7 @@ fn trim_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<TrimResult, Tr
         return Err(TrimExtendError::Degenerate);
     }
 
-    let hits = intersect(&Shape::Arc(*arc), boundary);
+    let hits = boundary.hits(&Shape::Arc(*arc));
     if hits.is_empty() {
         return Err(TrimExtendError::NoIntersection);
     }
@@ -343,7 +431,11 @@ fn trim_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<TrimResult, Tr
 // 延長
 // ---------------------------------------------------------------------------
 
-fn extend_line(seg: &LineSeg, boundary: &Shape, click: Point2) -> Result<Shape, TrimExtendError> {
+fn extend_line(
+    seg: &LineSeg,
+    boundary: Boundary<'_>,
+    click: Point2,
+) -> Result<Shape, TrimExtendError> {
     // 退化判定は座標スケールに対して相対（`line_param` と同じ基準）。
     if seg.length() <= point_tol(seg.a, seg.b) {
         return Err(TrimExtendError::Degenerate);
@@ -360,7 +452,15 @@ fn extend_line(seg: &LineSeg, boundary: &Shape, click: Point2) -> Result<Shape, 
     };
 
     // 境界 AABB を確実に覆う長さまで一時的に伸ばした線分で既存の交点計算にかける。
-    let reach = extend_reach(free, boundary.aabb());
+    // 無限直線の境界は AABB が無限なので、対象の直線と境界の直線の交点までの距離を
+    // 上界にする（平行なら交点が無い）。
+    let reach = match boundary {
+        Boundary::Shape(shape) => extend_reach(free, shape.aabb()),
+        Boundary::Line(line) => match line_line_intersection(seg, line) {
+            Some(p) => free.distance(p),
+            None => return Err(TrimExtendError::NoIntersection),
+        },
+    };
     let probe = LineSeg::new(
         fixed,
         free + u * (reach * (1.0 + REACH_MARGIN) + REACH_MARGIN),
@@ -369,7 +469,8 @@ fn extend_line(seg: &LineSeg, boundary: &Shape, click: Point2) -> Result<Shape, 
     // 自由端から外向きへの符号付き距離が正（＝現在の範囲の外）の候補のみ採る。
     // 許容量は座標スケールに対する相対値（`intersect` の点一致判定と同じ形）。
     let tol = rel_tol(free.to_vec2().length() + seg.length());
-    let best = intersect(&Shape::Line(probe), boundary)
+    let best = boundary
+        .hits(&Shape::Line(probe))
         .into_iter()
         .map(|p| ((p - free).dot(u), p))
         .filter(|&(s, _)| s > tol)
@@ -385,7 +486,7 @@ fn extend_line(seg: &LineSeg, boundary: &Shape, click: Point2) -> Result<Shape, 
     }))
 }
 
-fn extend_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<Shape, TrimExtendError> {
+fn extend_arc(arc: &Arc, boundary: Boundary<'_>, click: Point2) -> Result<Shape, TrimExtendError> {
     if arc_is_degenerate(arc) {
         return Err(TrimExtendError::Degenerate);
     }
@@ -400,7 +501,7 @@ fn extend_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<Shape, TrimE
 
     // 台円は「無限に伸びた弧」そのものなので、既存の交点計算をそのまま使える。
     let mut best: Option<f64> = None;
-    for p in intersect(&Shape::Circle(arc.circle()), boundary) {
+    for p in boundary.hits(&Shape::Circle(arc.circle())) {
         let theta = (p - arc.center).angle();
         // 既に弧の内部にある点は延長先の候補にしない（内部へ戻る・自己ループする解の排除）。
         let inside = wrap_2pi(theta - arc.start_angle);
@@ -448,7 +549,7 @@ fn extend_arc(arc: &Arc, boundary: &Shape, click: Point2) -> Result<Shape, TrimE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Circle, Polyline};
+    use crate::{Circle, Polyline, Vec2};
     use std::f64::consts::{FRAC_PI_2, PI};
 
     const TOL: f64 = 1e-9;
@@ -982,5 +1083,90 @@ mod tests {
             extend(&arc, &boundary, pt(5.0, 0.0)),
             Err(TrimExtendError::Degenerate)
         );
+    }
+
+    // --- 無限直線の境界（M12 タスク91） ---
+
+    #[test]
+    fn trim_by_line_uses_the_infinite_line_far_from_its_defining_points() {
+        // 境界の直線 x = 5 は (5, 100)-(5, 101) で定義され、対象の線分とは定義区間の外で交わる。
+        // 有限の線分として trim すると交点が無いが、無限直線としては (5, 0) で切れる。
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let boundary = LineSeg::new(pt(5.0, 100.0), pt(5.0, 101.0));
+        assert_eq!(
+            trim(&target, &Shape::Line(boundary), pt(8.0, 0.0)),
+            Err(TrimExtendError::NoIntersection)
+        );
+        let r = trim_by_line(&target, &boundary, pt(8.0, 0.0)).unwrap();
+        assert_eq!(r.retained.len(), 1);
+        let kept = as_line(&r.retained[0]);
+        approx_pt(kept.a, pt(0.0, 0.0));
+        approx_pt(kept.b, pt(5.0, 0.0));
+
+        // 弧も同じ規則（上半円を x = 3 の直線で切り、左側をクリック → 右側が残る）。
+        let arc = Arc::new(Point2::ORIGIN, 5.0, 0.0, PI);
+        let r = trim_by_line(
+            &Shape::Arc(arc),
+            &boundary.translated(Vec2::new(-2.0, 0.0)),
+            pt(-5.0, 1.0),
+        )
+        .unwrap();
+        assert_eq!(r.retained.len(), 1);
+        let kept = as_arc(&r.retained[0]);
+        approx_pt(kept.start_point(), pt(5.0, 0.0));
+        approx_pt(kept.end_point(), pt(3.0, 4.0));
+
+        // 平行・交わらない対象は NoIntersection、退化した境界は Degenerate。
+        let parallel = LineSeg::new(pt(0.0, 3.0), pt(1.0, 3.0));
+        assert_eq!(
+            trim_by_line(&target, &parallel, pt(8.0, 0.0)),
+            Err(TrimExtendError::NoIntersection)
+        );
+        let degenerate = LineSeg::new(pt(1.0, 1.0), pt(1.0, 1.0));
+        assert_eq!(
+            trim_by_line(&target, &degenerate, pt(8.0, 0.0)),
+            Err(TrimExtendError::Degenerate)
+        );
+    }
+
+    #[test]
+    fn extend_to_line_reaches_an_infinite_line_boundary_in_the_click_direction() {
+        // 境界 x = 50（定義区間は y ∈ [-1000, -999]。対象の延長とは定義区間の外で交わる）。
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let boundary = LineSeg::new(pt(50.0, -1000.0), pt(50.0, -999.0));
+        let r = extend_to_line(&target, &boundary, pt(9.0, 0.0)).unwrap();
+        let ext = as_line(&r);
+        approx_pt(ext.a, pt(0.0, 0.0));
+        approx_pt(ext.b, pt(50.0, 0.0));
+        // 反対側の自由端から見ると境界は後ろにある → 届かない。
+        assert_eq!(
+            extend_to_line(&target, &boundary, pt(1.0, 0.0)),
+            Err(TrimExtendError::NoIntersection)
+        );
+        // 平行な境界には届かない。
+        let parallel = LineSeg::new(pt(0.0, 5.0), pt(1.0, 5.0));
+        assert_eq!(
+            extend_to_line(&target, &parallel, pt(9.0, 0.0)),
+            Err(TrimExtendError::NoIntersection)
+        );
+        // 弧は台円と直線の交点まで回る（第 1 象限の弧を y = -3 の直線まで CW 側へ）。
+        let arc = Arc::new(Point2::ORIGIN, 5.0, 0.0, FRAC_PI_2);
+        let horizontal = LineSeg::new(pt(100.0, -3.0), pt(101.0, -3.0));
+        let r = extend_to_line(&Shape::Arc(arc), &horizontal, pt(5.0, 0.0)).unwrap();
+        let ext = as_arc(&r);
+        approx_pt(ext.start_point(), pt(4.0, -3.0));
+        approx_pt(ext.end_point(), pt(0.0, 5.0));
+    }
+
+    #[test]
+    fn extend_to_line_matches_extend_with_a_long_enough_segment() {
+        // 境界の線分が交点を十分に覆っていれば、無限直線版と有限版は同じ結果になる。
+        let target = line(1.0, 2.0, 4.0, 3.0);
+        let boundary = LineSeg::new(pt(20.0, -50.0), pt(22.0, 50.0));
+        let finite = extend(&target, &Shape::Line(boundary), pt(4.0, 3.0)).unwrap();
+        let infinite = extend_to_line(&target, &boundary, pt(4.0, 3.0)).unwrap();
+        let (a, b) = (as_line(&finite), as_line(&infinite));
+        approx_pt(a.a, b.a);
+        approx_pt(a.b, b.b);
     }
 }

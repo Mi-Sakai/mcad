@@ -33,11 +33,13 @@ use mcad_core::{
     DimKind, DimLinear, DimOrdinate, DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom,
     EntityId, FitClass, HorizontalAlign, Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation,
     PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style, TableGeom, TableKind,
-    TextGeom, TitleBlockFields, TitleBlockKind, ValueStyle, WidthMm, arrow_kind_occupies_line,
-    expand_dim, expand_table, label_box_center, label_box_contains, linear_pick_segments,
-    table_world_aabb,
+    TextGeom, TitleBlockFields, TitleBlockKind, ValueStyle, WidthMm, XLineGeom,
+    arrow_kind_occupies_line, expand_dim, expand_table, label_box_center, label_box_contains,
+    linear_pick_segments, table_world_aabb,
 };
-use mcad_geom::{Aabb, Arc, ArrowKind, DimSymbol, Point2, Polyline, Shape};
+use mcad_geom::{
+    Aabb, Arc, ArrowKind, DimSymbol, LineSeg, Point2, Polyline, Shape, clip_line_to_aabb,
+};
 use mcad_io::{ImportSummary, LoadSummary, load_dxf, load_mcad, save_dxf, save_mcad};
 
 use bom::{bom_anchor_above_title_block, default_bom_table};
@@ -57,7 +59,7 @@ use tool::{
     ExtendTool, FilletTool, GripDragOutcome, InputEvent, IsoCircleTool, LineTool, OffsetOutcome,
     PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolygonTool, PolylineTool,
     RectangleTool, SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool,
-    layer_visible,
+    XLineTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -200,10 +202,20 @@ const LAYER_COLOR_PALETTE: [Rgb; 6] = [
 /// → 外形線（実線 0.35mm）→ 寸法線（実線 0.18mm）→ 文字（実線 0.18mm、規定に明記の
 /// 行は無いため寸法線と同じ細線幅を流用）の順で奥から手前へ積む。文字を最前面に
 /// 置くのは図形に隠れないようにする一般的な運用。色は [`LAYER_COLOR_PALETTE`] から
-/// 重複しないよう割り当てる（`文字` は改名前の `"Text"` 時代から `palette[3]` を
-/// 維持し、他の4層は残りの添字を使う）。[`fresh_document`] がこの配列を基に
-/// カレントレイヤーを `外形線` へ設定する。
-const DEFAULT_EXTRA_LAYERS: [(&str, Rgb, Linetype, f32); 5] = [
+/// 重複しないよう割り当てる（寸法線・文字は 2026-09-06 のユーザー指示で白）。
+/// [`fresh_document`] がこの配列を基にカレントレイヤーを `外形線` へ設定する。
+///
+/// **最奥は構築線**（M12 タスク91 のスモークテスト後の変更、2026-09-27 ユーザー確定。
+/// 実線 0.13mm、色はパレットの未使用色 `palette[5]`）。作図の下敷きなので他のどの線にも
+/// 隠れる位置に置く。構築線ツール（`Shift+L`）は [`CONSTRUCTION_LAYER_NAME`] があれば
+/// ここへ置く（[`resolve_tool_layer`]）。
+const DEFAULT_EXTRA_LAYERS: [(&str, Rgb, Linetype, f32); 6] = [
+    (
+        CONSTRUCTION_LAYER_NAME,
+        LAYER_COLOR_PALETTE[5],
+        Linetype::Continuous,
+        0.13,
+    ),
     ("中心線", LAYER_COLOR_PALETTE[0], Linetype::DashDot, 0.13),
     ("破線", LAYER_COLOR_PALETTE[1], Linetype::Dashed, 0.35),
     ("外形線", LAYER_COLOR_PALETTE[2], Linetype::Continuous, 0.35),
@@ -228,6 +240,11 @@ const DIM_LAYER_NAME: &str = "寸法線";
 /// [`DIM_LAYER_NAME`] と同様、存在すれば使い、無ければカレントレイヤーへ
 /// フォールバックする。
 const TEXT_LAYER_NAME: &str = "文字";
+
+/// 構築線ツール（[`ToolKind::XLine`]、`Shift+L`。M12 タスク91）が新規エンティティを
+/// 割り当てる先のレイヤー名。[`DIM_LAYER_NAME`] と同様、存在すれば使い、無ければ
+/// カレントレイヤーへフォールバックする（既存図面にレイヤーを自動で足さない）。
+const CONSTRUCTION_LAYER_NAME: &str = "構築線";
 
 /// 文書中から名前が完全一致するレイヤーを探す（表示・ロック状態は問わない）。
 ///
@@ -631,6 +648,8 @@ enum ToolKind {
     Polyline,
     Rectangle,
     Polygon,
+    /// 構築線（`Shift+L`。M12 タスク91）。
+    XLine,
     Text,
     Table,
     DimLinear,
@@ -660,6 +679,7 @@ impl ToolKind {
             ToolKind::Polyline => Some(Box::new(PolylineTool::default())),
             ToolKind::Rectangle => Some(Box::new(RectangleTool::default())),
             ToolKind::Polygon => Some(Box::new(PolygonTool::default())),
+            ToolKind::XLine => Some(Box::new(XLineTool::default())),
             ToolKind::Text => Some(Box::new(TextTool::default())),
             ToolKind::Table => Some(Box::new(TableTool::default())),
             ToolKind::DimLinear => Some(Box::new(DimLinearTool::default())),
@@ -754,6 +774,7 @@ impl ToolKind {
             ToolKind::Polyline => "Polyline",
             ToolKind::Rectangle => "Rectangle",
             ToolKind::Polygon => "Polygon",
+            ToolKind::XLine => "Construction Line",
             ToolKind::Text => "Text",
             ToolKind::Table => "Table",
             ToolKind::DimLinear => "Linear Dim",
@@ -1019,6 +1040,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "S=Select",
     "1=Point",
     "L=Line",
+    "Shift+L=Construction Line",
     "C=Circle",
     "Shift+C=Polygon",
     "A=Arc",
@@ -1039,6 +1061,8 @@ const KEYBIND_LEGEND: &[&str] = &[
     "R=Rotate",
     "Shift+M=Mirror",
     "O=Offset",
+    "J=Join",
+    "Shift+J=Explode",
     "Ctrl+D=Duplicate",
     "Del=Delete",
     "Esc=Cancel",
@@ -1196,7 +1220,8 @@ impl McadApp {
     /// **エンティティは一切追加しない**という部分は変わらないが、**レイヤーについては
     /// 覆した**: 起動時・Ctrl+N ともに [`fresh_document`] を使い、`"0"` に加えて
     /// [`DEFAULT_EXTRA_LAYERS`]（M9 タスク53以降は規定4-1準拠の `中心線`/`破線`/
-    /// `外形線`/`寸法線`/`文字` の5層）を持つ文書を作る。文字を最前面に置く
+    /// `外形線`/`寸法線`/`文字` の5層、M12 タスク91 で最奥に `構築線` を足して6層）を
+    /// 持つ文書を作る。文字を最前面に置く
     /// といった典型的な運用を初期状態で満たすためで、既定セットを core ではなく app 側に
     /// 置いた理由（ファイル読込時にレイヤーが増えるのを避ける）は [`fresh_document`] の
     /// doc を参照。**読込経路は従来どおり `Document::new()` ベースで再構築する。**
@@ -2877,8 +2902,11 @@ impl eframe::App for McadApp {
             self.request_open_recent(path, now);
         }
 
+        let mut xlines_deleted = false;
         egui::Panel::right("layer_panel").show(ui, |ui| {
             layer_panel(ui, &mut self.document, &mut self.status, now);
+            xlines_deleted =
+                delete_all_xlines_button(ui, &mut self.document, &mut self.status, now);
             entity_style_panel(
                 ui,
                 &mut self.document,
@@ -2951,6 +2979,12 @@ impl eframe::App for McadApp {
                 self.persist_config(now);
             }
         });
+        // 「構築線を全て削除」（M12 タスク91）で消えたエンティティを選択・進行中の操作から外す
+        // （undo/redo の直後と同じ後始末。トリム・延長が境界として抱えた構築線の
+        // スナップショットも作り直しで捨てる）。
+        if xlines_deleted {
+            self.after_history_change();
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             let (rect, response) =
@@ -3449,7 +3483,8 @@ impl eframe::App for McadApp {
 
 /// キーボードショートカットでアクティブツールを切り替える（DESIGN.md 3.4 のツール群）。
 ///
-/// `S`=Select, `1`=Point, `L`=Line, `C`/`Shift+C`=Circle/Polygon, `A`=Arc, `I`=Iso Circle,
+/// `S`=Select, `1`=Point, `L`/`Shift+L`=Line/Construction Line, `C`/`Shift+C`=Circle/Polygon,
+/// `A`=Arc, `I`=Iso Circle,
 /// `P`/`Shift+P`=Polyline/Rectangle, `T`=Text,
 /// `K`=Table, `D`/`Shift+D`=Linear/Radial Dim, `G`/`Shift+G`=Diameter/Angular Dim,
 /// `Shift+V`=Ordinate Dim, `X`=Trim, `E`=Extend, `F`/`Shift+F`=Fillet/Chamfer。
@@ -3494,7 +3529,13 @@ fn handle_tool_shortcut_keys(
         } else if point_key_enabled && i.key_pressed(Key::Num1) {
             requested = Some(ToolKind::Point);
         } else if i.key_pressed(Key::L) {
-            requested = Some(ToolKind::Line);
+            // 修飾なしは線分、Shift 併用は構築線（M12 タスク91。それまで `L` は Shift を
+            // 見ておらず、Shift+L も線分になっていた）。
+            requested = Some(if i.modifiers.shift {
+                ToolKind::XLine
+            } else {
+                ToolKind::Line
+            });
         } else if i.key_pressed(Key::C) {
             // 修飾なしは円、Shift 併用は正多角形（M12 タスク89、`D`/`Shift+D` と
             // 同じ Shift 併用の流儀）。
@@ -3595,7 +3636,8 @@ fn selection_contains_bom(document: &Document, selection: &[EntityId]) -> bool {
 /// （M9 タスク53: 標準レイヤー構成と自動割当）。
 ///
 /// 寸法ツール（`DimLinear`/`DimRadial`/`DimDiameter`/`DimAngular`/`DimOrdinate`）は
-/// [`DIM_LAYER_NAME`]（`寸法線`）、文字ツール（[`ToolKind::Text`]）は [`TEXT_LAYER_NAME`]（`文字`）が
+/// [`DIM_LAYER_NAME`]（`寸法線`）、文字ツール（[`ToolKind::Text`]）は [`TEXT_LAYER_NAME`]（`文字`）、
+/// 構築線ツール（[`ToolKind::XLine`]、M12 タスク91）は [`CONSTRUCTION_LAYER_NAME`]（`構築線`）が
 /// 文書に存在すればそこへ、無ければ [`Document::current_layer`] へフォールバックする。
 /// それ以外のツールは常にカレントレイヤーを使う。**該当名のレイヤーが無い文書へ
 /// 新しくレイヤーを作ることはしない**（読込図面でレイヤーが勝手に増えないための
@@ -3616,6 +3658,8 @@ fn resolve_tool_layer(document: &Document, tool_kind: ToolKind) -> LayerId {
         ToolKind::Text | ToolKind::Table => {
             layer_named(document, TEXT_LAYER_NAME).unwrap_or_else(|| document.current_layer())
         }
+        ToolKind::XLine => layer_named(document, CONSTRUCTION_LAYER_NAME)
+            .unwrap_or_else(|| document.current_layer()),
         _ => document.current_layer(),
     }
 }
@@ -3819,8 +3863,17 @@ fn handle_tool_input(
             // 分割（`snaps_shape_pick()`）だけは対象決定の後、分割位置そのものを対象上へ
             // スナップさせる（DESIGN.md 7章「分割ツールのスナップ対応」論点(2)）。ヒットすれば
             // `click` をスナップ先へ差し替え、外れれば raw のまま `on_shape_pick` へ渡す。
-            match tool::pick_shape_entity(document, raw, pick_tol) {
-                Some(mut hit) => {
+            //
+            // トリム・延長の境界待ち（`accepts_xline_pick()`）だけは構築線も当てる（M12 タスク91。
+            // 構築線を境界にできる。対象としての構築線は従来どおり拾わない）。
+            let accepts_xline = active.accepts_xline_pick();
+            let hit = if accepts_xline {
+                tool::pick_shape_or_xline(document, raw, pick_tol)
+            } else {
+                tool::pick_shape_entity(document, raw, pick_tol).map(tool::ShapeOrXLinePick::Shape)
+            };
+            match hit {
+                Some(tool::ShapeOrXLinePick::Shape(mut hit)) => {
                     if snap_enabled
                         && active.snaps_shape_pick()
                         && let Some(snapped) = snap::snap_split_position(
@@ -3831,10 +3884,18 @@ fn handle_tool_input(
                     }
                     result = active.on_shape_pick(hit);
                 }
+                Some(tool::ShapeOrXLinePick::XLine(xline)) => {
+                    result = active.on_xline_pick(xline);
+                }
                 None => set_status(
                     status,
                     now,
-                    "Pick: click a line, arc, circle, or polyline".to_string(),
+                    if accepts_xline {
+                        "Pick: click a line, arc, circle, polyline, or construction line"
+                    } else {
+                        "Pick: click a line, arc, circle, or polyline"
+                    }
+                    .to_string(),
                 ),
             }
         } else {
@@ -4324,6 +4385,112 @@ fn layer_panel(
     for cmd in pending {
         if let Err(err) = document.apply(cmd) {
             set_status(status, now, format!("レイヤー操作に失敗しました: {err}"));
+        }
+    }
+}
+
+/// 「構築線を全て削除」の計画（M12 タスク91 のスモークテスト後の変更、DESIGN.md M12
+/// 設計判断9）。headless でテストできるよう、ボタン（[`delete_all_xlines_button`]）から
+/// 切り出した純関数の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XLineCleanup {
+    /// 削除する構築線（ロックされていないレイヤーのもの。文書の反復順）。
+    removed: Vec<EntityId>,
+    /// ロック中のレイヤーにあるため残す構築線の数。
+    kept_locked: usize,
+}
+
+impl XLineCleanup {
+    /// 削除コマンド（`Batch` 1 つ = undo 1 回）。削除するものが無ければ `None`。
+    fn command(&self) -> Option<Command> {
+        (!self.removed.is_empty()).then(|| {
+            Command::Batch(
+                self.removed
+                    .iter()
+                    .map(|&id| Command::RemoveEntity(id))
+                    .collect(),
+            )
+        })
+    }
+
+    /// ステータスバーの文言（既存のステータスに合わせて英語）。
+    fn status(&self) -> String {
+        let lines = |n: usize| {
+            if n == 1 {
+                "1 construction line".to_owned()
+            } else {
+                format!("{n} construction lines")
+            }
+        };
+        match (self.removed.len(), self.kept_locked) {
+            (removed, 0) => format!("Deleted {}", lines(removed)),
+            (0, kept) => format!("Deleted none: kept {} on locked layers", lines(kept)),
+            (removed, kept) => format!(
+                "Deleted {}; kept {} on locked layers",
+                lines(removed),
+                lines(kept)
+            ),
+        }
+    }
+}
+
+/// 文書中の構築線をすべて集め、削除するものとロック中のレイヤーに残すものへ分ける。
+/// **レイヤーの表示・非表示は問わない**（非表示レイヤーの構築線も消す）。
+fn plan_delete_all_xlines(document: &Document) -> XLineCleanup {
+    let mut cleanup = XLineCleanup {
+        removed: Vec::new(),
+        kept_locked: 0,
+    };
+    for (id, entity) in document.entities() {
+        if !matches!(entity.geom, EntityGeom::XLine(_)) {
+            continue;
+        }
+        if document.layer(entity.layer).is_some_and(|l| l.locked) {
+            cleanup.kept_locked += 1;
+        } else {
+            cleanup.removed.push(id);
+        }
+    }
+    cleanup
+}
+
+/// 右パネルのレイヤー欄の下の「構築線を全て削除」ボタン（M12 タスク91 のスモークテスト後の
+/// 変更、2026-09-27 ユーザー確定）。構築線が 0 本なら無効。押すと
+/// [`plan_delete_all_xlines`] の `Batch` を適用し、削除・残した件数をステータスへ出す。
+///
+/// 何かを削除したら `true` を返す（呼び出し側が選択・進行中の操作の後始末をする）。
+fn delete_all_xlines_button(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    status: &mut Option<StatusMessage>,
+    now: f64,
+) -> bool {
+    let count = document
+        .entities()
+        .filter(|(_, e)| matches!(e.geom, EntityGeom::XLine(_)))
+        .count();
+    let clicked = ui
+        .add_enabled(count > 0, egui::Button::new("構築線を全て削除"))
+        .on_hover_text(
+            "文書中の構築線をすべて削除します(非表示レイヤーを含む。ロック中のレイヤーは除く)",
+        )
+        .clicked();
+    if !clicked {
+        return false;
+    }
+    let cleanup = plan_delete_all_xlines(document);
+    let Some(cmd) = cleanup.command() else {
+        set_status(status, now, cleanup.status());
+        return false;
+    };
+    match document.apply(cmd) {
+        Ok(_) => {
+            set_status(status, now, cleanup.status());
+            true
+        }
+        Err(err) => {
+            set_status(status, now, format!("Delete failed: {err}"));
+            false
         }
     }
 }
@@ -7943,17 +8110,18 @@ fn handle_select_input(
     if ui.input(|i| !i.modifiers.command && i.key_pressed(Key::O)) {
         // Text・寸法はオフセット対象外（DESIGN.md M6 設計判断1）。pick() の汎用化で Text も
         // 選択できるようになったため、単一 Text 選択で O を押してもモードに入らないよう
-        // ここで明示的に拒否する（`offset_click` 側の拒否と二重の防御）。
+        // ここで明示的に拒否する（`offset_click` 側の拒否と二重の防御）。構築線は対象
+        // （M12 タスク91。結果は交点・用紙の縁で区切った線分）。
         let sel = select_tool.selection();
         let unsupported_single = sel.len() == 1
-            && document
-                .entity(sel[0])
-                .is_some_and(|e| e.geom.as_shape().is_none());
+            && document.entity(sel[0]).is_some_and(|e| {
+                e.geom.as_shape().is_none() && !matches!(e.geom, EntityGeom::XLine(_))
+            });
         if unsupported_single {
             set_status(
                 status,
                 now,
-                "Offset supports lines, circles, arcs, and polylines only",
+                "Offset supports lines, circles, arcs, polylines, and construction lines only",
             );
         } else if select_tool.start_offset() {
             set_status(
@@ -8886,7 +9054,8 @@ fn draw_paper_edge(painter: &egui::Painter, rect: Rect, viewport: &Viewport, she
 ///
 /// `k` は紙 1mm あたりのワールド mm（判断4）。Text・表のカリング判定は表示上のワールド
 /// AABB（[`entity_world_aabb`]）で行う（タスク37 / M10 タスク58。判断(c)により Text は
-/// トグル非依存で常に `height * k` を使い、表も常に紙基準）。
+/// トグル非依存で常に `height * k` を使い、表も常に紙基準）。判定の実体は
+/// [`entity_intersects_view`]（構築線だけは箱でなく直線で判定する）。
 fn entities_in_draw_order<'a>(
     document: &'a Document,
     visible: &Aabb,
@@ -8896,7 +9065,7 @@ fn entities_in_draw_order<'a>(
         .entities()
         .filter_map(|(id, entity)| {
             let layer = document.layer(entity.layer)?;
-            (layer.visible && entity_world_aabb(&entity.geom, k).intersects(visible))
+            (layer.visible && entity_intersects_view(&entity.geom, k, visible))
                 .then_some((id, entity, layer))
         })
         .collect();
@@ -8966,6 +9135,11 @@ fn draw_entities(
                     paper_display_enabled,
                     k,
                 );
+            }
+            // 構築線（M12 タスク91）は形状と同じく線種・線幅を反映し、表示範囲で切って描く。
+            EntityGeom::XLine(xline) => {
+                let stroke = Stroke::new(stroke_px, color);
+                draw_xline(painter, rect, viewport, xline, stroke, linetype, k);
             }
             // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
             _ => {}
@@ -9151,7 +9325,10 @@ fn draw_selection(
             paper_display,
             k,
         );
-        if let Some(ghost) = select_tool.offset_preview(document, offset_distance) {
+        // 構築線のオフセットの区間判定の許容量は確定（`handle_offset_input`）と同じ
+        // ピック許容量にする（プレビューと確定の線分を一致させる。M12 タスク91）。
+        let tol = PICK_TOLERANCE_PX / viewport.zoom;
+        if let Some(ghost) = select_tool.offset_preview(document, offset_distance, tol) {
             let preview = Stroke::new(SELECTION_WIDTH, OFFSET_PREVIEW_COLOR);
             draw_shape(
                 painter,
@@ -9213,6 +9390,17 @@ fn draw_selection(
                             highlight.color,
                             paper_display,
                             k,
+                        );
+                    }
+                    EntityGeom::XLine(xline) => {
+                        draw_xline(
+                            painter,
+                            rect,
+                            viewport,
+                            xline,
+                            highlight,
+                            Linetype::Continuous,
+                            1.0,
                         );
                     }
                     // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
@@ -9405,6 +9593,17 @@ fn draw_selected(
                     );
                     let aabb = table_world_aabb(table, k);
                     draw_aabb_outline(painter, rect, viewport, &aabb, stroke);
+                }
+                EntityGeom::XLine(xline) => {
+                    draw_xline(
+                        painter,
+                        rect,
+                        viewport,
+                        xline,
+                        stroke,
+                        Linetype::Continuous,
+                        1.0,
+                    );
                 }
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は描かない。
                 _ => {}
@@ -9896,12 +10095,127 @@ fn text_world_aabb(text: &TextGeom, k: f64) -> Aabb {
 ///
 /// それ以外（形状・寸法）はワールド座標そのものなので `aabb()` を素通しする。
 /// `EntityGeom` は `#[non_exhaustive]` なので、未知の幾何も素通し（1:1 解釈）にする。
+///
+/// **構築線（M12 タスク91）も素通しで、基点 1 点の退化した箱になる**（`mcad_core` の
+/// `EntityGeom::aabb` の契約。DESIGN.md M12 設計判断9「着手時の決定」）。これで
+/// ズームフィットは基点だけを含め、矩形選択は「基点が矩形に含まれれば選ぶ」になる。
+/// カリングだけはこの箱を使わず直線で判定する（[`entity_intersects_view`]）。
 fn entity_world_aabb(geom: &EntityGeom, k: f64) -> Aabb {
     match geom {
         EntityGeom::Text(text) => text_world_aabb(text, k),
         EntityGeom::Table(table) => table_world_aabb(table, k),
         _ => geom.aabb(),
     }
+}
+
+/// エンティティが表示範囲 `visible` に掛かるか（カリング。[`entities_in_draw_order`]）。
+///
+/// 通常は表示上のワールド AABB（[`entity_world_aabb`]）と `visible` の交差で判定する。
+/// **構築線だけは直線と `visible` の交差で判定する**（基点が画面外でも、線が画面を
+/// 横切れば描く。M12 タスク91、DESIGN.md M12 設計判断9「着手時の決定」）。
+fn entity_intersects_view(geom: &EntityGeom, k: f64, visible: &Aabb) -> bool {
+    match geom {
+        EntityGeom::XLine(xline) => clip_line_to_aabb(&xline.line(), visible).is_some(),
+        _ => entity_world_aabb(geom, k).intersects(visible),
+    }
+}
+
+/// 構築線 1 本を Painter へ描く（M12 タスク91）。表示範囲で切った線分として描く
+/// （[`xline_view_segment`]）。加えて**基点の印**（[`draw_xline_base_mark`]）を同じ色で
+/// 描く（画面専用。SVG/PDF/DXF の経路はこの関数を通らない）。
+///
+/// 表示範囲は線幅の半分だけ広げて切る（線端の丸めが画面の縁に見えないように）。
+/// 破線の位相は基点に固定する（パンで模様が線に沿って流れないように）。広げる量は
+/// 「線幅の半分 + 1 周期未満」に収まり、[`stroke_polyline`] が破線のときに掛ける
+/// クリップ（線幅 + 1 周期の余白）の内側なので、位相をそろえた始点がそこで切り直される
+/// ことはない。
+fn draw_xline(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    xline: &XLineGeom,
+    stroke: Stroke,
+    linetype: Linetype,
+    k: f64,
+) {
+    let margin = f64::from(stroke.width) * 0.5 / viewport.zoom;
+    let view = viewport.visible_aabb(rect).expanded(margin);
+    let dash_period = dash_pattern_px(linetype, k, viewport.zoom).map(|(dashes, gaps)| {
+        let period_px: f32 = dashes.iter().chain(&gaps).sum();
+        f64::from(period_px) / viewport.zoom
+    });
+    let Some(seg) = xline_view_segment(xline, &view, dash_period) else {
+        return;
+    };
+    let a = viewport.world_to_screen(rect, seg.a);
+    let b = viewport.world_to_screen(rect, seg.b);
+    stroke_polyline(
+        painter,
+        vec![a, b],
+        stroke,
+        linetype,
+        k,
+        viewport.zoom,
+        rect,
+    );
+    draw_xline_base_mark(painter, rect, viewport, xline, stroke.color);
+}
+
+/// 構築線の基点の印の半長（画面 px。線に直交する短い棒の片側の長さ）。
+const XLINE_BASE_MARK_HALF_PX: f32 = 5.0;
+/// 構築線の基点の印の線幅（画面 px。線幅・紙基準表示に依らず固定）。
+const XLINE_BASE_MARK_WIDTH_PX: f32 = 1.5;
+
+/// 構築線の基点の印（M12 タスク91 のスモークテスト後の変更、DESIGN.md M12 設計判断9）。
+///
+/// **基点を通り線に直交する短い棒**（片側 [`XLINE_BASE_MARK_HALF_PX`] px、固定幅
+/// [`XLINE_BASE_MARK_WIDTH_PX`] px）を線と同じ色で描く。スナップマーカー（緑・閉じた記号や
+/// ×・⊥ などの 2 画の記号、半径 [`SNAP_MARKER_SIZE`] px）・グリップ（塗りの正方形）・
+/// 点エンティティ（塗りの円）のどれとも形が違い、線そのものに付いた目盛りとして読める。
+/// 基点が画面外なら描かない。
+fn draw_xline_base_mark(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    xline: &XLineGeom,
+    color: Color32,
+) {
+    let c = viewport.world_to_screen(rect, xline.base);
+    let margin = XLINE_BASE_MARK_HALF_PX + XLINE_BASE_MARK_WIDTH_PX;
+    if !rect.expand(margin).contains(c) {
+        return;
+    }
+    painter.line_segment(
+        xline_base_mark_points(c, xline.dir),
+        Stroke::new(XLINE_BASE_MARK_WIDTH_PX, color),
+    );
+}
+
+/// 基点の印の 2 端点（画面座標）。`base_screen` は基点の画面座標、`dir` はワールドの
+/// 単位方向。画面は y 反転なので、ワールドの左法線 `(-dy, dx)` は画面では `(-dy, -dx)`
+/// になる（棒は両側へ伸ばすので向きの符号は問わない。画面上で線に直交していればよい）。
+fn xline_base_mark_points(base_screen: Pos2, dir: mcad_geom::Vec2) -> [Pos2; 2] {
+    let n = egui::vec2(-(dir.y as f32), -(dir.x as f32)) * XLINE_BASE_MARK_HALF_PX;
+    [base_screen - n, base_screen + n]
+}
+
+/// 構築線を矩形 `view`（ワールド）で切った線分。`view` と交わらなければ `None`。
+///
+/// 線分の向きは構築線の `dir` と同じ（[`clip_line_to_aabb`] の契約）。`dash_period`
+/// （ワールド長。正の有限値のときだけ効く）を渡すと、始点を「基点からの符号付き距離が
+/// 周期の倍数」になる位置まで手前（`-dir` 側）へずらす。ずらす量は 1 周期未満。
+/// 画面の破線は線分の始点を位相 0 として描くので、これで模様が基点に固定される。
+fn xline_view_segment(xline: &XLineGeom, view: &Aabb, dash_period: Option<f64>) -> Option<LineSeg> {
+    let seg = clip_line_to_aabb(&xline.line(), view)?;
+    let Some(period) = dash_period.filter(|p| p.is_finite() && *p > 0.0) else {
+        return Some(seg);
+    };
+    let t0 = (seg.a - xline.base).dot(xline.dir);
+    let aligned = (t0 / period).floor() * period;
+    if !aligned.is_finite() {
+        return Some(seg);
+    }
+    Some(LineSeg::new(xline.base + xline.dir * aligned, seg.b))
 }
 
 /// 表 1 つ（罫線 + セル文字）を Painter へ描く（M10 タスク58）。
@@ -11882,6 +12196,20 @@ mod tests {
             assert_eq!(layer.width_mm.mm(), width_mm);
         }
 
+        // 構築線レイヤー（M12 タスク91）は既定レイヤーの最奥（"0" の直後、order = 1）で、
+        // 実線・0.13mm・パレットの未使用色（他の既定レイヤーと色が重ならない）。
+        let construction = document
+            .layer(layer_named(&document, CONSTRUCTION_LAYER_NAME).unwrap())
+            .unwrap();
+        assert_eq!(construction.order, 1);
+        assert_eq!(construction.linetype, Linetype::Continuous);
+        assert_eq!(construction.width_mm.mm(), 0.13);
+        for (name, color, ..) in DEFAULT_EXTRA_LAYERS {
+            if name != CONSTRUCTION_LAYER_NAME {
+                assert_ne!(color, construction.color, "{name} と色が重なる");
+            }
+        }
+
         // カレントレイヤーは既定の作図対象である「外形線」（"0" のままではない）。
         let outline_layer = layer_named(&document, DEFAULT_CURRENT_LAYER_NAME).unwrap();
         assert_eq!(document.current_layer(), outline_layer);
@@ -11904,6 +12232,13 @@ mod tests {
 
         let text_layer = layer_named(&document, TEXT_LAYER_NAME).expect("文字 must exist");
         assert_eq!(document.layer(text_layer).unwrap().name, TEXT_LAYER_NAME);
+
+        let construction_layer =
+            layer_named(&document, CONSTRUCTION_LAYER_NAME).expect("構築線 must exist");
+        assert_eq!(
+            document.layer(construction_layer).unwrap().name,
+            CONSTRUCTION_LAYER_NAME
+        );
 
         assert_eq!(layer_named(&document, "存在しないレイヤー"), None);
         // 部分一致は不可（完全一致のみ）。
@@ -11943,6 +12278,11 @@ mod tests {
             resolve_tool_layer(&document, ToolKind::Line),
             document.current_layer()
         );
+        // 構築線（M12 タスク91）も「構築線」レイヤーが無ければカレントへ。
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::XLine),
+            document.current_layer()
+        );
     }
 
     #[test]
@@ -11973,6 +12313,13 @@ mod tests {
 
         let text_layer = layer_named(&document, TEXT_LAYER_NAME).unwrap();
         assert_eq!(resolve_tool_layer(&document, ToolKind::Text), text_layer);
+
+        // 構築線ツールは「構築線」レイヤーへ（M12 タスク91）。
+        let construction_layer = layer_named(&document, CONSTRUCTION_LAYER_NAME).unwrap();
+        assert_eq!(
+            resolve_tool_layer(&document, ToolKind::XLine),
+            construction_layer
+        );
 
         // それ以外のツールは常にカレントレイヤー（"外形線"）。
         assert_eq!(
@@ -13033,6 +13380,187 @@ mod tests {
         let aabb = document_aabb(&document).expect("document has a table entity");
         assert!((aabb.max.x - 60.0).abs() < 1e-9, "aabb={aabb:?}");
         assert!((aabb.max.y - 32.0).abs() < 1e-9, "aabb={aabb:?}");
+    }
+
+    // --- 構築線（M12 タスク91、DESIGN.md M12 設計判断9「着手時の決定」） ---
+
+    fn xline_geom(base: Point2, through: Point2) -> XLineGeom {
+        XLineGeom::through(base, through).expect("distinct points")
+    }
+
+    #[test]
+    fn plan_delete_all_xlines_takes_hidden_ones_and_keeps_locked_ones() {
+        let mut document = Document::new();
+        let add_layer = |document: &mut Document, name: &str, visible: bool| {
+            let id = document
+                .apply(Command::AddLayer(Layer::new(name, Rgb::WHITE)))
+                .unwrap()
+                .layers[0];
+            let mut props = document.layer(id).unwrap().clone();
+            props.visible = visible;
+            document
+                .apply(Command::SetLayerProps { id, props })
+                .unwrap();
+            id
+        };
+        let visible = document.current_layer();
+        let hidden = add_layer(&mut document, "hidden", false);
+        let locked = add_layer(&mut document, "locked", true);
+        let add = |document: &mut Document, geom: EntityGeom, layer: LayerId| {
+            document
+                .apply(Command::AddEntity(Entity::new(
+                    geom,
+                    layer,
+                    Style::inherited(),
+                )))
+                .unwrap()
+                .entities[0]
+        };
+        let xline =
+            |y: f64| EntityGeom::XLine(xline_geom(Point2::new(0.0, y), Point2::new(1.0, y)));
+        // 0 本なら何もしない（ボタンも無効になる）。
+        assert_eq!(plan_delete_all_xlines(&document).command(), None);
+
+        let a = add(&mut document, xline(0.0), visible);
+        let b = add(&mut document, xline(1.0), hidden);
+        let c = add(&mut document, xline(2.0), locked);
+        let line = add(
+            &mut document,
+            EntityGeom::Shape(Shape::Line(mcad_geom::LineSeg::new(
+                Point2::new(0.0, 0.0),
+                Point2::new(1.0, 1.0),
+            ))),
+            visible,
+        );
+        // ロックは構築線を置いてから掛ける（ロック中のレイヤーへは追加できない）。
+        let mut props = document.layer(locked).unwrap().clone();
+        props.locked = true;
+        document
+            .apply(Command::SetLayerProps { id: locked, props })
+            .unwrap();
+
+        let plan = plan_delete_all_xlines(&document);
+        assert_eq!(plan.removed, vec![a, b], "非表示レイヤーの構築線も対象");
+        assert_eq!(plan.kept_locked, 1);
+        assert_eq!(
+            plan.status(),
+            "Deleted 2 construction lines; kept 1 construction line on locked layers"
+        );
+        document.apply(plan.command().unwrap()).unwrap();
+        assert!(document.entity(a).is_none() && document.entity(b).is_none());
+        assert!(
+            document.entity(c).is_some(),
+            "ロック中のレイヤーの構築線は残る"
+        );
+        assert!(document.entity(line).is_some(), "構築線以外は消さない");
+        // undo 1 回で全部戻る（Batch 1 つ）。
+        assert!(document.undo());
+        assert!(document.entity(a).is_some() && document.entity(b).is_some());
+
+        // ロック中のものしか無いときはコマンドを作らず、残した件数だけを出す。
+        document.apply(plan.command().unwrap()).unwrap();
+        let only_locked = plan_delete_all_xlines(&document);
+        assert_eq!(only_locked.command(), None);
+        assert_eq!(
+            only_locked.status(),
+            "Deleted none: kept 1 construction line on locked layers"
+        );
+        let plain = XLineCleanup {
+            removed: vec![a],
+            kept_locked: 0,
+        };
+        assert_eq!(plain.status(), "Deleted 1 construction line");
+    }
+
+    #[test]
+    fn xline_base_mark_is_a_short_bar_perpendicular_to_the_line_on_screen() {
+        // ワールドで右上 45°（画面では y 反転で右上 = (1, -1) 方向）の線に対し、印は画面上で
+        // 直交し、長さは固定の 2 × XLINE_BASE_MARK_HALF_PX。
+        let d = std::f64::consts::FRAC_1_SQRT_2;
+        let [a, b] = xline_base_mark_points(Pos2::new(100.0, 50.0), mcad_geom::Vec2::new(d, d));
+        let bar = b - a;
+        let line_on_screen = egui::vec2(1.0, -1.0);
+        assert!(bar.dot(line_on_screen).abs() < 1e-4, "{bar:?}");
+        assert!((bar.length() - 2.0 * XLINE_BASE_MARK_HALF_PX).abs() < 1e-4);
+        assert!(((a + bar * 0.5) - Pos2::new(100.0, 50.0)).length() < 1e-4);
+        // 水平な線には縦の棒。
+        let [a, b] = xline_base_mark_points(Pos2::ZERO, mcad_geom::Vec2::new(1.0, 0.0));
+        assert_eq!(a.x, b.x);
+    }
+
+    #[test]
+    fn document_aabb_includes_only_the_xline_base() {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::XLine(xline_geom(Point2::new(7.0, -3.0), Point2::new(8.0, 5.0))),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        assert_eq!(
+            document_aabb(&document),
+            Some(Aabb::from_point(Point2::new(7.0, -3.0)))
+        );
+    }
+
+    #[test]
+    fn xline_culling_uses_the_line_not_the_base() {
+        let view = Aabb::from_corners(Point2::new(0.0, 0.0), Point2::new(100.0, 50.0));
+        // 基点は画面の遥か外だが、線は画面を横切る → 描く。
+        let crossing = EntityGeom::XLine(xline_geom(
+            Point2::new(-1.0e5, 25.0),
+            Point2::new(-1.0e5 + 1.0, 25.0),
+        ));
+        assert!(entity_intersects_view(&crossing, 1.0, &view));
+        // 画面の上を平行に通る → 描かない（基点が画面のすぐ上でも）。
+        let above = EntityGeom::XLine(xline_geom(Point2::new(50.0, 51.0), Point2::new(51.0, 51.0)));
+        assert!(!entity_intersects_view(&above, 1.0, &view));
+        // 他の幾何は従来どおり表示上の AABB で判定する。
+        let line = EntityGeom::Shape(Shape::Line(mcad_geom::LineSeg::new(
+            Point2::new(-10.0, -10.0),
+            Point2::new(-5.0, -5.0),
+        )));
+        assert!(!entity_intersects_view(&line, 1.0, &view));
+    }
+
+    #[test]
+    fn xline_view_segment_clips_and_anchors_the_dash_phase_to_the_base() {
+        let view = Aabb::from_corners(Point2::new(0.0, -1.0), Point2::new(10.0, 1.0));
+        let xline = xline_geom(Point2::new(-3.7, 0.0), Point2::new(0.0, 0.0));
+        // 破線でなければ表示範囲そのもの。
+        let plain = xline_view_segment(&xline, &view, None).unwrap();
+        assert!(plain.a.distance(Point2::new(0.0, 0.0)) < 1e-12, "{plain:?}");
+        assert!(
+            plain.b.distance(Point2::new(10.0, 0.0)) < 1e-12,
+            "{plain:?}"
+        );
+        // 周期 2.0: 始点は基点 (-3.7) からの距離が 2 の倍数になる位置まで手前へずれる
+        // （基点から 3.7 → 2.0 まで。x = -1.7）。終点は変わらない。
+        let dashed = xline_view_segment(&xline, &view, Some(2.0)).unwrap();
+        assert!(
+            dashed.a.distance(Point2::new(-1.7, 0.0)) < 1e-12,
+            "{dashed:?}"
+        );
+        assert_eq!(dashed.b, plain.b);
+        // ずらし量は 1 周期未満で、パンしても（表示範囲が動いても）位相は基点に固定される。
+        let panned = Aabb::from_corners(Point2::new(0.9, -1.0), Point2::new(10.9, 1.0));
+        let moved = xline_view_segment(&xline, &panned, Some(2.0)).unwrap();
+        let phase = |p: Point2| ((p.x - xline.base.x) / 2.0).fract().abs();
+        assert!(
+            phase(moved.a) < 1e-9 || phase(moved.a) > 1.0 - 1e-9,
+            "{moved:?}"
+        );
+        assert!(moved.a.x <= 0.9 && moved.a.x > 0.9 - 2.0, "{moved:?}");
+        // 非正・非有限の周期は無視する。表示範囲と交わらなければ None。
+        assert_eq!(xline_view_segment(&xline, &view, Some(0.0)), Some(plain));
+        assert_eq!(
+            xline_view_segment(&xline, &view, Some(f64::NAN)),
+            Some(plain)
+        );
+        let off = xline_geom(Point2::new(0.0, 5.0), Point2::new(1.0, 5.0));
+        assert_eq!(xline_view_segment(&off, &view, Some(2.0)), None);
     }
 
     #[test]
@@ -15328,7 +15856,7 @@ mod tests {
 mod numeric_input_app_tests {
     use super::*;
     use eframe::App as _;
-    use mcad_geom::LineSeg;
+    use mcad_geom::{LineSeg, Vec2};
 
     /// キャンバス上のどこか（上部パネルの下・右パネルの左）。
     const CANVAS_POS: Pos2 = Pos2::new(300.0, 500.0);
@@ -15506,6 +16034,199 @@ mod numeric_input_app_tests {
         h.press(Key::S);
         h.press_shift(Key::C);
         assert_eq!(h.app.tool_kind, ToolKind::Polygon);
+    }
+
+    /// `L`=線分、`Shift+L`=構築線（M12 タスク91）。`L` は以前 Shift を見ておらず、
+    /// `Shift+L` でも線分になっていた（`!shift` のガードを足した）。
+    #[test]
+    fn l_key_switches_to_line_and_shift_l_to_construction_line() {
+        let mut h = Harness::new();
+        h.press_shift(Key::L);
+        assert_eq!(h.app.tool_kind, ToolKind::XLine);
+        h.press(Key::S);
+        h.press(Key::L);
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+        // 作図ツールの使用中でも切り替わる（線分 → 構築線 → 線分）。
+        h.press_shift(Key::L);
+        assert_eq!(h.app.tool_kind, ToolKind::XLine);
+        h.press(Key::L);
+        assert_eq!(h.app.tool_kind, ToolKind::Line);
+    }
+
+    /// 構築線ツールは数値入力で基点・通過点を打てる。連続作図は基点を保ち、`Esc` は
+    /// 1 回目で基点からやり直し、2 回目で選択モードへ戻る（DESIGN.md M12 設計判断9・3）。
+    #[test]
+    fn construction_line_tool_takes_numeric_input_keeps_the_base_and_escapes_in_two_steps() {
+        let xlines = |h: &Harness| -> Vec<XLineGeom> {
+            h.app
+                .document
+                .entities()
+                .filter_map(|(_, e)| match &e.geom {
+                    EntityGeom::XLine(x) => Some(*x),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut h = Harness::new();
+        h.press_shift(Key::L);
+        h.enter("10,20");
+        assert!(xlines(&h).is_empty());
+        h.enter("@5,0");
+        // 基点を保ったまま 2 本目（`L<A` は基点からの極座標）。
+        h.enter("3<90");
+        let made = xlines(&h);
+        assert_eq!(made.len(), 2);
+        for x in &made {
+            assert_eq!(x.base, Point2::new(10.0, 20.0));
+        }
+        // 新規図面（McadApp::new）は「構築線」レイヤーを持つので、カレント（外形線）ではなく
+        // そこへ置かれる（M12 タスク91 のスモークテスト後の変更）。
+        let construction = layer_named(&h.app.document, CONSTRUCTION_LAYER_NAME).unwrap();
+        assert_ne!(construction, h.app.document.current_layer());
+        assert!(
+            h.app
+                .document
+                .entities()
+                .all(|(_, e)| e.layer == construction)
+        );
+        assert_eq!(made[0].dir, Vec2::new(1.0, 0.0));
+        assert!(
+            (made[1].dir - Vec2::new(0.0, 1.0)).length() < 1e-12,
+            "{made:?}"
+        );
+
+        // 基点と同じ点は拒否され、何も増えない（基点は保たれる）。
+        h.enter("@0,0");
+        assert_eq!(xlines(&h).len(), 2);
+        assert_eq!(h.app.tool_kind, ToolKind::XLine);
+
+        // Esc 1 回目: 基点を捨てる（ツールは構築線のまま）。次の点は新しい基点になる。
+        h.press(Key::Escape);
+        assert_eq!(h.app.tool_kind, ToolKind::XLine);
+        h.enter("0,0");
+        h.enter("@0,-4");
+        let made = xlines(&h);
+        assert_eq!(made.len(), 3);
+        assert_eq!(made[2].base, Point2::ORIGIN);
+        assert_eq!(made[2].dir, Vec2::new(0.0, -1.0));
+
+        // undo は 1 本ずつ。
+        assert!(h.app.document.undo());
+        assert_eq!(xlines(&h).len(), 2);
+
+        // Esc 2 回（基点を捨てる → 作図をやめる）で選択モードへ。
+        h.press(Key::Escape);
+        h.press(Key::Escape);
+        assert_eq!(h.app.tool_kind, ToolKind::Select);
+    }
+
+    /// キャンバスの `pos` を左クリックする（押下と解放を別フレームで届ける）。
+    fn click_at(h: &mut Harness, pos: Pos2) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.run(vec![egui::Event::PointerMoved(pos), button(true)]);
+        h.run(vec![button(false)]);
+        h.run(Vec::new());
+    }
+
+    /// トリム `X` の境界に構築線を使える（キャンバスのクリック経路。M12 タスク91 の
+    /// スモークテスト後の変更）。対象として構築線をクリックしても拾わない。
+    #[test]
+    fn trim_uses_a_construction_line_as_the_boundary_through_canvas_clicks() {
+        let mut h = Harness::new();
+        h.app.config.snap_enabled = false;
+        // キャンバス上の点 CANVAS_POS のワールド座標を、点ツールのクリックで実測する
+        // （キャンバス矩形はアプリが保持しないため）。
+        h.type_text("1");
+        assert_eq!(h.app.tool_kind, ToolKind::Point);
+        click_at(&mut h, CANVAS_POS);
+        let origin = match h.shapes().as_slice() {
+            [Shape::Point(p)] => *p,
+            other => panic!("expected one point, got {other:?}"),
+        };
+        assert!(h.app.document.undo());
+        h.press(Key::Escape);
+        assert_eq!(h.app.tool_kind, ToolKind::Select);
+        let zoom = h.app.viewport.zoom;
+        let world = |pos: Pos2| {
+            Point2::new(
+                origin.x + f64::from(pos.x - CANVAS_POS.x) / zoom,
+                origin.y - f64::from(pos.y - CANVAS_POS.y) / zoom,
+            )
+        };
+
+        // 構築線: CANVAS_POS を通る鉛直線（基点は画面の遥か上）。対象: その 40px 下の水平線分。
+        let layer = h.app.document.current_layer();
+        let xline = XLineGeom::through(
+            Point2::new(origin.x, origin.y + 1.0e4),
+            Point2::new(origin.x, origin.y + 1.0e4 - 1.0),
+        )
+        .unwrap();
+        h.app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::XLine(xline),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        let below = |dx: f32| Pos2::new(CANVAS_POS.x + dx, CANVAS_POS.y + 40.0);
+        let target = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(world(below(-40.0)), world(below(40.0)))),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+
+        h.press(Key::X);
+        assert_eq!(h.app.tool_kind, ToolKind::Trim);
+        // 構築線の上（線分から離れた位置）をクリック → 境界になる。
+        click_at(&mut h, Pos2::new(CANVAS_POS.x, CANVAS_POS.y - 30.0));
+        // 対象の右側をクリック → 右側が切り落とされ、左端 〜 構築線が残る。
+        click_at(&mut h, below(30.0));
+        let Some(EntityGeom::Shape(Shape::Line(kept))) =
+            h.app.document.entity(target).map(|e| e.geom.clone())
+        else {
+            panic!("target must remain a line");
+        };
+        assert!(kept.a.distance(world(below(-40.0))) < 1e-9, "{kept:?}");
+        assert!((kept.b.x - origin.x).abs() < 1e-9, "{kept:?}");
+
+        // 対象待ちで構築線をクリックしても拾わない（文書は変わらない）。
+        let before = h.app.document.generation();
+        click_at(&mut h, Pos2::new(CANVAS_POS.x, CANVAS_POS.y - 30.0));
+        assert_eq!(h.app.document.generation(), before);
+    }
+
+    /// 構築線を 1 本選んで `O` を押すとオフセットモードに入る（M12 タスク91 のスモークテスト後の
+    /// 変更。以前は入口で拒否していた）。
+    #[test]
+    fn o_key_starts_offset_mode_for_a_construction_line() {
+        let mut h = Harness::new();
+        let layer = h.app.document.current_layer();
+        let id = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::XLine(
+                    XLineGeom::through(Point2::new(0.0, 0.0), Point2::new(0.0, 1.0)).unwrap(),
+                ),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        h.app.select_tool.set_selection(vec![id]);
+        h.press(Key::O);
+        assert!(h.app.select_tool.is_offsetting());
     }
 
     /// 矩形ツールは数値入力（`@w,h`）で寸法指定できる（DESIGN.md M12 設計判断7・3）。

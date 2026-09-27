@@ -44,13 +44,15 @@ use mcad_core::{
     Command, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation, DimDiameter, DimDirection,
     DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom, EntityId,
     HorizontalAlign, LayerId, Linetype, NewIds, OrdinateAxis, Style, TableGeom, TableKind,
-    diameter_pick_segments, dim_distance, expand_angular, expand_diameter, expand_linear,
-    expand_ordinate, expand_radial, linear_pick_segments, radial_pick_segments, table_world_aabb,
+    XLineGeom, diameter_pick_segments, dim_distance, expand_angular, expand_diameter,
+    expand_linear, expand_ordinate, expand_radial, linear_pick_segments, radial_pick_segments,
+    table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, ChamferError, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape,
-    SplitError, TrimExtendError, Vec2, chamfer_lines, circumcircle, closest_point, distance_to,
-    extend, fillet_lines, split, trim,
+    SplitError, TrimExtendError, TrimResult, Vec2, chamfer_lines, circumcircle, clip_line_to_aabb,
+    closest_point, distance_to, extend, extend_to_line, fillet_lines, line_line_intersection,
+    line_shape_intersection, split, trim, trim_by_line,
 };
 
 use crate::bom::{BOM_STYLE_AC_WIDTH_MM, default_bom_table};
@@ -308,6 +310,25 @@ pub trait Tool {
         ToolResult::Continue
     }
 
+    /// [`Tool::wants_shape_pick`] が `true` のツールのうち、**次のクリックで構築線も拾って
+    /// よい**なら `true`（M12 タスク91 のスモークテスト後の変更: トリム・延長の境界に構築線を
+    /// 使える。DESIGN.md M12 設計判断9）。既定は `false`。
+    ///
+    /// `true` の間、app 層は [`pick_shape_or_xline`] で当て、構築線が最も近ければ
+    /// [`Tool::on_xline_pick`]、それ以外は従来どおり [`Tool::on_shape_pick`] を呼ぶ。
+    /// 構築線は [`ShapePick::shape`] に入らない（`Shape` ではない）ので、別の拡張点にする。
+    /// トリム・延長は**境界待ちのときだけ** `true` を返す（対象としての構築線は従来どおり
+    /// 拾わない = 「Pick: click a line, ...」で拒否される）。
+    fn accepts_xline_pick(&self) -> bool {
+        false
+    }
+
+    /// [`Tool::accepts_xline_pick`] が `true` のとき、app 層が当てた構築線を受け取る。
+    /// 既定は何もしない。
+    fn on_xline_pick(&mut self, _xline: XLineGeom) -> ToolResult {
+        ToolResult::Continue
+    }
+
     /// [`Tool::wants_shape_pick`] が `true` のツールのうち、ピック成功後にさらに
     /// 対象エンティティ上へスナップを掛けて `click` を差し替えるべきなら `true`。
     /// 既定は `false`（対象外）。app 層（`handle_tool_input`）はこれが `true` のときだけ
@@ -381,7 +402,8 @@ pub trait Tool {
     /// ortho の基準は直近の `p2` だけでよい）。誤って対象に入れないよう、ツールごとに
     /// 明示的にオプトインする専用の拡張点にする（`ortho.rs` のモジュール doc も参照）。
     ///
-    /// override するのは [`LineTool`]・[`PolylineTool`]・[`ArcTool`] の3つのみ。
+    /// override するのは [`LineTool`]・[`PolylineTool`]・[`ArcTool`]・[`RectangleTool`]・
+    /// [`PolygonTool`]・[`XLineTool`] の 6 つ（後ろの 3 つは M12 タスク89・91）。
     /// Circle・Text・寸法系・M7の4ツールは「直前の点からの方向が結果に効かない」
     /// または「クリックの意味が用途ごとに変わる」ため既定のまま（対象外）。
     fn ortho_origin(&self) -> Option<Point2> {
@@ -398,7 +420,8 @@ pub trait Tool {
     /// これを override するだけで乗れる。基点が [`Tool::ortho_origin`] と違うツールは
     /// [`Tool::numeric_input_base`] も override する。
     ///
-    /// override するのは点・線分・円・円弧・アイソメ円・ポリラインの 6 つ。既存図形を当てる
+    /// override するのは点・線分・円・円弧・アイソメ円・ポリライン・矩形・正多角形・構築線の
+    /// 9 つ（後ろの 3 つは M12 タスク89・91）。既存図形を当てる
     /// ツール（トリム・延長・フィレット・分割）・寸法ツール・文字・表は対象外
     /// （DESIGN.md M12 設計判断3・10）。
     fn accepts_numeric_input(&self) -> bool {
@@ -1447,6 +1470,106 @@ impl Tool for RectangleTool {
         match self.state {
             RectangleState::WaitingFirstCorner => None,
             RectangleState::WaitingSecondCorner(first) => Some(first),
+        }
+    }
+
+    fn accepts_numeric_input(&self) -> bool {
+        true
+    }
+}
+
+// ---------------------------------------------------------------------
+// XLine（構築線。M12 タスク91、設計判断9）
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+enum XLineState {
+    #[default]
+    WaitingBase,
+    WaitingThrough(Point2),
+}
+
+/// 構築線ツール（`Shift+L`。DESIGN.md M12 設計判断9「着手時の決定」）。1 クリック目 =
+/// 基点、2 クリック目 = 通過点で [`EntityGeom::XLine`] を確定する。
+///
+/// - **連続作図は基点を保つ**（AutoCAD の XLINE と同じ）: 確定後も同じ基点のまま次の
+///   通過点を待つので、1 点から放射状に何本でも引ける。
+/// - **`Esc` は 2 段階**（[`TextTool`] と同じ）: 通過点待ちの `Esc` は基点を捨てて
+///   基点待ちへ戻る（ツールは維持。基点からやり直せる）。基点待ちの `Esc` は作図をやめる
+///   （app 層が選択モードへ戻す）。
+/// - 通過点が基点と一致する（[`XLineGeom::through`] が `None`）クリックは拒否し、基点を
+///   保ったまま待ち続ける（[`RectangleTool`] の退化と同じ扱い）。
+/// - 2 点目には線分ツールと同じく数値入力・直交・極トラッキング・スナップが効く
+///   （[`Tool::ortho_origin`] = 基点）。**基点を自己スナップ候補（[`Tool::snap_points`]）
+///   には出さない**: 基点へ吸着したクリックは必ず拒否されるだけなので（線分ツールの
+///   始点とは違い、自分の点へ戻る意味が無い）。
+#[derive(Debug, Default)]
+pub struct XLineTool {
+    state: XLineState,
+    cursor: Option<Point2>,
+}
+
+impl Tool for XLineTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                XLineState::WaitingBase => {
+                    self.state = XLineState::WaitingThrough(p);
+                    ToolResult::Continue
+                }
+                XLineState::WaitingThrough(base) => match XLineGeom::through(base, p) {
+                    // 基点は保ったまま（連続作図）。
+                    Some(xline) => ToolResult::Commit(Command::AddEntity(Entity::new(
+                        EntityGeom::XLine(xline),
+                        ctx.layer,
+                        ctx.style,
+                    ))),
+                    None => ToolResult::Rejected(
+                        "Construction line: the through point must differ from the base point",
+                    ),
+                },
+            },
+            InputEvent::Cancel => match self.state {
+                XLineState::WaitingThrough(_) => {
+                    self.state = XLineState::WaitingBase;
+                    ToolResult::Continue
+                }
+                XLineState::WaitingBase => ToolResult::Cancel,
+            },
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _render: DimRender<'_>,
+    ) {
+        if let (XLineState::WaitingThrough(base), Some(cursor)) = (&self.state, self.cursor)
+            && let Some(xline) = XLineGeom::through(*base, cursor)
+        {
+            crate::draw_xline(
+                painter,
+                rect,
+                viewport,
+                &xline,
+                preview_stroke(),
+                Linetype::Continuous,
+                1.0,
+            );
+        }
+    }
+
+    fn ortho_origin(&self) -> Option<Point2> {
+        match self.state {
+            XLineState::WaitingBase => None,
+            XLineState::WaitingThrough(base) => Some(base),
         }
     }
 
@@ -3402,9 +3525,71 @@ pub fn pick_shape_entity(document: &Document, world: Point2, tol: f64) -> Option
     })
 }
 
+/// [`pick_shape_or_xline`] の結果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShapeOrXLinePick {
+    /// 形状エンティティ（[`pick_shape_entity`] と同じ内容）。
+    Shape(ShapePick),
+    /// 構築線（M12 タスク91）。境界として形状のスナップショットだけを使うので、ID は持たない。
+    XLine(XLineGeom),
+}
+
+/// [`pick_shape_entity`] に構築線（M12 タスク91）を加えたヒットテスト。形状と構築線の
+/// 中で `tol` 以内の最も近いもの（構築線は無限直線への距離）を返す。トリム・延長の境界
+/// 選択（[`Tool::accepts_xline_pick`]）で app 層が使う。
+#[must_use]
+pub fn pick_shape_or_xline(
+    document: &Document,
+    world: Point2,
+    tol: f64,
+) -> Option<ShapeOrXLinePick> {
+    pick_nearest(document, tol, |id, entity| match &entity.geom {
+        EntityGeom::XLine(xline) => {
+            Some((xline.distance_to(world), ShapeOrXLinePick::XLine(*xline)))
+        }
+        geom => {
+            let shape = geom.as_shape()?;
+            Some((
+                distance_to(shape, world),
+                ShapeOrXLinePick::Shape(ShapePick {
+                    id,
+                    shape: shape.clone(),
+                    click: world,
+                    layer: entity.layer,
+                    style: entity.style,
+                }),
+            ))
+        }
+    })
+}
+
 // ---------------------------------------------------------------------
 // トリム（X）／延長（E）
 // ---------------------------------------------------------------------
+
+/// トリム・延長の境界のスナップショット。形状か構築線（M12 タスク91。無限直線として
+/// [`trim_by_line`] / [`extend_to_line`] に渡す）。
+#[derive(Debug, Clone, PartialEq)]
+enum TrimBoundary {
+    Shape(Shape),
+    XLine(XLineGeom),
+}
+
+impl TrimBoundary {
+    fn trim(&self, target: &Shape, click: Point2) -> Result<TrimResult, TrimExtendError> {
+        match self {
+            TrimBoundary::Shape(boundary) => trim(target, boundary, click),
+            TrimBoundary::XLine(xline) => trim_by_line(target, &xline.line(), click),
+        }
+    }
+
+    fn extend(&self, target: &Shape, click: Point2) -> Result<Shape, TrimExtendError> {
+        match self {
+            TrimBoundary::Shape(boundary) => extend(target, boundary, click),
+            TrimBoundary::XLine(xline) => extend_to_line(target, &xline.line(), click),
+        }
+    }
+}
 
 /// トリム（`X`）と延長（`E`）が共有する 2 段階状態（DESIGN.md M7 設計判断6）。
 ///
@@ -3418,12 +3603,13 @@ enum BoundaryTargetState {
     WaitingBoundary,
     /// 対象エンティティのヒットテスト待ち（2 クリック目以降）。境界の形状は採取済み。
     ///
-    /// 境界は「交点計算の相手」としてしか使わないので [`EntityId`] ではなく [`Shape`] の
-    /// スナップショットを持つ（半径寸法が中心・半径だけを写し取るのと同じ非関連方式）。
+    /// 境界は「交点計算の相手」としてしか使わないので [`EntityId`] ではなく形状（または
+    /// 構築線。[`TrimBoundary`]）のスナップショットを持つ（半径寸法が中心・半径だけを
+    /// 写し取るのと同じ非関連方式）。
     /// このため undo/redo で境界エンティティ自体が消えるとスナップショットが実体と
     /// 食い違いうるが、app 層が undo/redo 後にツールを作り直して初期状態へ戻すことで
     /// 古い境界を持ち越さないようにしている（`main.rs` の `after_history_change`）。
-    WaitingTarget { boundary: Shape },
+    WaitingTarget { boundary: TrimBoundary },
 }
 
 /// [`BoundaryTargetTool`] が行う演算の種別。状態機械は完全に共通で、確定時に呼ぶ
@@ -3480,13 +3666,13 @@ impl BoundaryTargetTool {
 
     /// 対象ピックを演算へ通し、確定コマンドまたは拒否を返す。状態は
     /// `WaitingTarget { boundary }` のまま据え置く（成功・失敗どちらでも）。
-    fn apply_to_target(&mut self, boundary: &Shape, hit: ShapePick) -> ToolResult {
+    fn apply_to_target(&mut self, boundary: &TrimBoundary, hit: ShapePick) -> ToolResult {
         match self.op {
-            TrimExtendOp::Trim => match trim(&hit.shape, boundary, hit.click) {
+            TrimExtendOp::Trim => match boundary.trim(&hit.shape, hit.click) {
                 Ok(result) => self.commit_trim(&hit, result.retained),
                 Err(err) => Self::reject(self.op, err),
             },
-            TrimExtendOp::Extend => match extend(&hit.shape, boundary, hit.click) {
+            TrimExtendOp::Extend => match boundary.extend(&hit.shape, hit.click) {
                 Ok(shape) => ToolResult::Commit(Command::ModifyEntity {
                     id: hit.id,
                     new_geom: EntityGeom::from(shape),
@@ -3549,8 +3735,10 @@ impl BoundaryTargetTool {
     ) {
         // 選択済みの境界だけをハイライトして「今どちらを選んだか」を示す。カーソル追従の
         // ライブプレビューは行わない（上記のとおり）。
-        if let BoundaryTargetState::WaitingTarget { boundary } = &self.state {
-            draw_shape(
+        match &self.state {
+            BoundaryTargetState::WaitingTarget {
+                boundary: TrimBoundary::Shape(boundary),
+            } => draw_shape(
                 painter,
                 rect,
                 viewport,
@@ -3558,7 +3746,19 @@ impl BoundaryTargetTool {
                 preview_stroke(),
                 Linetype::Continuous,
                 1.0,
-            );
+            ),
+            BoundaryTargetState::WaitingTarget {
+                boundary: TrimBoundary::XLine(xline),
+            } => crate::draw_xline(
+                painter,
+                rect,
+                viewport,
+                xline,
+                preview_stroke(),
+                Linetype::Continuous,
+                1.0,
+            ),
+            BoundaryTargetState::WaitingBoundary => {}
         }
     }
 
@@ -3566,12 +3766,28 @@ impl BoundaryTargetTool {
         match self.state.clone() {
             BoundaryTargetState::WaitingBoundary => {
                 self.state = BoundaryTargetState::WaitingTarget {
-                    boundary: hit.shape,
+                    boundary: TrimBoundary::Shape(hit.shape),
                 };
                 ToolResult::Continue
             }
             BoundaryTargetState::WaitingTarget { boundary } => self.apply_to_target(&boundary, hit),
         }
+    }
+
+    /// 境界待ちのときだけ構築線を拾う（対象としての構築線は拾わない）。
+    fn accepts_xline_pick(&self) -> bool {
+        self.state == BoundaryTargetState::WaitingBoundary
+    }
+
+    /// 構築線を境界にする。境界待ち以外で呼ばれても状態は変えない（app 層は
+    /// [`Tool::accepts_xline_pick`] が `true` のときしか呼ばない）。
+    fn on_xline_pick(&mut self, xline: XLineGeom) -> ToolResult {
+        if self.state == BoundaryTargetState::WaitingBoundary {
+            self.state = BoundaryTargetState::WaitingTarget {
+                boundary: TrimBoundary::XLine(xline),
+            };
+        }
+        ToolResult::Continue
     }
 
     fn take_commit_selection(&mut self, new_ids: &NewIds) -> Option<Vec<EntityId>> {
@@ -3641,6 +3857,14 @@ macro_rules! impl_tool_for_boundary_target {
 
             fn on_shape_pick(&mut self, hit: ShapePick) -> ToolResult {
                 self.0.on_shape_pick(hit)
+            }
+
+            fn accepts_xline_pick(&self) -> bool {
+                self.0.accepts_xline_pick()
+            }
+
+            fn on_xline_pick(&mut self, xline: XLineGeom) -> ToolResult {
+                self.0.on_xline_pick(xline)
             }
 
             fn take_commit_selection(&mut self, new_ids: &NewIds) -> Option<Vec<EntityId>> {
@@ -4742,6 +4966,140 @@ fn offset_params(geom: &Shape, reference: Point2, fixed_distance: Option<f64>) -
     }
 }
 
+/// 構築線のオフセット（[`xline_offset_segment`]）が線分を作れない理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XLineOffsetReject {
+    /// 通過点方式で通過点が構築線の上（ピック許容量以内）にある、または距離が正でない。
+    ZeroDistance,
+    /// クリックを射影した点 `p` が交点の上（許容量以内）にあり、どちらの区間か決まらない。
+    OnIntersection,
+    /// `p` の片側（または両側）に交点が無く、用紙の範囲とも交わらないため端が決まらない。
+    Unbounded,
+}
+
+impl XLineOffsetReject {
+    /// ステータスバーの文言（既存のオフセットのメッセージに合わせて英語）。
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            XLineOffsetReject::ZeroDistance => "Zero offset distance - offset cancelled",
+            XLineOffsetReject::OnIntersection => {
+                "Offset: the click is on an intersection - click between two"
+            }
+            XLineOffsetReject::Unbounded => {
+                "Offset: no intersection or paper edge on one side - cancelled"
+            }
+        }
+    }
+}
+
+/// 構築線をオフセットしてできる**線分**（M12 タスク91 のスモークテスト後の変更、
+/// 2026-09-27 ユーザー確定。DESIGN.md M12 設計判断9）。
+///
+/// 1. 距離と側は他の図形のオフセットと同じ（`fixed_distance` が `Some(d)` なら距離 `d`・
+///    `click` の側、`None` なら `click` を通過点とする距離）。通過点方式で距離が `tol`
+///    以下なら [`XLineOffsetReject::ZeroDistance`]。平行に移した直線を `L'` とする。
+/// 2. `click` を `L'` へ射影した点を `p` とする。
+/// 3. `L'` と、**可視レイヤー**の他の構築線・形状（線分・円・円弧・ポリライン。点は
+///    含めない）との交点を集める。寸法・文字・表は含めない（スナップの対象と揃える）。
+///    元の構築線は `L'` と平行なので交点を作らない。
+/// 4. `p` を挟む最も近い交点を 2 つ選ぶ。`p` が交点から `tol` 以内なら
+///    [`XLineOffsetReject::OnIntersection`]。
+/// 5. 片側に交点が無ければ、その側の端は `L'` と**用紙の範囲**（ワールド座標。SVG/PDF の
+///    切り取りと同じ `(0,0)`〜`(W·k, H·k)`）の交点にする（その側で `p` に最も近い縁。`p` が
+///    用紙の内側なら縁はその側に 1 つだけ）。その側に用紙の縁が無ければ（用紙と交わらない、
+///    または `p` が用紙の外で縁が反対側にしか無い）[`XLineOffsetReject::Unbounded`]。
+///
+/// 返す線分の向きは構築線の `dir` と同じ（`a` が `-dir` 側の端）。`tol` は呼び出し側の
+/// ピック許容量（ワールド単位）。
+///
+/// # Errors
+///
+/// 上記の [`XLineOffsetReject`]。
+pub fn xline_offset_segment(
+    document: &Document,
+    xline: &XLineGeom,
+    click: Point2,
+    fixed_distance: Option<f64>,
+    tol: f64,
+) -> Result<LineSeg, XLineOffsetReject> {
+    let distance = match fixed_distance {
+        Some(d) => d,
+        None => {
+            let d = xline.distance_to(click);
+            if d <= tol {
+                return Err(XLineOffsetReject::ZeroDistance);
+            }
+            d
+        }
+    };
+    let moved = xline
+        .line()
+        .offset(distance, click)
+        .map_err(|_| XLineOffsetReject::ZeroDistance)?;
+    let offset_line = XLineGeom {
+        base: moved.a,
+        dir: xline.dir,
+    };
+    let line = offset_line.line();
+    let p = offset_line.closest_point(click);
+    let param = |q: Point2| (q - p).dot(offset_line.dir);
+
+    let mut below: Option<f64> = None;
+    let mut above: Option<f64> = None;
+    for (_, entity) in document.entities() {
+        if !layer_visible(document, entity) {
+            continue;
+        }
+        let hits: Vec<Point2> = match &entity.geom {
+            EntityGeom::XLine(other) => line_line_intersection(&line, &other.line())
+                .into_iter()
+                .collect(),
+            EntityGeom::Shape(Shape::Point(_)) => Vec::new(),
+            EntityGeom::Shape(shape) => line_shape_intersection(&line, shape),
+            _ => Vec::new(),
+        };
+        for t in hits.into_iter().map(param) {
+            if t.abs() <= tol {
+                return Err(XLineOffsetReject::OnIntersection);
+            }
+            if t < 0.0 {
+                below = Some(below.map_or(t, |b: f64| b.max(t)));
+            } else {
+                above = Some(above.map_or(t, |a: f64| a.min(t)));
+            }
+        }
+    }
+
+    if below.is_none() || above.is_none() {
+        let sheet = document.sheet();
+        let (w, h) = sheet.paper_extent_mm();
+        let k = sheet.scale.world_mm_per_paper_mm();
+        let paper = Aabb::from_corners(
+            crate::frame::paper_to_world(Point2::ORIGIN, k),
+            crate::frame::paper_to_world(Point2::new(w, h), k),
+        );
+        if let Some(edge) = clip_line_to_aabb(&line, &paper) {
+            // 用紙の縁との 2 交点を、交点が無い側の境界の候補にする（その側で `p` に最も
+            // 近いもの）。`p` が用紙の内側なら両側に 1 つずつ、外側なら片側に 2 つとも来る。
+            let edges = [param(edge.a), param(edge.b)];
+            if below.is_none() {
+                below = edges.into_iter().filter(|&t| t < -tol).reduce(f64::max);
+            }
+            if above.is_none() {
+                above = edges.into_iter().filter(|&t| t > tol).reduce(f64::min);
+            }
+        }
+    }
+    match (below, above) {
+        (Some(lo), Some(hi)) => Ok(LineSeg::new(
+            p + offset_line.dir * lo,
+            p + offset_line.dir * hi,
+        )),
+        _ => Err(XLineOffsetReject::Unbounded),
+    }
+}
+
 /// [`OffsetError`] を ASCII ステータスメッセージへ対応付ける（egui 既定フォントは CJK 非対応
 /// のため可視文字列は ASCII 限定）。文言は geom 側に持たせず UI 側で決める。
 fn offset_error_message(err: OffsetError) -> &'static str {
@@ -4920,6 +5278,9 @@ impl SelectTool {
                 // 割り切りで、罫線 1 本ずつへの距離は取らない（面として掴む方が操作
                 // として自然。M10 タスク58、`mcad_core` の `expand::table` モジュール doc）。
                 EntityGeom::Table(table) => table_world_aabb(table, k).distance_to_point(world),
+                // 構築線は無限直線への垂直距離（M12 タスク91。基点から遠くても線の上なら
+                // 拾える。基点だけの退化 aabb へ落とすと基点付近でしか拾えない）。
+                EntityGeom::XLine(xline) => xline.distance_to(world),
                 // `EntityGeom` は `#[non_exhaustive]`。未知の幾何は近似 aabb への
                 // 距離で拾う（ピック対象から黙って消えるより穏当）。
                 _ => entity.geom.aabb().distance_to_point(world),
@@ -5102,6 +5463,9 @@ impl SelectTool {
         let k = document.sheet().scale.world_mm_per_paper_mm();
         // 内包判定は表示上のワールド AABB（`crate::entity_world_aabb`）。Text は紙基準
         // 表示（タスク37）の判断(g) により height×k、表も同じく紙 mm × k（M10 タスク58）。
+        // 構築線はその箱が基点 1 点なので「基点が矩形に含まれれば選ぶ」になる（M12
+        // タスク91。「交われば選ぶ」にすると輪郭を囲うたびに図面を横切る構築線まで
+        // 選ばれるため。DESIGN.md M12 設計判断9「着手時の決定」）。
         self.selection = document
             .entities()
             .filter(|(_, e)| layer_visible(document, e))
@@ -5552,14 +5916,24 @@ impl SelectTool {
     ///
     /// `fixed_distance` は距離入力欄の解析値（`Some(正の有限値)` なら固定距離＋カーソル側、
     /// `None` ならカーソルを通過点とみなす通過点方式。[`offset_params`] 参照）。
+    ///
+    /// 構築線（M12 タスク91）は確定したときにできる**線分**（[`xline_offset_segment`]）を
+    /// 返す。`tol` はそのための許容量（[`SelectTool::offset_click`] と同じピック許容量を
+    /// 渡し、プレビューと確定の結果を一致させる）。他の図形は `tol` を使わない。
     #[must_use]
     pub fn offset_preview(
         &self,
         document: &Document,
         fixed_distance: Option<f64>,
+        tol: f64,
     ) -> Option<Shape> {
         let state = self.offset?;
         let entity = document.entity(state.target)?;
+        if let EntityGeom::XLine(xline) = &entity.geom {
+            return xline_offset_segment(document, xline, state.cursor, fixed_distance, tol)
+                .ok()
+                .map(Shape::Line);
+        }
         // M6: オフセット対象は Shape 系のみ（テキスト・寸法はオフセット対象外）。
         let shape = entity.geom.as_shape()?;
         let (distance, toward) = offset_params(shape, state.cursor, fixed_distance);
@@ -5592,6 +5966,20 @@ impl SelectTool {
             self.offset = None;
             return OffsetOutcome::Cancelled("Offset target missing");
         };
+        // 構築線（M12 タスク91）は交点・用紙の縁で区切った**線分**を**カレントレイヤー**へ
+        // 置く（スタイルは既定 = ByLayer。構築線から輪郭線を起こす操作なので、元の
+        // レイヤー・スタイルは引き継がない。DESIGN.md M12 設計判断9）。
+        if let EntityGeom::XLine(xline) = &entity.geom {
+            self.offset = None;
+            return match xline_offset_segment(document, xline, world, fixed_distance, tol) {
+                Ok(seg) => OffsetOutcome::Commit(Command::AddEntity(Entity::new(
+                    Shape::Line(seg),
+                    document.current_layer(),
+                    Style::inherited(),
+                ))),
+                Err(reject) => OffsetOutcome::Cancelled(reject.message()),
+            };
+        }
         // M6: オフセット対象は Shape 系のみ。テキスト・寸法は非対応としてキャンセルする。
         let Some(shape) = entity.geom.as_shape() else {
             self.offset = None;
@@ -8033,11 +8421,11 @@ mod tests {
 
         // カーソルが対象上（通過点方式で距離ほぼ0）→ 退化してゴーストなし。
         tool.offset_move(Point2::new(0.5, 0.0));
-        assert!(tool.offset_preview(&doc, None).is_none());
+        assert!(tool.offset_preview(&doc, None, 0.1).is_none());
 
         // カーソルを上方へ → ゴーストは y=3 の線分。
         tool.offset_move(Point2::new(0.5, 3.0));
-        match tool.offset_preview(&doc, None) {
+        match tool.offset_preview(&doc, None, 0.1) {
             Some(Shape::Line(l)) => {
                 assert!(l.a.distance(Point2::new(0.0, 3.0)) < 1e-9);
                 assert!(l.b.distance(Point2::new(1.0, 3.0)) < 1e-9);
@@ -8378,7 +8766,7 @@ mod tests {
 
         assert!(tool.start_offset());
         // プレビューは描かない（結果を作れない）。
-        assert!(tool.offset_preview(&doc, None).is_none());
+        assert!(tool.offset_preview(&doc, None, 0.1).is_none());
         let outcome = tool.offset_click(&doc, Point2::new(1.0, 1.0), 0.1, None);
         assert!(matches!(outcome, OffsetOutcome::Cancelled(_)));
         assert!(!tool.is_offsetting());
@@ -9758,7 +10146,7 @@ mod tests {
         assert_eq!(
             tool.0.state,
             BoundaryTargetState::WaitingTarget {
-                boundary: boundary_shape.clone()
+                boundary: TrimBoundary::Shape(boundary_shape.clone())
             },
             "確定後も同じ境界のまま対象待ちに留まる"
         );
@@ -9772,7 +10160,7 @@ mod tests {
         assert_eq!(
             tool.0.state,
             BoundaryTargetState::WaitingTarget {
-                boundary: boundary_shape
+                boundary: TrimBoundary::Shape(boundary_shape)
             }
         );
     }
@@ -9798,7 +10186,7 @@ mod tests {
         assert_eq!(
             tool.0.state,
             BoundaryTargetState::WaitingTarget {
-                boundary: boundary_shape
+                boundary: TrimBoundary::Shape(boundary_shape)
             },
             "拒否しても同じ境界のまま別対象を試せる"
         );
@@ -9843,7 +10231,7 @@ mod tests {
         assert_eq!(
             tool.0.state,
             BoundaryTargetState::WaitingTarget {
-                boundary: boundary_shape
+                boundary: TrimBoundary::Shape(boundary_shape)
             }
         );
     }
@@ -9865,7 +10253,7 @@ mod tests {
         assert_eq!(
             tool.0.state,
             BoundaryTargetState::WaitingTarget {
-                boundary: boundary_shape
+                boundary: TrimBoundary::Shape(boundary_shape)
             }
         );
     }
@@ -12414,5 +12802,540 @@ mod tests {
         let mut tool = SelectTool::default();
         tool.set_selection(vec![line]);
         assert!(tool.explode_command(&doc).is_none());
+    }
+
+    // --- 構築線（M12 タスク91、DESIGN.md M12 設計判断9「着手時の決定」） ---
+
+    fn xline_of(result: ToolResult) -> XLineGeom {
+        match result {
+            ToolResult::Commit(Command::AddEntity(entity)) => match entity.geom {
+                EntityGeom::XLine(xline) => xline,
+                other => panic!("expected XLine geom, got {other:?}"),
+            },
+            other => panic!("expected Commit(AddEntity(..)), got {other:?}"),
+        }
+    }
+
+    /// カレントレイヤーへ構築線（`base` を通り `through` へ向かう）を追加する。
+    fn add_xline(doc: &mut Document, base: Point2, through: Point2) -> EntityId {
+        let layer = doc.current_layer();
+        let xline = XLineGeom::through(base, through).expect("distinct points");
+        let entity = Entity::new(EntityGeom::XLine(xline), layer, Style::inherited());
+        doc.apply(Command::AddEntity(entity)).unwrap().entities[0]
+    }
+
+    #[test]
+    fn xline_tool_commits_from_base_and_through_and_keeps_the_base() {
+        let (_doc, ctx) = ctx();
+        let mut tool = XLineTool::default();
+        assert_eq!(tool.ortho_origin(), None);
+        assert!(tool.accepts_numeric_input());
+        let base = Point2::new(1.0, 1.0);
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(base)),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.ortho_origin(), Some(base));
+        // 基点は自己スナップ候補に出さない（吸着したクリックは必ず拒否されるだけ）。
+        assert!(tool.snap_points().is_empty());
+
+        let first = xline_of(tool.on_input(&ctx, InputEvent::Click(Point2::new(4.0, 5.0))));
+        assert_eq!(first.base, base);
+        assert!((first.dir - Vec2::new(0.6, 0.8)).length() < 1e-15);
+        // 連続作図: 基点は保たれ、次の通過点で同じ基点から 2 本目。
+        assert_eq!(tool.ortho_origin(), Some(base));
+        let second = xline_of(tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, -9.0))));
+        assert_eq!(second.base, base);
+        assert_eq!(second.dir, Vec2::new(0.0, -1.0));
+    }
+
+    #[test]
+    fn xline_tool_rejects_a_through_point_equal_to_the_base() {
+        let (_doc, ctx) = ctx();
+        let mut tool = XLineTool::default();
+        let base = Point2::new(2.0, 3.0);
+        tool.on_input(&ctx, InputEvent::Click(base));
+        assert!(matches!(
+            tool.on_input(&ctx, InputEvent::Click(base)),
+            ToolResult::Rejected(_)
+        ));
+        // 基点は保ったまま次の通過点を待つ。
+        assert_eq!(tool.ortho_origin(), Some(base));
+        let xline = xline_of(tool.on_input(&ctx, InputEvent::Click(Point2::new(3.0, 3.0))));
+        assert_eq!(xline.base, base);
+    }
+
+    #[test]
+    fn xline_tool_escape_restarts_from_the_base_then_ends() {
+        let (_doc, ctx) = ctx();
+        let mut tool = XLineTool::default();
+        tool.on_input(&ctx, InputEvent::Click(Point2::ORIGIN));
+        // 1 回目の Esc: 基点を捨てて基点待ちへ（ツールは維持）。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Cancel),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.ortho_origin(), None);
+        // 次のクリックは新しい基点。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(10.0, 0.0)));
+        assert_eq!(tool.ortho_origin(), Some(Point2::new(10.0, 0.0)));
+        tool.on_input(&ctx, InputEvent::Cancel);
+        // 基点待ちの Esc: 作図をやめる（app 層が選択モードへ戻す）。
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cancel), ToolResult::Cancel);
+        // Enter・Tab は何もしない。
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Confirm),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.on_input(&ctx, InputEvent::Cycle), ToolResult::Continue);
+    }
+
+    #[test]
+    fn select_picks_an_xline_by_its_distance_to_the_infinite_line() {
+        let mut doc = Document::new();
+        let x = add_xline(&mut doc, Point2::new(0.0, 0.0), Point2::new(1.0, 1.0));
+        // 基点から遠く離れた線上（+ 許容量以内のずれ）でも拾える。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(500.0, 500.05), 0.1, false);
+        assert_eq!(tool.selection(), &[x]);
+        // 直線から離れていれば、基点に近くても拾わない。
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, -0.5), 0.1, false);
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn rect_selection_selects_an_xline_only_when_its_base_is_inside() {
+        let mut doc = Document::new();
+        let x = add_xline(&mut doc, Point2::new(5.0, 5.0), Point2::new(6.0, 5.0));
+        // 基点を含む矩形は選ぶ。
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(Point2::new(0.0, 0.0));
+        tool.on_drag_end(&doc, Point2::new(10.0, 10.0));
+        assert_eq!(tool.selection(), &[x]);
+        // 線が横切るが基点を含まない矩形は選ばない（「交われば選ぶ」は採らない）。
+        let mut tool = SelectTool::default();
+        tool.on_drag_start(Point2::new(20.0, 0.0));
+        tool.on_drag_end(&doc, Point2::new(30.0, 10.0));
+        assert!(tool.selection().is_empty());
+    }
+
+    #[test]
+    fn trim_tool_uses_an_xline_as_the_boundary_far_from_its_base() {
+        // 境界の構築線 x = 5（基点は (5, 1000) で遠い）。対象 (0,0)-(10,0) の右側をクリック
+        // → 左側 (0,0)-(5,0) が残る。構築線は同じ境界のまま連続で使える。
+        let mut doc = Document::new();
+        let mut tool = TrimTool::default();
+        assert!(tool.accepts_xline_pick(), "境界待ちでは構築線を拾う");
+        let xline = XLineGeom::through(Point2::new(5.0, 1000.0), Point2::new(5.0, 1001.0)).unwrap();
+        assert_eq!(tool.on_xline_pick(xline), ToolResult::Continue);
+        assert_eq!(
+            tool.0.state,
+            BoundaryTargetState::WaitingTarget {
+                boundary: TrimBoundary::XLine(xline)
+            }
+        );
+        // 対象待ちでは構築線を拾わない（対象としての構築線は従来どおり拒否）。
+        assert!(!tool.accepts_xline_pick());
+
+        let target = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(8.0, 0.0));
+        let id = target.id;
+        let kept = line_of(&modified_geom(&tool.on_shape_pick(target), id));
+        assert_eq!(kept.a, Point2::new(0.0, 0.0));
+        assert!(kept.b.distance(Point2::new(5.0, 0.0)) < 1e-9, "{kept:?}");
+
+        // 2 本目（y = 3）も同じ構築線で切れる。交わらない対象（構築線と平行）は拒否して
+        // 状態を据え置く。
+        let second = shape_pick(&mut doc, hline(0.0, 10.0, 3.0), Point2::new(1.0, 3.0));
+        let id2 = second.id;
+        let kept = line_of(&modified_geom(&tool.on_shape_pick(second), id2));
+        assert!(kept.a.distance(Point2::new(5.0, 3.0)) < 1e-9, "{kept:?}");
+        let parallel = shape_pick(&mut doc, vline(7.0, 0.0, 10.0), Point2::new(7.0, 5.0));
+        assert_eq!(
+            tool.on_shape_pick(parallel),
+            ToolResult::Rejected("Trim: target does not cross the boundary")
+        );
+        assert_eq!(
+            tool.0.state,
+            BoundaryTargetState::WaitingTarget {
+                boundary: TrimBoundary::XLine(xline)
+            }
+        );
+        // Esc で境界待ちへ戻り、再び構築線を拾える。
+        assert_eq!(
+            tool.on_input(&ctx().1, InputEvent::Cancel),
+            ToolResult::Cancel
+        );
+        assert!(tool.accepts_xline_pick());
+    }
+
+    #[test]
+    fn extend_tool_reaches_an_xline_boundary() {
+        // 境界の構築線は 45° の直線 y = x - 20（基点 (100, 80)）。対象 (0,0)-(5,0) の右端を
+        // 延ばすと (20, 0) まで届く。弧も台円と直線の交点まで回る。
+        let mut doc = Document::new();
+        let mut tool = ExtendTool::default();
+        assert!(tool.accepts_xline_pick());
+        let xline = XLineGeom::through(Point2::new(100.0, 80.0), Point2::new(101.0, 81.0)).unwrap();
+        tool.on_xline_pick(xline);
+        assert!(!tool.accepts_xline_pick());
+
+        let target = shape_pick(&mut doc, hline(0.0, 5.0, 0.0), Point2::new(4.0, 0.0));
+        let id = target.id;
+        let ext = line_of(&modified_geom(&tool.on_shape_pick(target), id));
+        assert_eq!(ext.a, Point2::new(0.0, 0.0));
+        assert!(ext.b.distance(Point2::new(20.0, 0.0)) < 1e-9, "{ext:?}");
+
+        // 反対側の端は構築線から遠ざかる向きなので届かない（状態は据え置き）。
+        let back = shape_pick(&mut doc, hline(0.0, 5.0, 1.0), Point2::new(0.5, 1.0));
+        assert_eq!(
+            tool.on_shape_pick(back),
+            ToolResult::Rejected("Extend: boundary is not reachable in that direction")
+        );
+    }
+
+    #[test]
+    fn pick_shape_or_xline_returns_the_nearest_of_shapes_and_xlines() {
+        let mut doc = Document::new();
+        let xline_id = add_xline(&mut doc, Point2::new(0.0, 0.0), Point2::new(0.0, 1.0));
+        let line = add_line(&mut doc, Point2::new(1.0, -5.0), Point2::new(1.0, 5.0));
+        let EntityGeom::XLine(xline) = doc.entity(xline_id).unwrap().geom else {
+            panic!("xline");
+        };
+        // 構築線 x = 0 の方が近い（基点から遠い位置でも）。
+        assert_eq!(
+            pick_shape_or_xline(&doc, Point2::new(0.2, 300.0), 0.5),
+            Some(ShapeOrXLinePick::XLine(xline))
+        );
+        // 線分 x = 1 の方が近い。
+        match pick_shape_or_xline(&doc, Point2::new(0.8, 0.0), 0.5) {
+            Some(ShapeOrXLinePick::Shape(hit)) => assert_eq!(hit.id, line),
+            other => panic!("expected the line, got {other:?}"),
+        }
+        assert_eq!(pick_shape_or_xline(&doc, Point2::new(5.0, 0.0), 0.5), None);
+    }
+
+    #[test]
+    fn only_trim_and_extend_accept_an_xline_pick() {
+        let others: [Box<dyn Tool>; 3] = [
+            Box::new(FilletTool::default()),
+            Box::new(ChamferTool::default()),
+            Box::new(SplitTool::default()),
+        ];
+        for tool in &others {
+            assert!(!tool.accepts_xline_pick());
+        }
+    }
+
+    // --- 構築線のオフセット（M12 タスク91 のスモークテスト後の変更、2026-09-27 ユーザー確定） ---
+
+    /// 鉛直な構築線 x = 0（基点は原点から遠い (0, 5000)）。
+    fn vertical_xline() -> XLineGeom {
+        XLineGeom::through(Point2::new(0.0, 5000.0), Point2::new(0.0, 5001.0)).unwrap()
+    }
+
+    fn seg_close(s: &LineSeg, a: Point2, b: Point2) -> bool {
+        s.a.distance(a) < 1e-9 && s.b.distance(b) < 1e-9
+    }
+
+    #[test]
+    fn xline_offset_segment_spans_between_the_nearest_intersections_around_the_click() {
+        // 水平線 y = 10・y = -5・y = 30、円（中心 (3, 20)・半径 2 → x = 3 と y = 18, 22 で交わる）、
+        // 水平な構築線 y = -40。x = 3 へ移した直線上の p = (3, 2) を挟む最も近い交点は
+        // y = 10 と y = -5。
+        let mut doc = Document::new();
+        for y in [10.0, -5.0, 30.0] {
+            add_line(&mut doc, Point2::new(-100.0, y), Point2::new(100.0, y));
+        }
+        add_xline(
+            &mut doc,
+            Point2::new(900.0, -40.0),
+            Point2::new(901.0, -40.0),
+        );
+        let layer = doc.current_layer();
+        doc.apply(Command::AddEntity(Entity::new(
+            Shape::Circle(mcad_geom::Circle::new(Point2::new(3.0, 20.0), 2.0)),
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap();
+        // 寸法・文字は交点に数えない（p と y = 10 の間に文字を置いても区間は変わらない）。
+        add_text(&mut doc, Point2::new(3.0, 6.0), "Ab", 2.0);
+
+        let seg = xline_offset_segment(&doc, &vertical_xline(), Point2::new(3.0, 2.0), None, 0.1)
+            .unwrap();
+        assert!(
+            seg_close(&seg, Point2::new(3.0, -5.0), Point2::new(3.0, 10.0)),
+            "{seg:?}"
+        );
+        // p が y = 10 と円の間なら、円の下側の交点 (3, 18) まで。
+        let seg = xline_offset_segment(&doc, &vertical_xline(), Point2::new(3.0, 12.0), None, 0.1)
+            .unwrap();
+        assert!(
+            seg_close(&seg, Point2::new(3.0, 10.0), Point2::new(3.0, 18.0)),
+            "{seg:?}"
+        );
+        // 他の構築線（水平な y = -40、基点は遠い）も境界になる。
+        let seg = xline_offset_segment(&doc, &vertical_xline(), Point2::new(3.0, -20.0), None, 0.1)
+            .unwrap();
+        assert!(
+            seg_close(&seg, Point2::new(3.0, -40.0), Point2::new(3.0, -5.0)),
+            "{seg:?}"
+        );
+        // 距離指定: 距離 4、側はクリック（x > 0）。p はクリックの射影 (4, 2)。
+        let seg = xline_offset_segment(
+            &doc,
+            &vertical_xline(),
+            Point2::new(1.0, 2.0),
+            Some(4.0),
+            0.1,
+        )
+        .unwrap();
+        assert!(
+            seg_close(&seg, Point2::new(4.0, -5.0), Point2::new(4.0, 10.0)),
+            "{seg:?}"
+        );
+    }
+
+    #[test]
+    fn xline_offset_segment_falls_back_to_the_paper_edge_on_a_side_without_intersections() {
+        // 1:2 の図面。用紙はワールドで (0,0)〜(2W, 2H)。交点は y = 10 だけ。
+        let mut doc = Document::new();
+        doc.apply(Command::SetSheet(mcad_core::SheetMeta {
+            scale: mcad_core::Scale::new(1, 2).unwrap(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (_, h) = doc.sheet().paper_extent_mm();
+        add_line(
+            &mut doc,
+            Point2::new(-100.0, 10.0),
+            Point2::new(100.0, 10.0),
+        );
+        // 下側は用紙の下端 y = 0 まで。
+        let seg = xline_offset_segment(&doc, &vertical_xline(), Point2::new(3.0, 2.0), None, 0.1)
+            .unwrap();
+        assert!(
+            seg_close(&seg, Point2::new(3.0, 0.0), Point2::new(3.0, 10.0)),
+            "{seg:?}"
+        );
+        // 上側は用紙の上端 y = 2H まで（尺度でワールドへ換算した用紙）。
+        let seg = xline_offset_segment(&doc, &vertical_xline(), Point2::new(3.0, 20.0), None, 0.1)
+            .unwrap();
+        assert!(
+            seg_close(&seg, Point2::new(3.0, 10.0), Point2::new(3.0, 2.0 * h)),
+            "{seg:?}"
+        );
+    }
+
+    #[test]
+    fn xline_offset_segment_rejects_unbounded_zero_distance_and_clicks_on_intersections() {
+        let mut doc = Document::new();
+        add_line(
+            &mut doc,
+            Point2::new(-100.0, 10.0),
+            Point2::new(100.0, 10.0),
+        );
+        // 用紙（x ≥ 0）の外 x = -500 へ移すと、交点も用紙の縁も無い（y = 10 の線分は
+        // x ∈ [-100, 100] なので届かない）。
+        assert_eq!(
+            xline_offset_segment(&doc, &vertical_xline(), Point2::new(-500.0, 2.0), None, 0.1),
+            Err(XLineOffsetReject::Unbounded)
+        );
+        // 片側だけ決まらない: p が用紙の上の外側にあり、上に交点が無い（用紙の縁は下側だけ）。
+        let (_, h) = doc.sheet().paper_extent_mm();
+        assert_eq!(
+            xline_offset_segment(
+                &doc,
+                &vertical_xline(),
+                Point2::new(3.0, h + 50.0),
+                None,
+                0.1
+            ),
+            Err(XLineOffsetReject::Unbounded)
+        );
+        // p が交点から許容量以内。
+        assert_eq!(
+            xline_offset_segment(&doc, &vertical_xline(), Point2::new(3.0, 10.05), None, 0.1),
+            Err(XLineOffsetReject::OnIntersection)
+        );
+        // 通過点が構築線の上（距離が許容量以内）。
+        assert_eq!(
+            xline_offset_segment(&doc, &vertical_xline(), Point2::new(0.05, 3.0), None, 0.1),
+            Err(XLineOffsetReject::ZeroDistance)
+        );
+    }
+
+    #[test]
+    fn xline_offset_segment_ignores_hidden_layers() {
+        let mut doc = Document::new();
+        add_line(
+            &mut doc,
+            Point2::new(-100.0, 10.0),
+            Point2::new(100.0, 10.0),
+        );
+        let hidden = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "hidden",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let mut props = doc.layer(hidden).unwrap().clone();
+        props.visible = false;
+        doc.apply(Command::SetLayerProps { id: hidden, props })
+            .unwrap();
+        // 非表示レイヤーの線分 y = 5 と構築線 y = 7 は交点に数えない。
+        doc.apply(Command::AddEntity(Entity::new(
+            Shape::Line(LineSeg::new(
+                Point2::new(-100.0, 5.0),
+                Point2::new(100.0, 5.0),
+            )),
+            hidden,
+            Style::inherited(),
+        )))
+        .unwrap();
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::XLine(
+                XLineGeom::through(Point2::new(0.0, 7.0), Point2::new(1.0, 7.0)).unwrap(),
+            ),
+            hidden,
+            Style::inherited(),
+        )))
+        .unwrap();
+        let seg = xline_offset_segment(&doc, &vertical_xline(), Point2::new(3.0, 2.0), None, 0.1)
+            .unwrap();
+        assert!(
+            seg_close(&seg, Point2::new(3.0, 0.0), Point2::new(3.0, 10.0)),
+            "{seg:?}"
+        );
+    }
+
+    #[test]
+    fn offsetting_an_xline_commits_a_line_on_the_current_layer_and_keeps_the_selection() {
+        let mut doc = Document::new();
+        add_line(
+            &mut doc,
+            Point2::new(-100.0, 10.0),
+            Point2::new(100.0, 10.0),
+        );
+        // 構築線は別レイヤー・線種上書き付き。結果はカレントレイヤー・既定スタイルの線分。
+        let other = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "construction",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let x = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::XLine(vertical_xline()),
+                other,
+                Style {
+                    linetype: Some(Linetype::Dashed),
+                    ..Style::inherited()
+                },
+            )))
+            .unwrap()
+            .entities[0];
+        assert_ne!(doc.current_layer(), other);
+
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![x]);
+        assert!(tool.start_offset());
+        tool.offset_move(Point2::new(3.0, 2.0));
+        // プレビューは確定したときにできる線分そのもの。
+        let preview = tool.offset_preview(&doc, None, 0.1);
+        let OffsetOutcome::Commit(Command::AddEntity(entity)) =
+            tool.offset_click(&doc, Point2::new(3.0, 2.0), 0.1, None)
+        else {
+            panic!("expected a committed line");
+        };
+        assert_eq!(entity.layer, doc.current_layer());
+        assert_eq!(entity.style, Style::inherited());
+        let EntityGeom::Shape(line @ Shape::Line(seg)) = &entity.geom else {
+            panic!("expected a Shape::Line, got {:?}", entity.geom);
+        };
+        assert_eq!(preview.as_ref(), Some(line));
+        assert!(
+            seg_close(seg, Point2::new(3.0, 0.0), Point2::new(3.0, 10.0)),
+            "{seg:?}"
+        );
+        // 選択は元の構築線のまま（既存オフセットの流儀）。
+        assert_eq!(tool.selection(), &[x]);
+        assert!(!tool.is_offsetting());
+
+        // 決まらない場合は理由つきで取り消し、モードを抜ける。
+        assert!(tool.start_offset());
+        assert_eq!(
+            tool.offset_click(&doc, Point2::new(3.0, 10.05), 0.1, None),
+            OffsetOutcome::Cancelled(XLineOffsetReject::OnIntersection.message())
+        );
+        assert!(!tool.is_offsetting());
+    }
+
+    #[test]
+    fn xline_is_not_a_pick_target_for_trim_extend_fillet_chamfer_or_split() {
+        // トリム・延長・フィレット・面取り・分割はいずれも `pick_shape_entity` 経由で対象を
+        // 拾う（`wants_shape_pick`）。構築線は `as_shape()` が `None` なので、線の上を
+        // クリックしても拾われない = app 層の「Pick: click a line, ...」で拒否される
+        // （トリム・延長の**境界**だけは `pick_shape_or_xline` で拾う。上のテスト）。
+        let tools: [Box<dyn Tool>; 5] = [
+            Box::new(TrimTool::default()),
+            Box::new(ExtendTool::default()),
+            Box::new(FilletTool::default()),
+            Box::new(ChamferTool::default()),
+            Box::new(SplitTool::default()),
+        ];
+        for tool in &tools {
+            assert!(tool.wants_shape_pick());
+        }
+        let mut doc = Document::new();
+        add_xline(&mut doc, Point2::new(0.0, 0.0), Point2::new(1.0, 0.0));
+        assert!(pick_shape_entity(&doc, Point2::new(50.0, 0.0), 0.5).is_none());
+        // 線分が近くにあればそちらを拾う（構築線に遮られない）。
+        let line = add_line(&mut doc, Point2::new(40.0, -1.0), Point2::new(60.0, -1.0));
+        let hit = pick_shape_entity(&doc, Point2::new(50.0, -0.6), 0.5).expect("line");
+        assert_eq!(hit.id, line);
+    }
+
+    #[test]
+    fn join_and_explode_reject_xlines_through_existing_paths() {
+        let mut doc = Document::new();
+        let x = add_xline(&mut doc, Point2::new(0.0, 0.0), Point2::new(0.0, 1.0));
+        let line = add_line(&mut doc, Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+
+        // 結合: 対象外の幾何として拒否。
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![line, x]);
+        assert_eq!(
+            tool.join_command(&doc),
+            Err(JoinReject::UnsupportedGeometry)
+        );
+
+        // 分解: 対象外として無視（ポリラインが無いので None）。
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![x]);
+        assert!(tool.explode_command(&doc).is_none());
+    }
+
+    #[test]
+    fn xline_has_no_grips_and_moves_rotates_and_mirrors_with_the_selection() {
+        let mut doc = Document::new();
+        let x = add_xline(&mut doc, Point2::new(1.0, 0.0), Point2::new(2.0, 0.0));
+        let geom = doc.entity(x).unwrap().geom.clone();
+        assert!(dim_grips(&geom).is_empty());
+        // 移動・回転・鏡映は `EntityGeom` の変換を通る（単位方向を保つ）。
+        for moved in [
+            geom.translated(Vec2::new(3.0, 4.0)),
+            geom.rotated(Point2::ORIGIN, 0.3),
+            geom.mirrored(Point2::ORIGIN, Point2::new(1.0, 2.0)),
+        ] {
+            doc.apply(Command::ModifyEntity {
+                id: x,
+                new_geom: moved,
+            })
+            .expect("transformed xline must stay valid");
+        }
     }
 }

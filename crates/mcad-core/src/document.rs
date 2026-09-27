@@ -2017,6 +2017,29 @@ mod tests {
         assert_eq!(doc.undo_stack.len(), undo_len_before);
     }
 
+    #[test]
+    fn add_entity_accepts_unit_xline_and_rejects_non_unit_direction() {
+        // M12 タスク91: 構築線の方向は単位ベクトル（DESIGN.md M12 設計判断9「着手時の決定」）。
+        // 正規化していない方向はコマンド境界で拒否される（部分適用なし）。
+        let mut doc = Document::new();
+        let unit = crate::XLineGeom::through(Point2::new(1.0, 2.0), Point2::new(4.0, 6.0))
+            .expect("distinct points");
+        doc.apply(add_line(&doc, EntityGeom::XLine(unit)))
+            .expect("unit direction must be accepted");
+        assert_eq!(doc.entity_count(), 1);
+
+        let non_unit = crate::XLineGeom {
+            base: Point2::ORIGIN,
+            dir: mcad_geom::Vec2::new(3.0, 4.0),
+        };
+        let result = doc.apply(add_line(&doc, EntityGeom::XLine(non_unit)));
+        assert!(
+            matches!(result, Err(CoreError::InvalidGeometry(_))),
+            "expected InvalidGeometry, got {result:?}"
+        );
+        assert_eq!(doc.entity_count(), 1);
+    }
+
     // --- 寸法注記のコマンド境界拒否（DESIGN.md M9 設計判断2、タスク47-2）---
 
     /// 注記つきの長さ寸法（`p1`-`p2` は妥当なので、拒否されるなら注記が理由）。

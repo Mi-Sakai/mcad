@@ -133,11 +133,30 @@
 //! ある線分では延長（虚）でも同じグループの別の線分では区間内（実）という場合に、
 //! 前者を仮想交点として提示してしまっていた。グループ化後は「グループ内のいずれかの
 //! メンバー上にあれば実体上」という判定になり、この不整合が解消された。
+//!
+//! # 構築線（M12 タスク91、DESIGN.md M12 設計判断9「着手時の決定」）
+//!
+//! 構築線（[`EntityGeom::XLine`]）は無限長なので、端点・中点・四半円点を持たず、
+//! [`EntityGeom::aabb`] は基点だけの退化した箱になる。そのため上の「カーソル近傍 AABB」
+//! の絞り込み（`near`）には**載せず**、**直線とカーソル近傍 AABB の交差**
+//! （[`mcad_geom::clip_line_to_aabb`]）で別に集める（`near_xlines`）。無損失の理由は
+//! 交点と同じ論法（候補点は構築線上にあり、カーソルから半径内なら構築線はカーソル
+//! 近傍 AABB を通る）。
+//!
+//! - **交点**: 構築線 × `near` の形状（線分・円・円弧・ポリラインの辺・点。
+//!   [`mcad_geom::line_shape_intersection`]）と、構築線どうし
+//!   （[`mcad_geom::line_line_intersection`]）を [`SnapKind::Intersection`] として出す。
+//! - **近接点**: 無限直線への射影。**垂線**: 基点から無限直線への垂線の足（線分と違い
+//!   足は常に直線上にあるので、区間の判定は無い）。接線は無い。
+//! - **仮想交点の対象にしない**（もともと延長しているので交点で足りる。走査は
+//!   [`EntityGeom::Shape`] だけを見る）。
+//! - 分割ツールのスナップ（[`snap_split_position`]）でも、対象と構築線の交点を
+//!   交点候補にする（分割位置は対象上の点なので、マーカーと実際の分割位置は一致する）。
 
-use mcad_core::{Document, Entity, EntityGeom, EntityId};
+use mcad_core::{Document, Entity, EntityGeom, EntityId, XLineGeom};
 use mcad_geom::{
-    Aabb, Arc, Circle, LineSeg, Point2, Shape, Vec2, closest_point, intersect,
-    line_circle_intersection, line_line_intersection, point_tol,
+    Aabb, Arc, Circle, LineSeg, Point2, Shape, Vec2, clip_line_to_aabb, closest_point, intersect,
+    line_circle_intersection, line_line_intersection, line_shape_intersection, point_tol,
 };
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
@@ -460,6 +479,22 @@ pub fn snap(
     // 計算が残る。M12 タスク85 Codex adversarial review 指摘）。
     let cursor_box = Aabb::from_point(cursor).expanded(radius);
     let wants_perp_or_tangent = base.is_some() && (kinds.perpendicular || kinds.tangent);
+    // 構築線（M12 タスク91）: 箱ではなく直線とカーソル近傍 AABB の交差で集める
+    // （モジュール doc「構築線」）。使う種別がすべて無効なら集めない。
+    let near_xlines: Vec<XLineGeom> =
+        if kinds.intersection || kinds.nearest || (base.is_some() && kinds.perpendicular) {
+            document
+                .entities()
+                .filter(|(_, e)| layer_visible(document, e))
+                .filter_map(|(_, e)| match &e.geom {
+                    EntityGeom::XLine(xline) => Some(*xline),
+                    _ => None,
+                })
+                .filter(|xline| clip_line_to_aabb(&xline.line(), &cursor_box).is_some())
+                .collect()
+        } else {
+            Vec::new()
+        };
     let near: Vec<&Shape> = if kinds.intersection || kinds.nearest || wants_perp_or_tangent {
         document
             .entities()
@@ -479,6 +514,20 @@ pub fn snap(
                 }
             }
         }
+        // 構築線 × 形状、構築線どうし（M12 タスク91）。
+        for (i, xline) in near_xlines.iter().enumerate() {
+            let line = xline.line();
+            for shape in &near {
+                for p in line_shape_intersection(&line, shape) {
+                    best.consider(SnapKind::Intersection, p, cursor, r2);
+                }
+            }
+            for other in &near_xlines[i + 1..] {
+                if let Some(p) = line_line_intersection(&line, &other.line()) {
+                    best.consider(SnapKind::Intersection, p, cursor, r2);
+                }
+            }
+        }
     }
 
     // 垂線・接線: 基点が要る（M12 タスク86、DESIGN.md M12 設計判断5）。基点が無い、
@@ -486,6 +535,16 @@ pub fn snap(
     // ループは何もしない。基点があるときだけ `near` 上の Line/Polyline（垂線）・
     // Circle/Arc（接線）を走査する。
     if let Some(origin) = base {
+        // 構築線への垂線の足は常に直線上にある（区間の判定が無い）。基点自身と一致する
+        // 足は線分と同じ理由で出さない（[`consider_perpendicular_foot`] の doc）。
+        if kinds.perpendicular {
+            for xline in &near_xlines {
+                let foot = xline.closest_point(origin);
+                if foot.distance(origin) >= point_tol(foot, origin) {
+                    best.consider(SnapKind::Perpendicular, foot, cursor, r2);
+                }
+            }
+        }
         for shape in &near {
             if kinds.perpendicular {
                 match shape {
@@ -547,6 +606,9 @@ pub fn snap(
             let p = closest_point(shape, cursor);
             best.consider(SnapKind::Nearest, p, cursor, r2);
         }
+        for xline in &near_xlines {
+            best.consider(SnapKind::Nearest, xline.closest_point(cursor), cursor, r2);
+        }
     }
 
     // グリッド: カーソルに最も近いグリッド交点。最低優先度なので他候補が無いときの
@@ -584,8 +646,8 @@ pub fn snap(
 ///   「表示→クリック→拒否」の無意味な誘導になる（中間頂点での分割は頂点重複の無い
 ///   正当な操作なので候補にする）。
 /// - [`SnapKind::Intersection`]: `target`（`target_id`）と他の可視 [`Shape`] エンティティ
-///   （`target_id` 自身は除く）との交点。[`snap`] と同じカーソル近傍 AABB カリングを
-///   踏襲する（絞り込みが無損失である理由は本モジュール doc を参照）。**target の全体端点
+///   （`target_id` 自身は除く）・構築線（M12 タスク91）との交点。[`snap`] と同じカーソル
+///   近傍 AABB カリングを踏襲する（絞り込みが無損失である理由は本モジュール doc を参照）。**target の全体端点
 ///   （Line/Arc の両端、開いた Polyline の先頭・末尾頂点）の近傍にある交点は除外する**
 ///   （端点候補と同じ理由 — `split` がそこを常に `TooCloseToEndpoint` で拒否するため）。
 ///
@@ -664,6 +726,19 @@ pub fn snap_split_position(
     if kinds.intersection && target.aabb().intersects(&cursor_box) {
         for (id, entity) in document.entities() {
             if id == target_id || !layer_visible(document, entity) {
+                continue;
+            }
+            // 構築線との交点も分割位置の候補にする（M12 タスク91）。構築線は箱ではなく
+            // 直線とカーソル近傍 AABB の交差で絞る（モジュール doc「構築線」）。
+            if let EntityGeom::XLine(xline) = &entity.geom {
+                let line = xline.line();
+                if clip_line_to_aabb(&line, &cursor_box).is_some() {
+                    for p in line_shape_intersection(&line, target) {
+                        if !near_overall_endpoint(p) {
+                            best.consider(SnapKind::Intersection, p, cursor, r2);
+                        }
+                    }
+                }
                 continue;
             }
             let Some(other) = entity.geom.as_shape() else {
@@ -3135,5 +3210,168 @@ mod tests {
         // 空オブジェクトは各フィールドの既定値（nearest だけ false）へ補完される。
         let empty: SnapKinds = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, SnapKinds::default());
+    }
+
+    // --- 構築線（M12 タスク91、DESIGN.md M12 設計判断9「着手時の決定」） ---
+
+    /// カレントレイヤーへ構築線（`base` を通り `through` へ向かう）を追加する。
+    fn add_xline(doc: &mut Document, base: Point2, through: Point2) {
+        let layer = doc.current_layer();
+        let xline = XLineGeom::through(base, through).expect("distinct points");
+        doc.apply(Command::AddEntity(Entity::new(
+            EntityGeom::XLine(xline),
+            layer,
+            Style::inherited(),
+        )))
+        .expect("current layer must accept entity");
+    }
+
+    #[test]
+    fn xline_intersects_a_segment_far_from_its_base() {
+        // 構築線 y=0（基点は原点）と、基点から 1000 離れた縦の線分 x=1000。
+        // 基点だけの退化 aabb で前段絞り込みをすると取りこぼす位置の交点。
+        let mut doc = Document::new();
+        add_xline(&mut doc, Point2::new(0.0, 0.0), Point2::new(1.0, 0.0));
+        add(&mut doc, line(1000.0, -50.0, 1000.0, 50.0));
+        let r = snap_no_grid(&doc, Point2::new(1000.3, 0.2), 1.0).unwrap();
+        assert_eq!(r.kind, SnapKind::Intersection);
+        assert!(r.point.distance(Point2::new(1000.0, 0.0)) < 1e-9, "{r:?}");
+    }
+
+    #[test]
+    fn xline_intersects_circles_and_other_xlines() {
+        let mut doc = Document::new();
+        add_xline(&mut doc, Point2::new(0.0, 0.0), Point2::new(1.0, 1.0));
+        add_xline(&mut doc, Point2::new(0.0, 10.0), Point2::new(1.0, 10.0));
+        add(
+            &mut doc,
+            Shape::Circle(Circle::new(Point2::new(-20.0, 0.0), 5.0)),
+        );
+
+        // 構築線どうし: y=x と y=10 の交点 (10,10)。どちらの基点からも離れている。
+        let r = snap_no_grid(&doc, Point2::new(10.4, 9.8), 1.0).unwrap();
+        assert_eq!(r.kind, SnapKind::Intersection);
+        assert!(r.point.distance(Point2::new(10.0, 10.0)) < 1e-9, "{r:?}");
+
+        // 構築線 y=10 と円（中心 (-20,0)・半径 5）は交わらない。y=x と円も交わらない。
+        // 円の上端 (-20,5) 付近では四半円点が出るが交点は出ない。
+        let r = snap_no_grid(&doc, Point2::new(-20.0, 5.2), 1.0).unwrap();
+        assert_eq!(r.kind, SnapKind::Quadrant);
+
+        // 円と交わる構築線を足す: y=0（基点 (100,0)）は円と (-25,0)・(-15,0) で交わる。
+        add_xline(&mut doc, Point2::new(100.0, 0.0), Point2::new(101.0, 0.0));
+        let r = snap_no_grid(&doc, Point2::new(-15.3, 0.4), 1.0).unwrap();
+        assert_eq!(r.kind, SnapKind::Intersection);
+        assert!(r.point.distance(Point2::new(-15.0, 0.0)) < 1e-9, "{r:?}");
+    }
+
+    #[test]
+    fn xline_has_no_endpoint_or_midpoint_and_its_base_is_not_a_candidate() {
+        let mut doc = Document::new();
+        add_xline(&mut doc, Point2::new(3.0, 4.0), Point2::new(4.0, 4.0));
+        // 近接点は既定 OFF なので、基点の真上でも候補は無い（端点・中点を持たない）。
+        assert_eq!(snap_no_grid(&doc, Point2::new(3.0, 4.0), 1.0), None);
+    }
+
+    #[test]
+    fn xline_nearest_and_perpendicular_project_onto_the_infinite_line() {
+        let mut doc = Document::new();
+        add_xline(&mut doc, Point2::new(0.0, 0.0), Point2::new(1.0, 0.0));
+        let kinds = SnapKinds {
+            nearest: true,
+            ..SnapKinds::default()
+        };
+        // 近接点: 基点から遠い位置でも直線への射影。
+        let r = snap_no_grid_with_kinds(&doc, Point2::new(-300.0, 0.4), 1.0, kinds).unwrap();
+        assert_eq!(r.kind, SnapKind::Nearest);
+        assert_eq!(r.point, Point2::new(-300.0, 0.0));
+
+        // 垂線: 基点 (50, 20) から y=0 への足 (50, 0)。区間の制約は無い。
+        let r = snap_no_grid_with_kinds_and_base(
+            &doc,
+            Point2::new(50.3, 0.3),
+            1.0,
+            SnapKinds::default(),
+            Some(Point2::new(50.0, 20.0)),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::Perpendicular);
+        assert_eq!(r.point, Point2::new(50.0, 0.0));
+        // 基点が直線上にあれば足は基点自身なので出さない。
+        assert_eq!(
+            snap_no_grid_with_kinds_and_base(
+                &doc,
+                Point2::new(50.3, 0.3),
+                1.0,
+                SnapKinds::default(),
+                Some(Point2::new(50.0, 0.0)),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn xline_is_not_a_virtual_intersection_source() {
+        // 線分 (0,5)-(0,8) の延長は構築線 y=0 と (0,0) で交わるが、構築線は仮想交点の
+        // 走査対象ではない（交点で足りる。延長側の線分が実交点を持たないので何も出ない）。
+        let mut doc = Document::new();
+        add_xline(&mut doc, Point2::new(100.0, 0.0), Point2::new(101.0, 0.0));
+        add(&mut doc, line(0.0, 5.0, 0.0, 8.0));
+        let kinds = SnapKinds {
+            virtual_intersection: true,
+            ..SnapKinds::default()
+        };
+        assert_eq!(
+            snap_no_grid_with_kinds(&doc, Point2::new(0.2, 0.2), 1.0, kinds),
+            None
+        );
+    }
+
+    #[test]
+    fn xline_on_a_hidden_layer_does_not_snap() {
+        let mut doc = Document::new();
+        add_xline(&mut doc, Point2::new(0.0, 0.0), Point2::new(1.0, 0.0));
+        add(&mut doc, line(10.0, -5.0, 10.0, 5.0));
+        let layer_id = doc.current_layer();
+        let mut props = doc.layer(layer_id).unwrap().clone();
+        props.visible = false;
+        doc.apply(Command::SetLayerProps {
+            id: layer_id,
+            props,
+        })
+        .unwrap();
+        assert_eq!(snap_no_grid(&doc, Point2::new(10.2, 0.2), 1.0), None);
+    }
+
+    #[test]
+    fn split_snap_offers_the_intersection_with_an_xline() {
+        let mut doc = Document::new();
+        let target = line(0.0, 0.0, 10.0, 0.0);
+        let id = add_id(&mut doc, target.clone());
+        add_xline(&mut doc, Point2::new(3.0, 50.0), Point2::new(3.0, 51.0));
+        let r = snap_split_position(
+            &doc,
+            id,
+            &target,
+            Point2::new(3.2, 0.1),
+            0.5,
+            SnapKinds::default(),
+        )
+        .unwrap();
+        assert_eq!(r.kind, SnapKind::Intersection);
+        assert!(r.point.distance(Point2::new(3.0, 0.0)) < 1e-9, "{r:?}");
+        // 交点が対象の端点に載るなら候補にしない（split が拒否するため）。
+        add_xline(&mut doc, Point2::new(10.0, 50.0), Point2::new(10.0, 51.0));
+        assert_eq!(
+            snap_split_position(
+                &doc,
+                id,
+                &target,
+                Point2::new(9.9, 0.1),
+                0.5,
+                SnapKinds::default(),
+            ),
+            None
+        );
     }
 }

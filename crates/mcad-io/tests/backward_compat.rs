@@ -1,6 +1,6 @@
 //! `.mcad` v1〜v8 の後方互換 fixture テスト（M11 タスク65、v7 はタスク68、v8 と
 //! `v7_legacy_boms.mcad` は M12 タスク81 で追加、`v8_before_col_aligns.mcad` は
-//! M12 タスク93 で追加）。
+//! M12 タスク93 で追加、`v8.mcad` の構築線は M12 タスク91 で追加）。
 //!
 //! # fixture について
 //!
@@ -46,7 +46,7 @@ use std::path::PathBuf;
 use mcad_core::{
     ArrowPlacement, DimDirection, Document, EntityGeom, HorizontalAlign, Linetype, TableKind,
 };
-use mcad_geom::{ArrowKind, DimSymbol};
+use mcad_geom::{ArrowKind, DimSymbol, Point2, Vec2};
 use mcad_io::{FORMAT_VERSION, export_document, from_json};
 
 /// `tests/fixtures/v{version}.mcad` の内容を読む。
@@ -517,7 +517,7 @@ fn v8_fixture_loads_with_expected_content() {
     let doc = summary.document;
 
     assert_eq!(doc.layer_count(), 2);
-    assert_eq!(doc.entity_count(), 4);
+    assert_eq!(doc.entity_count(), 5);
     assert!(!doc.sheet().use_bom, "use_bom = false はそのまま読む");
     assert_eq!(table_kinds(&doc), vec![TableKind::Bom, TableKind::Table]);
 
@@ -555,6 +555,19 @@ fn v8_fixture_loads_with_expected_content() {
         .unwrap();
     assert_eq!(dim.direction, DimDirection::Rotated(0.0));
     assert_eq!(dim.ext_angle, Some(1.2));
+
+    // 構築線（M12 タスク91、v8 に相乗り）は基点と単位方向をファイルの値のまま読む。
+    // スタイルの線種上書きも他の図形と同じく保たれる。
+    let (xline, style) = doc
+        .entities()
+        .find_map(|(_, e)| match &e.geom {
+            EntityGeom::XLine(x) => Some((*x, e.style)),
+            _ => None,
+        })
+        .expect("構築線が 1 本あるはず");
+    assert_eq!(xline.base, Point2::new(10.0, 20.0));
+    assert_eq!(xline.dir, Vec2::new(0.6, 0.8));
+    assert_eq!(style.linetype, Some(Linetype::DashDot));
 }
 
 #[test]

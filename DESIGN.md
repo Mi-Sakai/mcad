@@ -1935,6 +1935,102 @@ undo 1 回で復帰、削られる区間内のクリックでも遠い側が残�
 Dist 1 空欄・Dist 2 不正・線分以外・同じ線の 2 回選択の拒否表示、ロック中レイヤーでの拒否と不変、Esc・ツール切替での
 リセット、数字キーで数値入力欄が開かない、の各項目で問題なし。**
 
+#### タスク89 の実装時追記(2026-09-27、implement-sonnet の判断を采配役が検算のうえ採用)
+
+- **依頼どおりにした点**:
+  - **新しい幾何は足さず**、矩形・正多角形とも `Shape::Polyline`（`closed: true`）を
+    `Command::AddEntity` 1 つで確定する（undo 1 回）。頂点計算は `tool.rs` の純関数
+    `rectangle_vertices(p1, p2) -> Option<[Point2; 4]>` / `polygon_vertices(center, q,
+    sides, mode) -> Option<Vec<Point2>>` に切り出し、`Document`/`egui` 非依存の
+    headless テストで固定した（[`ArcTool::build_arc`] と同じ「ツール本体とは別の
+    純関数」方針）。頂点順はどちらも CCW（反時計回り）で、`rectangle_vertices` は
+    テストで隣接頂点の角度が単調増加することを、単位ベクトルの外積ではなく
+    実際に生成した頂点の並びで確認した。
+  - **矩形（`Shift+P`、`ToolKind::Rectangle`）**: 1 隅目 → 2 隅目（対角）の 2 クリック。
+    `rectangle_vertices` は `p1`・`p2` がどちらの隅でもよいよう、幅・高さの符号から
+    「左下 → 右下 → 右上 → 左上」に正規化する（テスト
+    `rectangle_vertices_orders_ccw_from_any_pair_of_opposite_corners` が 4 通りの
+    入力順で同じ結果になることを確認）。幅・高さのどちらかが
+    [`DIM_DEGENERATE_EPSILON`]（1e-9、既存の縮尺非依存な退化判定と共通）以下なら
+    `None` を返し、`RectangleTool` は "Rectangle: width and height must be
+    non-zero" で拒否して 1 隅目を保持する（`ToolResult::Rejected`、状態は据え置き。
+    `IsoCircleTool` の半径 0 判定と同じ流儀）。確定後は 1 隅目待ちへ戻り、続けて
+    描ける。`ortho_origin`/`numeric_input_base` は 1 隅目、`accepts_numeric_input`
+    は `true` なので `@w,h` で寸法指定できる（Harness テスト
+    `rectangle_tool_takes_numeric_dimension_input` で `0,0` → `@30,20` の矩形を固定）。
+    等測グリッド中も軸平行のまま（依頼どおり、アイソメの菱形は作らない）。
+  - **正多角形（`Shift+C`、`ToolKind::Polygon`）**: 中心 → 点 Q の 2 クリック。
+    `polygon_vertices` は内接（既定、`PolygonMode::Inscribed`）で
+    `半径 = |Q-中心|`・`Q` が頂点の 1 つ、外接（`PolygonMode::Circumscribed`）で
+    `内接円半径 = |Q-中心|`・`頂点半径 = 内接円半径 / cos(π/sides)`・`Q` の方向を
+    挟む `±π/sides` の位置に頂点を置く（`Q` が辺の中点に一致することをテスト
+    `polygon_vertices_circumscribed_places_q_as_an_edge_midpoint` で確認）。`Tab`
+    （`InputEvent::Cycle`）でモードを切替え、`IsoCircleTool` の面切替と同じく
+    中心クリック前でも切替を受け付ける。上部パネルへの表示・コンボ選択は
+    `Tool::variant_options`/`set_variant`（`IsoFace` と同型の `PolygonMode`
+    `next`/`index`/`from_index`/`OPTIONS`）にそのまま乗せたので、専用の表示コードを
+    足していない。辺数は上部パネルの "Sides" 欄（初期値 `"6"`、`main.rs` の
+    `DEFAULT_POLYGON_SIDES`）から `parse_polygon_sides`（3〜64 の整数のみ `Some`。
+    フィレット半径欄の `parse_fillet_radius` と同型）→
+    `Tool::set_polygon_sides(Option<u32>)`（`set_radius_input` と同じ「app 層の
+    入力欄 → ツール」の毎フレーム流し込み拡張点）で渡す。中心と Q が実質一致（半径
+    退化）なら "Polygon: radius must be non-zero" で拒否し中心を保持する。
+  - **一次レビューで見つけた穴（実装時に自分で修正）**: `PolygonTool::sides` は
+    `Option<u32>` を `set_polygon_sides` でそのまま受け取るだけだと、
+    `parse_polygon_sides` を経由しない呼び出し元（テスト等）が範囲外の値
+    （例: `Some(2)`）を渡した場合に、2 頂点の退化した「多角形」を作ってしまう
+    （実際に `polygon_tool_rejects_missing_or_out_of_range_sides_and_keeps_center`
+    が最初の実装でこれを検出した）。`main.rs` 側の解析だけに範囲を委ねず、
+    `PolygonTool::on_input`（2 クリック目）と `draw_preview` の両方で
+    `self.sides.filter(|&s| (3..=64).contains(&s))` を通すよう直し、辺数の契約を
+    ツール自身が守る形にした。
+  - **キー**: `P` 単押しでポリライン、`Shift+P` で矩形。`C` 単押しで円、`Shift+C`
+    で正多角形（`D`/`Shift+D`・`F`/`Shift+F` と同じ Shift 併用の書式）。
+    `handle_tool_shortcut_keys` の doc・`KEYBIND_LEGEND`・上部パネルの Sides 欄を
+    追加した。数値入力を受け付けるツールの一覧（`tool.rs` の
+    `numeric_input_is_accepted_by_point_taking_tools_only`）に矩形・正多角形を足した
+    （6 件 → 8 件）。
+  - **Harness テスト**を追加し、`Shift+P`→Rectangle・`P`→Polyline・`Shift+C`→Polygon・
+    `C`→Circle を 1 件（`p_and_c_keys_switch_to_polyline_rectangle_circle_and_polygon`）、
+    矩形の数値入力 `@30,20` を 1 件（`rectangle_tool_takes_numeric_dimension_input`）で
+    固定した。
+  - 追加した単体テストは tool.rs 側 15 件（純関数4件・矩形ツール3件・正多角形ツール6件・
+    Cycle 切替1件・零半径1件。内訳は上の段落）＋ main.rs の numeric_input 受け手一覧の
+    差分（6→8）＋ Harness 2 件。geom/core は変更していないため `../tcad` のテストは
+    対象外（既存どおり無変更）。
+- **自分で判断した点**:
+  - **辺数欄の初期値・リセット方針**: `FilletTool`/`ChamferTool` の距離欄は空欄始まり・
+    リセット時もクリア（意味を持つフォールバックが無いため空欄のまま）だが、依頼の
+    「初期値 "6"」を素直に満たすため、`polygon_sides_input` は起動時 `"6"`
+    （`DEFAULT_POLYGON_SIDES`）、`reset_transient_ui_state` でもクリアではなく
+    `"6"` へ戻す（`DEFAULT_TEXT_HEIGHT`/`text_height_input` と同じ「クリアではなく
+    既定値へ戻す」流儀を踏襲）。一方 `PolygonTool::sides`（ツール内部の保持値）は
+    `FilletTool::radius` と同じ `#[derive(Default)]` の `None` 始まりにした
+    （`main.rs` が毎フレーム `set_polygon_sides` を呼ぶため、ツール生成直後の
+    一瞬だけ `None` でも実害が無く、既存ツールとの型の一貫性を優先した）。
+  - **矩形は連続作図にしなかった**: `LineTool` は確定した終点を次の始点に引き継ぐ
+    連続線分モードだが、矩形は依頼文言どおり「確定後は 1 隅目待ちへ戻り、続けて
+    描ける」に留め、前回の隅を次回へ引き継がない（矩形は独立した図形として置くのが
+    自然で、依頼にも「基点を引き継ぐ」への言及が無いため）。
+  - **矩形・正多角形とも `keeps_state_on_commit_failure`/`caches_picked_shapes` に
+    含めなかった**: 既存の点・線分・円・ポリラインと同じく、確定失敗（レイヤー
+    ロック等）時は `spawn()` で作り直す既定動作のままにした。依頼にこの点の言及が
+    無く、`Line`/`Circle`/`Polyline` も同じ扱いのため、動作を合わせるのが自然と
+    判断した（1 隅目・中心を保持したまま再挑戦させたい場合は要望が出てから対応）。
+  - **正多角形の零半径・辺数不正のメッセージ文言**は依頼に指定が無かったため、
+    フィレット・面取りのメッセージと語調を揃えて自分で決めた
+    （"Polygon: radius must be non-zero" / "Polygon: sides must be an integer from
+    3 to 64"）。
+- **采配役の一次レビューでの確認(2026-09-27)**: 外接の頂点(Q 方向 ±π/n・半径 r/cos(π/n))の
+  2 頂点の中点が Q になることを検算した。内接/外接のモードはツール切替と確定失敗(`spawn()` で
+  作り直し)で内接へ戻る。依頼の範囲内(セッション中の保持は任意)として残す。
+
+**→ 手動スモークテスト実施済み(2026-09-27、ユーザー実施、release ビルド): `Shift+P`/`P`・`Shift+C`/`C` のツール切替、
+矩形の 2 隅クリックとプレビュー・どの隅からでも同じ形、`@30,20` による寸法指定、幅・高さ 0 の拒否と 1 隅目の保持、
+正六角形(内接で Q が頂点)、`Tab` の外接切替(上部パネル・プレビュー反映、Q が辺の中点)、Sides の 2・65・非整数・空欄の
+拒否と 3・64 の作図、正多角形での数値入力・極トラッキング・スナップ、undo 1 回・連続作図、Esc・ロック中レイヤーの拒否、
+作図した図形の選択・移動・オフセット・スナップ、の各項目で問題なし。**
+
 #### タスク分割
 
 | # | タスク | 内容 | 担当 | 依存 |
@@ -1949,7 +2045,7 @@ Dist 1 空欄・Dist 2 不正・線分以外・同じ線の 2 回選択の拒否
 | 86 | geom+app: 垂線・接線スナップ **(完了 2026-09-26)** | 設計判断5。geom に点 → 線分の垂線の足・点 → 円の接点の純関数、基点の受け渡し。手動スモーク | implement-sonnet | 85 |
 | 87 | geom+app: 仮想交点スナップ **(完了 2026-09-26)** | 設計判断5。無限直線・円の交点の純関数と無損失な絞り込みのテスト、点線マーカー。手動スモーク | implement-sonnet | 86 |
 | 88 | geom+app: 面取り **(完了 2026-09-27)** | 設計判断6。`chamfer_lines`(proptest を含む)・ツール・`Shift+F`。`../tcad` 通過。手動スモーク | implement-sonnet | 83 |
-| 89 | app: 矩形・正多角形 | 設計判断7。頂点計算の純関数とテスト・ツール 2 つ・キー。手動スモーク | implement-sonnet | 83 |
+| 89 | app: 矩形・正多角形 **(完了 2026-09-27)** | 設計判断7。頂点計算の純関数とテスト・ツール 2 つ・キー。手動スモーク | implement-sonnet | 83 |
 | 90 | geom+app: 結合・分解 | 設計判断8。鎖の判定の純関数(分岐・離れ・混在の拒否をテストで固定)・選択モードのキー。手動スモーク | implement-sonnet | 83 |
 | 91 | core+io+app: 構築線 | 設計判断9。`EntityGeom::XLine`・validate・変換・pick・描画と出力の切り取り・AABB 前提箇所の扱い(着手時に決めて追記)・v8 相乗り・DXF `XLINE` の往復・ツール `Shift+L`・交点スナップ。`../tcad` 通過。手動スモーク | implement-opus | 81・87・90 |
 | 92 | ドキュメント整合・v0.12.0 リリース | README(キー・スナップ・数値入力の書式)・AGENTS.md(v8)・CHANGELOG(采配役が書く)・本節の `docs/design/M12.md` への移設 | implement-sonnet + 采配役 | 81〜91・93・94 |

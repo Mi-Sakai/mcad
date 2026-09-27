@@ -55,8 +55,9 @@ use tool::{
     ArcTool, ChamferDistInput, ChamferTool, CircleTool, DIM_DEGENERATE_EPSILON, DimAngularTool,
     DimDiameterTool, DimLinearTool, DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput,
     ExtendTool, FilletTool, GripDragOutcome, InputEvent, IsoCircleTool, LineTool, OffsetOutcome,
-    PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool,
-    SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
+    PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolygonTool, PolylineTool,
+    RectangleTool, SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool,
+    layer_visible,
 };
 use viewport::Viewport;
 
@@ -628,6 +629,8 @@ enum ToolKind {
     Arc,
     IsoCircle,
     Polyline,
+    Rectangle,
+    Polygon,
     Text,
     Table,
     DimLinear,
@@ -655,6 +658,8 @@ impl ToolKind {
             ToolKind::Arc => Some(Box::new(ArcTool::default())),
             ToolKind::IsoCircle => Some(Box::new(IsoCircleTool::default())),
             ToolKind::Polyline => Some(Box::new(PolylineTool::default())),
+            ToolKind::Rectangle => Some(Box::new(RectangleTool::default())),
+            ToolKind::Polygon => Some(Box::new(PolygonTool::default())),
             ToolKind::Text => Some(Box::new(TextTool::default())),
             ToolKind::Table => Some(Box::new(TableTool::default())),
             ToolKind::DimLinear => Some(Box::new(DimLinearTool::default())),
@@ -747,6 +752,8 @@ impl ToolKind {
             ToolKind::Arc => "Arc",
             ToolKind::IsoCircle => "Iso Circle",
             ToolKind::Polyline => "Polyline",
+            ToolKind::Rectangle => "Rectangle",
+            ToolKind::Polygon => "Polygon",
             ToolKind::Text => "Text",
             ToolKind::Table => "Table",
             ToolKind::DimLinear => "Linear Dim",
@@ -989,10 +996,21 @@ struct McadApp {
     /// クリックとして渡す（[`McadApp::route_numeric_input`]）。egui の `TextEdit` ではなく
     /// ビューポートに描く独自の欄なので、egui のフォーカスは持たない。
     numeric_input: NumericInputState,
+    /// 正多角形ツールの辺数入力欄の文字列（M12 タスク89、設計判断7）。**3〜64 の整数のみ**
+    /// 受理する（[`parse_polygon_sides`]）。フィレット半径欄・面取り Dist 欄と違い、
+    /// 空欄に対する意味を持つフォールバックが無い上に既定値が要る（1 図面につき同じ辺数を
+    /// 続けて使うことが多いため）ので、初期値は空欄ではなく `"6"`（[`DEFAULT_POLYGON_SIDES`]）。
+    /// 欄は正多角形ツール中のみ上部パネルへ表示するが、文字列自体はセッション中保持し、
+    /// 新規・読込では [`McadApp::reset_transient_ui_state`] で `"6"` へ戻す
+    /// （Text ツールの高さ欄と同じ「クリアではなく既定値へ戻す」流儀）。
+    polygon_sides_input: String,
 }
 
 /// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
 const DEFAULT_TEXT_HEIGHT: &str = "20";
+
+/// 正多角形ツールの辺数入力欄の既定値（M12 タスク89、設計判断7）。
+const DEFAULT_POLYGON_SIDES: &str = "6";
 
 /// ステータスバー2行目のキーバインド凡例。項目ごとに分けて `ui.horizontal_wrapped` へ
 /// 渡し、利用可能幅に応じて自動で折り返す（以前は1本の長い文字列で、標準的な
@@ -1002,9 +1020,11 @@ const KEYBIND_LEGEND: &[&str] = &[
     "1=Point",
     "L=Line",
     "C=Circle",
+    "Shift+C=Polygon",
     "A=Arc",
     "I=Iso Circle",
     "P=Polyline",
+    "Shift+P=Rectangle",
     "T=Text",
     "K=Table",
     "D=Linear Dim",
@@ -1219,6 +1239,7 @@ impl McadApp {
             text_content_input: String::new(),
             text_height_input: DEFAULT_TEXT_HEIGHT.to_owned(),
             text_field_shown: false,
+            polygon_sides_input: DEFAULT_POLYGON_SIDES.to_owned(),
             sheet_dialog: None,
             scale_custom_selected: false,
             scale_custom_input: String::new(),
@@ -1325,6 +1346,9 @@ impl McadApp {
         self.text_content_input.clear();
         self.text_height_input = DEFAULT_TEXT_HEIGHT.to_owned();
         self.text_field_shown = false;
+        // 正多角形の辺数欄も別図面へ持ち越さない。クリアではなく既定値 "6" へ戻す
+        // （空欄は確定を拒否するだけで意味を持たないため）。
+        self.polygon_sides_input = DEFAULT_POLYGON_SIDES.to_owned();
         self.snap_marker = None;
         self.polar_marker = None;
         // 表題欄編集ダイアログ・尺度カスタム入力も別図面へ持ち越さない。
@@ -2725,6 +2749,18 @@ impl eframe::App for McadApp {
                         );
                         ui.separator();
                     }
+                    // 正多角形の辺数入力欄（M12 タスク89、設計判断7）。フィレット半径欄と
+                    // 同じ常設パネル方式で、正多角形ツール中のみ表示する。既定値 "6" は
+                    // フィールドの初期文字列（[`DEFAULT_POLYGON_SIDES`]）として持つ。
+                    if self.tool_kind == ToolKind::Polygon {
+                        ui.label("Sides:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.polygon_sides_input)
+                                .desired_width(40.0)
+                                .hint_text("3-64"),
+                        );
+                        ui.separator();
+                    }
                     // 循環する選択肢を持つツールの現在値（アイソメ円ツールの面
                     // Top/Left/Right、長さ寸法ツールの向き Aligned/Horizontal/Vertical）。
                     // ツール本体が持つ状態なので `Tool::variant_options()` で取り出す
@@ -3004,6 +3040,7 @@ impl eframe::App for McadApp {
                         parse_fillet_radius(&self.chamfer_dist1_input),
                         parse_chamfer_dist2(&self.chamfer_dist2_input),
                         parse_ext_angle_deg(&self.ext_angle_input),
+                        parse_polygon_sides(&self.polygon_sides_input),
                         &mut self.numeric_input,
                         numeric_submit,
                     );
@@ -3412,7 +3449,8 @@ impl eframe::App for McadApp {
 
 /// キーボードショートカットでアクティブツールを切り替える（DESIGN.md 3.4 のツール群）。
 ///
-/// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `I`=Iso Circle, `P`=Polyline, `T`=Text,
+/// `S`=Select, `1`=Point, `L`=Line, `C`/`Shift+C`=Circle/Polygon, `A`=Arc, `I`=Iso Circle,
+/// `P`/`Shift+P`=Polyline/Rectangle, `T`=Text,
 /// `K`=Table, `D`/`Shift+D`=Linear/Radial Dim, `G`/`Shift+G`=Diameter/Angular Dim,
 /// `Shift+V`=Ordinate Dim, `X`=Trim, `E`=Extend, `F`/`Shift+F`=Fillet/Chamfer。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
@@ -3458,7 +3496,13 @@ fn handle_tool_shortcut_keys(
         } else if i.key_pressed(Key::L) {
             requested = Some(ToolKind::Line);
         } else if i.key_pressed(Key::C) {
-            requested = Some(ToolKind::Circle);
+            // 修飾なしは円、Shift 併用は正多角形（M12 タスク89、`D`/`Shift+D` と
+            // 同じ Shift 併用の流儀）。
+            requested = Some(if i.modifiers.shift {
+                ToolKind::Polygon
+            } else {
+                ToolKind::Circle
+            });
         } else if i.key_pressed(Key::A) {
             requested = Some(ToolKind::Arc);
         } else if i.key_pressed(Key::I) {
@@ -3466,7 +3510,13 @@ fn handle_tool_shortcut_keys(
             // 確認済み）。DESIGN.md 7章「アイソメ図・アクソメ図の作図補助」設計確定1。
             requested = Some(ToolKind::IsoCircle);
         } else if i.key_pressed(Key::P) {
-            requested = Some(ToolKind::Polyline);
+            // 修飾なしはポリライン、Shift 併用は矩形（M12 タスク89、`D`/`Shift+D` と
+            // 同じ Shift 併用の流儀）。
+            requested = Some(if i.modifiers.shift {
+                ToolKind::Rectangle
+            } else {
+                ToolKind::Polyline
+            });
         } else if i.key_pressed(Key::T) {
             requested = Some(ToolKind::Text);
         // Key::K（表/部品表ツール）はここでは扱わない。`McadApp::request_table_or_bom_key`
@@ -3616,6 +3666,7 @@ fn handle_tool_input(
     chamfer_dist1: Option<f64>,
     chamfer_dist2: ChamferDistInput,
     ext_angle_input: ExtAngleInput,
+    polygon_sides: Option<u32>,
     numeric: &mut NumericInputState,
     numeric_submit: bool,
 ) {
@@ -3639,6 +3690,8 @@ fn handle_tool_input(
     active.set_chamfer_distances(chamfer_dist1, chamfer_dist2);
     // 長さ寸法ツールの補助線傾き欄（M11 タスク73）。他ツールでは既定実装の no-op。
     active.set_ext_angle_input(ext_angle_input);
+    // 正多角形の辺数欄（M12 タスク89）。他ツールでは既定実装の no-op。
+    active.set_polygon_sides(polygon_sides);
 
     // ピック許容量（ワールド）。半径寸法ツールの円/円弧ヒットテスト（画面上のピック =
     // ズーム依存）が選択のピック許容量と揃うようにする。寸法の退化判定はこれとは別に
@@ -8250,6 +8303,15 @@ fn parse_chamfer_dist2(text: &str) -> ChamferDistInput {
         Some(v) => ChamferDistInput::Value(v),
         None => ChamferDistInput::Invalid,
     }
+}
+
+/// 正多角形ツールの辺数入力欄を解析する（M12 タスク89、設計判断7）。**3〜64 の整数のみ**
+/// `Some`。空欄・非整数・範囲外は `None` で、[`PolygonTool`] が 2 クリック目を
+/// 「Polygon: sides must be an integer from 3 to 64」として拒否する（フィレット半径欄と
+/// 同じく、意味を持つフォールバックは無い）。
+fn parse_polygon_sides(text: &str) -> Option<u32> {
+    let value: u32 = text.trim().parse().ok()?;
+    (3..=64).contains(&value).then_some(value)
 }
 
 /// 長さ寸法ツールの補助線傾き欄（度）を解析する（M11 タスク73）。フィレット半径欄の
@@ -15390,6 +15452,50 @@ mod numeric_input_app_tests {
         h.press(Key::S);
         h.press_shift(Key::F);
         assert_eq!(h.app.tool_kind, ToolKind::Chamfer);
+    }
+
+    /// `P`=ポリライン、`Shift+P`=矩形、`C`=円、`Shift+C`=正多角形
+    /// （M12 タスク89、`D`/`Shift+D` と同じ Shift 併用の流儀）。
+    #[test]
+    fn p_and_c_keys_switch_to_polyline_rectangle_circle_and_polygon() {
+        let mut h = Harness::new();
+        h.press(Key::P);
+        assert_eq!(h.app.tool_kind, ToolKind::Polyline);
+        h.press(Key::S);
+        h.press_shift(Key::P);
+        assert_eq!(h.app.tool_kind, ToolKind::Rectangle);
+        h.press(Key::S);
+        h.press(Key::C);
+        assert_eq!(h.app.tool_kind, ToolKind::Circle);
+        h.press(Key::S);
+        h.press_shift(Key::C);
+        assert_eq!(h.app.tool_kind, ToolKind::Polygon);
+    }
+
+    /// 矩形ツールは数値入力（`@w,h`）で寸法指定できる（DESIGN.md M12 設計判断7・3）。
+    #[test]
+    fn rectangle_tool_takes_numeric_dimension_input() {
+        let mut h = Harness::new();
+        h.press_shift(Key::P);
+        assert_eq!(h.app.tool_kind, ToolKind::Rectangle);
+        h.enter("0,0");
+        assert!(h.shapes().is_empty());
+        h.enter("@30,20");
+        let Shape::Polyline(pl) = h.shapes().into_iter().next().expect("one shape") else {
+            panic!("expected Polyline");
+        };
+        assert!(pl.closed);
+        assert_eq!(
+            pl.vertices,
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(30.0, 0.0),
+                Point2::new(30.0, 20.0),
+                Point2::new(0.0, 20.0),
+            ]
+        );
+        // 確定後は 1 隅目待ちへ戻り、続けて描ける。
+        assert_eq!(h.app.tool_kind, ToolKind::Rectangle);
     }
 
     /// `1`（点ツール）への切替は選択モードからだけ（DESIGN.md M12 設計判断3、2026-09-25 の

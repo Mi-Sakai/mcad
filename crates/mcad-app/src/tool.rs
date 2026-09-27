@@ -444,6 +444,14 @@ pub trait Tool {
     /// 必要がある — [`ExtAngleInput`] と同じ理由）。既定は何もしない。
     fn set_chamfer_distances(&mut self, _dist1: Option<f64>, _dist2: ChamferDistInput) {}
 
+    /// app 層が持つ数値入力欄（[`PolygonTool`] の辺数欄）の解析値をツールへ渡す
+    /// （DESIGN.md M12 設計判断7）。[`Tool::set_radius_input`] と同じ理由（2 クリック目の
+    /// 確定判断を行うツール側が値を知っている必要がある）で Tool トレイトに置く。
+    ///
+    /// **3〜64 の整数のみ** `Some`（フィレット半径欄と同じく、意味を持つフォールバックが
+    /// 無い値なので範囲外・非整数・空欄は `None` のまま確定を拒否させる）。既定は何もしない。
+    fn set_polygon_sides(&mut self, _sides: Option<u32>) {}
+
     /// app 層が持つ数値入力欄（[`DimLinearTool`] の補助線傾き欄、度→ラジアン変換済み）を
     /// ツールへ渡す（M11 タスク73）。既定は何もしない。
     ///
@@ -1316,6 +1324,356 @@ impl Tool for PolylineTool {
 
     fn accepts_numeric_input(&self) -> bool {
         true
+    }
+}
+
+// ---------------------------------------------------------------------
+// Rectangle（M12 タスク89、設計判断7）
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+enum RectangleState {
+    #[default]
+    WaitingFirstCorner,
+    WaitingSecondCorner(Point2),
+}
+
+/// 2 点（対角の隅）から、軸平行（ワールド座標）の矩形の頂点を CCW（反時計回り）で
+/// 求める。頂点順は「左下 → 右下 → 右上 → 左上」に正規化するので、`p1`・`p2` は
+/// どちらの隅でもよい。
+///
+/// 幅・高さのどちらかが退化（[`DIM_DEGENERATE_EPSILON`] 以下）なら `None`
+/// （[`IsoCircleTool::arcs`] の半径 0 判定と同じ、ズームに依存しない絶対値基準）。
+fn rectangle_vertices(p1: Point2, p2: Point2) -> Option<[Point2; 4]> {
+    let width = p2.x - p1.x;
+    let height = p2.y - p1.y;
+    if width.abs() <= DIM_DEGENERATE_EPSILON || height.abs() <= DIM_DEGENERATE_EPSILON {
+        return None;
+    }
+    let (x_min, x_max) = if width >= 0.0 {
+        (p1.x, p2.x)
+    } else {
+        (p2.x, p1.x)
+    };
+    let (y_min, y_max) = if height >= 0.0 {
+        (p1.y, p2.y)
+    } else {
+        (p2.y, p1.y)
+    };
+    Some([
+        Point2::new(x_min, y_min),
+        Point2::new(x_max, y_min),
+        Point2::new(x_max, y_max),
+        Point2::new(x_min, y_max),
+    ])
+}
+
+/// 矩形ツール（`Shift+P`）。クリック2回（隅・対角の隅）で軸平行の閉じた
+/// [`Shape::Polyline`] を確定する。新しい幾何は足さない（DESIGN.md M12 設計判断7）。
+/// 等測グリッド中も軸平行のまま（アイソメの菱形は non-goal）。確定後は 1 隅目待ちへ
+/// 戻り、続けて描ける（矩形は独立した図形として続けて置くのが自然なため、[`LineTool`]
+/// の連続線分のように前回の頂点を引き継ぐことはしない）。
+#[derive(Debug, Default)]
+pub struct RectangleTool {
+    state: RectangleState,
+    cursor: Option<Point2>,
+}
+
+impl Tool for RectangleTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                RectangleState::WaitingFirstCorner => {
+                    self.state = RectangleState::WaitingSecondCorner(p);
+                    ToolResult::Continue
+                }
+                RectangleState::WaitingSecondCorner(first) => match rectangle_vertices(first, p) {
+                    Some(vertices) => {
+                        let cmd = Command::AddEntity(Entity::new(
+                            Shape::Polyline(Polyline::new(vertices.to_vec(), true)),
+                            ctx.layer,
+                            ctx.style,
+                        ));
+                        self.state = RectangleState::WaitingFirstCorner;
+                        ToolResult::Commit(cmd)
+                    }
+                    // 幅・高さが退化。1 隅目を保持したまま 2 隅目のクリックをやり直させる。
+                    None => ToolResult::Rejected("Rectangle: width and height must be non-zero"),
+                },
+            },
+            InputEvent::Cancel => {
+                self.state = RectangleState::WaitingFirstCorner;
+                ToolResult::Cancel
+            }
+            InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _render: DimRender<'_>,
+    ) {
+        if let (RectangleState::WaitingSecondCorner(first), Some(cursor)) =
+            (&self.state, self.cursor)
+            && let Some(vertices) = rectangle_vertices(*first, cursor)
+        {
+            draw_shape(
+                painter,
+                rect,
+                viewport,
+                &Shape::Polyline(Polyline::new(vertices.to_vec(), true)),
+                preview_stroke(),
+                Linetype::Continuous,
+                1.0,
+            );
+        }
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            RectangleState::WaitingFirstCorner => Vec::new(),
+            RectangleState::WaitingSecondCorner(first) => vec![first],
+        }
+    }
+
+    fn ortho_origin(&self) -> Option<Point2> {
+        match self.state {
+            RectangleState::WaitingFirstCorner => None,
+            RectangleState::WaitingSecondCorner(first) => Some(first),
+        }
+    }
+
+    fn accepts_numeric_input(&self) -> bool {
+        true
+    }
+}
+
+// ---------------------------------------------------------------------
+// Polygon（正多角形。M12 タスク89、設計判断7）
+// ---------------------------------------------------------------------
+
+/// 正多角形の基準方式（内接/外接）。`Tab`（[`InputEvent::Cycle`]）で切り替える
+/// （[`IsoFace`] と同型の enum。DESIGN.md M12 設計判断7）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PolygonMode {
+    /// 内接（既定）: 2 点目 Q が頂点の 1 つ（外接円半径 = `|Q-中心|`）。
+    #[default]
+    Inscribed,
+    /// 外接: 2 点目 Q が辺の中点の 1 つ（内接円半径 = `|Q-中心|`）。
+    Circumscribed,
+}
+
+impl PolygonMode {
+    /// 次のモード（`Inscribed` → `Circumscribed` → `Inscribed`）。
+    #[must_use]
+    fn next(self) -> Self {
+        match self {
+            PolygonMode::Inscribed => PolygonMode::Circumscribed,
+            PolygonMode::Circumscribed => PolygonMode::Inscribed,
+        }
+    }
+
+    /// [`Tool::variant_options`] の選択肢一覧（`Tab` 循環の順序 = [`Self::next`] の順序）。
+    const OPTIONS: [&'static str; 2] = ["Inscribed", "Circumscribed"];
+
+    /// [`Self::OPTIONS`] 内の現在のモードの添字。
+    #[must_use]
+    fn index(self) -> usize {
+        match self {
+            PolygonMode::Inscribed => 0,
+            PolygonMode::Circumscribed => 1,
+        }
+    }
+
+    /// [`Self::OPTIONS`] の添字からモードを作る。範囲外は `Inscribed`（既定）に倒す。
+    #[must_use]
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => PolygonMode::Circumscribed,
+            _ => PolygonMode::Inscribed,
+        }
+    }
+}
+
+/// 中心 `center`・2 点目 `q`・辺数 `sides`（3 以上）・基準方式 `mode` から、正多角形の
+/// 頂点を CCW（反時計回り）で求める。
+///
+/// **内接**（既定）: `q` を頂点の 1 つとする。外接円半径は `|q - center|` そのもので、
+/// `center` から `q` への角度を基準に `2π/sides` ずつ回して頂点を並べる。
+///
+/// **外接**: `q` を辺の中点の 1 つとする。内接円半径が `|q - center|` になるので、
+/// 頂点半径は正 n 角形の内接円・外接円の関係から `内接円半径 / cos(π/sides)`。
+/// 頂点は `q` の方向を挟む `±π/sides` の位置に置く（この 2 頂点を結ぶ辺の中点が
+/// ちょうど `q` になる）。
+///
+/// `center` と `q` の距離が退化（[`DIM_DEGENERATE_EPSILON`] 以下）なら `None`。
+fn polygon_vertices(
+    center: Point2,
+    q: Point2,
+    sides: u32,
+    mode: PolygonMode,
+) -> Option<Vec<Point2>> {
+    let to_q = q - center;
+    let dist = to_q.length();
+    if dist <= DIM_DEGENERATE_EPSILON {
+        return None;
+    }
+    let base_angle = to_q.angle();
+    let n = f64::from(sides);
+    let half_step = std::f64::consts::PI / n;
+    let (radius, start_angle) = match mode {
+        PolygonMode::Inscribed => (dist, base_angle),
+        PolygonMode::Circumscribed => (dist / half_step.cos(), base_angle - half_step),
+    };
+    let step = 2.0 * std::f64::consts::PI / n;
+    Some(
+        (0..sides)
+            .map(|k| {
+                let angle = start_angle + step * f64::from(k);
+                center + Vec2::new(radius * angle.cos(), radius * angle.sin())
+            })
+            .collect(),
+    )
+}
+
+#[derive(Debug, Default)]
+enum PolygonState {
+    #[default]
+    WaitingCenter,
+    WaitingPoint(Point2),
+}
+
+/// 正多角形ツール（`Shift+C`）。クリック2回（中心・点 Q）で閉じた [`Shape::Polyline`]
+/// を確定する。新しい幾何は足さない（DESIGN.md M12 設計判断7）。辺数は上部パネルの
+/// 入力欄から [`Tool::set_polygon_sides`] 経由で流し込まれ（[`FilletTool`] の半径欄と
+/// 同じ流儀）、基準方式（内接/外接）は `Tab`（[`InputEvent::Cycle`]）で切り替える。
+/// 確定後は中心待ちへ戻る。
+#[derive(Debug, Default)]
+pub struct PolygonTool {
+    state: PolygonState,
+    cursor: Option<Point2>,
+    mode: PolygonMode,
+    /// 上部パネルの辺数欄の解析値（[`Tool::set_polygon_sides`]）。範囲外・非整数・
+    /// 空欄は `None`（2 クリック目を拒否する。[`FilletTool::radius`] と同じ、
+    /// 意味を持つフォールバックが無い値の扱い）。
+    sides: Option<u32>,
+}
+
+impl Tool for PolygonTool {
+    fn on_input(&mut self, ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            InputEvent::Move(p) => {
+                self.cursor = Some(p);
+                ToolResult::Continue
+            }
+            InputEvent::Click(p) => match self.state {
+                PolygonState::WaitingCenter => {
+                    self.state = PolygonState::WaitingPoint(p);
+                    ToolResult::Continue
+                }
+                PolygonState::WaitingPoint(center) => {
+                    // 範囲は `Tool::set_polygon_sides` の呼び出し元（`main.rs` の
+                    // `parse_polygon_sides`）が既に絞っている想定だが、テストやその他の
+                    // 呼び出し元が範囲外の値を渡しても退化した多角形を作らないよう、
+                    // ここでも 3〜64 を確認する（`polygon_vertices` は sides>=3 を前提にした
+                    // 契約のため）。
+                    let Some(sides) = self.sides.filter(|&s| (3..=64).contains(&s)) else {
+                        return ToolResult::Rejected(
+                            "Polygon: sides must be an integer from 3 to 64",
+                        );
+                    };
+                    match polygon_vertices(center, p, sides, self.mode) {
+                        Some(vertices) => {
+                            let cmd = Command::AddEntity(Entity::new(
+                                Shape::Polyline(Polyline::new(vertices, true)),
+                                ctx.layer,
+                                ctx.style,
+                            ));
+                            self.state = PolygonState::WaitingCenter;
+                            ToolResult::Commit(cmd)
+                        }
+                        // 中心と Q が実質一致（半径 0）。中心を保持したまま Q を選び直させる。
+                        None => ToolResult::Rejected("Polygon: radius must be non-zero"),
+                    }
+                }
+            },
+            // 面切替（アイソメ円）と同じく、中心クリック前でもモードを選べる。
+            InputEvent::Cycle => {
+                self.mode = self.mode.next();
+                ToolResult::Continue
+            }
+            InputEvent::Cancel => {
+                self.state = PolygonState::WaitingCenter;
+                ToolResult::Cancel
+            }
+            InputEvent::Confirm => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _render: DimRender<'_>,
+    ) {
+        if let (PolygonState::WaitingPoint(center), Some(cursor), Some(sides)) = (
+            &self.state,
+            self.cursor,
+            self.sides.filter(|&s| (3..=64).contains(&s)),
+        ) && let Some(vertices) = polygon_vertices(*center, cursor, sides, self.mode)
+        {
+            draw_shape(
+                painter,
+                rect,
+                viewport,
+                &Shape::Polyline(Polyline::new(vertices, true)),
+                preview_stroke(),
+                Linetype::Continuous,
+                1.0,
+            );
+        }
+    }
+
+    fn snap_points(&self) -> Vec<Point2> {
+        match self.state {
+            PolygonState::WaitingCenter => Vec::new(),
+            PolygonState::WaitingPoint(center) => vec![center],
+        }
+    }
+
+    fn ortho_origin(&self) -> Option<Point2> {
+        match self.state {
+            PolygonState::WaitingCenter => None,
+            PolygonState::WaitingPoint(center) => Some(center),
+        }
+    }
+
+    fn accepts_numeric_input(&self) -> bool {
+        true
+    }
+
+    fn set_polygon_sides(&mut self, sides: Option<u32>) {
+        self.sides = sides;
+    }
+
+    fn variant_options(&self) -> Option<VariantOptions> {
+        Some(VariantOptions {
+            heading: "Polygon mode",
+            options: &PolygonMode::OPTIONS,
+            current: self.mode.index(),
+        })
+    }
+
+    fn set_variant(&mut self, index: usize) {
+        self.mode = PolygonMode::from_index(index);
     }
 }
 
@@ -5801,6 +6159,204 @@ mod tests {
         let a = Point2::new(2.0, 3.0);
         tool.on_input(&ctx, InputEvent::Click(a));
         assert_eq!(tool.snap_points(), vec![a]);
+    }
+
+    // --- Rectangle（M12 タスク89） ---
+
+    #[test]
+    fn rectangle_vertices_orders_ccw_from_any_pair_of_opposite_corners() {
+        let bl = Point2::new(0.0, 0.0);
+        let tr = Point2::new(10.0, 5.0);
+        let expected = [
+            Point2::new(0.0, 0.0),
+            Point2::new(10.0, 0.0),
+            Point2::new(10.0, 5.0),
+            Point2::new(0.0, 5.0),
+        ];
+        assert_eq!(rectangle_vertices(bl, tr), Some(expected));
+        // 対角の指定順が逆でも、対角の隅が逆でも同じ正規化された頂点列になる。
+        assert_eq!(rectangle_vertices(tr, bl), Some(expected));
+        let tl = Point2::new(0.0, 5.0);
+        let br = Point2::new(10.0, 0.0);
+        assert_eq!(rectangle_vertices(tl, br), Some(expected));
+        assert_eq!(rectangle_vertices(br, tl), Some(expected));
+    }
+
+    #[test]
+    fn rectangle_vertices_rejects_zero_width_or_height() {
+        let p1 = Point2::new(1.0, 1.0);
+        assert_eq!(rectangle_vertices(p1, Point2::new(1.0, 5.0)), None);
+        assert_eq!(rectangle_vertices(p1, Point2::new(5.0, 1.0)), None);
+        assert_eq!(rectangle_vertices(p1, p1), None);
+    }
+
+    #[test]
+    fn rectangle_tool_commits_closed_polyline_and_returns_to_first_corner() {
+        let (_doc, ctx) = ctx();
+        let mut tool = RectangleTool::default();
+        assert_eq!(tool.ortho_origin(), None);
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 0.0)));
+        assert_eq!(tool.ortho_origin(), Some(Point2::new(0.0, 0.0)));
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(10.0, 5.0)));
+        let Shape::Polyline(pl) = shape_of(result) else {
+            panic!("expected Polyline");
+        };
+        assert!(pl.closed);
+        assert_eq!(
+            pl.vertices,
+            vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+                Point2::new(10.0, 5.0),
+                Point2::new(0.0, 5.0),
+            ]
+        );
+        // 確定後は 1 隅目待ちへ戻り、続けて描ける。
+        assert_eq!(tool.ortho_origin(), None);
+    }
+
+    #[test]
+    fn rectangle_tool_rejects_degenerate_second_corner_and_keeps_first() {
+        let (_doc, ctx) = ctx();
+        let mut tool = RectangleTool::default();
+        let first = Point2::new(0.0, 0.0);
+        tool.on_input(&ctx, InputEvent::Click(first));
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(0.0, 5.0)));
+        assert_eq!(
+            result,
+            ToolResult::Rejected("Rectangle: width and height must be non-zero")
+        );
+        // 1 隅目は保持したまま、2 隅目を選び直せる。
+        assert_eq!(tool.ortho_origin(), Some(first));
+    }
+
+    // --- Polygon（M12 タスク89） ---
+
+    #[test]
+    fn polygon_vertices_inscribed_places_q_as_a_vertex() {
+        let center = Point2::new(0.0, 0.0);
+        let q = Point2::new(1.0, 0.0);
+        let verts = polygon_vertices(center, q, 4, PolygonMode::Inscribed).expect("vertices");
+        assert_eq!(verts.len(), 4);
+        assert!((verts[0].x - 1.0).abs() < 1e-9 && verts[0].y.abs() < 1e-9);
+        // 全頂点が中心から半径 1（Q までの距離）にある。
+        for v in &verts {
+            assert!((v.distance(center) - 1.0).abs() < 1e-9);
+        }
+        // CCW: 隣接頂点への角度が単調増加（+2π/4 ずつ）。
+        for i in 0..4 {
+            let a0 = (verts[i] - center).angle();
+            let a1 = (verts[(i + 1) % 4] - center).angle();
+            let delta = (a1 - a0 + std::f64::consts::TAU) % std::f64::consts::TAU;
+            assert!((delta - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn polygon_vertices_circumscribed_places_q_as_an_edge_midpoint() {
+        let center = Point2::new(0.0, 0.0);
+        let q = Point2::new(1.0, 0.0);
+        let verts = polygon_vertices(center, q, 4, PolygonMode::Circumscribed).expect("vertices");
+        assert_eq!(verts.len(), 4);
+        // Q は、方向 0 を挟む 2 頂点(±π/4 の頂点)を結ぶ辺の中点に一致する。
+        let mid = verts.iter().enumerate().find_map(|(i, v)| {
+            let next = verts[(i + 1) % verts.len()];
+            let m = Point2::new((v.x + next.x) / 2.0, (v.y + next.y) / 2.0);
+            (m.distance(q) < 1e-9).then_some(m)
+        });
+        assert!(mid.is_some(), "no edge midpoint matches Q: {verts:?}");
+        // 頂点半径 = 内接半径(1) / cos(π/4)。
+        let expected_r = 1.0 / (std::f64::consts::PI / 4.0).cos();
+        for v in &verts {
+            assert!((v.distance(center) - expected_r).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn polygon_vertices_rejects_zero_radius() {
+        let center = Point2::new(3.0, 4.0);
+        assert_eq!(
+            polygon_vertices(center, center, 6, PolygonMode::Inscribed),
+            None
+        );
+    }
+
+    #[test]
+    fn polygon_tool_commits_closed_polyline_and_returns_to_center() {
+        let (_doc, ctx) = ctx();
+        let mut tool = PolygonTool::default();
+        tool.set_polygon_sides(Some(6));
+        assert_eq!(tool.ortho_origin(), None);
+        let center = Point2::new(0.0, 0.0);
+        tool.on_input(&ctx, InputEvent::Click(center));
+        assert_eq!(tool.ortho_origin(), Some(center));
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0)));
+        let Shape::Polyline(pl) = shape_of(result) else {
+            panic!("expected Polyline");
+        };
+        assert!(pl.closed);
+        assert_eq!(pl.vertices.len(), 6);
+        // 確定後は中心待ちへ戻る。
+        assert_eq!(tool.ortho_origin(), None);
+    }
+
+    #[test]
+    fn polygon_tool_rejects_missing_or_out_of_range_sides_and_keeps_center() {
+        let (_doc, ctx) = ctx();
+        let mut tool = PolygonTool::default();
+        let center = Point2::new(0.0, 0.0);
+        tool.on_input(&ctx, InputEvent::Click(center));
+        // sides 未設定（既定 None）は拒否される。
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0)));
+        assert_eq!(
+            result,
+            ToolResult::Rejected("Polygon: sides must be an integer from 3 to 64")
+        );
+        assert_eq!(tool.ortho_origin(), Some(center));
+
+        // 範囲外の値も同様に拒否される。
+        tool.set_polygon_sides(Some(2));
+        let result = tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0)));
+        assert_eq!(
+            result,
+            ToolResult::Rejected("Polygon: sides must be an integer from 3 to 64")
+        );
+        assert_eq!(tool.ortho_origin(), Some(center));
+    }
+
+    #[test]
+    fn polygon_tool_cycle_toggles_mode() {
+        let (_doc, ctx) = ctx();
+        let mut tool = PolygonTool::default();
+        assert_eq!(
+            tool.variant_options().map(|o| o.current),
+            Some(PolygonMode::Inscribed.index())
+        );
+        tool.on_input(&ctx, InputEvent::Cycle);
+        assert_eq!(
+            tool.variant_options().map(|o| o.current),
+            Some(PolygonMode::Circumscribed.index())
+        );
+        tool.on_input(&ctx, InputEvent::Cycle);
+        assert_eq!(
+            tool.variant_options().map(|o| o.current),
+            Some(PolygonMode::Inscribed.index())
+        );
+    }
+
+    #[test]
+    fn polygon_tool_rejects_zero_radius_and_keeps_center() {
+        let (_doc, ctx) = ctx();
+        let mut tool = PolygonTool::default();
+        tool.set_polygon_sides(Some(6));
+        let center = Point2::new(2.0, 2.0);
+        tool.on_input(&ctx, InputEvent::Click(center));
+        let result = tool.on_input(&ctx, InputEvent::Click(center));
+        assert_eq!(
+            result,
+            ToolResult::Rejected("Polygon: radius must be non-zero")
+        );
+        assert_eq!(tool.ortho_origin(), Some(center));
     }
 
     // --- Select / 編集 ---
@@ -11276,13 +11832,15 @@ mod tests {
 
     #[test]
     fn numeric_input_is_accepted_by_point_taking_tools_only() {
-        let accepting: [Box<dyn Tool>; 6] = [
+        let accepting: [Box<dyn Tool>; 8] = [
             Box::new(PointTool::default()),
             Box::new(LineTool::default()),
             Box::new(CircleTool::default()),
             Box::new(ArcTool::default()),
             Box::new(IsoCircleTool::default()),
             Box::new(PolylineTool::default()),
+            Box::new(RectangleTool::default()),
+            Box::new(PolygonTool::default()),
         ];
         for tool in &accepting {
             assert!(tool.accepts_numeric_input());

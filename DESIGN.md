@@ -1864,6 +1864,77 @@ release ビルド): 右パネル「表」の種類別の表示とボタン(汎�
   結果が食い違う。ずれは座標の約 1e-9 倍(1 km 先で 0.0005 mm)。見直すなら `mcad-geom` 全体の許容量方針
   (`../tcad` に影響)として別タスクで扱う。
 
+#### タスク88 の実装時追記(2026-09-27、implement-sonnet の判断を采配役が検算のうえ採用)
+
+- **依頼どおりにした点**:
+  - **`mcad_geom::chamfer` に `chamfer_lines(a, b, dist_a, dist_b, near_a, near_b)`
+    を追加**（既存 API は変更せず追加のみ、`lib.rs` から `ChamferError`・`ChamferResult`・
+    `chamfer_lines` を再公開）。コーナー `P` は既存の `line_line_intersection`（無限直線
+    どうしの交点、退化・平行で `None`）を再利用して求め、平行・退化判定は `fillet_lines`
+    と同じ相対イプシロン方針（`EPS`/`point_tol`/`rel_tol`）をそのまま踏襲した。
+  - **残す側の決定は依頼どおり P 基準**: `near_a`/`near_b` を各直線のパラメータ空間へ
+    射影し、コーナー `P` のパラメータと比べた符号で「残す側」を決める（`fillet_lines`
+    は接点基準）。この違いをモジュール doc に明記した。`near` が `P` と実質一致すると
+    側が決まらず `Degenerate`。
+  - **面取り点 `C_a`/`C_b`**: `P` から `near` 側へ `dist_a`/`dist_b` 進んだ直線 `a`/`b`
+    上の点。パラメータが区間 `[0, 1]`（±`EPS`）外なら `DistanceTooLarge`（延長しては
+    作らない。線分がコーナーに届いていなくても、面取り点自体が線分上にあれば通す —
+    依頼の「コーナー未到達でも面取り点が線分上なら通す」を、`P` のパラメータではなく
+    `C_a`/`C_b` のパラメータで判定することで自然に満たしている)。
+  - **単体テスト 13 件**（削られる区間内のクリック〔下の一次レビュー修正で追加〕・直角・非直交・非対称2距離・十字交差4分岐・コーナー未到達で
+    通る例・平行・非正距離(NaN/inf含む)・距離過大(両方向)・コーナー未到達で拒否・退化
+    線分・非有限入力・クリックがコーナーと一致・残存長ゼロ）と、`properties.rs` に
+    proptest 2 件（`chamfer_lines_endpoints_match_the_requested_distances`: bevel の
+    両端がコーナーから要求距離にあり、トリム済み線分の切断端に一致する。
+    `chamfer_lines_is_scale_invariant`: `fillet_lines_is_scale_invariant` と同型の
+    1e-6〜1e6 倍不変性）。
+  - **`ChamferTool`（`tool.rs`）は `FilletTool` と同じ状態機械**（`ChamferState`
+    `WaitingFirstLine`/`WaitingSecondLine`、`pre_commit_state`・`committed_pair`・
+    `on_commit_failed` の巻き戻し）をそのまま複製し、確定は
+    `Batch([ModifyEntity, ModifyEntity, AddEntity])` 1 つ。新しい面の線分（bevel）は
+    1 本目のレイヤー・スタイルを継承する。`FilletTool` が現れる箇所
+    （`caches_picked_shapes`・`keeps_state_on_commit_failure`・`snaps_shape_pick`
+    既定 false の一覧・`accepts_numeric_input` の rejecting 一覧・`ToolKind` の各
+    match・上部パネルの入力欄・ステータス文言）はすべて Chamfer 分を追加した。
+  - **Dist 1・Dist 2 入力欄**: `Tool::set_chamfer_distances(dist1: Option<f64>, dist2:
+    ChamferDistInput)` を新しい拡張点として `Tool` トレイトへ追加（既定 no-op）。Dist 1
+    は `parse_fillet_radius`（正の有限値のみ `Some`）をそのまま再利用。Dist 2 は
+    `ExtAngleInput` と同型の 3 状態 enum `ChamferDistInput { Empty, Value(f64), Invalid
+    }` を新設し、`parse_chamfer_dist2` で解析する（空欄 = Dist 1 と等距離、不正な
+    文字列は空欄へ黙って倒さず確定を拒否 — 依頼の「Dist 2 が非空で不正なら拒否」を
+    ExtAngleInput と同じ理由付けで満たす）。上部パネルはフィレット半径欄と同じ位置に
+    Dist 1・Dist 2 の 2 欄を常設し、面取りツール中のみ表示する。
+  - **キー**: `F` 単押しでフィレット、`Shift+F` で面取り（`D`/`Shift+D` と同じ書式）。
+    `handle_tool_shortcut_keys` のドキュメントコメント・`KEYBIND_LEGEND`・
+    「数値入力を受け付けないツール」の列挙も更新した。
+  - **数値入力の対象外**: `ChamferTool` は `Tool::accepts_numeric_input` を override
+    しない（既定 `false`）ので追加作業は不要。`tool.rs` の
+    `numeric_input_is_accepted_by_point_taking_tools_only` の rejecting 一覧、および
+    `main.rs` の `point_tool_key_works_only_from_select_mode`（`Shift+F` でも `1` が
+    点ツールへ切り替わらないことを追加検証）に Chamfer を足した。
+  - **Harness テスト**を追加し `F`→Fillet・`Shift+F`→Chamfer を固定
+    （`f_key_switches_to_fillet_and_shift_f_to_chamfer`）。
+  - `../tcad` の `cargo build --workspace`・`cargo test --workspace` は無変更で通過
+    （`mcad-geom`/`mcad-app` の追加は既存 API に影響しない）。
+- **自分で判断した点**: 依頼の契約どおりに実装しており、設計判断からの逸脱は無い。
+  Dist 2 欄の 3 状態区別を独自の enum（`ChamferDistInput`）にする代わりに
+  `ExtAngleInput` を再利用する案も検討したが、`ExtAngleInput::Value` は度→ラジアン
+  変換済みの意味を固定で持っており（doc 参照）、距離という別の単位・別の既定値の
+  意味（空欄 = Dist 1 と同じ）を持たせるのは同じ型の誤用になるため、同型の新しい
+  enum を素直に新設した。
+- **一次レビュー指摘の修正（2026-09-27、采配役）**: 実装当初はトリムする側を面取り点基準
+  （`t_near < t_面取り点`、`fillet` の `trim_to_tangent` と同じ比較）で決めており、モジュール doc の
+  「コーナー基準」と食い違っていた。削られる区間内（コーナーと面取り点の間）をクリックすると、
+  面取り点の位置は正しいのに残る線分がコーナー側の断片になる。`trim_to_point` をコーナー基準
+  （`t_near < t_P`）へ改め、区間内・区間外のクリックで結果が一致するテスト
+  （`clicking_inside_the_removed_part_keeps_the_same_side`）で固定した。
+
+**→ 手動スモークテスト実施済み(2026-09-27、ユーザー実施、release ビルド): `Shift+F` で面取り・`F` でフィレット、
+Dist 2 空欄で等距離・Dist 1/2 の非対称(1 本目に Dist 1)、確定後の 3 本の選択と面の線分のレイヤー・スタイル継承、
+undo 1 回で復帰、削られる区間内のクリックでも遠い側が残る、十字交差でクリックした象限が残る、距離過大・平行・
+Dist 1 空欄・Dist 2 不正・線分以外・同じ線の 2 回選択の拒否表示、ロック中レイヤーでの拒否と不変、Esc・ツール切替での
+リセット、数字キーで数値入力欄が開かない、の各項目で問題なし。**
+
 #### タスク分割
 
 | # | タスク | 内容 | 担当 | 依存 |
@@ -1877,7 +1948,7 @@ release ビルド): 右パネル「表」の種類別の表示とボタン(汎�
 | 85 | geom+app: 四半円点・近接点と種別 ON/OFF **(完了 2026-09-26)** | 設計判断5 のうち基点不要のもの。`SnapKind` 追加・優先度・`config.json`・上部パネル。手動スモーク | implement-sonnet | 84 |
 | 86 | geom+app: 垂線・接線スナップ **(完了 2026-09-26)** | 設計判断5。geom に点 → 線分の垂線の足・点 → 円の接点の純関数、基点の受け渡し。手動スモーク | implement-sonnet | 85 |
 | 87 | geom+app: 仮想交点スナップ **(完了 2026-09-26)** | 設計判断5。無限直線・円の交点の純関数と無損失な絞り込みのテスト、点線マーカー。手動スモーク | implement-sonnet | 86 |
-| 88 | geom+app: 面取り | 設計判断6。`chamfer_lines`(proptest を含む)・ツール・`Shift+F`。`../tcad` 通過。手動スモーク | implement-sonnet | 83 |
+| 88 | geom+app: 面取り **(完了 2026-09-27)** | 設計判断6。`chamfer_lines`(proptest を含む)・ツール・`Shift+F`。`../tcad` 通過。手動スモーク | implement-sonnet | 83 |
 | 89 | app: 矩形・正多角形 | 設計判断7。頂点計算の純関数とテスト・ツール 2 つ・キー。手動スモーク | implement-sonnet | 83 |
 | 90 | geom+app: 結合・分解 | 設計判断8。鎖の判定の純関数(分岐・離れ・混在の拒否をテストで固定)・選択モードのキー。手動スモーク | implement-sonnet | 83 |
 | 91 | core+io+app: 構築線 | 設計判断9。`EntityGeom::XLine`・validate・変換・pick・描画と出力の切り取り・AABB 前提箇所の扱い(着手時に決めて追記)・v8 相乗り・DXF `XLINE` の往復・ツール `Shift+L`・交点スナップ。`../tcad` 通過。手動スモーク | implement-opus | 81・87・90 |

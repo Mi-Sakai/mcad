@@ -14,14 +14,16 @@
 //! - 分割: 線分・弧・開いたポリラインの往復性（2 ピースの端点が元の端点と分割点に一致）。
 //! - フィレット: 弧が両直線に接し（中心から各直線までの距離＝半径）、両端点が
 //!   トリム済み線分の切断端に一致し、掃引が π 以下に収まる。
+//! - 面取り: 2 つの面取り点がそれぞれコーナーから要求距離にあり、bevel の両端が
+//!   トリム済み線分の切断端に一致する。
 //! - **スケール不変性**（M8 タスク43）: 図面全体を 1e-6〜1e6 倍しても、交点・最近点・
 //!   分割・トリム・フィレットの結果が同じだけ拡大縮小され、退化判定の結論も変わらない。
 //!   相対 EPS（[`mcad_geom::rel_tol`] / [`mcad_geom::point_tol`]）が横断的に効いているか
 //!   の検証で、絶対 EPS のままだと極端スケールで結論が変わる。
 
 use mcad_geom::{
-    Aabb, Arc, Circle, LineSeg, OffsetError, Point2, Polyline, Shape, Vec2, closest_point, extend,
-    extend_reach, fillet_lines, intersect, point_tol, split, trim,
+    Aabb, Arc, Circle, LineSeg, OffsetError, Point2, Polyline, Shape, Vec2, chamfer_lines,
+    closest_point, extend, extend_reach, fillet_lines, intersect, point_tol, split, trim,
 };
 use proptest::prelude::*;
 
@@ -830,6 +832,82 @@ proptest! {
                 prop_assert!(v.trimmed_a.b.distance(scale_pt(u.trimmed_a.b, s)) <= tol_at(s));
                 prop_assert!(v.trimmed_b.a.distance(scale_pt(u.trimmed_b.a, s)) <= tol_at(s));
                 prop_assert!(v.trimmed_b.b.distance(scale_pt(u.trimmed_b.b, s)) <= tol_at(s));
+            }
+            (Err(e1), Err(e2)) => prop_assert_eq!(e1, e2),
+            (x, y) => prop_assert!(false, "scale {s} changed the outcome: {x:?} vs {y:?}"),
+        }
+    }
+
+    /// 面取り: 2 つの面取り点はそれぞれコーナーから `dist_a`・`dist_b` の距離にあり、
+    /// bevel の両端がトリム済み線分の切断端に一致する。（DESIGN.md M12 タスク88）
+    #[test]
+    fn chamfer_lines_endpoints_match_the_requested_distances(
+        corner in base_point(),
+        ang_a in 0.0f64..std::f64::consts::TAU,
+        wedge in 0.5f64..2.6f64,
+        len in 5.0f64..20.0f64,
+        dist_a_frac in 0.1f64..0.5f64,
+        dist_b_frac in 0.1f64..0.5f64,
+    ) {
+        let (da, db) = (unit_vec(ang_a), unit_vec(ang_a + wedge));
+        let a = LineSeg::new(corner, corner + da * len);
+        let b = LineSeg::new(corner, corner + db * len);
+        let dist_a = dist_a_frac * len;
+        let dist_b = dist_b_frac * len;
+        let near_a = corner + da * (len * 0.9);
+        let near_b = corner + db * (len * 0.9);
+
+        let res = chamfer_lines(a, b, dist_a, dist_b, near_a, near_b).unwrap();
+
+        prop_assert!((corner.distance(res.bevel.a) - dist_a).abs() <= TOL);
+        prop_assert!((corner.distance(res.bevel.b) - dist_b).abs() <= TOL);
+        // bevel の両端はトリム済み線分の切断端（＝コーナー側の端点）に一致する。
+        let a_ends_at_bevel = res.trimmed_a.a.distance(res.bevel.a) <= TOL
+            || res.trimmed_a.b.distance(res.bevel.a) <= TOL;
+        let b_ends_at_bevel = res.trimmed_b.a.distance(res.bevel.b) <= TOL
+            || res.trimmed_b.b.distance(res.bevel.b) <= TOL;
+        prop_assert!(a_ends_at_bevel);
+        prop_assert!(b_ends_at_bevel);
+    }
+
+    /// **スケール不変性**: 図面全体を 1e-6〜1e6 倍しても、面取りの結果が同じだけ
+    /// 拡大縮小され、退化判定の結論も変わらない（[`fillet_lines_is_scale_invariant`]
+    /// と同じ検証）。
+    #[test]
+    fn chamfer_lines_is_scale_invariant(
+        corner in base_point(),
+        ang_a in 0.0f64..std::f64::consts::TAU,
+        wedge in 0.5f64..2.6f64,
+        len in 5.0f64..20.0f64,
+        dist_a_frac in 0.1f64..0.5f64,
+        dist_b_frac in 0.1f64..0.5f64,
+        s in scale(),
+    ) {
+        let (da, db) = (unit_vec(ang_a), unit_vec(ang_a + wedge));
+        let a = LineSeg::new(corner, corner + da * len);
+        let b = LineSeg::new(corner, corner + db * len);
+        let dist_a = dist_a_frac * len;
+        let dist_b = dist_b_frac * len;
+        let near_a = corner + da * (len * 0.9);
+        let near_b = corner + db * (len * 0.9);
+
+        let small = chamfer_lines(a, b, dist_a, dist_b, near_a, near_b);
+        let big = chamfer_lines(
+            scale_seg(a, s),
+            scale_seg(b, s),
+            dist_a * s,
+            dist_b * s,
+            scale_pt(near_a, s),
+            scale_pt(near_b, s),
+        );
+        match (small, big) {
+            (Ok(u), Ok(v)) => {
+                prop_assert!(v.trimmed_a.a.distance(scale_pt(u.trimmed_a.a, s)) <= tol_at(s));
+                prop_assert!(v.trimmed_a.b.distance(scale_pt(u.trimmed_a.b, s)) <= tol_at(s));
+                prop_assert!(v.trimmed_b.a.distance(scale_pt(u.trimmed_b.a, s)) <= tol_at(s));
+                prop_assert!(v.trimmed_b.b.distance(scale_pt(u.trimmed_b.b, s)) <= tol_at(s));
+                prop_assert!(v.bevel.a.distance(scale_pt(u.bevel.a, s)) <= tol_at(s));
+                prop_assert!(v.bevel.b.distance(scale_pt(u.bevel.b, s)) <= tol_at(s));
             }
             (Err(e1), Err(e2)) => prop_assert_eq!(e1, e2),
             (x, y) => prop_assert!(false, "scale {s} changed the outcome: {x:?} vs {y:?}"),

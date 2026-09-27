@@ -48,9 +48,9 @@ use mcad_core::{
     expand_ordinate, expand_radial, linear_pick_segments, radial_pick_segments, table_world_aabb,
 };
 use mcad_geom::{
-    Aabb, Arc, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape, SplitError,
-    TrimExtendError, Vec2, circumcircle, closest_point, distance_to, extend, fillet_lines, split,
-    trim,
+    Aabb, Arc, ChamferError, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape,
+    SplitError, TrimExtendError, Vec2, chamfer_lines, circumcircle, closest_point, distance_to,
+    extend, fillet_lines, split, trim,
 };
 
 use crate::bom::{BOM_STYLE_AC_WIDTH_MM, default_bom_table};
@@ -433,6 +433,17 @@ pub trait Tool {
     /// 拡張点。app 層は毎フレーム呼ぶので、ツール側は最後に渡された値だけを保持すればよい。
     fn set_radius_input(&mut self, _radius: Option<f64>) {}
 
+    /// app 層が持つ数値入力欄（[`ChamferTool`] の Dist 1・Dist 2 欄）の解析値をツールへ
+    /// 渡す（DESIGN.md M12 設計判断6）。[`Tool::set_radius_input`] と同じ理由
+    /// （2 本目のヒットテストと同時に確定するため、確定判断を行うツール側が値を
+    /// 知っている必要がある）で、こちらも Tool トレイトに置く。
+    ///
+    /// `dist1` は 1 本目の距離（正の有限値のみ `Some`、空欄・不正値は `None`）。`dist2`
+    /// は 2 本目の距離欄の状態（[`ChamferDistInput`]。空欄なら `dist1` と等距離という
+    /// 意味を持つため、フィレット半径欄と違って「空欄」と「不正な文字列」を区別する
+    /// 必要がある — [`ExtAngleInput`] と同じ理由）。既定は何もしない。
+    fn set_chamfer_distances(&mut self, _dist1: Option<f64>, _dist2: ChamferDistInput) {}
+
     /// app 層が持つ数値入力欄（[`DimLinearTool`] の補助線傾き欄、度→ラジアン変換済み）を
     /// ツールへ渡す（M11 タスク73）。既定は何もしない。
     ///
@@ -540,6 +551,23 @@ pub enum ExtAngleInput {
     /// 有効な角度（度→ラジアン変換済み。絶対角・CCW・+x 軸基準）。
     Value(f64),
     /// 非数値・非有限などの不正な文字列。確定クリックは拒否する。
+    Invalid,
+}
+
+/// 上部パネルの面取り Dist 2 欄を解析した結果（DESIGN.md M12 設計判断6）。
+///
+/// [`ExtAngleInput`] と同型: Dist 2 は「空欄なら Dist 1 と等距離」という意味を持つ
+/// 既定値を持つため、空欄をそのまま確定できる一方、不正な文字列（非数値・非正・
+/// 非有限）を黙って空欄と同じ扱いにすると、打ち間違えた値がそのまま「等距離」として
+/// 確定してしまう。そこで不正値は確定クリックそのものを拒否する。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum ChamferDistInput {
+    /// 空欄。確定すると Dist 1 と同じ距離を使う。
+    #[default]
+    Empty,
+    /// 有効な距離（正の有限値）。
+    Value(f64),
+    /// 空でないが非数値・非正・非有限などの不正な文字列。確定クリックは拒否する。
     Invalid,
 }
 
@@ -3461,6 +3489,199 @@ impl Tool for FilletTool {
     /// 「変更された2本 + 新規の弧」へ載せ替えてしまう）をクリアし、`apply_second_line`
     /// が先取りで進めていた状態を `pre_commit_state` から `WaitingSecondLine` へ巻き戻す
     /// （DESIGN.md M7設計判断6: 失敗時は1本目を選び直さず2本目だけ試し直せる）。
+    fn on_commit_failed(&mut self) {
+        self.committed_pair = None;
+        if let Some(previous) = self.pre_commit_state.take() {
+            self.state = previous;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// 面取り（Shift+F）
+// ---------------------------------------------------------------------
+
+/// [`ChamferTool`] の状態。[`FilletState`] と同型（DESIGN.md M12 設計判断6）。
+#[derive(Debug, Default, Clone, PartialEq)]
+enum ChamferState {
+    /// 1 本目の線分のヒットテスト待ち。
+    #[default]
+    WaitingFirstLine,
+    /// 2 本目の線分のヒットテスト待ち。1 本目は採取済み。
+    ///
+    /// [`FilletState::WaitingSecondLine`] と同じ理由で `ShapePick` 全体を保持する。
+    WaitingSecondLine { first: ShapePick, line: LineSeg },
+}
+
+/// 面取りツール（`Shift+F`）。2 本の線分を順にクリックし、Dist 1・Dist 2 入力欄の値で
+/// 角を面取りする（DESIGN.md M12 設計判断6）。[`FilletTool`] と同じ状態機械・確定規約
+/// （`Batch` 1 つ = undo 1 回、新しい面の線分は 1 本目のレイヤー・スタイルを継承、
+/// 確定失敗時は 1 本目を選び直さず 2 本目だけ試し直せる）を踏襲する。
+///
+/// 1 本目・2 本目とも「面取り後に**残したい側**」をクリックする。`fillet_lines` と違い
+/// [`chamfer_lines`] は接点ではなくコーナーを基準に残す側を決める
+/// （[`mcad_geom::chamfer`] モジュール doc 参照）。
+///
+/// Dist 2 が空欄なら Dist 1 と等距離（設計判断6「既定は等距離」）。
+#[derive(Debug, Default)]
+pub struct ChamferTool {
+    state: ChamferState,
+    /// app 層の Dist 1 入力欄の解析値（[`Tool::set_chamfer_distances`] が毎フレーム更新する）。
+    dist1: Option<f64>,
+    /// app 層の Dist 2 入力欄の状態。空欄なら `dist1` と等距離。
+    dist2: ChamferDistInput,
+    /// 直前の `Commit` で変更した 2 本の ID。[`FilletTool::committed_pair`] と同じ役割。
+    committed_pair: Option<(EntityId, EntityId)>,
+    /// [`FilletTool::pre_commit_state`] と同じ役割の巻き戻し用スナップショット。
+    pre_commit_state: Option<ChamferState>,
+}
+
+impl ChamferTool {
+    /// 対象が線分ならその [`LineSeg`] を返す（面取りも線分同士のみ。設計判断10）。
+    fn as_line(shape: &Shape) -> Option<LineSeg> {
+        match shape {
+            Shape::Line(seg) => Some(*seg),
+            _ => None,
+        }
+    }
+
+    /// geom のエラーを ASCII のステータス文言へ対応付ける（[`FilletTool::reject`] と
+    /// 同じパターン）。
+    fn reject(err: ChamferError) -> ToolResult {
+        ToolResult::Rejected(match err {
+            ChamferError::Parallel => "Chamfer: the two lines are parallel",
+            ChamferError::NonPositiveDistance => "Chamfer: distance must be a positive number",
+            ChamferError::DistanceTooLarge => "Chamfer: distance is too large for these lines",
+            ChamferError::Degenerate => "Chamfer: cannot chamfer there, click away from the corner",
+        })
+    }
+
+    /// Dist 1・Dist 2 入力欄から `(dist_a, dist_b)` を解決する。Dist 1 が無ければ
+    /// `None`（呼び出し側が「enter a distance」で拒否）。Dist 2 が不正な文字列なら
+    /// `None`（Dist 1 の有無に関わらず拒否。設計判断6の代償なし方針）。Dist 2 が
+    /// 空欄なら Dist 1 と同じ値を使う。
+    fn resolve_distances(&self) -> Option<(f64, f64)> {
+        let dist1 = self.dist1?;
+        let dist2 = match self.dist2 {
+            ChamferDistInput::Empty => dist1,
+            ChamferDistInput::Value(v) => v,
+            ChamferDistInput::Invalid => return None,
+        };
+        Some((dist1, dist2))
+    }
+
+    /// 2 本目のピックを受けて確定コマンドを組み立てる（[`FilletTool::apply_second_line`]
+    /// と同じ流れ）。
+    fn apply_second_line(&mut self, first: &ShapePick, a: LineSeg, hit: &ShapePick) -> ToolResult {
+        let Some(b) = Self::as_line(&hit.shape) else {
+            return ToolResult::Rejected("Chamfer: second pick must be a line");
+        };
+        if hit.id == first.id {
+            return ToolResult::Rejected("Chamfer: pick two different lines");
+        }
+        let Some((dist_a, dist_b)) = self.resolve_distances() else {
+            return ToolResult::Rejected("Chamfer: enter a distance");
+        };
+        let result = match chamfer_lines(a, b, dist_a, dist_b, first.click, hit.click) {
+            Ok(result) => result,
+            Err(err) => return Self::reject(err),
+        };
+
+        self.pre_commit_state = Some(ChamferState::WaitingSecondLine {
+            first: first.clone(),
+            line: a,
+        });
+        self.state = ChamferState::WaitingFirstLine;
+        self.committed_pair = Some((first.id, hit.id));
+        ToolResult::Commit(Command::Batch(vec![
+            Command::ModifyEntity {
+                id: first.id,
+                new_geom: EntityGeom::from(Shape::Line(result.trimmed_a)),
+            },
+            Command::ModifyEntity {
+                id: hit.id,
+                new_geom: EntityGeom::from(Shape::Line(result.trimmed_b)),
+            },
+            // 新しい面の線分は 1 本目のレイヤー・スタイルを継承する（設計判断6、
+            // フィレットの弧の継承と同じ規約）。
+            Command::AddEntity(Entity::new(
+                Shape::Line(result.bevel),
+                first.layer,
+                first.style,
+            )),
+        ]))
+    }
+}
+
+impl Tool for ChamferTool {
+    fn on_input(&mut self, _ctx: &ToolCtx, ev: InputEvent) -> ToolResult {
+        match ev {
+            // フィレットと同じ理由でホバー中のライブプレビューは行わない。
+            InputEvent::Move(_) | InputEvent::Confirm | InputEvent::Cycle => ToolResult::Continue,
+            InputEvent::Cancel => {
+                self.state = ChamferState::WaitingFirstLine;
+                ToolResult::Cancel
+            }
+            // クリックは常にヒットテスト経路（`wants_shape_pick`）を通るのでここへは
+            // 来ない想定。来ても状態は変えない。
+            InputEvent::Click(_) => ToolResult::Continue,
+        }
+    }
+
+    fn draw_preview(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        viewport: &Viewport,
+        _render: DimRender<'_>,
+    ) {
+        // 選んだ 1 本目だけをハイライトする（フィレットと同じ流儀）。
+        if let ChamferState::WaitingSecondLine { first, .. } = &self.state {
+            draw_shape(
+                painter,
+                rect,
+                viewport,
+                &first.shape,
+                preview_stroke(),
+                Linetype::Continuous,
+                1.0,
+            );
+        }
+    }
+
+    fn wants_shape_pick(&self) -> bool {
+        true
+    }
+
+    fn on_shape_pick(&mut self, hit: ShapePick) -> ToolResult {
+        match self.state.clone() {
+            ChamferState::WaitingFirstLine => match Self::as_line(&hit.shape) {
+                Some(line) => {
+                    self.state = ChamferState::WaitingSecondLine { first: hit, line };
+                    ToolResult::Continue
+                }
+                None => ToolResult::Rejected("Chamfer: first pick must be a line"),
+            },
+            ChamferState::WaitingSecondLine { first, line } => {
+                self.apply_second_line(&first, line, &hit)
+            }
+        }
+    }
+
+    fn take_commit_selection(&mut self, new_ids: &NewIds) -> Option<Vec<EntityId>> {
+        let (id_a, id_b) = self.committed_pair.take()?;
+        self.pre_commit_state = None;
+        let mut ids = vec![id_a, id_b];
+        ids.extend(new_ids.entities.iter().copied());
+        Some(ids)
+    }
+
+    fn set_chamfer_distances(&mut self, dist1: Option<f64>, dist2: ChamferDistInput) {
+        self.dist1 = dist1;
+        self.dist2 = dist2;
+    }
+
+    /// [`FilletTool::on_commit_failed`] と同じ後始末。
     fn on_commit_failed(&mut self) {
         self.committed_pair = None;
         if let Some(previous) = self.pre_commit_state.take() {
@@ -9342,6 +9563,359 @@ mod tests {
         assert_eq!(doc.entity(id_b).unwrap().geom, geom_b_before);
     }
 
+    // --- 面取りツール（M12 タスク88）---
+
+    /// 面取り確定の `Batch` を分解し、(trimmed_a, trimmed_b, 面の線分のエンティティ) を返す
+    /// （[`fillet_commit`] と同じ形）。
+    fn chamfer_commit(
+        result: &ToolResult,
+        expect_a: EntityId,
+        expect_b: EntityId,
+    ) -> (LineSeg, LineSeg, Entity) {
+        let ToolResult::Commit(Command::Batch(cmds)) = result else {
+            panic!("expected Commit(Batch), got {result:?}");
+        };
+        assert_eq!(cmds.len(), 3, "ModifyEntity ×2 + AddEntity ×1");
+        let mut trimmed = Vec::new();
+        for (cmd, expect_id) in cmds[..2].iter().zip([expect_a, expect_b]) {
+            let Command::ModifyEntity { id, new_geom } = cmd else {
+                panic!("expected ModifyEntity, got {cmd:?}");
+            };
+            assert_eq!(*id, expect_id, "ModifyEntity は対象 ID を維持する");
+            let EntityGeom::Shape(shape) = new_geom else {
+                panic!("expected a Shape geom");
+            };
+            trimmed.push(line_of(shape));
+        }
+        let Command::AddEntity(entity) = &cmds[2] else {
+            panic!("expected AddEntity, got {:?}", cmds[2]);
+        };
+        (trimmed[0], trimmed[1], entity.clone())
+    }
+
+    #[test]
+    fn chamfer_tool_commits_batch_and_inherits_first_line_layer_style() {
+        let mut doc = Document::new();
+        // 1 本目を既定と違うレイヤー・スタイルに置き、面の線分がそちらを継承することを
+        // 検証する（設計判断6: フィレットの弧と同じ継承規約）。
+        let layer_a = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "a",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let style_a = Style {
+            color: Some(mcad_core::Rgb::new(1, 2, 3)),
+            ..Style::inherited()
+        };
+        let id_a = doc
+            .apply(Command::AddEntity(Entity::new(
+                hline(0.0, 10.0, 0.0),
+                layer_a,
+                style_a,
+            )))
+            .unwrap()
+            .entities[0];
+        let pick_a = ShapePick {
+            id: id_a,
+            shape: hline(0.0, 10.0, 0.0),
+            click: Point2::new(8.0, 0.0),
+            layer: layer_a,
+            style: style_a,
+        };
+        // 2 本目は既定レイヤー・スタイル（継承元にならないことの確認用）。
+        let pick_b = shape_pick(&mut doc, vline(0.0, 0.0, 10.0), Point2::new(0.0, 8.0));
+        let id_b = pick_b.id;
+
+        let mut tool = ChamferTool::default();
+        assert!(tool.wants_shape_pick());
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+
+        assert_eq!(tool.on_shape_pick(pick_a), ToolResult::Continue);
+        let result = tool.on_shape_pick(pick_b);
+        let (trimmed_a, trimmed_b, bevel_entity) = chamfer_commit(&result, id_a, id_b);
+
+        // 面取り点 (2,0)・(0,2) までトリムされ、クリックした側（遠い端）が残る。
+        assert!((trimmed_a.a.x - 2.0).abs() < 1e-9 && trimmed_a.a.y.abs() < 1e-9);
+        assert_eq!(trimmed_a.b, Point2::new(10.0, 0.0));
+        assert!((trimmed_b.a.y - 2.0).abs() < 1e-9 && trimmed_b.a.x.abs() < 1e-9);
+        assert_eq!(trimmed_b.b, Point2::new(0.0, 10.0));
+
+        // 面の線分は (2,0)-(0,2) で、1 本目のレイヤー・スタイルを継承する。
+        assert_eq!(
+            bevel_entity.layer, layer_a,
+            "面の線分のレイヤーは 1 本目由来"
+        );
+        assert_eq!(
+            bevel_entity.style, style_a,
+            "面の線分のスタイルは 1 本目由来"
+        );
+        let EntityGeom::Shape(Shape::Line(bevel)) = &bevel_entity.geom else {
+            panic!("expected a Line geom, got {:?}", bevel_entity.geom);
+        };
+        let joins = (bevel.a.distance(Point2::new(2.0, 0.0)) < 1e-9
+            && bevel.b.distance(Point2::new(0.0, 2.0)) < 1e-9)
+            || (bevel.a.distance(Point2::new(0.0, 2.0)) < 1e-9
+                && bevel.b.distance(Point2::new(2.0, 0.0)) < 1e-9);
+        assert!(joins, "bevel {bevel:?}");
+
+        // 確定後の選択集合は「変更した 2 本 + 新規の面の線分」の 3 件（設計判断6）。
+        let bevel_id = doc
+            .apply(Command::AddEntity(Entity::new(
+                hline(50.0, 51.0, 0.0),
+                layer_a,
+                style_a,
+            )))
+            .unwrap()
+            .entities[0];
+        let new_ids = NewIds {
+            entities: vec![bevel_id],
+            ..NewIds::default()
+        };
+        assert_eq!(
+            tool.take_commit_selection(&new_ids),
+            Some(vec![id_a, id_b, bevel_id])
+        );
+        assert_eq!(tool.take_commit_selection(&new_ids), None, "消費済み");
+    }
+
+    #[test]
+    fn chamfer_tool_uses_dist1_when_dist2_is_empty() {
+        // 設計判断6「Dist 2 が空なら Dist 1 と等距離」。
+        let mut doc = Document::new();
+        let (a, b) = corner_pair(&mut doc);
+        let id_a = a.id;
+        let id_b = b.id;
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+        tool.on_shape_pick(a);
+        let result = tool.on_shape_pick(b);
+        let (trimmed_a, trimmed_b, _) = chamfer_commit(&result, id_a, id_b);
+        assert!((trimmed_a.a.x - 2.0).abs() < 1e-9);
+        assert!((trimmed_b.a.y - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn chamfer_tool_uses_distinct_dist2_when_given() {
+        let mut doc = Document::new();
+        let (a, b) = corner_pair(&mut doc);
+        let id_a = a.id;
+        let id_b = b.id;
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Value(4.0));
+        tool.on_shape_pick(a);
+        let result = tool.on_shape_pick(b);
+        let (trimmed_a, trimmed_b, _) = chamfer_commit(&result, id_a, id_b);
+        assert!((trimmed_a.a.x - 2.0).abs() < 1e-9, "{trimmed_a:?}");
+        assert!((trimmed_b.a.y - 4.0).abs() < 1e-9, "{trimmed_b:?}");
+    }
+
+    #[test]
+    fn chamfer_tool_returns_to_waiting_first_line_after_commit() {
+        // 単発仕様: 確定後は 1 本目待ちへ戻る（フィレットと同じ）。
+        let mut doc = Document::new();
+        let (a, b) = corner_pair(&mut doc);
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+        tool.on_shape_pick(a);
+        assert!(matches!(tool.state, ChamferState::WaitingSecondLine { .. }));
+        assert!(matches!(tool.on_shape_pick(b), ToolResult::Commit(_)));
+        assert_eq!(tool.state, ChamferState::WaitingFirstLine);
+    }
+
+    #[test]
+    fn chamfer_tool_rejects_missing_or_invalid_distance_and_keeps_state() {
+        let mut doc = Document::new();
+        let (a, b) = corner_pair(&mut doc);
+        let mut tool = ChamferTool::default();
+        // Dist 1 未入力。
+        tool.set_chamfer_distances(None, ChamferDistInput::Empty);
+        tool.on_shape_pick(a.clone());
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(b.clone()),
+            ToolResult::Rejected("Chamfer: enter a distance")
+        );
+        assert_eq!(tool.state, before, "1 本目を保持して 2 本目だけ選び直せる");
+        assert_eq!(tool.take_commit_selection(&NewIds::default()), None);
+
+        // Dist 1 はあるが Dist 2 が不正な文字列。
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Invalid);
+        assert_eq!(
+            tool.on_shape_pick(b.clone()),
+            ToolResult::Rejected("Chamfer: enter a distance")
+        );
+        assert_eq!(tool.state, before);
+
+        // 入れ直せば同じ 2 本目のピックで確定できる。
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+        assert!(matches!(tool.on_shape_pick(b), ToolResult::Commit(_)));
+    }
+
+    #[test]
+    fn chamfer_tool_rejects_non_line_picks() {
+        let mut doc = Document::new();
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+
+        // 1 本目が円 → 拒否。状態は 1 本目待ちのまま。
+        let circle = shape_pick(
+            &mut doc,
+            Shape::Circle(mcad_geom::Circle::new(Point2::new(20.0, 20.0), 3.0)),
+            Point2::new(23.0, 20.0),
+        );
+        assert_eq!(
+            tool.on_shape_pick(circle.clone()),
+            ToolResult::Rejected("Chamfer: first pick must be a line")
+        );
+        assert_eq!(tool.state, ChamferState::WaitingFirstLine);
+
+        // 2 本目が円 → 拒否。1 本目は保持したまま。
+        let (a, _) = corner_pair(&mut doc);
+        tool.on_shape_pick(a);
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(circle),
+            ToolResult::Rejected("Chamfer: second pick must be a line")
+        );
+        assert_eq!(tool.state, before);
+    }
+
+    #[test]
+    fn chamfer_tool_rejects_same_entity_twice() {
+        let mut doc = Document::new();
+        let (a, _) = corner_pair(&mut doc);
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+        tool.on_shape_pick(a.clone());
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(a),
+            ToolResult::Rejected("Chamfer: pick two different lines")
+        );
+        assert_eq!(tool.state, before);
+    }
+
+    #[test]
+    fn chamfer_tool_maps_geom_errors_and_keeps_state() {
+        let mut doc = Document::new();
+
+        // 平行な 2 本。
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(1.0), ChamferDistInput::Empty);
+        let a = shape_pick(&mut doc, hline(0.0, 10.0, 0.0), Point2::new(5.0, 0.0));
+        let parallel = shape_pick(&mut doc, hline(0.0, 10.0, 5.0), Point2::new(5.0, 5.0));
+        tool.on_shape_pick(a);
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(parallel),
+            ToolResult::Rejected("Chamfer: the two lines are parallel")
+        );
+        assert_eq!(tool.state, before);
+
+        // 距離が線分長に対して過大（面取り点が線分の外へ出る）。
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(100.0), ChamferDistInput::Empty);
+        let (a, b) = corner_pair(&mut doc);
+        tool.on_shape_pick(a);
+        let before = tool.state.clone();
+        assert_eq!(
+            tool.on_shape_pick(b),
+            ToolResult::Rejected("Chamfer: distance is too large for these lines")
+        );
+        assert_eq!(tool.state, before);
+    }
+
+    #[test]
+    fn chamfer_tool_resets_on_escape_and_tool_switch() {
+        let (mut doc, ctx) = ctx();
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+        let (a, b) = corner_pair(&mut doc);
+        assert_eq!(tool.on_shape_pick(a), ToolResult::Continue);
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Cancel),
+            ToolResult::Cancel,
+            "Esc は Cancel（app 層が Select へ戻す）"
+        );
+        assert_eq!(tool.state, ChamferState::WaitingFirstLine);
+        assert_eq!(tool.on_shape_pick(b), ToolResult::Continue);
+
+        // ツール切替は app 層が `ToolKind::spawn()` で作り直す（＝Default 相当）。
+        let fresh = ChamferTool::default();
+        assert_eq!(fresh.state, ChamferState::WaitingFirstLine);
+        assert_eq!(fresh.dist1, None);
+        assert_eq!(fresh.dist2, ChamferDistInput::Empty);
+    }
+
+    #[test]
+    fn chamfer_tool_click_event_does_not_advance_state() {
+        let (_doc, ctx) = ctx();
+        let mut tool = ChamferTool::default();
+        assert_eq!(
+            tool.on_input(&ctx, InputEvent::Click(Point2::new(1.0, 0.0))),
+            ToolResult::Continue
+        );
+        assert_eq!(tool.state, ChamferState::WaitingFirstLine);
+    }
+
+    #[test]
+    fn chamfer_batch_rolls_back_on_locked_layer() {
+        // Batch は原子的（フィレットと同じ検証）。
+        let mut doc = Document::new();
+        let locked_layer = doc
+            .apply(Command::AddLayer(mcad_core::Layer::new(
+                "locked",
+                mcad_core::Rgb::WHITE,
+            )))
+            .unwrap()
+            .layers[0];
+        let shape_a = hline(0.0, 10.0, 0.0);
+        let id_a = doc
+            .apply(Command::AddEntity(Entity::new(
+                shape_a.clone(),
+                locked_layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut props = doc.layer(locked_layer).unwrap().clone();
+        props.locked = true;
+        doc.apply(Command::SetLayerProps {
+            id: locked_layer,
+            props,
+        })
+        .unwrap();
+        let pick_b = shape_pick(&mut doc, vline(0.0, 0.0, 10.0), Point2::new(0.0, 8.0));
+        let id_b = pick_b.id;
+
+        let mut tool = ChamferTool::default();
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+        tool.on_shape_pick(ShapePick {
+            id: id_a,
+            shape: shape_a,
+            click: Point2::new(8.0, 0.0),
+            layer: locked_layer,
+            style: Style::inherited(),
+        });
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(pick_b) else {
+            panic!("expected Commit");
+        };
+
+        let count_before = doc.entities().count();
+        let geom_a_before = doc.entity(id_a).unwrap().geom.clone();
+        let geom_b_before = doc.entity(id_b).unwrap().geom.clone();
+        assert!(doc.apply(cmd).is_err(), "ロックレイヤーなので失敗する");
+        assert_eq!(
+            doc.entities().count(),
+            count_before,
+            "面の線分は追加されない"
+        );
+        assert_eq!(doc.entity(id_a).unwrap().geom, geom_a_before);
+        assert_eq!(doc.entity(id_b).unwrap().geom, geom_b_before);
+    }
+
     // --- 分割ツール（M7 タスク33）---
 
     fn as_line_shape(shape: &Shape) -> LineSeg {
@@ -9794,6 +10368,7 @@ mod tests {
         assert!(!TrimTool::default().snaps_shape_pick());
         assert!(!ExtendTool::default().snaps_shape_pick());
         assert!(!FilletTool::default().snaps_shape_pick());
+        assert!(!ChamferTool::default().snaps_shape_pick());
     }
 
     #[test]
@@ -10713,7 +11288,7 @@ mod tests {
             assert!(tool.accepts_numeric_input());
         }
         // 既存図形を当てるツール・寸法・文字・表は対象外（DESIGN.md M12 設計判断3・10）。
-        let rejecting: [Box<dyn Tool>; 11] = [
+        let rejecting: [Box<dyn Tool>; 12] = [
             Box::new(TextTool::default()),
             Box::new(TableTool::default()),
             Box::new(DimLinearTool::default()),
@@ -10724,6 +11299,7 @@ mod tests {
             Box::new(TrimTool::default()),
             Box::new(ExtendTool::default()),
             Box::new(FilletTool::default()),
+            Box::new(ChamferTool::default()),
             Box::new(SplitTool::default()),
         ];
         for tool in &rejecting {

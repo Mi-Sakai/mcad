@@ -23,6 +23,7 @@
 //! 軸並行境界ボックスを算出でき、ビューポートカリング・矩形選択に使う。
 
 mod aabb;
+pub mod chamfer;
 pub mod fillet;
 mod intersect;
 mod point;
@@ -33,6 +34,7 @@ pub mod trim_extend;
 mod vec2;
 
 pub use aabb::Aabb;
+pub use chamfer::{ChamferError, ChamferResult, chamfer_lines};
 pub use fillet::{FilletError, FilletResult, fillet_lines};
 pub use intersect::{intersect, line_circle_intersection, line_line_intersection};
 pub use point::Point2;

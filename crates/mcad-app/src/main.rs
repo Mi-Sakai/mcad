@@ -52,11 +52,11 @@ use numeric_input::{KeyRouting, NumericInputState};
 use plot::dash_pattern_mm;
 
 use tool::{
-    ArcTool, CircleTool, DIM_DEGENERATE_EPSILON, DimAngularTool, DimDiameterTool, DimLinearTool,
-    DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput, ExtendTool, FilletTool,
-    GripDragOutcome, InputEvent, IsoCircleTool, LineTool, OffsetOutcome, PlacementKind,
-    PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool, SplitTool, TableTool,
-    TextTool, Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
+    ArcTool, ChamferDistInput, ChamferTool, CircleTool, DIM_DEGENERATE_EPSILON, DimAngularTool,
+    DimDiameterTool, DimLinearTool, DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput,
+    ExtendTool, FilletTool, GripDragOutcome, InputEvent, IsoCircleTool, LineTool, OffsetOutcome,
+    PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolylineTool, SelectTool,
+    SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -638,6 +638,7 @@ enum ToolKind {
     Trim,
     Extend,
     Fillet,
+    Chamfer,
     Split,
 }
 
@@ -664,6 +665,7 @@ impl ToolKind {
             ToolKind::Trim => Some(Box::new(TrimTool::default())),
             ToolKind::Extend => Some(Box::new(ExtendTool::default())),
             ToolKind::Fillet => Some(Box::new(FilletTool::default())),
+            ToolKind::Chamfer => Some(Box::new(ChamferTool::default())),
             ToolKind::Split => Some(Box::new(SplitTool::default())),
         }
     }
@@ -688,7 +690,11 @@ impl ToolKind {
     fn caches_picked_shapes(self) -> bool {
         matches!(
             self,
-            ToolKind::Trim | ToolKind::Extend | ToolKind::Fillet | ToolKind::DimAngular
+            ToolKind::Trim
+                | ToolKind::Extend
+                | ToolKind::Fillet
+                | ToolKind::Chamfer
+                | ToolKind::DimAngular
         )
     }
 
@@ -715,12 +721,16 @@ impl ToolKind {
     /// `ChainParallelLine`）は、`spawn()` で作り直すとレイヤーロック等の確定失敗のたびに
     /// 失われる。単発（1本だけの確定）でも同じ理由で失敗時に2点を失わせない
     /// （`DimLinearTool::on_commit_failed` が確定直前の状態へ巻き戻す）。
+    ///
+    /// `Chamfer`（面取り）も `Fillet` と同じ理由で含む（M12 タスク88）:
+    /// `ChamferTool` の `WaitingSecondLine` が同じ理由で失われるのを防ぐ。
     fn keeps_state_on_commit_failure(self) -> bool {
         matches!(
             self,
             ToolKind::Trim
                 | ToolKind::Extend
                 | ToolKind::Fillet
+                | ToolKind::Chamfer
                 | ToolKind::Split
                 | ToolKind::DimOrdinate
                 | ToolKind::DimLinear
@@ -747,6 +757,7 @@ impl ToolKind {
             ToolKind::Trim => "Trim",
             ToolKind::Extend => "Extend",
             ToolKind::Fillet => "Fillet",
+            ToolKind::Chamfer => "Chamfer",
             ToolKind::Split => "Split",
         }
     }
@@ -844,6 +855,16 @@ struct McadApp {
     /// 自体はセッション中保持し、同じ半径での連続フィレットに使い回せる（新規・読込では
     /// [`McadApp::reset_transient_ui_state`] でクリア）。
     fillet_radius_input: String,
+    /// 面取り Dist 1 入力欄の文字列（M12 タスク88、設計判断6）。フィレット半径欄と同じ
+    /// 「正の有限値のみ受理」規則（[`parse_fillet_radius`]）で解析する。欄は面取りツール中
+    /// のみ上部パネルへ表示し、文字列自体はセッション中保持する（新規・読込では
+    /// [`McadApp::reset_transient_ui_state`] でクリア）。
+    chamfer_dist1_input: String,
+    /// 面取り Dist 2 入力欄の文字列（設計判断6「Dist 2 が空なら Dist 1 と等距離」）。
+    /// フィレット半径欄と違い、空欄と不正な文字列を区別する必要があるため
+    /// [`tool::ChamferDistInput`]（[`ExtAngleInput`] と同型）で解析する
+    /// （[`parse_chamfer_dist2`]）。
+    chamfer_dist2_input: String,
     /// 長さ寸法ツールの補助線傾き入力欄（度、M11 タスク73）。フィレット半径欄と同じ
     /// 「上部パネルはツール選択中のみ表示・文字列はセッション中保持」の流儀。空欄は
     /// `ExtAngleInput::Empty`（垂直）、有効な数値は度→ラジアンへ変換した
@@ -992,6 +1013,7 @@ const KEYBIND_LEGEND: &[&str] = &[
     "X=Trim",
     "E=Extend",
     "F=Fillet",
+    "Shift+F=Chamfer",
     "B=Split",
     "M=Move",
     "R=Rotate",
@@ -1191,6 +1213,8 @@ impl McadApp {
             pending_recent_path: None,
             offset_distance_input: String::new(),
             fillet_radius_input: String::new(),
+            chamfer_dist1_input: String::new(),
+            chamfer_dist2_input: String::new(),
             ext_angle_input: String::new(),
             text_content_input: String::new(),
             text_height_input: DEFAULT_TEXT_HEIGHT.to_owned(),
@@ -1294,6 +1318,8 @@ impl McadApp {
         // 読込前の距離・半径入力は持ち越さない（別図面では意味が変わるため）。
         self.offset_distance_input.clear();
         self.fillet_radius_input.clear();
+        self.chamfer_dist1_input.clear();
+        self.chamfer_dist2_input.clear();
         self.ext_angle_input.clear();
         // Text 入力欄も初期化する（文字列はクリア、高さは既定へ戻す）。
         self.text_content_input.clear();
@@ -2681,6 +2707,24 @@ impl eframe::App for McadApp {
                         );
                         ui.separator();
                     }
+                    // 面取り Dist 1・Dist 2 入力欄（M12 タスク88、設計判断6）。フィレット半径欄と
+                    // 同じ常設パネル方式で、面取りツール中のみ表示する。Dist 2 が空欄なら
+                    // Dist 1 と等距離（[`tool::ChamferDistInput::Empty`]）。
+                    if self.tool_kind == ToolKind::Chamfer {
+                        ui.label("Dist 1:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.chamfer_dist1_input)
+                                .desired_width(56.0)
+                                .hint_text("dist"),
+                        );
+                        ui.label("Dist 2:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.chamfer_dist2_input)
+                                .desired_width(56.0)
+                                .hint_text("= Dist 1"),
+                        );
+                        ui.separator();
+                    }
                     // 循環する選択肢を持つツールの現在値（アイソメ円ツールの面
                     // Top/Left/Right、長さ寸法ツールの向き Aligned/Horizontal/Vertical）。
                     // ツール本体が持つ状態なので `Tool::variant_options()` で取り出す
@@ -2957,6 +3001,8 @@ impl eframe::App for McadApp {
                         &mut self.status,
                         now,
                         parse_fillet_radius(&self.fillet_radius_input),
+                        parse_fillet_radius(&self.chamfer_dist1_input),
+                        parse_chamfer_dist2(&self.chamfer_dist2_input),
                         parse_ext_angle_deg(&self.ext_angle_input),
                         &mut self.numeric_input,
                         numeric_submit,
@@ -3368,7 +3414,7 @@ impl eframe::App for McadApp {
 ///
 /// `S`=Select, `1`=Point, `L`=Line, `C`=Circle, `A`=Arc, `I`=Iso Circle, `P`=Polyline, `T`=Text,
 /// `K`=Table, `D`/`Shift+D`=Linear/Radial Dim, `G`/`Shift+G`=Diameter/Angular Dim,
-/// `Shift+V`=Ordinate Dim, `X`=Trim, `E`=Extend, `F`=Fillet。
+/// `Shift+V`=Ordinate Dim, `X`=Trim, `E`=Extend, `F`/`Shift+F`=Fillet/Chamfer。
 /// ツール切替は途中経過を破棄する（新しいツールインスタンスに置き換わるため）。
 /// 作図ツールへ切り替えるときは、描画中に古い選択ハイライトが残らないよう選択をクリアする。
 ///
@@ -3376,7 +3422,7 @@ impl eframe::App for McadApp {
 /// ユーザー了承済み。2026-09-25 のユーザー確認で、数値入力を受け付けない作図ツールでも止める
 /// ことに確定）。作図ツールの使用中は、数値入力を受け付けるツールなら数字キーが先に数値入力欄へ
 /// 取られ（[`McadApp::route_numeric_input`]）、受け付けないツール（寸法・トリム・延長・
-/// フィレット・分割・文字・表）ならここで無視する（入力欄も開かず何も起きない。ステータス表示も
+/// フィレット・面取り・分割・文字・表）ならここで無視する（入力欄も開かず何も起きない。ステータス表示も
 /// しない）。選択モード（回転・鏡映の配置中を含む）では従来どおり点ツールへ切り替わり、移動・
 /// 複製の配置中は数値入力欄が先に取る。
 fn handle_tool_shortcut_keys(
@@ -3451,7 +3497,13 @@ fn handle_tool_shortcut_keys(
             // 既に除かれている。
             requested = Some(ToolKind::Extend);
         } else if i.key_pressed(Key::F) {
-            requested = Some(ToolKind::Fillet);
+            // 修飾なしはフィレット、Shift 併用は面取り（M12 タスク88、`D`/`Shift+D` と
+            // 同じ Shift 併用の流儀）。
+            requested = Some(if i.modifiers.shift {
+                ToolKind::Chamfer
+            } else {
+                ToolKind::Fillet
+            });
         } else if i.key_pressed(Key::B) {
             requested = Some(ToolKind::Split);
         }
@@ -3561,6 +3613,8 @@ fn handle_tool_input(
     status: &mut Option<StatusMessage>,
     now: f64,
     fillet_radius: Option<f64>,
+    chamfer_dist1: Option<f64>,
+    chamfer_dist2: ChamferDistInput,
     ext_angle_input: ExtAngleInput,
     numeric: &mut NumericInputState,
     numeric_submit: bool,
@@ -3580,6 +3634,9 @@ fn handle_tool_input(
     // ヒットテストと同時に確定するため、確定判断を行うツール側が値を持っている必要がある
     // （[`Tool::set_radius_input`] の doc 参照）。他ツールでは既定実装の no-op。
     active.set_radius_input(fillet_radius);
+    // 面取り Dist 1・Dist 2 欄（M12 タスク88）。フィレット半径欄と同じ理由で
+    // Tool トレイト経由で流し込む。他ツールでは既定実装の no-op。
+    active.set_chamfer_distances(chamfer_dist1, chamfer_dist2);
     // 長さ寸法ツールの補助線傾き欄（M11 タスク73）。他ツールでは既定実装の no-op。
     active.set_ext_angle_input(ext_angle_input);
 
@@ -8180,6 +8237,21 @@ fn parse_fillet_radius(text: &str) -> Option<f64> {
     parse_positive_length(text)
 }
 
+/// 面取り Dist 2 入力欄を解析する（M12 タスク88、設計判断6）。フィレット半径欄の
+/// [`parse_positive_length`] と違い、空欄・有効値・不正値の 3 状態を区別する必要がある
+/// （[`ChamferDistInput`] の doc 参照 — 空欄は「Dist 1 と等距離」という意味を持つ既定値
+/// のため、不正な文字列を黙ってそちらへ倒さず確定を拒否する。[`parse_ext_angle_deg`] と
+/// 同じ理由）。
+fn parse_chamfer_dist2(text: &str) -> ChamferDistInput {
+    if text.trim().is_empty() {
+        return ChamferDistInput::Empty;
+    }
+    match parse_positive_length(text) {
+        Some(v) => ChamferDistInput::Value(v),
+        None => ChamferDistInput::Invalid,
+    }
+}
+
 /// 長さ寸法ツールの補助線傾き欄（度）を解析する（M11 タスク73）。フィレット半径欄の
 /// [`parse_positive_length`] と違い、空欄・有効値・不正値の 3 状態を区別する必要がある
 /// （[`ExtAngleInput`] の doc 参照 — 不正値は `None`（垂直）へ黙って倒さず確定を拒否する）。
@@ -10420,6 +10492,28 @@ mod tests {
     }
 
     #[test]
+    fn chamfer_tool_caches_picked_shapes() {
+        // フィレットと同じ理由（M12 タスク88）。
+        assert!(ToolKind::Chamfer.caches_picked_shapes());
+    }
+
+    #[test]
+    fn parse_chamfer_dist2_distinguishes_empty_value_and_invalid() {
+        assert_eq!(parse_chamfer_dist2(""), ChamferDistInput::Empty);
+        assert_eq!(parse_chamfer_dist2("   "), ChamferDistInput::Empty);
+        assert_eq!(parse_chamfer_dist2("2.5"), ChamferDistInput::Value(2.5));
+        assert_eq!(parse_chamfer_dist2("  3 "), ChamferDistInput::Value(3.0));
+        // 空でないが正の有限値でない文字列は不正扱い（空欄＝等距離へ黙って倒さない）。
+        for text in ["0", "-1", "abc", "inf", "NaN"] {
+            assert_eq!(
+                parse_chamfer_dist2(text),
+                ChamferDistInput::Invalid,
+                "input: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn dim_angular_tool_caches_picked_shapes() {
         // M11 タスク80: 2 lines モードは辺（LineSeg）のスナップショットを抱えるため、
         // フィレット等と同じ理由で対象に含める（DESIGN.md タスク80「着手時設計」）。
@@ -11372,6 +11466,71 @@ mod tests {
         // 1本目を持ち越していれば、2本目の再ピックはまた確定（Commit）になる。作り直して
         // いた旧実装では WaitingFirstLine に戻り、この2本目ピックは「1本目の選び直し」
         // （Continue、しかも b は線分なので通ってしまう）になっていた。
+        let retry = tool.on_shape_pick(second);
+        assert!(
+            matches!(retry, ToolResult::Commit(_)),
+            "1本目を持ち越したまま2本目だけ選び直せるはず、got {retry:?}"
+        );
+    }
+
+    #[test]
+    fn chamfer_tool_keeps_first_line_after_locked_layer_commit_failure() {
+        // フィレットと同じ検証（M12 タスク88）: 直角コーナー、等距離2で面取り点(2,0)/(0,2)。
+        let mut document = Document::new();
+        let a_shape = Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0)));
+        let b_shape = Shape::Line(LineSeg::new(Point2::new(0.0, 0.0), Point2::new(0.0, 10.0)));
+        let a_id = document
+            .apply(Command::AddEntity(Entity::new(
+                a_shape.clone(),
+                document.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let b_id = document
+            .apply(Command::AddEntity(Entity::new(
+                b_shape.clone(),
+                document.current_layer(),
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let layer = lock_current_layer(&mut document);
+
+        let mut tool = ToolKind::Chamfer
+            .spawn()
+            .expect("Chamfer always spawns a tool");
+        tool.set_chamfer_distances(Some(2.0), ChamferDistInput::Empty);
+        assert_eq!(
+            tool.on_shape_pick(tool::ShapePick {
+                id: a_id,
+                shape: a_shape,
+                click: Point2::new(8.0, 0.0),
+                layer,
+                style: Style::inherited(),
+            }),
+            ToolResult::Continue,
+            "1本目のピックは状態を進めるだけ"
+        );
+
+        let second = tool::ShapePick {
+            id: b_id,
+            shape: b_shape,
+            click: Point2::new(0.0, 8.0),
+            layer,
+            style: Style::inherited(),
+        };
+        let ToolResult::Commit(cmd) = tool.on_shape_pick(second.clone()) else {
+            panic!("expected Commit");
+        };
+        assert!(
+            document.apply(cmd).is_err(),
+            "ロックレイヤーなので確定は失敗する"
+        );
+
+        assert!(ToolKind::Chamfer.keeps_state_on_commit_failure());
+        tool.on_commit_failed();
+
         let retry = tool.on_shape_pick(second);
         assert!(
             matches!(retry, ToolResult::Commit(_)),
@@ -15134,6 +15293,12 @@ mod numeric_input_app_tests {
             self.run(vec![key_press(key)]);
         }
 
+        /// Shift 併用のキー押下（`Shift+F`=面取り等。egui は `i.modifiers` を
+        /// `RawInput::modifiers` から読むので、こちらに `SHIFT` を立てれば足りる）。
+        fn press_shift(&mut self, key: Key) {
+            self.run_with(vec![key_press(key)], egui::Modifiers::SHIFT);
+        }
+
         /// `text` を打って `Enter` で確定する。
         fn enter(&mut self, text: &str) {
             self.type_text(text);
@@ -15215,6 +15380,18 @@ mod numeric_input_app_tests {
         assert!(!h.app.numeric_input.is_open());
     }
 
+    /// `F`=フィレット、`Shift+F`=面取り（M12 タスク88、`D`/`Shift+D` と同じ Shift 併用の
+    /// 流儀）。
+    #[test]
+    fn f_key_switches_to_fillet_and_shift_f_to_chamfer() {
+        let mut h = Harness::new();
+        h.press(Key::F);
+        assert_eq!(h.app.tool_kind, ToolKind::Fillet);
+        h.press(Key::S);
+        h.press_shift(Key::F);
+        assert_eq!(h.app.tool_kind, ToolKind::Chamfer);
+    }
+
     /// `1`（点ツール）への切替は選択モードからだけ（DESIGN.md M12 設計判断3、2026-09-25 の
     /// ユーザー確認）。数値入力を受け付けない作図ツールでも止め、入力欄も開かない。
     #[test]
@@ -15243,6 +15420,22 @@ mod numeric_input_app_tests {
             ]);
             assert_eq!(h.app.tool_kind, ToolKind::Select);
         }
+
+        // Shift 併用ツール（面取り）も同じ制約を受ける。
+        h.press_shift(Key::F);
+        assert_eq!(h.app.tool_kind, ToolKind::Chamfer);
+        h.type_text("1");
+        assert_eq!(
+            h.app.tool_kind,
+            ToolKind::Chamfer,
+            "`1` must not switch from Chamfer"
+        );
+        assert!(
+            !h.app.numeric_input.is_open(),
+            "Chamfer takes no numeric input"
+        );
+        h.press(Key::S);
+        assert_eq!(h.app.tool_kind, ToolKind::Select);
 
         // 選択モード（回転の配置中を含む）からは点ツールへ切り替わる。
         let layer = h.app.document.current_layer();

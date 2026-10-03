@@ -5,7 +5,7 @@
 //!
 //! # 公開 API の概要
 //!
-//! - ID: [`EntityId`], [`LayerId`]（`slotmap` キー。undo/redo をまたいでも安定）
+//! - ID: [`EntityId`], [`LayerId`], [`ConstraintId`]（`slotmap` キー。undo/redo をまたいでも安定）
 //! - 値型: [`Rgb`], [`WidthMm`], [`Linetype`], [`Style`], [`Layer`], [`Entity`]
 //! - 長さ寸法の向き: [`DimDirection`]（[`DimLinear::direction`]。整列寸法と回転寸法。
 //!   M11 タスク68）
@@ -32,8 +32,19 @@
 //!   値の組版は [`layout_dim_label`]。**画面・SVG/PDF・DXF export の唯一の出所**
 //! - 構築線: [`XLineGeom`]（[`EntityGeom::XLine`] の中身。基点と単位方向の無限直線。
 //!   `aabb` は基点だけの箱。M12 タスク91）
+//! - 幾何拘束（M13 タスク96）: [`Constraint`]（対象は [`EntityId`] と [`PointRef`] /
+//!   [`PointKind`]。側は [`Side`]、円どうしの接線の種類は [`CircleTangency`] /
+//!   [`LargerCircle`]）。追加・削除・値の変更は [`Command::AddConstraint`] /
+//!   [`Command::RemoveConstraint`] / [`Command::SetConstraintValue`]、切り詰め・延長は
+//!   [`Command::ReshapeEntity`]。現在の形から側・値を決めるコンストラクタは
+//!   [`Constraint::distance`] など、解かずに満たされているかを見るのは
+//!   [`Constraint::is_satisfied`]、接線の接点と区間外判定は [`Constraint::tangent_contact`]
+//!   （[`TangentContact`]）。読み取りは [`Document::constraint`] / [`Document::constraints`] /
+//!   [`Document::constraints_of`] / [`Document::constraint_count`]。
+//!   **この段階では解かない**: [`Document::apply`] は適用後の形が拘束を満たさなければ
+//!   コマンド全体を拒否する（[`CoreError::ConstraintUnsatisfied`]）
 //! - ドキュメント: [`Document`]（エンティティ・レイヤー・カレントレイヤー・
-//!   図面メタデータと履歴を保持）
+//!   図面メタデータ・拘束と履歴を保持）
 //! - 変更: [`Command`] を [`Document::apply`] に渡す。戻り値の [`NewIds`] で
 //!   新規発行された ID を受け取れる。取り消し/やり直しは
 //!   [`Document::undo`] / [`Document::redo`]
@@ -53,6 +64,7 @@
 //!   （DESIGN.md M8 設計判断2・5）。
 
 mod command;
+mod constraint;
 mod dim;
 mod document;
 mod entity;
@@ -66,6 +78,9 @@ mod style;
 mod title_block;
 
 pub use command::Command;
+pub use constraint::{
+    CircleTangency, Constraint, LargerCircle, PointKind, PointRef, Side, TangentContact,
+};
 pub use dim::{
     ArrowPlacement, DimAnnotation, DimKind, DimStyle, FitClass, MAX_DIM_AFFIX_LEN,
     MAX_DIM_DECIMALS, MAX_DIM_STYLE_MM, SizeTolerance, ValueStyle,
@@ -88,7 +103,7 @@ pub use expand::{
     linear_distance, linear_pick_segments, ordinate_distance, ordinate_pick_segments,
     radial_distance, radial_pick_segments, table_world_aabb,
 };
-pub use id::{EntityId, LayerId};
+pub use id::{ConstraintId, EntityId, LayerId};
 pub use layer::Layer;
 pub use sheet::{
     MAX_SCALE_TERM, Orientation, PaperSize, ProjectionMethod, Scale, SheetMeta, TitleBlockFields,

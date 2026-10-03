@@ -1,6 +1,9 @@
 //! ドキュメントを変更する唯一の手段である [`Command`]。
 
-use crate::{DimStyle, Entity, EntityGeom, EntityId, Layer, LayerId, SheetMeta, Style};
+use crate::{
+    Constraint, ConstraintId, DimStyle, Entity, EntityGeom, EntityId, Layer, LayerId, SheetMeta,
+    Style,
+};
 
 /// ドキュメントへの変更を表すコマンド。
 ///
@@ -21,13 +24,55 @@ pub enum Command {
     AddEntity(Entity),
 
     /// エンティティを削除する。
+    ///
+    /// そのエンティティを参照する拘束（M13）もすべて同じ undo 単位の中で消す
+    /// （undo でエンティティと一緒に同じ [`ConstraintId`] へ戻る）。
     RemoveEntity(EntityId),
 
     /// エンティティの幾何を差し替える（移動・変形などの確定操作）。
+    ///
+    /// 拘束（M13）は残す。図形の固定（[`Constraint::FixEntity`]）がついた図形の幾何を
+    /// 変える場合は [`crate::CoreError::EntityFixed`]、幾何の種類が変わって既存の拘束が
+    /// 指せなくなる場合は [`crate::CoreError::InvalidConstraint`] で拒否する。変更後の形が
+    /// 拘束を満たさなければ [`crate::Document::apply`] の最後の充足検査で拒否される。
+    /// 切り詰め・延長には [`Command::ReshapeEntity`] を使う。
     ModifyEntity {
         /// 対象エンティティ。
         id: EntityId,
         /// 差し替え後の幾何。
+        new_geom: EntityGeom,
+    },
+
+    /// エンティティの形を**切り詰める・延長する**（1 断片のトリム・延長・フィレット・面取り。
+    /// M13 タスク96、DESIGN.md M13 設計判断4）。
+    ///
+    /// 幾何の差し替えという点は [`Command::ModifyEntity`] と同じで、検証（幾何の妥当性・
+    /// 編集可能・部品表）も同じ。違いは拘束の扱い: `ModifyEntity` は「動かす・変形する」の
+    /// 意味で拘束を残す（残した拘束に反すれば拒否）のに対し、`ReshapeEntity` は切り詰めで
+    /// 意味を失う拘束を**同じ undo 単位の中で消す**。
+    ///
+    /// **対象を参照する拘束が 1 件でもあるときは、支持する直線・円が変わらない変更だけを
+    /// 受け付ける**: 線分 → 線分は新しい両端点が元の線分を延長した直線の上にあり、向きが
+    /// 反転しないこと。円 → 円弧・円弧 → 円弧は中心と半径が変わらないこと。それ以外
+    /// （平行移動・回転・向きの反転・中心や半径の変更・円弧 → 円・種類の変わる変更）は
+    /// [`crate::CoreError::InvalidConstraint`] で拒否し、拘束は消さない（動かすには
+    /// `ModifyEntity` を使う）。受け付けた変更では:
+    ///
+    /// - 位置が変わった点（`Start`・`End`・`Center` のうち長さ型の許容値を超えて動いたもの）を
+    ///   指す一致・距離は消す。
+    /// - 端点が動いた線分を含む等長は消す。
+    /// - 向き・無限直線・半径に依存する拘束（水平・垂直・平行・直交・角度・点と線の距離の
+    ///   「線」側・接線・半径・等半径）は残す。
+    /// - 図形の固定がついた図形、動いた点に点の固定がある図形は
+    ///   [`crate::CoreError::EntityFixed`] で拒否する。
+    ///
+    /// 残った拘束は [`crate::Document::apply`] の最後の充足検査に掛かる。拘束の無い
+    /// エンティティに対しては `ModifyEntity` と同じ結果になる。同一幾何への差し替えは
+    /// 意味的 no-op（拘束も消さない）。
+    ReshapeEntity {
+        /// 対象エンティティ。
+        id: EntityId,
+        /// 切り詰め・延長後の幾何。
         new_geom: EntityGeom,
     },
 
@@ -100,6 +145,40 @@ pub enum Command {
     /// 即座に反映される。`Some(n)` の明示上書きを持つ寸法は影響を受けない（DESIGN.md M9
     /// 設計判断4 実装時追記）。このコマンドはエンティティの `annotation` 自体には一切触れない。
     SetDimStyle(DimStyle),
+
+    /// 幾何拘束を追加する（M13 タスク96、DESIGN.md M13 設計判断2）。
+    ///
+    /// [`Constraint`] は**完全な値**（側の符号・外接/内接・固定座標・角度を含む）を載せる。
+    /// 現在の形からそれらを決めるには [`Constraint`] のコンストラクタ
+    /// （[`Constraint::tangent_line_circle`] など）を使う。`.mcad` 読込も同じコマンドを使う。
+    ///
+    /// 実行前に構造を検証する（参照先の存在と種類、同じ対象の二重指定、値の範囲。
+    /// 違反は [`crate::CoreError::InvalidConstraint`] / [`crate::CoreError::EntityNotFound`]）。
+    /// 角度の値は `(−π, π]` へ正規化して格納する。レイヤーのロックは見ない（拘束の追加は
+    /// エンティティを変えない）。
+    ///
+    /// **現在の形で満たされていない拘束は拒否する**
+    /// （[`crate::CoreError::ConstraintUnsatisfied`]。この段階では解かない）。退化した図形
+    /// （長さが `ATOL_LEN` 未満の線分、半径が `ATOL_LEN` 未満の円・円弧）を参照する拘束も、
+    /// 残差に関わらず満たされていない扱いで拒否する。
+    AddConstraint(Constraint),
+
+    /// 幾何拘束を削除する。レイヤーのロックは見ない。
+    RemoveConstraint(ConstraintId),
+
+    /// 拘束の値（点どうしの距離・点と線の距離・半径・角度）を変える。
+    ///
+    /// 値を持たない拘束に対しては [`crate::CoreError::InvalidConstraint`]。値の範囲の検証は
+    /// [`Command::AddConstraint`] と同じ（点どうしの距離は長さ型の許容値より大きい、
+    /// 点と線の距離は 0 以上、半径は正、角度は `(−π, π]` へ正規化）。同じ値の設定は
+    /// 意味的 no-op。現在の形が新しい値を満たさなければ拒否する
+    /// （[`crate::CoreError::ConstraintUnsatisfied`]。この段階では解かない）。
+    SetConstraintValue {
+        /// 対象の拘束。
+        id: ConstraintId,
+        /// 新しい値（長さはワールド単位、角度はラジアン）。
+        value: f64,
+    },
 
     /// 複数のサブコマンドを **1 つの操作** としてまとめて適用する複合コマンド。
     ///

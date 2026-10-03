@@ -1925,6 +1925,7 @@ name = "mcad-core"
 version = "0.12.0"
 dependencies = [
  "mcad-geom",
+ "proptest",
  "serde",
  "serde_json",
  "slotmap",

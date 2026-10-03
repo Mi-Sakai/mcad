@@ -15,13 +15,18 @@
 //!
 //! 代償として、削除済みエンティティのスロットはセッション中回収されない
 //! （undo 履歴がそれらを参照しうるため妥当）。数千エンティティ規模の MVP では問題ない。
+//!
+//! 幾何拘束（M13）も同じ方式で `SlotMap<ConstraintId, Option<Constraint>>` に格納する。
+//! 拘束に関わる処理（読み取り API・連鎖削除・充足検査）は `constraints` サブモジュールにある。
 
 use slotmap::SlotMap;
 
 use crate::{
-    Command, CoreError, DimStyle, Entity, EntityGeom, EntityId, Layer, LayerId, Rgb, SheetMeta,
-    Style,
+    Command, Constraint, ConstraintId, CoreError, DimStyle, Entity, EntityGeom, EntityId, Layer,
+    LayerId, Rgb, SheetMeta, Style,
 };
+
+mod constraints;
 
 /// 実行済みコマンドの逆操作可能な記録（内部専用）。
 ///
@@ -37,11 +42,17 @@ enum Applied {
     RemoveEntity {
         id: EntityId,
         entity: Entity,
+        /// このエンティティを参照していたために一緒に消した拘束（M13）。undo で同じスロットへ戻す。
+        removed_constraints: Vec<(ConstraintId, Constraint)>,
     },
+    /// [`Command::ModifyEntity`] と [`Command::ReshapeEntity`] の共通の記録。
     ModifyEntity {
         id: EntityId,
         before: EntityGeom,
         after: EntityGeom,
+        /// [`Command::ReshapeEntity`] が設計判断4 の規則で消した拘束（M13）。
+        /// `ModifyEntity` では常に空。
+        removed_constraints: Vec<(ConstraintId, Constraint)>,
     },
     SetEntityStyle {
         id: EntityId,
@@ -78,6 +89,19 @@ enum Applied {
         before: DimStyle,
         after: DimStyle,
     },
+    AddConstraint {
+        id: ConstraintId,
+        constraint: Constraint,
+    },
+    RemoveConstraint {
+        id: ConstraintId,
+        constraint: Constraint,
+    },
+    SetConstraintValue {
+        id: ConstraintId,
+        before: Constraint,
+        after: Constraint,
+    },
     /// 複合コマンドの逆操作記録。サブコマンドの [`Applied`] を **適用順** に保持する。
     /// undo は逆順・redo は正順に適用することで、バッチ全体が 1 単位で戻る/やり直せる。
     Batch(Vec<Applied>),
@@ -100,16 +124,21 @@ struct HistoryEntry {
 
 /// [`Document::apply`] が新規発行した ID の一覧。
 ///
-/// `AddEntity`/`AddLayer`（単体、および [`Command::Batch`] にネストされたもの）が
-/// 発行した新規キーを、呼び出し側が「集合差分を取る」ような自前のハックなしに
+/// `AddEntity`/`AddLayer`/`AddConstraint`（単体、および [`Command::Batch`] にネストされた
+/// もの）が発行した新規キーを、呼び出し側が「集合差分を取る」ような自前のハックなしに
 /// 直接受け取れるようにするための型。含まれる ID は **適用順**。
 /// それ以外のコマンド（`ModifyEntity` など）は空の `NewIds` を返す。
+///
+/// 連鎖して**消えた**拘束は載せない（消えた件数は [`Document::constraint_count`] の
+/// 前後差で分かる）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewIds {
     /// 新規発行されたエンティティ ID（適用順）。
     pub entities: Vec<EntityId>,
     /// 新規発行されたレイヤー ID（適用順）。
     pub layers: Vec<LayerId>,
+    /// 新規発行された拘束 ID（適用順。M13）。
+    pub constraints: Vec<ConstraintId>,
 }
 
 /// [`Document::execute`] の実行結果（内部専用）。
@@ -170,6 +199,11 @@ pub struct Document {
     current_layer: LayerId,
     /// デフォルトレイヤー（レイヤー0相当）。削除不可。
     default_layer: LayerId,
+    /// 幾何拘束の格納庫（M13）。`None` は墓標（削除済みスロット）。
+    constraints: SlotMap<ConstraintId, Option<Constraint>>,
+    /// 生存している拘束の数。拘束の無い文書で拘束の処理を O(1) で読み飛ばすために持つ
+    /// （スロットの書き換えは `constraints` サブモジュールのヘルパーだけが行い、そこで保つ）。
+    live_constraints: usize,
     /// 図面メタデータ（尺度・用紙・表題欄）。変更は [`Command::SetSheet`] 経由のみ。
     sheet: SheetMeta,
     /// 文書単位の寸法スタイル。変更は [`Command::SetDimStyle`] 経由のみ。
@@ -204,6 +238,8 @@ impl Document {
             layers,
             current_layer: default_layer,
             default_layer,
+            constraints: SlotMap::with_key(),
+            live_constraints: 0,
             sheet: SheetMeta::default(),
             dim_style: DimStyle::default(),
             undo_stack: Vec::new(),
@@ -369,6 +405,17 @@ impl Document {
     /// 存在しない ID への操作、デフォルト/カレント/非空レイヤーの削除、
     /// ロックされたレイヤー上のエンティティへの変更・削除、2 つ目の部品表を作る
     /// 追加・変更（[`CoreError::BomAlreadyExists`]）などで [`CoreError`] を返す。
+    ///
+    /// # 拘束の充足検査（M13 タスク96）
+    ///
+    /// コマンド（[`Command::Batch`] なら全体）を適用し終えた後に **1 回だけ**、幾何が変わった
+    /// エンティティと追加・値変更した拘束に関わる拘束が満たされているかを検査する
+    /// （DESIGN.md M13 設計判断3 の「解くのは最も外側の `apply` 1 回につき 1 回」の足場。
+    /// タスク97 がこの検査を求解に置き換える）。満たされていない拘束があればコマンド全体を
+    /// 巻き戻して [`CoreError::ConstraintUnsatisfied`]（[`ConstraintId`] 順で最初の違反）を返す。
+    /// サブコマンドごとには検査しないので、拘束でつながった複数の図形を 1 つの `Batch` で
+    /// まとめて動かす操作は、動かした後の形が拘束を満たせば通る。拘束が 1 件も無い文書では
+    /// 検査しない。
     pub fn apply(&mut self, cmd: Command) -> Result<NewIds, CoreError> {
         // 原子性（検証→変更、失敗時のロールバック）の保証内容は [`Command::Batch`] の
         // doc（「# 原子性」節）を参照。no-op 判定の仕組みは [`ExecuteOutcome`] の doc を参照。
@@ -383,6 +430,12 @@ impl Document {
         // （redo は保持したままにする）。
         if !changed {
             return Ok(NewIds::default());
+        }
+        // 拘束の充足検査（M13）。世代・履歴に触れる前に行い、失敗したら `execute` が
+        // 行った変更をすべて巻き戻す（undo と同じ経路なので部分適用は残らない）。
+        if let Err(err) = self.check_constraints(&applied) {
+            self.revert(&applied);
+            return Err(err);
         }
         // 実変更があったので新しい世代を採番する。`next_generation` は単調増加の高水位で、
         // undo で世代を戻しても減らさないため、過去に使った番号を再利用しない（内容が違えば
@@ -455,40 +508,24 @@ impl Document {
                     applied: Applied::AddEntity { id, entity },
                     new_ids: NewIds {
                         entities: vec![id],
-                        layers: Vec::new(),
+                        ..NewIds::default()
                     },
                     changed: true,
                 })
             }
             Command::RemoveEntity(id) => {
                 self.require_editable_entity(id)?;
+                // このエンティティを参照する拘束も一緒に消す（M13 設計判断4）。
+                let removed_constraints = self.take_constraints_of(id);
                 let entity = self.take_entity(id);
                 Ok(ExecuteOutcome::mutation(Applied::RemoveEntity {
                     id,
                     entity,
+                    removed_constraints,
                 }))
             }
-            Command::ModifyEntity { id, new_geom } => {
-                // NaN/∞座標・負半径などの不正ジオメトリへの差し替えは拒否する
-                // （DESIGN.md M4 タスク15）。
-                new_geom.validate().map_err(CoreError::InvalidGeometry)?;
-                self.require_editable_entity(id)?;
-                // 部品表は 1 図面に 1 つ（M12 タスク81）。対象自身が既に部品表なら数えない
-                // （部品表の移動・編集は通す）。部品表 → 表は常に通る。
-                self.ensure_single_bom(&new_geom, Some(id))?;
-                let slot = self.live_entity_mut(id);
-                let before = std::mem::replace(&mut slot.geom, new_geom.clone());
-                // 同一幾何への差し替えは意味的 no-op（履歴を汚さない）。
-                let changed = before != new_geom;
-                Ok(ExecuteOutcome::conditional(
-                    Applied::ModifyEntity {
-                        id,
-                        before,
-                        after: new_geom,
-                    },
-                    changed,
-                ))
-            }
+            Command::ModifyEntity { id, new_geom } => self.replace_geom(id, new_geom, false),
+            Command::ReshapeEntity { id, new_geom } => self.replace_geom(id, new_geom, true),
             Command::SetEntityStyle { id, style } => {
                 self.require_editable_entity(id)?;
                 let slot = self.live_entity_mut(id);
@@ -526,8 +563,8 @@ impl Document {
                 Ok(ExecuteOutcome {
                     applied: Applied::AddLayer { id, layer },
                     new_ids: NewIds {
-                        entities: Vec::new(),
                         layers: vec![id],
+                        ..NewIds::default()
                     },
                     changed: true,
                 })
@@ -606,6 +643,44 @@ impl Document {
                     changed,
                 ))
             }
+            Command::AddConstraint(constraint) => {
+                // 構造と値の検証（参照先の存在と種類・二重指定・値の範囲）。現在の形で
+                // 満たされているかは `apply` の最後の充足検査が見る。
+                constraint.validate(self)?;
+                let constraint = constraint.normalized();
+                let id = self.insert_constraint(constraint.clone());
+                Ok(ExecuteOutcome {
+                    applied: Applied::AddConstraint { id, constraint },
+                    new_ids: NewIds {
+                        constraints: vec![id],
+                        ..NewIds::default()
+                    },
+                    changed: true,
+                })
+            }
+            Command::RemoveConstraint(id) => {
+                self.require_constraint(id)?;
+                let constraint = self.take_constraint(id);
+                Ok(ExecuteOutcome::mutation(Applied::RemoveConstraint {
+                    id,
+                    constraint,
+                }))
+            }
+            Command::SetConstraintValue { id, value } => {
+                let before = self.require_constraint(id)?.clone();
+                let after = before.with_value(value).ok_or_else(|| {
+                    CoreError::InvalidConstraint("the constraint has no value to change".to_owned())
+                })?;
+                after.validate(self)?;
+                let after = after.normalized();
+                // 同じ値の設定は意味的 no-op（履歴を汚さない）。
+                let changed = before != after;
+                self.set_constraint(id, Some(after.clone()));
+                Ok(ExecuteOutcome::conditional(
+                    Applied::SetConstraintValue { id, before, after },
+                    changed,
+                ))
+            }
             Command::Batch(subs) => {
                 let mut applied: Vec<Applied> = Vec::with_capacity(subs.len());
                 let mut new_ids = NewIds::default();
@@ -619,6 +694,7 @@ impl Document {
                             applied.push(outcome.applied);
                             new_ids.entities.extend(outcome.new_ids.entities);
                             new_ids.layers.extend(outcome.new_ids.layers);
+                            new_ids.constraints.extend(outcome.new_ids.constraints);
                             changed |= outcome.changed;
                         }
                         Err(err) => {
@@ -641,12 +717,65 @@ impl Document {
         }
     }
 
+    /// [`Command::ModifyEntity`]（`reshape == false`）と [`Command::ReshapeEntity`]
+    /// （`reshape == true`）の共通処理。検証（幾何の妥当性・編集可能・部品表）は同じで、
+    /// 違いは拘束の扱いだけ（`constraints` サブモジュールの `geom_change_effects`）。
+    fn replace_geom(
+        &mut self,
+        id: EntityId,
+        new_geom: EntityGeom,
+        reshape: bool,
+    ) -> Result<ExecuteOutcome, CoreError> {
+        // NaN/∞座標・負半径などの不正ジオメトリへの差し替えは拒否する
+        // （DESIGN.md M4 タスク15）。
+        new_geom.validate().map_err(CoreError::InvalidGeometry)?;
+        self.require_editable_entity(id)?;
+        // 部品表は 1 図面に 1 つ（M12 タスク81）。対象自身が既に部品表なら数えない
+        // （部品表の移動・編集は通す）。部品表 → 表は常に通る。
+        self.ensure_single_bom(&new_geom, Some(id))?;
+        // 拘束（M13）: 固定された図形の変更・拘束が指せなくなる種類の変更を拒否し、
+        // ReshapeEntity なら消す拘束を決める。ここまでは状態を変えない。
+        let doomed = self.geom_change_effects(id, &new_geom, reshape)?;
+        let removed_constraints: Vec<(ConstraintId, Constraint)> = doomed
+            .into_iter()
+            .map(|cid| (cid, self.take_constraint(cid)))
+            .collect();
+        let slot = self.live_entity_mut(id);
+        let before = std::mem::replace(&mut slot.geom, new_geom.clone());
+        // 同一幾何への差し替えは意味的 no-op（履歴を汚さない。拘束も消していない）。
+        let changed = before != new_geom;
+        Ok(ExecuteOutcome::conditional(
+            Applied::ModifyEntity {
+                id,
+                before,
+                after: new_geom,
+                removed_constraints,
+            },
+            changed,
+        ))
+    }
+
     /// [`Applied`] を逆転（undo 方向）に適用する。履歴は一貫しているものとして扱う。
     fn revert(&mut self, applied: &Applied) {
         match applied {
             Applied::AddEntity { id, .. } => self.set_entity(*id, None),
-            Applied::RemoveEntity { id, entity } => self.set_entity(*id, Some(entity.clone())),
-            Applied::ModifyEntity { id, before, .. } => self.set_entity_geom(*id, before.clone()),
+            Applied::RemoveEntity {
+                id,
+                entity,
+                removed_constraints,
+            } => {
+                self.set_entity(*id, Some(entity.clone()));
+                self.restore_constraints(removed_constraints);
+            }
+            Applied::ModifyEntity {
+                id,
+                before,
+                removed_constraints,
+                ..
+            } => {
+                self.set_entity_geom(*id, before.clone());
+                self.restore_constraints(removed_constraints);
+            }
             Applied::SetEntityStyle { id, before, .. } => self.set_entity_style(*id, *before),
             Applied::SetEntityLayer { id, before, .. } => self.set_entity_layer(*id, *before),
             Applied::AddLayer { id, .. } => self.set_layer(*id, None),
@@ -655,6 +784,13 @@ impl Document {
             Applied::SetCurrentLayer { before, .. } => self.current_layer = *before,
             Applied::SetSheet { before, .. } => self.sheet = (**before).clone(),
             Applied::SetDimStyle { before, .. } => self.dim_style = *before,
+            Applied::AddConstraint { id, .. } => self.set_constraint(*id, None),
+            Applied::RemoveConstraint { id, constraint } => {
+                self.set_constraint(*id, Some(constraint.clone()));
+            }
+            Applied::SetConstraintValue { id, before, .. } => {
+                self.set_constraint(*id, Some(before.clone()));
+            }
             // バッチは逆順に各サブ逆操作を適用する（依存関係を正しく巻き戻すため）。
             Applied::Batch(applied) => {
                 for a in applied.iter().rev() {
@@ -668,8 +804,23 @@ impl Document {
     fn reapply(&mut self, applied: &Applied) {
         match applied {
             Applied::AddEntity { id, entity } => self.set_entity(*id, Some(entity.clone())),
-            Applied::RemoveEntity { id, .. } => self.set_entity(*id, None),
-            Applied::ModifyEntity { id, after, .. } => self.set_entity_geom(*id, after.clone()),
+            Applied::RemoveEntity {
+                id,
+                removed_constraints,
+                ..
+            } => {
+                self.bury_constraints(removed_constraints);
+                self.set_entity(*id, None);
+            }
+            Applied::ModifyEntity {
+                id,
+                after,
+                removed_constraints,
+                ..
+            } => {
+                self.bury_constraints(removed_constraints);
+                self.set_entity_geom(*id, after.clone());
+            }
             Applied::SetEntityStyle { id, after, .. } => self.set_entity_style(*id, *after),
             Applied::SetEntityLayer { id, after, .. } => self.set_entity_layer(*id, *after),
             Applied::AddLayer { id, layer } => self.set_layer(*id, Some(layer.clone())),
@@ -678,6 +829,13 @@ impl Document {
             Applied::SetCurrentLayer { after, .. } => self.current_layer = *after,
             Applied::SetSheet { after, .. } => self.sheet = (**after).clone(),
             Applied::SetDimStyle { after, .. } => self.dim_style = *after,
+            Applied::AddConstraint { id, constraint } => {
+                self.set_constraint(*id, Some(constraint.clone()));
+            }
+            Applied::RemoveConstraint { id, .. } => self.set_constraint(*id, None),
+            Applied::SetConstraintValue { id, after, .. } => {
+                self.set_constraint(*id, Some(after.clone()));
+            }
             // バッチは正順に各サブ操作を再適用する（execute と同じ順序）。
             Applied::Batch(applied) => {
                 for a in applied.iter() {
@@ -854,6 +1012,9 @@ impl Default for Document {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod constraint_tests;
 
 #[cfg(test)]
 mod tests {

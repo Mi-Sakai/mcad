@@ -4,6 +4,14 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+### 追加
+
+- **幾何拘束のデータモデル**(`crates/mcad-core`、M13 タスク96): `Constraint`(一致・水平・垂直・距離・平行・
+  直交・等長・等半径・半径・角度・接線・固定)と `ConstraintId`・`PointRef`、`Command::AddConstraint` /
+  `RemoveConstraint` / `SetConstraintValue` / `ReshapeEntity`。エンティティを削除するとその拘束も消え、undo で
+  そろって戻る。**この段階では解かない** — 適用後の形が拘束を満たさないコマンドは `Document::apply` が拒否する
+  (求解はタスク97)。UI と `.mcad` への保存はまだ無い。詳細は DESIGN.md「M13」設計判断2・4 の実装時追記
+
 ## [0.12.0] - 2026-09-27 — 作図補助
 
 作図中の数値入力・極トラッキング・スナップ種別の拡充(四半円点・近接点・垂線・接線・仮想交点)、面取り・矩形・

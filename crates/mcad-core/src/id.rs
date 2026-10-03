@@ -1,4 +1,4 @@
-//! エンティティ・レイヤーの識別子（`slotmap` キー型）。
+//! エンティティ・レイヤー・拘束の識別子（`slotmap` キー型）。
 
 slotmap::new_key_type! {
     /// [`crate::Entity`] を一意に識別するキー。
@@ -13,4 +13,9 @@ slotmap::new_key_type! {
     ///
     /// 安定性の保証は [`EntityId`] と同じ。
     pub struct LayerId;
+
+    /// [`crate::Constraint`]（幾何拘束。M13）を一意に識別するキー。
+    ///
+    /// 安定性の保証は [`EntityId`] と同じ（拘束の削除も墓標化で表す）。
+    pub struct ConstraintId;
 }

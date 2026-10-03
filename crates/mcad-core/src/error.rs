@@ -1,6 +1,6 @@
 //! コア操作のエラー型。
 
-use crate::{EntityId, LayerId};
+use crate::{ConstraintId, EntityId, LayerId};
 
 /// [`crate::Document::apply`] などコア操作が返しうるエラー。
 ///
@@ -93,4 +93,40 @@ pub enum CoreError {
     /// 実行前チェックで返る。削除済み（墓標）の部品表は数えない。
     #[error("the drawing already has a bill of materials: {0:?}")]
     BomAlreadyExists(EntityId),
+
+    /// 指定した [`ConstraintId`] の拘束が存在しない（または既に削除済み）。
+    #[error("constraint not found: {0:?}")]
+    ConstraintNotFound(ConstraintId),
+
+    /// 拘束の構造・値が不正で拒否した（M13 タスク96、DESIGN.md M13 設計判断2）。
+    ///
+    /// 参照先の種類が合わない（線分専用の拘束が円を指す、円に `Start` を指定するなど）、
+    /// 同じ対象を 2 回指す、値が非有限・範囲外（点どうしの距離が長さ型の許容値以下、
+    /// 半径が 0 以下など）、等半径の内接、値を持たない拘束への
+    /// [`crate::Command::SetConstraintValue`]、[`crate::Command::ModifyEntity`] で幾何の
+    /// 種類が変わり既存の拘束が指せなくなる場合、拘束のついた図形への
+    /// [`crate::Command::ReshapeEntity`] が支持する直線・円を変える（切り詰め・延長でない）
+    /// 場合に返る。
+    #[error("invalid constraint: {0}")]
+    InvalidConstraint(String),
+
+    /// コマンドを適用した後の形が拘束を満たさないため、コマンド全体を拒否した。
+    ///
+    /// 値は満たされなかった拘束のうち [`ConstraintId`] 順で最初のもの（決定的）。
+    /// 満たされていない拘束の追加、形と合わない値への変更、拘束に反する
+    /// [`crate::Command::ModifyEntity`] / [`crate::Command::ReshapeEntity`] で返る。
+    /// 拘束が参照する図形が退化している（線分の長さ・円と円弧の半径がソルバーの扱える
+    /// 下限 `ATOL_LEN` 未満）ときも、残差に関わらず満たされていない扱いでこれを返す。
+    #[error("constraint is not satisfied: {0:?}")]
+    ConstraintUnsatisfied(ConstraintId),
+
+    /// 固定の拘束（図形の固定、または動かそうとした点の固定）がついた図形の幾何を
+    /// 変える操作を拒否した。値は対象のエンティティ。
+    ///
+    /// 図形の固定（[`crate::Constraint::FixEntity`]）がついた図形への
+    /// [`crate::Command::ModifyEntity`] / [`crate::Command::ReshapeEntity`]、および
+    /// 点の固定（[`crate::Constraint::FixPoint`]）がついた点を動かす
+    /// [`crate::Command::ReshapeEntity`] で返る。
+    #[error("entity is fixed by a constraint: {0:?}")]
+    EntityFixed(EntityId),
 }

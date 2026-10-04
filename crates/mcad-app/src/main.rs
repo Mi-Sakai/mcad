@@ -56,10 +56,10 @@ use plot::dash_pattern_mm;
 use tool::{
     ArcTool, ChamferDistInput, ChamferTool, CircleTool, DIM_DEGENERATE_EPSILON, DimAngularTool,
     DimDiameterTool, DimLinearTool, DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput,
-    ExtendTool, FilletTool, GripDragOutcome, InputEvent, IsoCircleTool, LineTool, OffsetOutcome,
-    PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolygonTool, PolylineTool,
-    RectangleTool, SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx, ToolResult, TrimTool,
-    XLineTool, layer_visible,
+    ExtendTool, FilletTool, GripDragOutcome, InputEvent, IsoCircleTool, LineTool, MirrorChoice,
+    OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolygonTool,
+    PolylineTool, RectangleTool, SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx,
+    ToolResult, TrimTool, XLineTool, layer_visible,
 };
 use viewport::Viewport;
 
@@ -1117,6 +1117,55 @@ fn removed_constraint_count(before: usize, after: usize, added: usize) -> usize 
     (before + added).saturating_sub(after)
 }
 
+/// 鏡映確定モーダルの回答（[`SelectTool::resolve_mirror_choice`] の結果）を適用する。
+///
+/// - `Commit`（元を消す）: 従来の鏡映。選択は維持し、`Mirrored {n} entities`（消えた拘束が
+///   あれば件数を添える）。
+/// - `MirrorCopy`（元を残す）: 追加した新しい図形を新しい選択にし、
+///   `Mirrored {n} entities (copy)`。拘束は触らない。
+/// - `Cancelled`: 何も変えずメッセージだけ出す。
+///
+/// `apply` の失敗はどちらもステータスバーへ出す（Batch 原子性で Document は変わらない）。
+fn apply_mirror_outcome(
+    document: &mut Document,
+    select_tool: &mut SelectTool,
+    outcome: PlacementOutcome,
+    status: &mut Option<StatusMessage>,
+    now: f64,
+) {
+    match outcome {
+        PlacementOutcome::Continue | PlacementOutcome::MirrorChoicePending => {}
+        PlacementOutcome::Cancelled(msg) => set_status(status, now, msg),
+        PlacementOutcome::MirrorCopy(cmd) => match document.apply(cmd) {
+            Ok(new_ids) => {
+                let n = new_ids.entities.len();
+                select_tool.set_selection(new_ids.entities);
+                set_status(status, now, format!("Mirrored {n} entities (copy)"));
+            }
+            Err(err) => set_status(status, now, format!("Mirror failed: {err}")),
+        },
+        PlacementOutcome::Commit { cmd, .. } => {
+            let constraints_before = document.constraint_count();
+            match document.apply(cmd) {
+                Ok(new_ids) => {
+                    let removed = removed_constraint_count(
+                        constraints_before,
+                        document.constraint_count(),
+                        new_ids.constraints.len(),
+                    );
+                    let n = select_tool.selection().len();
+                    set_status(
+                        status,
+                        now,
+                        with_constraint_note(&format!("Mirrored {n} entities"), removed),
+                    );
+                }
+                Err(err) => set_status(status, now, format!("Mirror failed: {err}")),
+            }
+        }
+    }
+}
+
 /// 成功メッセージ `base` の末尾へ、消えた拘束の件数を添える。0 件なら `base` のまま。
 fn with_constraint_note(base: &str, removed: usize) -> String {
     if removed == 0 {
@@ -1334,9 +1383,13 @@ impl McadApp {
     /// `handle_tool_input` が呼ばれず更新も消去もされないため、残すと古い吸着先が有効な
     /// ガイドとしてモーダルの背後に出続ける（M12 タスク84、Codex adversarial review [medium]）。
     fn reset_transient_state_for_modal(&mut self) {
-        if self.select_tool.is_placing()
-            || self.select_tool.is_offsetting()
-            || self.select_tool.is_grip_dragging()
+        // 鏡映確定モーダルだけが開いている間は、保留中の軸（配置）を畳まない。
+        let mirror_choice_only =
+            self.select_tool.is_mirror_choice_pending() && !self.other_modal_open();
+        if !mirror_choice_only
+            && (self.select_tool.is_placing()
+                || self.select_tool.is_offsetting()
+                || self.select_tool.is_grip_dragging())
         {
             self.select_tool.cancel_placement();
             self.select_tool.cancel_offset();
@@ -1359,6 +1412,12 @@ impl McadApp {
     }
 
     fn modal_open(&self) -> bool {
+        self.other_modal_open() || self.select_tool.is_mirror_choice_pending()
+    }
+
+    /// 鏡映確定モーダル以外のモーダルが開いているか。他のモーダルは配置モードを畳むが、
+    /// 鏡映確定モーダルは配置の一部（保留中の軸）なので畳まない。
+    fn other_modal_open(&self) -> bool {
         self.confirm_state != ConfirmState::Idle
             || self.sheet_dialog.is_some()
             || self.dim_style_dialog.is_some()
@@ -3250,6 +3309,53 @@ impl eframe::App for McadApp {
             if modal.should_close() {
                 self.confirm_state = ConfirmState::Idle;
                 self.pending_recent_path = None;
+            }
+        }
+
+        // 鏡映確定モーダル: 軸の 2 点目をクリックした時点で、元の図形を残すか消すかを尋ねる。
+        // 英語の領域（未保存確認モーダルと同じ流儀）。Esc・モーダル外クリックは Cancel。
+        // Document は回答するまで変わらない。他のモーダルが開いているときは出さない
+        // （そちらが配置ごと保留を畳む）。
+        if self.select_tool.is_mirror_choice_pending() && !self.other_modal_open() {
+            let mut choice = None;
+            let modal =
+                egui::Modal::new(egui::Id::new("mirror_choice_modal")).show(ui.ctx(), |ui| {
+                    ui.set_width(280.0);
+                    ui.heading("Mirror");
+                    ui.label("Keep the original entities?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let keep = ui.button("Keep original");
+                        // 既定のボタン: 他にフォーカスが無ければ Keep original（Enter で押せる）。
+                        if ui.memory(|m| m.focused().is_none()) {
+                            keep.request_focus();
+                        }
+                        if keep.clicked() {
+                            choice = Some(MirrorChoice::KeepOriginal);
+                        }
+                        if ui.button("Delete original").clicked() {
+                            choice = Some(MirrorChoice::DeleteOriginal);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            choice = Some(MirrorChoice::Cancel);
+                        }
+                    });
+                });
+            if choice.is_none() && modal.should_close() {
+                choice = Some(MirrorChoice::Cancel);
+            }
+            if let Some(choice) = choice {
+                self.snap_marker = None;
+                let outcome = self
+                    .select_tool
+                    .resolve_mirror_choice(&self.document, choice);
+                apply_mirror_outcome(
+                    &mut self.document,
+                    &mut self.select_tool,
+                    outcome,
+                    &mut self.status,
+                    now,
+                );
             }
         }
 
@@ -8456,6 +8562,11 @@ fn handle_placement_input(
                 *snap_marker = None;
                 set_status(status, now, msg);
             }
+            // 鏡映の軸を確定した。モーダルの回答（`McadApp::resolve_mirror_choice`）まで
+            // Document は変えない。`MirrorCopy` は回答側でしか生じない。
+            PlacementOutcome::MirrorChoicePending | PlacementOutcome::MirrorCopy(_) => {
+                *snap_marker = None;
+            }
             PlacementOutcome::Commit { kind, cmd } => {
                 *snap_marker = None;
                 // ロックレイヤー混在時は Batch 原子性で全体が失敗し、位置も選択も変わらない。
@@ -11604,6 +11715,119 @@ mod tests {
         assert!(!app.select_tool.is_placing());
         assert!(app.snap_marker.is_none());
         assert_eq!(app.select_tool.selection(), &[a]);
+    }
+
+    /// 鏡映の軸 2 点まで進めて、モーダルの回答待ちにする。
+    fn app_with_pending_mirror() -> (McadApp, mcad_core::EntityId) {
+        let mut app = McadApp::new();
+        let a = add_line(&mut app, 0.0);
+        app.select_tool.set_selection(vec![a]);
+        assert!(app.select_tool.start_mirror());
+        let _ = app
+            .select_tool
+            .placement_click(&app.document, Point2::new(0.0, 5.0), 0.1);
+        assert_eq!(
+            app.select_tool
+                .placement_click(&app.document, Point2::new(1.0, 5.0), 0.1),
+            PlacementOutcome::MirrorChoicePending
+        );
+        (app, a)
+    }
+
+    #[test]
+    fn pending_mirror_choice_opens_modal_and_survives_modal_reset() {
+        let (mut app, a) = app_with_pending_mirror();
+        assert!(app.modal_open());
+        assert!(!app.other_modal_open());
+        let generation = app.document.generation();
+
+        // 鏡映確定モーダルだけなら、毎フレームのモーダル用リセットでも保留は残る。
+        app.reset_transient_state_for_modal();
+        assert!(app.select_tool.is_mirror_choice_pending());
+
+        // 別のモーダルが開けば配置ごと畳む。
+        app.confirm_state = ConfirmState::ConfirmingNew;
+        app.reset_transient_state_for_modal();
+        assert!(!app.select_tool.is_placing());
+        assert_eq!(app.select_tool.selection(), &[a]);
+        assert_eq!(app.document.generation(), generation);
+    }
+
+    #[test]
+    fn reset_transient_ui_state_clears_pending_mirror_choice() {
+        let (mut app, _a) = app_with_pending_mirror();
+        app.reset_transient_ui_state();
+        assert!(!app.select_tool.is_mirror_choice_pending());
+        assert!(!app.modal_open());
+    }
+
+    #[test]
+    fn mirror_choice_keep_selects_copy_and_reports_copy_status() {
+        let (mut app, a) = app_with_pending_mirror();
+        let outcome = app
+            .select_tool
+            .resolve_mirror_choice(&app.document, MirrorChoice::KeepOriginal);
+        apply_mirror_outcome(
+            &mut app.document,
+            &mut app.select_tool,
+            outcome,
+            &mut app.status,
+            0.0,
+        );
+        assert_eq!(app.document.entity_count(), 2);
+        assert_eq!(app.select_tool.selection().len(), 1);
+        assert_ne!(app.select_tool.selection()[0], a);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Mirrored 1 entities (copy)")
+        );
+        assert!(app.document.undo());
+        assert_eq!(app.document.entity_count(), 1);
+    }
+
+    #[test]
+    fn mirror_choice_delete_replaces_original_and_cancel_changes_nothing() {
+        let (mut app, a) = app_with_pending_mirror();
+        let before = app.document.entity(a).unwrap().geom.clone();
+        let outcome = app
+            .select_tool
+            .resolve_mirror_choice(&app.document, MirrorChoice::DeleteOriginal);
+        apply_mirror_outcome(
+            &mut app.document,
+            &mut app.select_tool,
+            outcome,
+            &mut app.status,
+            0.0,
+        );
+        assert_eq!(app.document.entity_count(), 1);
+        assert_eq!(
+            app.document.entity(a).unwrap().geom,
+            before.mirrored(Point2::new(0.0, 5.0), Point2::new(1.0, 5.0))
+        );
+        assert_eq!(app.select_tool.selection(), &[a]);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Mirrored 1 entities")
+        );
+
+        let (mut app, a) = app_with_pending_mirror();
+        let before = app.document.entity(a).unwrap().geom.clone();
+        let outcome = app
+            .select_tool
+            .resolve_mirror_choice(&app.document, MirrorChoice::Cancel);
+        apply_mirror_outcome(
+            &mut app.document,
+            &mut app.select_tool,
+            outcome,
+            &mut app.status,
+            0.0,
+        );
+        assert_eq!(app.document.entity(a).unwrap().geom, before);
+        assert_eq!(app.select_tool.selection(), &[a]);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Mirror cancelled")
+        );
     }
 
     #[test]

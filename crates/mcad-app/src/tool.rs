@@ -4816,6 +4816,11 @@ enum PlacementStage {
         p2: Point2,
         cursor: Point2,
     },
+    /// 鏡映の軸 2 点（`p1`・`p2`）を確定済みで、元の図形を残すか消すかのモーダルの
+    /// 回答待ち（鏡映のみ）。Document はまだ変更していない。回答は
+    /// [`SelectTool::resolve_mirror_choice`] で受け、Esc・ツール切替・ファイル読込などの
+    /// [`SelectTool::cancel_placement`] で他の配置と同じく消える。
+    MirrorChoice { p1: Point2, p2: Point2 },
 }
 
 /// 進行中の配置モード（種別＋段階）。
@@ -4837,6 +4842,14 @@ pub enum PlacementOutcome {
     Continue,
     /// 変位ゼロ等でモードをキャンセルした。ASCII メッセージを表示する。
     Cancelled(&'static str),
+    /// 鏡映の軸 2 点を確定した。元の図形を残すか消すかを尋ねるモーダルの回答待ちで、
+    /// 配置は継続中（[`SelectTool::is_mirror_choice_pending`]）。呼び出し側は何も適用せず、
+    /// モーダルの回答を [`SelectTool::resolve_mirror_choice`] へ渡す。
+    MirrorChoicePending,
+    /// 元の図形を残す鏡映（コピー）の確定コマンド。`AddEntity` だけの [`Command::Batch`]。
+    /// 呼び出し側が `Document::apply` し、返る `NewIds.entities` を新しい選択にする
+    /// （複製と同じ）。拘束は複製も書き換えもしない。
+    MirrorCopy(Command),
     /// 確定コマンド。呼び出し側が `Document::apply` したうえで、`kind` に応じた後処理を
     /// 行う（複製は返る `NewIds.entities` を [`SelectTool::set_selection`] で新選択にし、
     /// 移動・回転・鏡映は ID 不変なので選択をそのまま維持する）。`kind` はステータス文言の
@@ -4860,6 +4873,17 @@ pub enum PlacementPreview {
     Rotate { pivot: Point2, angle: f64 },
     /// 鏡映プレビュー（選択集合を `axis_a`→`axis_b` の直線で鏡映した先を仮表示する）。
     Mirror { axis_a: Point2, axis_b: Point2 },
+}
+
+/// 鏡映確定モーダルの回答。[`SelectTool::resolve_mirror_choice`] へ渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorChoice {
+    /// 元の図形を残し、鏡映した新しい図形を追加する（拘束は触らない）。
+    KeepOriginal,
+    /// 元の図形を鏡映した幾何へ差し替える（従来の鏡映。拘束も組み直す）。
+    DeleteOriginal,
+    /// 何も変更せず、配置モードを終える。
+    Cancel,
 }
 
 /// 回転の相対角がこの値（ラジアン）未満なら no-op として確定を拒否するしきい値。
@@ -5776,17 +5800,27 @@ impl SelectTool {
                         PlacementKind::Rotate => unreachable!("rotate handled above"),
                     });
                 }
+                // 鏡映は確定せず、元の図形を残すか消すかの回答待ちへ進む（Document は不変）。
+                if placement.kind == PlacementKind::Mirror {
+                    self.placement = Some(Placement {
+                        kind: placement.kind,
+                        stage: PlacementStage::MirrorChoice { p1, p2: world },
+                    });
+                    return PlacementOutcome::MirrorChoicePending;
+                }
                 let delta = world - p1;
                 let cmd = match placement.kind {
                     PlacementKind::Duplicate => self.build_duplicate_command(document, delta),
                     PlacementKind::Move => {
                         self.build_modify_command(document, |g| g.translated(delta))
                     }
-                    PlacementKind::Mirror => self.build_mirror_command(document, p1, world),
+                    PlacementKind::Mirror => unreachable!("mirror handled above"),
                     PlacementKind::Rotate => unreachable!("rotate handled above"),
                 };
                 self.finish_commit(placement.kind, cmd)
             }
+            // 回答待ちの間のクリックは何もしない（モーダル表示中は入力自体がゲートされる）。
+            PlacementStage::MirrorChoice { .. } => PlacementOutcome::Continue,
             PlacementStage::WaitingP3 { p1, p2, .. } => {
                 // 回転3クリック目: pivot=p1, 基準点=p2, 回転先=world。
                 //
@@ -5807,6 +5841,64 @@ impl SelectTool {
                 }
                 let cmd = self.build_modify_command(document, |g| g.rotated(p1, angle));
                 self.finish_commit(placement.kind, cmd)
+            }
+        }
+    }
+
+    /// 鏡映の軸 2 点を確定済みで、モーダルの回答待ちか。
+    #[must_use]
+    pub fn is_mirror_choice_pending(&self) -> bool {
+        matches!(
+            self.placement,
+            Some(Placement {
+                stage: PlacementStage::MirrorChoice { .. },
+                ..
+            })
+        )
+    }
+
+    /// 鏡映確定モーダルの回答を受け、確定コマンドまたはキャンセルを返す。回答待ちでなければ
+    /// `Continue`（何もしない）。どの回答でも配置モードは終わる。選択は変えない（コピーの
+    /// 新選択への切替は、`apply` 後に呼び出し側が行う）。
+    ///
+    /// - `DeleteOriginal`: 従来の鏡映（[`SelectTool::build_mirror_command`]）の `Commit`。
+    /// - `KeepOriginal`: 各図形を `mirrored` した新しい図形の `AddEntity` だけの
+    ///   [`PlacementOutcome::MirrorCopy`]（複製と同じ [`SelectTool::build_copy_command`]）。
+    ///   部品表を含む選択は複製と同じく拒否する（`Cancelled`）。
+    /// - `Cancel`: `Cancelled`。
+    #[must_use]
+    pub fn resolve_mirror_choice(
+        &mut self,
+        document: &Document,
+        choice: MirrorChoice,
+    ) -> PlacementOutcome {
+        let Some(Placement {
+            stage: PlacementStage::MirrorChoice { p1, p2 },
+            ..
+        }) = self.placement
+        else {
+            return PlacementOutcome::Continue;
+        };
+        self.placement = None;
+        match choice {
+            MirrorChoice::Cancel => PlacementOutcome::Cancelled("Mirror cancelled"),
+            MirrorChoice::DeleteOriginal => match self.build_mirror_command(document, p1, p2) {
+                Some(cmd) => PlacementOutcome::Commit {
+                    kind: PlacementKind::Mirror,
+                    cmd,
+                },
+                None => PlacementOutcome::Cancelled("Nothing to mirror"),
+            },
+            MirrorChoice::KeepOriginal => {
+                if crate::selection_contains_bom(document, &self.selection) {
+                    return PlacementOutcome::Cancelled(
+                        "Cannot mirror a copy: selection includes the bill of materials",
+                    );
+                }
+                match self.build_copy_command(document, |g| g.mirrored(p1, p2)) {
+                    Some(cmd) => PlacementOutcome::MirrorCopy(cmd),
+                    None => PlacementOutcome::Cancelled("Nothing to mirror"),
+                }
             }
         }
     }
@@ -6030,6 +6122,14 @@ impl SelectTool {
                 axis_a: p1,
                 axis_b: cursor,
             }),
+            // モーダルの回答待ちの間も、確定した軸での鏡映後をゴーストとして出し続ける。
+            Placement {
+                kind: PlacementKind::Mirror,
+                stage: PlacementStage::MirrorChoice { p1, p2 },
+            } => Some(PlacementPreview::Mirror {
+                axis_a: p1,
+                axis_b: p2,
+            }),
             Placement {
                 kind: PlacementKind::Rotate,
                 stage: PlacementStage::WaitingP3 { p1, p2, cursor },
@@ -6046,13 +6146,23 @@ impl SelectTool {
     /// まとめる。レイヤー・スタイルは元エンティティを丸ごとクローンして保持し、幾何のみ
     /// 差し替える。生存している選択物が無ければ `None`。
     fn build_duplicate_command(&self, document: &Document, delta: Vec2) -> Option<Command> {
+        self.build_copy_command(document, |g| g.translated(delta))
+    }
+
+    /// 選択中の各エンティティの幾何を `transform` で変換した複製の `AddEntity` を 1 バッチに
+    /// まとめる。複製（`translated`）と元を残す鏡映（`mirrored`）が共有する。
+    fn build_copy_command(
+        &self,
+        document: &Document,
+        transform: impl Fn(&EntityGeom) -> EntityGeom,
+    ) -> Option<Command> {
         let subs: Vec<Command> = self
             .selection
             .iter()
             .filter_map(|&id| {
                 document.entity(id).map(|e| {
                     let mut copy = e.clone();
-                    copy.geom = copy.geom.translated(delta);
+                    copy.geom = transform(&copy.geom);
                     Command::AddEntity(copy)
                 })
             })
@@ -8145,8 +8255,20 @@ mod tests {
             other => panic!("expected Mirror preview, got {other:?}"),
         }
 
-        // 2クリック目=軸点B(1,0)。x 軸に対する鏡映の ModifyEntity バッチを返す。
-        let outcome = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+        // 2クリック目=軸点B(1,0)。確定せず回答待ちになり（Document 不変・プレビュー継続）、
+        // 「元を消す」の回答で x 軸に対する鏡映の ModifyEntity バッチを返す。
+        assert_eq!(
+            tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1),
+            PlacementOutcome::MirrorChoicePending
+        );
+        assert!(tool.is_placing());
+        assert!(tool.is_mirror_choice_pending());
+        assert!(matches!(
+            tool.placement_preview(),
+            Some(PlacementPreview::Mirror { .. })
+        ));
+        assert_eq!(doc.entity(a).unwrap().geom, before_a);
+        let outcome = tool.resolve_mirror_choice(&doc, MirrorChoice::DeleteOriginal);
         let PlacementOutcome::Commit { kind, .. } = &outcome else {
             panic!("expected Commit, got {outcome:?}");
         };
@@ -8182,7 +8304,8 @@ mod tests {
 
         assert!(tool.start_mirror());
         let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1);
-        let outcome = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+        let outcome = tool.resolve_mirror_choice(&doc, MirrorChoice::DeleteOriginal);
         let PlacementOutcome::Commit { cmd, .. } = outcome else {
             panic!("expected Commit, got {outcome:?}");
         };
@@ -8194,6 +8317,128 @@ mod tests {
 
         assert!(doc.undo());
         assert_eq!(doc.entity(a).unwrap().geom, before_a);
+    }
+
+    #[test]
+    fn mirror_keep_original_adds_mirrored_copies_and_undoes_as_one_unit() {
+        let mut doc = Document::new();
+        let layer2 = doc.current_layer();
+        let style = Style::inherited();
+        let a = doc
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(Point2::new(0.0, 2.0), Point2::new(1.0, 3.0))),
+                layer2,
+                style,
+            )))
+            .unwrap()
+            .entities[0];
+        let before_a = doc.entity(a).unwrap().clone();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 2.5), 0.2, false);
+
+        assert!(tool.start_mirror());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1);
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+        let outcome = tool.resolve_mirror_choice(&doc, MirrorChoice::KeepOriginal);
+        let PlacementOutcome::MirrorCopy(Command::Batch(subs)) = &outcome else {
+            panic!("expected MirrorCopy(Batch), got {outcome:?}");
+        };
+        assert_eq!(subs.len(), 1);
+        let Command::AddEntity(copy) = &subs[0] else {
+            panic!("expected AddEntity");
+        };
+        assert_eq!(
+            copy.geom,
+            before_a
+                .geom
+                .mirrored(Point2::new(0.0, 0.0), Point2::new(1.0, 0.0))
+        );
+        assert_eq!(copy.layer, before_a.layer);
+        assert_eq!(copy.style, before_a.style);
+        assert!(!tool.is_placing());
+
+        let PlacementOutcome::MirrorCopy(cmd) = outcome else {
+            unreachable!()
+        };
+        let new_ids = doc.apply(cmd).unwrap();
+        assert_eq!(new_ids.entities.len(), 1);
+        assert_eq!(doc.entity_count(), 2);
+        assert_eq!(doc.entity(a).unwrap(), &before_a);
+
+        assert!(doc.undo());
+        assert_eq!(doc.entity_count(), 1);
+        assert_eq!(doc.entity(a).unwrap(), &before_a);
+    }
+
+    #[test]
+    fn mirror_keep_original_rejects_selection_containing_a_bom() {
+        let mut doc = Document::new();
+        let layer = doc.current_layer();
+        let bom = doc
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::Table(crate::bom::default_bom_table(Point2::new(0.0, 0.0), 180.0)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let mut tool = SelectTool::default();
+        tool.set_selection(vec![bom]);
+        assert!(tool.start_mirror());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1);
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+        assert_eq!(
+            tool.resolve_mirror_choice(&doc, MirrorChoice::KeepOriginal),
+            PlacementOutcome::Cancelled(
+                "Cannot mirror a copy: selection includes the bill of materials"
+            )
+        );
+        assert!(!tool.is_placing());
+        assert_eq!(doc.entity_count(), 1);
+    }
+
+    #[test]
+    fn mirror_cancel_choice_changes_nothing_and_keeps_selection() {
+        let mut doc = Document::new();
+        let a = add_hline(&mut doc, 0.0);
+        let before = doc.entity(a).unwrap().clone();
+        let gen_before = doc.generation();
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+        assert!(tool.start_mirror());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 5.0), 0.1);
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 5.0), 0.1);
+        assert!(tool.is_mirror_choice_pending());
+        assert_eq!(doc.generation(), gen_before);
+
+        assert_eq!(
+            tool.resolve_mirror_choice(&doc, MirrorChoice::Cancel),
+            PlacementOutcome::Cancelled("Mirror cancelled")
+        );
+        assert!(!tool.is_placing());
+        assert_eq!(tool.selection(), &[a]);
+        assert_eq!(doc.entity(a).unwrap(), &before);
+        assert_eq!(doc.generation(), gen_before);
+        // 回答待ちでなければ no-op。
+        assert_eq!(
+            tool.resolve_mirror_choice(&doc, MirrorChoice::KeepOriginal),
+            PlacementOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn cancel_placement_clears_pending_mirror_choice() {
+        let mut doc = Document::new();
+        let _a = add_hline(&mut doc, 0.0);
+        let mut tool = SelectTool::default();
+        tool.on_click(&doc, Point2::new(0.5, 0.0), 0.1, false);
+        assert!(tool.start_mirror());
+        let _ = tool.placement_click(&doc, Point2::new(0.0, 5.0), 0.1);
+        let _ = tool.placement_click(&doc, Point2::new(1.0, 5.0), 0.1);
+        assert!(tool.is_mirror_choice_pending());
+        tool.cancel_placement();
+        assert!(!tool.is_mirror_choice_pending());
+        assert!(!tool.is_placing());
     }
 
     #[test]

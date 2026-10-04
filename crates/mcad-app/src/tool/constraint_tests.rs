@@ -293,7 +293,12 @@ fn run_mirror(doc: &Document, ids: &[EntityId]) -> Command {
         tool.placement_click(doc, Point2::new(0.0, 0.0), 0.1),
         PlacementOutcome::Continue
     );
-    match tool.placement_click(doc, Point2::new(1.0, 0.0), 0.1) {
+    // 2 点目では確定せず回答待ちになり、「元を消す」で従来のコマンドが出る。
+    assert_eq!(
+        tool.placement_click(doc, Point2::new(1.0, 0.0), 0.1),
+        PlacementOutcome::MirrorChoicePending
+    );
+    match tool.resolve_mirror_choice(doc, MirrorChoice::DeleteOriginal) {
         PlacementOutcome::Commit { cmd, .. } => cmd,
         other => panic!("expected commit, got {other:?}"),
     }
@@ -409,4 +414,31 @@ fn extend_and_trim_from_either_end_keep_the_line_direction() {
             assert_eq!(dir(after), dir(before));
         }
     }
+}
+
+#[test]
+fn mirror_keep_original_leaves_constraints_untouched() {
+    let mut doc = Document::new();
+    let ids = mirror_fixture(&mut doc);
+    let constraints: Vec<_> = doc.constraints().map(|(_, c)| c.clone()).collect();
+    assert_eq!(constraints.len(), 4);
+
+    let mut tool = SelectTool::default();
+    tool.set_selection(ids.clone());
+    assert!(tool.start_mirror());
+    let _ = tool.placement_click(&doc, Point2::new(0.0, 0.0), 0.1);
+    let _ = tool.placement_click(&doc, Point2::new(1.0, 0.0), 0.1);
+    let PlacementOutcome::MirrorCopy(cmd) =
+        tool.resolve_mirror_choice(&doc, MirrorChoice::KeepOriginal)
+    else {
+        panic!("expected MirrorCopy");
+    };
+    let Command::Batch(subs) = &cmd else {
+        panic!("expected batch");
+    };
+    assert!(subs.iter().all(|c| matches!(c, Command::AddEntity(_))));
+    doc.apply(cmd).expect("copy accepted");
+    assert_eq!(doc.entity_count(), 8);
+    let after: Vec<_> = doc.constraints().map(|(_, c)| c.clone()).collect();
+    assert_eq!(after, constraints);
 }

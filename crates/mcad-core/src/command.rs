@@ -34,7 +34,9 @@ pub enum Command {
     /// 拘束（M13）は残す。図形の固定（[`Constraint::FixEntity`]）がついた図形の幾何を
     /// 変える場合は [`crate::CoreError::EntityFixed`]、幾何の種類が変わって既存の拘束が
     /// 指せなくなる場合は [`crate::CoreError::InvalidConstraint`] で拒否する。変更後の形が
-    /// 拘束を満たさなければ [`crate::Document::apply`] の最後の充足検査で拒否される。
+    /// 拘束を満たさなければ、[`crate::Document::apply`] が**このコマンドで動かした点・半径・
+    /// 角度を止めたまま**ほかを解いて追従させる（同じ undo 単位。`apply` の doc「拘束の求解」）。
+    /// 線分の片方の端点だけを変えれば、もう片方は自由なまま（グリップ編集）。
     /// 切り詰め・延長には [`Command::ReshapeEntity`] を使う。
     ModifyEntity {
         /// 対象エンティティ。
@@ -66,7 +68,8 @@ pub enum Command {
     /// - 図形の固定がついた図形、動いた点に点の固定がある図形は
     ///   [`crate::CoreError::EntityFixed`] で拒否する。
     ///
-    /// 残った拘束は [`crate::Document::apply`] の最後の充足検査に掛かる。拘束の無い
+    /// 残った拘束は [`crate::Document::apply`] の最後の求解に掛かる（支持する直線・円が
+    /// 変わらないので、ふつうは満たされたままで何も動かない）。拘束の無い
     /// エンティティに対しては `ModifyEntity` と同じ結果になる。同一幾何への差し替えは
     /// 意味的 no-op（拘束も消さない）。
     ReshapeEntity {
@@ -146,7 +149,7 @@ pub enum Command {
     /// 設計判断4 実装時追記）。このコマンドはエンティティの `annotation` 自体には一切触れない。
     SetDimStyle(DimStyle),
 
-    /// 幾何拘束を追加する（M13 タスク96、DESIGN.md M13 設計判断2）。
+    /// 幾何拘束を追加する（M13 タスク96・97、DESIGN.md M13 設計判断2・3）。
     ///
     /// [`Constraint`] は**完全な値**（側の符号・外接/内接・固定座標・角度を含む）を載せる。
     /// 現在の形からそれらを決めるには [`Constraint`] のコンストラクタ
@@ -154,14 +157,30 @@ pub enum Command {
     ///
     /// 実行前に構造を検証する（参照先の存在と種類、同じ対象の二重指定、値の範囲。
     /// 違反は [`crate::CoreError::InvalidConstraint`] / [`crate::CoreError::EntityNotFound`]）。
-    /// 角度の値は `(−π, π]` へ正規化して格納する。レイヤーのロックは見ない（拘束の追加は
-    /// エンティティを変えない）。
+    /// 角度の値は `(−π, π]` へ正規化して格納する。レイヤーのロックは見ない（拘束の追加
+    /// そのものはエンティティを変えない。ロックされたレイヤーの図形は、求解でも動かない）。
     ///
-    /// **現在の形で満たされていない拘束は拒否する**
-    /// （[`crate::CoreError::ConstraintUnsatisfied`]。この段階では解かない）。退化した図形
-    /// （長さが `ATOL_LEN` 未満の線分、半径が `ATOL_LEN` 未満の円・円弧）を参照する拘束も、
-    /// 残差に関わらず満たされていない扱いで拒否する。
-    AddConstraint(Constraint),
+    /// **現在の形で満たされていなければ、[`crate::Document::apply`] が解いて図形を動かす**
+    /// （同じ undo 単位）。満たされていれば何も動かさない。満たす形が無い（ほかの拘束と
+    /// 矛盾する）追加は拒否する。退化した図形（長さが `ATOL_LEN` 未満の線分、半径が
+    /// `ATOL_LEN` 未満の円・円弧）を参照する拘束は [`crate::CoreError::DegenerateShape`] で
+    /// 拒否する。
+    ///
+    /// # `hold`: 止めておく図形
+    ///
+    /// 「拘束を付けたときに動くのは後に選んだ図形」（M13 ユーザー確定事項）のための指定。
+    /// `Some(e)` なら `e`（先に選んだ図形）の全パラメータを止めて解き、**それで満たせない
+    /// ときに限り**、止めずに解き直す（返るエラーは解き直しのもの）。`None` は止める図形なしで、
+    /// 動きが最小になる解（最小ノルム）を選ぶ。`e` はこの拘束の対象でなければならない
+    /// （違えば [`crate::CoreError::InvalidConstraint`]）。1 つの [`Command::Batch`] に複数の
+    /// `AddConstraint` があるときは、拘束でつながった図形のまとまり（連結成分）ごとに、
+    /// その中の `hold` をまとめて止めて 1 回解き、満たせなければまとめて外して解き直す。
+    AddConstraint {
+        /// 追加する拘束。
+        constraint: Constraint,
+        /// 止めておく図形（先に選んだ図形）。`None` なら止めない。
+        hold: Option<EntityId>,
+    },
 
     /// 幾何拘束を削除する。レイヤーのロックは見ない。
     RemoveConstraint(ConstraintId),
@@ -171,13 +190,33 @@ pub enum Command {
     /// 値を持たない拘束に対しては [`crate::CoreError::InvalidConstraint`]。値の範囲の検証は
     /// [`Command::AddConstraint`] と同じ（点どうしの距離は長さ型の許容値より大きい、
     /// 点と線の距離は 0 以上、半径は正、角度は `(−π, π]` へ正規化）。同じ値の設定は
-    /// 意味的 no-op。現在の形が新しい値を満たさなければ拒否する
-    /// （[`crate::CoreError::ConstraintUnsatisfied`]。この段階では解かない）。
+    /// 意味的 no-op。現在の形が新しい値を満たさなければ、[`crate::Document::apply`] が
+    /// 解いて形を変える（同じ undo 単位。止める図形は足さず、動きが最小になる解を選ぶ）。
     SetConstraintValue {
         /// 対象の拘束。
         id: ConstraintId,
         /// 新しい値（長さはワールド単位、角度はラジアン）。
         value: f64,
+    },
+
+    /// 既存の拘束を、**同じ [`ConstraintId`] のまま**別の拘束へ差し替える（M13 タスク97）。
+    ///
+    /// ミラーのように、図形を動かすと拘束の中身（側の符号・角度の符号・円弧の端点の指し方）も
+    /// 変えなければ同じ幾何関係を表せない操作のためのコマンド。図形の `ModifyEntity` と同じ
+    /// [`Command::Batch`] に入れて使う（差し替える拘束は [`Constraint::mirrored`] で作る）。
+    ///
+    /// 検証は [`Command::AddConstraint`] と同じ（構造の検証と、角度の正規化）。対象の
+    /// エンティティ・拘束の種類が変わる差し替えも受け付ける。同じ値への差し替えは意味的
+    /// no-op。存在しない ID は [`crate::CoreError::ConstraintNotFound`]。レイヤーのロックは
+    /// 見ない。
+    ///
+    /// 差し替えた拘束が現在の形で満たされていなければ、[`crate::Document::apply`] が解く
+    /// （止める図形は足さない。[`Command::SetConstraintValue`] と同じ）。
+    ReplaceConstraint {
+        /// 対象の拘束。
+        id: ConstraintId,
+        /// 差し替え後の拘束。
+        constraint: Constraint,
     },
 
     /// 複数のサブコマンドを **1 つの操作** としてまとめて適用する複合コマンド。

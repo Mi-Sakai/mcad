@@ -17,7 +17,7 @@
 //! （undo 履歴がそれらを参照しうるため妥当）。数千エンティティ規模の MVP では問題ない。
 //!
 //! 幾何拘束（M13）も同じ方式で `SlotMap<ConstraintId, Option<Constraint>>` に格納する。
-//! 拘束に関わる処理（読み取り API・連鎖削除・充足検査）は `constraints` サブモジュールにある。
+//! 拘束に関わる処理（読み取り API・連鎖削除・`apply` の中の求解）は `constraints` サブモジュールにある。
 
 use slotmap::SlotMap;
 
@@ -92,11 +92,16 @@ enum Applied {
     AddConstraint {
         id: ConstraintId,
         constraint: Constraint,
+        /// [`Command::AddConstraint`] の `hold`（止めておく図形）。`apply` の最後の求解だけが
+        /// 読む（undo/redo は使わない。追従した修正は別の記録として同じ履歴エントリに入る）。
+        hold: Option<EntityId>,
     },
     RemoveConstraint {
         id: ConstraintId,
         constraint: Constraint,
     },
+    /// [`Command::SetConstraintValue`] と [`Command::ReplaceConstraint`] の共通の記録
+    /// （どちらも「同じ ID の拘束を別の値へ差し替える」）。
     SetConstraintValue {
         id: ConstraintId,
         before: Constraint,
@@ -406,16 +411,31 @@ impl Document {
     /// ロックされたレイヤー上のエンティティへの変更・削除、2 つ目の部品表を作る
     /// 追加・変更（[`CoreError::BomAlreadyExists`]）などで [`CoreError`] を返す。
     ///
-    /// # 拘束の充足検査（M13 タスク96）
+    /// # 拘束の求解（M13 タスク97、DESIGN.md M13 設計判断3）
     ///
-    /// コマンド（[`Command::Batch`] なら全体）を適用し終えた後に **1 回だけ**、幾何が変わった
-    /// エンティティと追加・値変更した拘束に関わる拘束が満たされているかを検査する
-    /// （DESIGN.md M13 設計判断3 の「解くのは最も外側の `apply` 1 回につき 1 回」の足場。
-    /// タスク97 がこの検査を求解に置き換える）。満たされていない拘束があればコマンド全体を
-    /// 巻き戻して [`CoreError::ConstraintUnsatisfied`]（[`ConstraintId`] 順で最初の違反）を返す。
-    /// サブコマンドごとには検査しないので、拘束でつながった複数の図形を 1 つの `Batch` で
-    /// まとめて動かす操作は、動かした後の形が拘束を満たせば通る。拘束が 1 件も無い文書では
-    /// 検査しない。
+    /// **拘束は常に満たされた状態を保つ**。コマンド（[`Command::Batch`] なら全体。サブコマンド
+    /// ごとには解かない）を適用し終えた後に **1 回だけ**、次のものに関わる拘束の連結成分
+    /// （拘束でつながった図形のまとまり）を調べる: 幾何が変わったエンティティ、追加・値変更・
+    /// 差し替えした拘束、消えた拘束。
+    ///
+    /// - 成分の拘束がすべて満たされていれば、**解かずに通す**（何も動かさない。拘束で
+    ///   つながった図形をまとめて移動・回転する `Batch` は、bit 単位でそのまま入る）。
+    /// - 満たされていない拘束があれば解き、動いた図形の修正を**同じ undo 単位**に入れる
+    ///   （undo 1 回でコマンドと追従がそろって戻り、redo は解き直さずに同じ形を再現する）。
+    /// - 解けなければコマンド全体を巻き戻して `Err`: 満たす形が無い
+    ///   （[`CoreError::ConstraintUnsolvable`]）、止められた図形だけに関わる拘束が満たされない
+    ///   （[`CoreError::ConstraintBlockedByFixed`]）、図形か拘束が退化する
+    ///   （[`CoreError::DegenerateShape`] / [`CoreError::DegenerateConstraint`]）。
+    ///
+    /// 解くときに**止めておく**のは: 図形の固定（[`Constraint::FixEntity`]）の対象、ロックされた
+    /// レイヤー上のエンティティ、**そのコマンドで値が変わったパラメータ**（利用者が動かしたもの。
+    /// 適用前と適用後の幾何を f64 の完全一致で比べ、線分は始点・終点、円と円弧は中心を点の
+    /// 単位で、半径・開始角・終了角は個別に止める。種類が変わった図形は全体を止め、その
+    /// `apply` で追加された図形は止めない）、そして [`Command::AddConstraint`] の `hold`。
+    /// 解は現在の形から最も動きの小さいもの（最小ノルム。円弧の角度は弧長で測る）。
+    ///
+    /// 受理した文書では、すべての拘束が [`Constraint::is_satisfied`] を満たす。拘束が 1 件も
+    /// 無い文書では何もしない。
     pub fn apply(&mut self, cmd: Command) -> Result<NewIds, CoreError> {
         // 原子性（検証→変更、失敗時のロールバック）の保証内容は [`Command::Batch`] の
         // doc（「# 原子性」節）を参照。no-op 判定の仕組みは [`ExecuteOutcome`] の doc を参照。
@@ -431,12 +451,10 @@ impl Document {
         if !changed {
             return Ok(NewIds::default());
         }
-        // 拘束の充足検査（M13）。世代・履歴に触れる前に行い、失敗したら `execute` が
-        // 行った変更をすべて巻き戻す（undo と同じ経路なので部分適用は残らない）。
-        if let Err(err) = self.check_constraints(&applied) {
-            self.revert(&applied);
-            return Err(err);
-        }
+        // 拘束の求解（M13）。世代・履歴に触れる前に行う。失敗したら `execute` が行った変更を
+        // すべて巻き戻してある（undo と同じ経路なので部分適用は残らない）。成功したら、
+        // 追従した修正を足した記録が返る。
+        let applied = self.follow_constraints(applied)?;
         // 実変更があったので新しい世代を採番する。`next_generation` は単調増加の高水位で、
         // undo で世代を戻しても減らさないため、過去に使った番号を再利用しない（内容が違えば
         // 世代も必ず違う、という dirty 判定の前提を保つ）。採番した世代を履歴エントリに
@@ -643,14 +661,24 @@ impl Document {
                     changed,
                 ))
             }
-            Command::AddConstraint(constraint) => {
+            Command::AddConstraint { constraint, hold } => {
                 // 構造と値の検証（参照先の存在と種類・二重指定・値の範囲）。現在の形で
-                // 満たされているかは `apply` の最後の充足検査が見る。
+                // 満たされていなければ、`apply` の最後の求解が満たす。
                 constraint.validate(self)?;
+                if hold.is_some_and(|held| !constraint.references(held)) {
+                    return Err(CoreError::InvalidConstraint(
+                        "the entity to hold must be one of the entities the constraint refers to"
+                            .to_owned(),
+                    ));
+                }
                 let constraint = constraint.normalized();
                 let id = self.insert_constraint(constraint.clone());
                 Ok(ExecuteOutcome {
-                    applied: Applied::AddConstraint { id, constraint },
+                    applied: Applied::AddConstraint {
+                        id,
+                        constraint,
+                        hold,
+                    },
                     new_ids: NewIds {
                         constraints: vec![id],
                         ..NewIds::default()
@@ -674,6 +702,18 @@ impl Document {
                 after.validate(self)?;
                 let after = after.normalized();
                 // 同じ値の設定は意味的 no-op（履歴を汚さない）。
+                let changed = before != after;
+                self.set_constraint(id, Some(after.clone()));
+                Ok(ExecuteOutcome::conditional(
+                    Applied::SetConstraintValue { id, before, after },
+                    changed,
+                ))
+            }
+            Command::ReplaceConstraint { id, constraint } => {
+                let before = self.require_constraint(id)?.clone();
+                constraint.validate(self)?;
+                let after = constraint.normalized();
+                // 同じ拘束への差し替えは意味的 no-op（履歴を汚さない）。
                 let changed = before != after;
                 self.set_constraint(id, Some(after.clone()));
                 Ok(ExecuteOutcome::conditional(
@@ -829,7 +869,7 @@ impl Document {
             Applied::SetCurrentLayer { after, .. } => self.current_layer = *after,
             Applied::SetSheet { after, .. } => self.sheet = (**after).clone(),
             Applied::SetDimStyle { after, .. } => self.dim_style = *after,
-            Applied::AddConstraint { id, constraint } => {
+            Applied::AddConstraint { id, constraint, .. } => {
                 self.set_constraint(*id, Some(constraint.clone()));
             }
             Applied::RemoveConstraint { id, .. } => self.set_constraint(*id, None),
@@ -1013,6 +1053,8 @@ impl Default for Document {
     }
 }
 
+#[cfg(test)]
+mod constraint_solve_tests;
 #[cfg(test)]
 mod constraint_tests;
 

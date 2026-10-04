@@ -3673,7 +3673,7 @@ impl BoundaryTargetTool {
                 Err(err) => Self::reject(self.op, err),
             },
             TrimExtendOp::Extend => match boundary.extend(&hit.shape, hit.click) {
-                Ok(shape) => ToolResult::Commit(Command::ModifyEntity {
+                Ok(shape) => ToolResult::Commit(Command::ReshapeEntity {
                     id: hit.id,
                     new_geom: EntityGeom::from(shape),
                 }),
@@ -3686,7 +3686,7 @@ impl BoundaryTargetTool {
     fn commit_trim(&mut self, hit: &ShapePick, mut retained: Vec<Shape>) -> ToolResult {
         match retained.len() {
             // 1 断片: 「同じ物体が短くなっただけ」なので ID を維持する。
-            1 => ToolResult::Commit(Command::ModifyEntity {
+            1 => ToolResult::Commit(Command::ReshapeEntity {
                 id: hit.id,
                 new_geom: EntityGeom::from(retained.remove(0)),
             }),
@@ -3977,11 +3977,11 @@ impl FilletTool {
         self.state = FilletState::WaitingFirstLine;
         self.committed_pair = Some((first.id, hit.id));
         ToolResult::Commit(Command::Batch(vec![
-            Command::ModifyEntity {
+            Command::ReshapeEntity {
                 id: first.id,
                 new_geom: EntityGeom::from(Shape::Line(result.trimmed_a)),
             },
-            Command::ModifyEntity {
+            Command::ReshapeEntity {
                 id: hit.id,
                 new_geom: EntityGeom::from(Shape::Line(result.trimmed_b)),
             },
@@ -4176,11 +4176,11 @@ impl ChamferTool {
         self.state = ChamferState::WaitingFirstLine;
         self.committed_pair = Some((first.id, hit.id));
         ToolResult::Commit(Command::Batch(vec![
-            Command::ModifyEntity {
+            Command::ReshapeEntity {
                 id: first.id,
                 new_geom: EntityGeom::from(Shape::Line(result.trimmed_a)),
             },
-            Command::ModifyEntity {
+            Command::ReshapeEntity {
                 id: hit.id,
                 new_geom: EntityGeom::from(Shape::Line(result.trimmed_b)),
             },
@@ -5782,9 +5782,7 @@ impl SelectTool {
                     PlacementKind::Move => {
                         self.build_modify_command(document, |g| g.translated(delta))
                     }
-                    PlacementKind::Mirror => {
-                        self.build_modify_command(document, |g| g.mirrored(p1, world))
-                    }
+                    PlacementKind::Mirror => self.build_mirror_command(document, p1, world),
                     PlacementKind::Rotate => unreachable!("rotate handled above"),
                 };
                 self.finish_commit(placement.kind, cmd)
@@ -6066,6 +6064,39 @@ impl SelectTool {
         }
     }
 
+    /// 鏡映の確定コマンド。図形の `ModifyEntity` に加え、選択集合内の図形を参照する各拘束を
+    /// [`Constraint::mirrored`] で組み直し、元と異なるものだけ [`Command::ReplaceConstraint`] を
+    /// 同じバッチの末尾へ積む（側・角度の符号・円弧の端点の指し方を保つため。M13 タスク97、
+    /// DESIGN.md M13 設計判断4）。拘束が 0 件なら従来の `build_modify_command` と同じ。
+    fn build_mirror_command(&self, document: &Document, p1: Point2, p2: Point2) -> Option<Command> {
+        let cmd = self.build_modify_command(document, |g| g.mirrored(p1, p2))?;
+        if document.constraint_count() == 0 {
+            return Some(cmd);
+        }
+        let Command::Batch(mut subs) = cmd else {
+            return Some(cmd);
+        };
+        let in_set: std::collections::HashSet<EntityId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|&id| document.entity(id).is_some())
+            .collect();
+        for (id, constraint) in document.constraints() {
+            if !constraint.entities().iter().any(|e| in_set.contains(e)) {
+                continue;
+            }
+            let mirrored = constraint.mirrored(document, |e| in_set.contains(&e));
+            if mirrored != *constraint {
+                subs.push(Command::ReplaceConstraint {
+                    id,
+                    constraint: mirrored,
+                });
+            }
+        }
+        Some(Command::Batch(subs))
+    }
+
     /// 選択中の各エンティティの幾何を `transform` で変換する `ModifyEntity` を 1 バッチに
     /// まとめる（ID は不変）。生存している選択物が無ければ `None`。移動（`translated`）・
     /// 回転（`rotated`）・鏡映（`mirrored`）が共有する、複製（`AddEntity`）と対になる編集版。
@@ -6091,6 +6122,9 @@ impl SelectTool {
         }
     }
 }
+
+#[cfg(test)]
+mod constraint_tests;
 
 #[cfg(test)]
 mod tests {
@@ -10016,21 +10050,21 @@ mod tests {
 
     fn modified_geom(result: &ToolResult, expect_id: EntityId) -> Shape {
         match result {
-            ToolResult::Commit(Command::ModifyEntity { id, new_geom }) => {
-                assert_eq!(*id, expect_id, "ModifyEntity は対象 ID を維持する");
+            ToolResult::Commit(Command::ReshapeEntity { id, new_geom }) => {
+                assert_eq!(*id, expect_id, "ReshapeEntity は対象 ID を維持する");
                 match new_geom {
                     EntityGeom::Shape(shape) => shape.clone(),
                     other => panic!("expected a Shape geom, got {other:?}"),
                 }
             }
-            other => panic!("expected Commit(ModifyEntity), got {other:?}"),
+            other => panic!("expected Commit(ReshapeEntity), got {other:?}"),
         }
     }
 
     #[test]
     fn trim_tool_two_stage_pick_commits_single_piece() {
         // 境界 x=1 の縦線、対象 (0,0)-(2,0) の横線。交点は (1,0) の1点だけなので、
-        // 交点より右をクリックすると右半分が消え、残るのは1断片 → ID 維持の ModifyEntity。
+        // 交点より右をクリックすると右半分が消え、残るのは1断片 → ID 維持の ReshapeEntity。
         let mut doc = Document::new();
         let mut tool = TrimTool::default();
         assert!(tool.wants_shape_pick());
@@ -10369,13 +10403,13 @@ mod tests {
         let ToolResult::Commit(Command::Batch(cmds)) = result else {
             panic!("expected Commit(Batch), got {result:?}");
         };
-        assert_eq!(cmds.len(), 3, "ModifyEntity ×2 + AddEntity ×1");
+        assert_eq!(cmds.len(), 3, "ReshapeEntity ×2 + AddEntity ×1");
         let mut trimmed = Vec::new();
         for (cmd, expect_id) in cmds[..2].iter().zip([expect_a, expect_b]) {
-            let Command::ModifyEntity { id, new_geom } = cmd else {
-                panic!("expected ModifyEntity, got {cmd:?}");
+            let Command::ReshapeEntity { id, new_geom } = cmd else {
+                panic!("expected ReshapeEntity, got {cmd:?}");
             };
-            assert_eq!(*id, expect_id, "ModifyEntity は対象 ID を維持する");
+            assert_eq!(*id, expect_id, "ReshapeEntity は対象 ID を維持する");
             let EntityGeom::Shape(shape) = new_geom else {
                 panic!("expected a Shape geom");
             };
@@ -10677,13 +10711,13 @@ mod tests {
         let ToolResult::Commit(Command::Batch(cmds)) = result else {
             panic!("expected Commit(Batch), got {result:?}");
         };
-        assert_eq!(cmds.len(), 3, "ModifyEntity ×2 + AddEntity ×1");
+        assert_eq!(cmds.len(), 3, "ReshapeEntity ×2 + AddEntity ×1");
         let mut trimmed = Vec::new();
         for (cmd, expect_id) in cmds[..2].iter().zip([expect_a, expect_b]) {
-            let Command::ModifyEntity { id, new_geom } = cmd else {
-                panic!("expected ModifyEntity, got {cmd:?}");
+            let Command::ReshapeEntity { id, new_geom } = cmd else {
+                panic!("expected ReshapeEntity, got {cmd:?}");
             };
-            assert_eq!(*id, expect_id, "ModifyEntity は対象 ID を維持する");
+            assert_eq!(*id, expect_id, "ReshapeEntity は対象 ID を維持する");
             let EntityGeom::Shape(shape) = new_geom else {
                 panic!("expected a Shape geom");
             };

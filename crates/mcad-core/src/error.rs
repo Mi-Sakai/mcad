@@ -110,15 +110,48 @@ pub enum CoreError {
     #[error("invalid constraint: {0}")]
     InvalidConstraint(String),
 
-    /// コマンドを適用した後の形が拘束を満たさないため、コマンド全体を拒否した。
+    /// コマンドを適用した後の形から拘束を解いたが、満たす形が見つからなかったため、コマンド
+    /// 全体を拒否した（M13 タスク97、DESIGN.md M13 設計判断3）。矛盾する拘束の追加、
+    /// 拘束どうしが両立しない値への変更、動かした図形に他の図形が追従しきれない編集で返る。
     ///
-    /// 値は満たされなかった拘束のうち [`ConstraintId`] 順で最初のもの（決定的）。
-    /// 満たされていない拘束の追加、形と合わない値への変更、拘束に反する
-    /// [`crate::Command::ModifyEntity`] / [`crate::Command::ReshapeEntity`] で返る。
-    /// 拘束が参照する図形が退化している（線分の長さ・円と円弧の半径がソルバーの扱える
-    /// 下限 `ATOL_LEN` 未満）ときも、残差に関わらず満たされていない扱いでこれを返す。
-    #[error("constraint is not satisfied: {0:?}")]
-    ConstraintUnsatisfied(ConstraintId),
+    /// 値は、解く前（コマンドを適用した直後）の形で満たされていなかった拘束のうち
+    /// [`ConstraintId`] 順で最初のもの（決定的。矛盾の原因とは限らない）。拒否された
+    /// [`crate::Command::AddConstraint`] が発行するはずだった ID を指すことがあり、その ID は
+    /// 文書に残らない（[`crate::Document::constraint`] では引けない）。
+    #[error("no shape satisfies the constraints (first unsatisfied: {0:?})")]
+    ConstraintUnsolvable(ConstraintId),
+
+    /// 拘束が満たされておらず、その拘束が参照するパラメータがすべて止められているため、
+    /// 解かずにコマンド全体を拒否した。値はその拘束（[`ConstraintId`] 順で最初のもの）。
+    ///
+    /// 止められているのは、図形の固定（[`crate::Constraint::FixEntity`]）の対象、ロックされた
+    /// レイヤー上の図形、そのコマンドで利用者が動かした点・半径・角度。水平拘束のついた線分を
+    /// 単独で回転する、点の固定がついた点を動かす、ロックされたレイヤーの図形と一致で
+    /// つながった図形をまるごと動かす、といった「動かした図形そのものが拘束に反する」編集で
+    /// 返る。
+    #[error("the constraint cannot be satisfied because everything it refers to is held: {0:?}")]
+    ConstraintBlockedByFixed(ConstraintId),
+
+    /// 拘束を満たそうとすると図形が退化するため、コマンド全体を拒否した。値はその図形
+    /// （[`EntityId`] 順で最初のもの）。
+    ///
+    /// 退化とは: 線分の長さ・円と円弧の半径がソルバーの扱える下限 `ATOL_LEN` 未満、または
+    /// それを参照する長さ型の拘束の許容値以下へ落ちる（線分が 1 点につぶれる）、円弧の
+    /// 掃引角が 0 以下・2π 以上へ達する。拘束が参照する図形が解く前から退化している場合
+    /// （長さ 0 の線分への拘束の追加、拘束のついた線分を 1 点へつぶす
+    /// [`crate::Command::ModifyEntity`]）もこれを返す。
+    #[error("satisfying the constraints would degenerate the shape: {0:?}")]
+    DegenerateShape(EntityId),
+
+    /// コマンドを適用した後（解いた場合は解いた後）の形で、拘束の構造条件が崩れるため、
+    /// コマンド全体を拒否した。値はその拘束（[`ConstraintId`] 順で最初のもの）。
+    ///
+    /// 構造条件は [`crate::Command::AddConstraint`] が追加の前に確かめるものと同じ: 内接の
+    /// 2 円の半径の差 `s(r1 − r2)` が長さ型の許容値より大きい（同心・等半径になる変更を
+    /// 拒否する）、点どうしの距離の値が許容値より大きい（図形が大きくなって許容値が値を
+    /// 超える変更を拒否する）。
+    #[error("the constraint degenerates in the resulting shape: {0:?}")]
+    DegenerateConstraint(ConstraintId),
 
     /// 固定の拘束（図形の固定、または動かそうとした点の固定）がついた図形の幾何を
     /// 変える操作を拒否した。値は対象のエンティティ。

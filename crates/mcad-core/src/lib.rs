@@ -32,17 +32,23 @@
 //!   値の組版は [`layout_dim_label`]。**画面・SVG/PDF・DXF export の唯一の出所**
 //! - 構築線: [`XLineGeom`]（[`EntityGeom::XLine`] の中身。基点と単位方向の無限直線。
 //!   `aabb` は基点だけの箱。M12 タスク91）
-//! - 幾何拘束（M13 タスク96）: [`Constraint`]（対象は [`EntityId`] と [`PointRef`] /
+//! - 幾何拘束（M13 タスク96・97）: [`Constraint`]（対象は [`EntityId`] と [`PointRef`] /
 //!   [`PointKind`]。側は [`Side`]、円どうしの接線の種類は [`CircleTangency`] /
-//!   [`LargerCircle`]）。追加・削除・値の変更は [`Command::AddConstraint`] /
-//!   [`Command::RemoveConstraint`] / [`Command::SetConstraintValue`]、切り詰め・延長は
+//!   [`LargerCircle`]）。追加・削除・値の変更・差し替えは [`Command::AddConstraint`]
+//!   （`hold` = 止めておく図形）/ [`Command::RemoveConstraint`] /
+//!   [`Command::SetConstraintValue`] / [`Command::ReplaceConstraint`]、切り詰め・延長は
 //!   [`Command::ReshapeEntity`]。現在の形から側・値を決めるコンストラクタは
 //!   [`Constraint::distance`] など、解かずに満たされているかを見るのは
 //!   [`Constraint::is_satisfied`]、接線の接点と区間外判定は [`Constraint::tangent_contact`]
-//!   （[`TangentContact`]）。読み取りは [`Document::constraint`] / [`Document::constraints`] /
-//!   [`Document::constraints_of`] / [`Document::constraint_count`]。
-//!   **この段階では解かない**: [`Document::apply`] は適用後の形が拘束を満たさなければ
-//!   コマンド全体を拒否する（[`CoreError::ConstraintUnsatisfied`]）
+//!   （[`TangentContact`]）、ミラーしたときに同じ関係を表す拘束は [`Constraint::mirrored`]。
+//!   読み取りは [`Document::constraint`] / [`Document::constraints`] /
+//!   [`Document::constraints_of`] / [`Document::constraint_count`]、連結成分の自由度は
+//!   [`Document::degrees_of_freedom`]。
+//!   **[`Document::apply`] が拘束を解く**: コマンドを適用した後の形が拘束を満たさなければ、
+//!   利用者が動かした点を止めたままほかの図形を追従させ、同じ undo 単位に入れる。解けなければ
+//!   コマンド全体を拒否する（[`CoreError::ConstraintUnsolvable`] /
+//!   [`CoreError::ConstraintBlockedByFixed`] / [`CoreError::DegenerateShape`] /
+//!   [`CoreError::DegenerateConstraint`]）
 //! - ドキュメント: [`Document`]（エンティティ・レイヤー・カレントレイヤー・
 //!   図面メタデータ・拘束と履歴を保持）
 //! - 変更: [`Command`] を [`Document::apply`] に渡す。戻り値の [`NewIds`] で

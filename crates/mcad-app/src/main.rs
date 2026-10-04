@@ -1109,6 +1109,23 @@ fn set_status_important(status: &mut Option<StatusMessage>, now: f64, text: impl
     set_status_with_duration(status, now, text, STATUS_MESSAGE_SECS_IMPORTANT);
 }
 
+/// `apply` が消した拘束の件数（M13 タスク97）。`before`・`after` は `apply` の前後の
+/// [`Document::constraint_count`]、`added` はその `apply` が追加した拘束の数
+/// （`NewIds::constraints.len()`）。追加分を足し戻すので、追加と削除が同時に起きても
+/// 差し引きで見誤らない。
+fn removed_constraint_count(before: usize, after: usize, added: usize) -> usize {
+    (before + added).saturating_sub(after)
+}
+
+/// 成功メッセージ `base` の末尾へ、消えた拘束の件数を添える。0 件なら `base` のまま。
+fn with_constraint_note(base: &str, removed: usize) -> String {
+    if removed == 0 {
+        base.to_owned()
+    } else {
+        format!("{base}, removed {removed} constraint(s)")
+    }
+}
+
 /// [`set_status`] / [`set_status_important`] の共通実装。
 fn set_status_with_duration(
     status: &mut Option<StatusMessage>,
@@ -3955,8 +3972,19 @@ fn handle_tool_input(
             //
             // 失敗時のみ spawn() でリセットする: 確定できなかった中途状態を
             // 次のクリックへ持ち越さないため。
+            let constraints_before = document.constraint_count();
             match document.apply(cmd) {
                 Ok(new_ids) => {
+                    // 拘束が消えたら件数を出す（トリムの断片化・延長・フィレット・面取り。
+                    // 消えないときは従来どおり何も出さない）。
+                    let removed = removed_constraint_count(
+                        constraints_before,
+                        document.constraint_count(),
+                        new_ids.constraints.len(),
+                    );
+                    if removed > 0 {
+                        set_status(status, now, with_constraint_note("Done", removed));
+                    }
                     // トポロジが変わる確定（2 断片トリム）だけ、新規エンティティを
                     // 選択集合へ載せ替える（DESIGN.md M7 設計判断3a）。それ以外の
                     // ツールは `None` を返すので選択は変わらない。
@@ -8431,28 +8459,58 @@ fn handle_placement_input(
             PlacementOutcome::Commit { kind, cmd } => {
                 *snap_marker = None;
                 // ロックレイヤー混在時は Batch 原子性で全体が失敗し、位置も選択も変わらない。
+                let constraints_before = document.constraint_count();
                 match document.apply(cmd) {
-                    Ok(new_ids) => match kind {
-                        // 複製: 新しい ID 群（コマンド順）を選択にして件数を表示する。
-                        PlacementKind::Duplicate => {
-                            let n = new_ids.entities.len();
-                            select_tool.set_selection(new_ids.entities);
-                            set_status(status, now, format!("Duplicated {n} entities"));
+                    Ok(new_ids) => {
+                        let removed = removed_constraint_count(
+                            constraints_before,
+                            document.constraint_count(),
+                            new_ids.constraints.len(),
+                        );
+                        match kind {
+                            // 複製: 新しい ID 群（コマンド順）を選択にして件数を表示する。
+                            PlacementKind::Duplicate => {
+                                let n = new_ids.entities.len();
+                                select_tool.set_selection(new_ids.entities);
+                                set_status(
+                                    status,
+                                    now,
+                                    with_constraint_note(
+                                        &format!("Duplicated {n} entities"),
+                                        removed,
+                                    ),
+                                );
+                            }
+                            // 移動・回転・鏡映: ID は不変なので選択はそのまま維持する。
+                            PlacementKind::Move => {
+                                let n = select_tool.selection().len();
+                                set_status(
+                                    status,
+                                    now,
+                                    with_constraint_note(&format!("Moved {n} entities"), removed),
+                                );
+                            }
+                            PlacementKind::Rotate => {
+                                let n = select_tool.selection().len();
+                                set_status(
+                                    status,
+                                    now,
+                                    with_constraint_note(&format!("Rotated {n} entities"), removed),
+                                );
+                            }
+                            PlacementKind::Mirror => {
+                                let n = select_tool.selection().len();
+                                set_status(
+                                    status,
+                                    now,
+                                    with_constraint_note(
+                                        &format!("Mirrored {n} entities"),
+                                        removed,
+                                    ),
+                                );
+                            }
                         }
-                        // 移動・回転・鏡映: ID は不変なので選択はそのまま維持する。
-                        PlacementKind::Move => {
-                            let n = select_tool.selection().len();
-                            set_status(status, now, format!("Moved {n} entities"));
-                        }
-                        PlacementKind::Rotate => {
-                            let n = select_tool.selection().len();
-                            set_status(status, now, format!("Rotated {n} entities"));
-                        }
-                        PlacementKind::Mirror => {
-                            let n = select_tool.selection().len();
-                            set_status(status, now, format!("Mirrored {n} entities"));
-                        }
-                    },
+                    }
                     Err(err) => match kind {
                         PlacementKind::Duplicate => {
                             set_status(status, now, format!("Duplicate failed: {err}"));
@@ -12142,7 +12200,7 @@ mod tests {
             layer: unlocked_layer,
             style: Style::inherited(),
         }) else {
-            panic!("expected Commit(ModifyEntity) for the 1-piece trim");
+            panic!("expected Commit(ReshapeEntity) for the 1-piece trim");
         };
         let new_ids = document.apply(cmd).expect("unlocked layer commit succeeds");
 

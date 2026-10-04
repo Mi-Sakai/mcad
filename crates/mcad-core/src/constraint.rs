@@ -8,8 +8,11 @@
 //! - コンストラクタ（[`Constraint::distance`] など）: 現在の形から値・側・外接/内接を決める。
 //! - [`Constraint::tangent_contact`] は、接線拘束の接点と、接点が線分の区間・円弧の掃引範囲の
 //!   外にあるか（表示用）。
+//! - [`Constraint::mirrored`] は、図形をミラーしたときに同じ幾何関係を表す拘束
+//!   （[`crate::Command::ReplaceConstraint`] に載せる）。
 //! - `equations` モジュール（クレート内部）: 拘束を `mcad_geom::solve` の方程式
-//!   （残差と解析ヤコビアン）へ落とし、方程式系を組み立てる。
+//!   （残差と解析ヤコビアン）へ落とし、方程式系を組み立てる。解くのは
+//!   [`crate::Document::apply`]（`document/constraints.rs`）。
 //! - `reshape_removals`（クレート内部）: [`crate::Command::ReshapeEntity`] で消す拘束を
 //!   決める純関数（設計判断4）。
 //!
@@ -126,8 +129,9 @@ pub enum CircleTangency {
 /// # フィールドの順
 ///
 /// 同じ種類の対象を 2 つ取る拘束（一致・点どうしの距離・平行・直交・等長・等半径・角度・
-/// 円どうしの接線）は、**`a` が先に選んだ対象、`b` が後に選んだ対象**。求解（タスク97）の
-/// 「後に選んだ方を動かす」はこの順を使う。
+/// 円どうしの接線）の `a`・`b` の**順に意味は無い**（方程式の符号と、角度の測り始め、内接で
+/// どちらが大きいかの基準になるだけ）。「先に選んだ図形を止めて、後に選んだ図形を動かす」
+/// という選択順は、拘束ではなく [`crate::Command::AddConstraint`] の `hold` で渡す。
 ///
 /// # 値の単位
 ///
@@ -137,22 +141,29 @@ pub enum CircleTangency {
 ///
 /// 各バリアントの doc に残差（= 0 で満たされる）を書く。線分 `ℓ` の方向は始点 → 終点、
 /// 符号付き距離は「線分を延長した直線から点までの距離で、左側が正」。
+///
+/// 向きの拘束（水平・垂直・平行・直交）は線分の向きを区別しないので、角度を**周期 π で
+/// 畳んだ**ラジアンを残差にする（角度型。許容値は `ATOL_ANG`）: `α` を線分の方向角
+/// `atan2(dy, dx)`、`φ` を 2 線分のなす角（[`Constraint::Angle`] と同じ定義）として、
+/// 0 と π で 0 になる `½·atan2(sin 2t, cos 2t)` か、±π/2 で 0 になる
+/// `½·atan2(−sin 2t, −cos 2t)`。残差は解までの回転角で、解からちょうど 90° ずれた形でも
+/// 勾配が 0 にならない（その形へ拘束を足しても解ける）。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constraint {
     /// 一致: 2 点の x・y の差（方程式 2 本）。
     Coincident {
-        /// 先に選んだ点。
+        /// 1 つ目の点。
         a: PointRef,
-        /// 後に選んだ点。
+        /// 2 つ目の点。
         b: PointRef,
     },
-    /// 水平: 線分の端点の y の差。
+    /// 水平: 方向角 `α` を畳んだ `½·atan2(sin 2α, cos 2α)`（`α = 0`・`π` で 0）。
     Horizontal {
         /// 対象の線分。
         line: EntityId,
     },
-    /// 垂直: 線分の端点の x の差。
+    /// 垂直: 方向角 `α` を畳んだ `½·atan2(−sin 2α, −cos 2α)`（`α = ±π/2` で 0）。
     Vertical {
         /// 対象の線分。
         line: EntityId,
@@ -160,9 +171,9 @@ pub enum Constraint {
     /// 点どうしの距離: `‖a − b‖ − value`。`value` は長さ型の許容値より大きい正の値
     /// （0 にしたいときは [`Constraint::Coincident`]）。線分の長さは同じ線分の始点・終点で表す。
     Distance {
-        /// 先に選んだ点。
+        /// 1 つ目の点。
         a: PointRef,
-        /// 後に選んだ点。
+        /// 2 つ目の点。
         b: PointRef,
         /// 距離（`> 0`）。
         value: f64,
@@ -178,32 +189,32 @@ pub enum Constraint {
         /// 距離（`≥ 0`）。
         value: f64,
     },
-    /// 平行: 単位方向ベクトルの外積（反平行も満たす）。
+    /// 平行: なす角 `φ` を畳んだ `½·atan2(sin 2φ, cos 2φ)`（`φ = 0`・`π` で 0。反平行も満たす）。
     Parallel {
-        /// 先に選んだ線分。
+        /// 1 つ目の線分。
         a: EntityId,
-        /// 後に選んだ線分。
+        /// 2 つ目の線分。
         b: EntityId,
     },
-    /// 直交: 単位方向ベクトルの内積。
+    /// 直交: なす角 `φ` を畳んだ `½·atan2(−sin 2φ, −cos 2φ)`（`φ = ±π/2` で 0）。
     Perpendicular {
-        /// 先に選んだ線分。
+        /// 1 つ目の線分。
         a: EntityId,
-        /// 後に選んだ線分。
+        /// 2 つ目の線分。
         b: EntityId,
     },
     /// 等長: 線分の長さの差。
     EqualLength {
-        /// 先に選んだ線分。
+        /// 1 つ目の線分。
         a: EntityId,
-        /// 後に選んだ線分。
+        /// 2 つ目の線分。
         b: EntityId,
     },
     /// 等半径: 円・円弧の半径の差。
     EqualRadius {
-        /// 先に選んだ円・円弧。
+        /// 1 つ目の円・円弧。
         a: EntityId,
-        /// 後に選んだ円・円弧。
+        /// 2 つ目の円・円弧。
         b: EntityId,
     },
     /// 半径: `r − value`。`value > 0`。
@@ -216,9 +227,9 @@ pub enum Constraint {
     /// 角度: 線分 `a` の方向から `b` の方向へのなす角 `φ = atan2(d1 × d2, d1 · d2)` と
     /// `value` の差を `(−π, π]` へ主値化したもの。`value` は `(−π, π]` に正規化して格納する。
     Angle {
-        /// 先に選んだ線分。
+        /// 1 つ目の線分。
         a: EntityId,
-        /// 後に選んだ線分。
+        /// 2 つ目の線分。
         b: EntityId,
         /// 角度 `θ`（ラジアン、`(−π, π]`）。
         value: f64,
@@ -236,9 +247,9 @@ pub enum Constraint {
     /// 円・円弧どうしの接線: 外接は `‖c1 − c2‖ − (r1 + r2)`、内接は `‖c1 − c2‖ − s(r1 − r2)`。
     /// 円弧はそれを含む円として扱う。
     TangentCircles {
-        /// 先に選んだ円・円弧。
+        /// 1 つ目の円・円弧。
         a: EntityId,
-        /// 後に選んだ円・円弧。
+        /// 2 つ目の円・円弧。
         b: EntityId,
         /// 外接か内接か（作成時の形から決める。同じ近さなら外接）。
         kind: CircleTangency,
@@ -516,6 +527,111 @@ impl Constraint {
         self
     }
 
+    // ---- ミラー ----
+
+    /// 図形の集合 `in_set` をミラー（鏡映）したとき、**ミラー後の形で同じ幾何関係を表す**
+    /// 拘束を返す。何も変える必要が無ければ `self` と等しい値を返す。
+    ///
+    /// ミラーは向きを反転させるので、図形だけを [`crate::Command::ModifyEntity`] で鏡映すると、
+    /// 側・角度の符号・円弧の端点を持つ拘束が元の関係を表さなくなる。呼び出し側は、
+    /// ミラーする図形に関わる各拘束についてこれを呼び、`self` と等しくないものだけを
+    /// [`crate::Command::ReplaceConstraint`] として、図形の `ModifyEntity` と同じ
+    /// [`crate::Command::Batch`] に積む。
+    ///
+    /// 規則:
+    ///
+    /// - **集合内の円弧を指す点**（[`PointRef`]）は `Start` ↔ `End` を入れ替える
+    ///   （[`mcad_geom::Arc::mirrored`] は CCW 掃引を保つために開始角と終了角を入れ替える。
+    ///   点を物理的な点に追従させる）。相手の対象が集合内かどうかには依らない。点の固定
+    ///   （[`Constraint::FixPoint`]）の点も同じ。線分は `mirrored` が始点・終点の順を保つので
+    ///   入れ替えない。
+    /// - **側**（点と線の距離・線と円の接線の [`Side`]）は、その拘束の 2 つの対象が**両方とも
+    ///   集合内**のときだけ反転する。点と線の距離の値が 0（点が直線上）なら反転しない
+    ///   （[`Constraint::point_line_distance`] と同じく `Left` のままにする）。
+    /// - **角度**は、2 本の線分が両方とも集合内のときだけ符号を反転する（`(−π, π]` へ正規化。
+    ///   `π` は `π` のまま）。
+    /// - それ以外（水平・垂直・平行・直交・等長・等半径・半径・円どうしの接線の種類・
+    ///   図形の固定）は変えない。**点の固定の座標 `at` はミラーしない**: 固定した点を動かす
+    ///   操作は、平行移動と同じく拒否されるのが正しい（軸上の点なら動かないので通る）。
+    ///
+    /// 片方だけが集合内の拘束で側・角度を変えないのは、ミラーされなかった相手との関係が
+    /// 元のまま残るため（その形で満たせなければ `apply` が解くか、拒否する）。
+    ///
+    /// `doc` は対象が円弧かどうかの判定にだけ使う。ミラーは図形の種類を変えないので、
+    /// **ミラーの前に呼んでも後に呼んでも結果は同じ**。
+    #[must_use]
+    pub fn mirrored(&self, doc: &Document, in_set: impl Fn(EntityId) -> bool) -> Self {
+        let point = |p: PointRef| {
+            let is_arc = || {
+                doc.entity(p.entity)
+                    .is_some_and(|e| shape_kind(&e.geom) == Some(ShapeKind::Arc))
+            };
+            let kind = match p.kind {
+                PointKind::Start if in_set(p.entity) && is_arc() => PointKind::End,
+                PointKind::End if in_set(p.entity) && is_arc() => PointKind::Start,
+                kind => kind,
+            };
+            PointRef::new(p.entity, kind)
+        };
+        let flip = |side: Side| match side {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        };
+        match *self {
+            Self::Coincident { a, b } => Self::Coincident {
+                a: point(a),
+                b: point(b),
+            },
+            Self::Distance { a, b, value } => Self::Distance {
+                a: point(a),
+                b: point(b),
+                value,
+            },
+            Self::PointLineDistance {
+                point: p,
+                line,
+                side,
+                value,
+            } => Self::PointLineDistance {
+                point: point(p),
+                line,
+                side: if in_set(p.entity) && in_set(line) && value != 0.0 {
+                    flip(side)
+                } else {
+                    side
+                },
+                value,
+            },
+            Self::Angle { a, b, value } if in_set(a) && in_set(b) => Self::Angle {
+                a,
+                b,
+                value: normalize_angle(-value),
+            },
+            Self::TangentLineCircle { line, circle, side } if in_set(line) && in_set(circle) => {
+                Self::TangentLineCircle {
+                    line,
+                    circle,
+                    side: flip(side),
+                }
+            }
+            Self::FixPoint { point: p, at } => Self::FixPoint {
+                point: point(p),
+                at,
+            },
+            Self::Angle { .. }
+            | Self::TangentLineCircle { .. }
+            | Self::Horizontal { .. }
+            | Self::Vertical { .. }
+            | Self::Parallel { .. }
+            | Self::Perpendicular { .. }
+            | Self::EqualLength { .. }
+            | Self::EqualRadius { .. }
+            | Self::Radius { .. }
+            | Self::TangentCircles { .. }
+            | Self::FixEntity { .. } => self.clone(),
+        }
+    }
+
     // ---- 検証 ----
 
     /// 構造と値を検証する（[`crate::Command::AddConstraint`] /
@@ -528,8 +644,10 @@ impl Constraint {
     /// - 内接は `s(r1 − r2)` が長さ型の許容値より大きい（等半径の内接と、大小の食い違いを
     ///   拒否する）。
     ///
-    /// 長さ型の許容値は、この拘束の方程式が現在の形から計算する値そのもの
-    /// （`equations::length_tolerance`）で、判定の式を別に持たない。
+    /// 長さ型の許容値は、この拘束の方程式が現在の形から計算する値そのもので、判定の式を
+    /// 別に持たない。形に依存する 2 つの条件（点どうしの距離・内接）は
+    /// `equations::structure_holds` を通し、[`crate::Document::apply`] が解いた後の形に掛ける
+    /// 検査と同じ式を使う。
     /// 現在の形が拘束を満たすかは見ない（[`Constraint::is_satisfied`]）。
     pub(crate) fn validate(&self, doc: &Document) -> Result<(), CoreError> {
         for (entity, role) in self.targets() {
@@ -565,8 +683,7 @@ impl Constraint {
             Self::Distance { a, b, value } => {
                 distinct(a == b, "point")?;
                 finite(value, "distance")?;
-                let tol = equations::length_tolerance(doc, self)?;
-                if value > tol {
+                if equations::structure_holds(doc, self)? {
                     Ok(())
                 } else {
                     Err(invalid(format!(
@@ -605,15 +722,7 @@ impl Constraint {
             }
             Self::TangentCircles { a, b, kind } => {
                 distinct(a == b, "circle")?;
-                let CircleTangency::Internal(larger) = kind else {
-                    return Ok(());
-                };
-                // 種類は上で確かめたので必ず取れる。
-                let (Some(ra), Some(rb)) = (round_of(doc, a), round_of(doc, b)) else {
-                    return Err(invalid("tangent targets must be circles or arcs"));
-                };
-                let tol = equations::length_tolerance(doc, self)?;
-                if larger.sign() * (ra.radius - rb.radius) > tol {
+                if kind == CircleTangency::External || equations::structure_holds(doc, self)? {
                     Ok(())
                 } else {
                     Err(invalid(
@@ -635,13 +744,14 @@ impl Constraint {
     /// 現在の形がこの拘束を満たすか（解かずに残差だけを見る）。
     ///
     /// 判定は `mcad_geom::solve::is_satisfied` と同じ: 方程式ごとに、**その形から計算した
-    /// 許容値**で割った残差の絶対値の最大が 1 以下。[`Document::apply`] の充足検査と
-    /// 同じ判定で、`.mcad` 読込時の検査（設計判断5）にも使える。
+    /// 許容値**で割った残差の絶対値の最大が 1 以下。[`Document::apply`] が「解かずに通す」か
+    /// どうかを決める判定・解いた後に確かめる判定と同じで（`apply` が受理した文書では、
+    /// すべての拘束がこれを満たす）、`.mcad` 読込時の検査（設計判断5）にも使える。
     ///
     /// 次の形は、満たさないものとして `Ok(false)` を返す:
     ///
     /// - **参照する図形が退化している**（線分の長さ・円と円弧の半径が `ATOL_LEN` 未満）。
-    ///   長さ 0 の線分でも水平・垂直・等長の残差は 0 になるが、ソルバーが扱えない形なので
+    ///   長さ 0 の線分でも等長・一致の残差は 0 になるが、ソルバーが扱えない形なので
     ///   満たされていない扱いにする。方程式を持たない [`Constraint::FixEntity`] も同じ。
     /// - 残差か許容値が有限でない（座標が極端に大きい）。
     ///

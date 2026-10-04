@@ -18,8 +18,9 @@ use std::cell::Cell;
 use std::f64::consts::PI;
 
 use mcad_geom::solve::{
-    ATOL_ANG, ATOL_LEN, Equation, MAX_TRIALS, Problem, RTOL, ResidualKind, Solution, SolveError,
-    check_jacobian, degrees_of_freedom, is_satisfied, max_scaled_residual, solve,
+    ATOL_ANG, ATOL_LEN, Equation, LAMBDA_0, LAMBDA_MAX, LAMBDA_MIN, LAMBDA_RETRY, MAX_TRIALS,
+    Problem, RTOL, ResidualKind, Solution, SolveError, check_jacobian, degrees_of_freedom,
+    is_satisfied, max_scaled_residual, solve,
 };
 use proptest::prelude::*;
 
@@ -938,6 +939,20 @@ fn invalid_inputs() {
     let p = Problem::new(&sys.x, &sys.fixed, &sys.w, &eqs);
     assert_eq!(solve(&p), Err(SolveError::InvalidInput));
 
+    // 減衰係数の初期値が範囲外・非有限。自由度の計算は初期値を使わないので、検査もしない。
+    for mu in [
+        0.0,
+        -1e-3,
+        LAMBDA_MIN / 2.0,
+        LAMBDA_MAX * 2.0,
+        f64::INFINITY,
+        f64::NAN,
+    ] {
+        let p = sys.problem().with_initial_damping(mu);
+        assert_eq!(solve(&p), Err(SolveError::InvalidInput), "mu {mu}");
+        assert_eq!(degrees_of_freedom(&p), degrees_of_freedom(&sys.problem()));
+    }
+
     // 開始時に非有限。
     let mut nan = sys.clone();
     nan.x[3] = f64::NAN;
@@ -1385,8 +1400,12 @@ fn minimum_norm_moves_as_little_as_possible() {
     let sol = solved(&s);
     assert_eq!(sol.params[a], 0.0);
     assert_eq!(sol.params[b], 10.0);
-    assert!((sol.params[a + 1] - 0.5).abs() < 1e-12);
-    assert!((sol.params[b + 1] - 0.5).abs() < 1e-12);
+    // 許容値（1e-9 × 長さ 10）に入った時点で止まるので、中点との差もその程度まで残る
+    // （初期減衰が小さいと 1 回目のステップでほぼ届き、そこで収束と判定される）。
+    assert!((sol.params[a + 1] - 0.5).abs() < 1e-8);
+    assert!((sol.params[b + 1] - 0.5).abs() < 1e-8);
+    // 両端は対称に動く（最小ノルム）。
+    assert!((sol.params[a + 1] + sol.params[b + 1] - 1.0).abs() < 1e-12);
 
     // 長さ拘束: 線分の向きに沿って両端が対称に伸びる。
     let mut s = Sys::default();
@@ -1394,8 +1413,12 @@ fn minimum_norm_moves_as_little_as_possible() {
     let b = s.point((10.0, 0.0));
     s.distance(a, b, 20.0, &[Ent::Seg(a, b)]);
     let sol = solved(&s);
-    assert_close(pt_of(&sol.params, a), (-5.0, 0.0), 1e-9);
-    assert_close(pt_of(&sol.params, b), (15.0, 0.0), 1e-9);
+    // 長さの許容値（1e-9 × 20）に入った時点で止まるので、端点の位置もその程度まで残る。
+    assert_close(pt_of(&sol.params, a), (-5.0, 0.0), 2e-8);
+    assert_close(pt_of(&sol.params, b), (15.0, 0.0), 2e-8);
+    // 両端は対称に動く（最小ノルム）。
+    assert!((sol.params[a] + sol.params[b] - 10.0).abs() < 1e-12);
+    assert_eq!((sol.params[a + 1], sol.params[b + 1]), (0.0, 0.0));
 
     // 拘束と関係の無い線分は動かない（連結していない自由なパラメータ）。
     let mut s = rectangle((0.0, 0.0), 1.0, RECT_NEAR);
@@ -1493,6 +1516,46 @@ fn admissible_hook_rejects_trial_points() {
     let sol = solve(&s.problem().with_admissible(&once)).unwrap();
     assert_solved(&s, &sol);
     assert!(sol.trials >= 2);
+}
+
+#[test]
+fn initial_damping_can_be_overridden() {
+    // 既定は LAMBDA_0。同じ値を明示しても結果は bit 単位で同じ。
+    let sys = rectangle((0.0, 0.0), 1.0, RECT_FAR);
+    assert_eq!(sys.problem().initial_damping, LAMBDA_0);
+    let default = solved(&sys);
+    let explicit = solve(&sys.problem().with_initial_damping(LAMBDA_0)).unwrap();
+    assert_eq!(default, explicit);
+
+    // 解き直し用の大きい初期値でも解け、受理したステップの F は単調に減る。減衰が効くぶん
+    // 1 回目のステップが短く、試行回数は増える。範囲の両端の値も受け付ける。
+    let damped = solve(&sys.problem().with_initial_damping(LAMBDA_RETRY)).unwrap();
+    assert_solved(&sys, &damped);
+    assert!(
+        damped.trials > default.trials,
+        "{} vs {}",
+        damped.trials,
+        default.trials
+    );
+    assert!(damped.objective[1] > default.objective[1]);
+    for mu in [LAMBDA_MIN, 1.0] {
+        let sol = solve(&sys.problem().with_initial_damping(mu)).unwrap();
+        assert_solved(&sys, &sol);
+    }
+    // 上限の値も入力としては受け付ける（不正な入力ではない）。ステップが小さすぎて F の
+    // 減少が表せず、停滞として失敗する。
+    assert_eq!(
+        solve(&sys.problem().with_initial_damping(LAMBDA_MAX)),
+        Err(SolveError::Stalled)
+    );
+
+    // 解の無い系は、初期値を変えても決定的に失敗する。
+    let sys = inconsistent((0.0, 0.0), 1.0);
+    for mu in [LAMBDA_0, LAMBDA_RETRY] {
+        let p = sys.problem().with_initial_damping(mu);
+        assert_eq!(solve(&p), Err(SolveError::Stalled));
+        assert_eq!(solve(&p), Err(SolveError::Stalled));
+    }
 }
 
 #[test]

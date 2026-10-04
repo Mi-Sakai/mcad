@@ -9,8 +9,15 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 - **幾何拘束のデータモデル**(`crates/mcad-core`、M13 タスク96): `Constraint`(一致・水平・垂直・距離・平行・
   直交・等長・等半径・半径・角度・接線・固定)と `ConstraintId`・`PointRef`、`Command::AddConstraint` /
   `RemoveConstraint` / `SetConstraintValue` / `ReshapeEntity`。エンティティを削除するとその拘束も消え、undo で
-  そろって戻る。**この段階では解かない** — 適用後の形が拘束を満たさないコマンドは `Document::apply` が拒否する
-  (求解はタスク97)。UI と `.mcad` への保存はまだ無い。詳細は DESIGN.md「M13」設計判断2・4 の実装時追記
+  そろって戻る。UI と `.mcad` への保存はまだ無い。詳細は DESIGN.md「M13」設計判断2・4 の実装時追記
+- **拘束の求解**(`crates/mcad-core`・`crates/mcad-app`、M13 タスク97): `Document::apply` がコマンドの適用後に
+  拘束を解き、追従した修正を同じ undo 単位に入れる。解けない編集は拒否して図面を変えない。拘束の追加は
+  `Command::AddConstraint { constraint, hold }` で止めておく図形を渡す。`Command::ReplaceConstraint`、
+  `Constraint::mirrored`、`Document::degrees_of_freedom`。トリム(1 断片)・延長・フィレット・面取りは
+  `Command::ReshapeEntity` を出し、ミラーは拘束を書き換える。平行・直交・水平・垂直の残差は角度の主値で、
+  ちょうど直角の形からも解ける。汎用ソルバーの初期減衰 `mcad_geom::solve::LAMBDA_0` を 1e-3 → 1e-9 へ下げた
+  (非線形な拘束で追従した形がずれる不具合の修正)。求解が停滞・試行上限で失敗したときは従来の初期減衰で
+  解き直す(`Problem::with_initial_damping`・`LAMBDA_RETRY`)。詳細は DESIGN.md「M13」設計判断3 の実装時追記
 
 ## [0.12.0] - 2026-09-27 — 作図補助
 

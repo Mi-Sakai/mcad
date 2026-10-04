@@ -2,6 +2,8 @@
 //!
 //! - 全方程式の解析ヤコビアンと中心差分の一致（proptest。円弧の端点を指す拘束を含む）
 //! - 角度の残差の主値化: ±π をまたぐ回転での連続性、`θ` が 0・±π の近く、反平行
+//! - 向きの拘束（水平・垂直・平行・直交）の周期 π で畳んだ残差: ちょうど満たす形で 0、解の
+//!   近くでの連続性、解から最も遠い形（90° ずれ）でも勾配が 0 にならないこと、そこから解けること
 //! - 特異点: 一致した 2 点の距離、同心の円の外接（NaN を出さずに収束）
 //! - 点の固定: 円弧の自由度、始点を固定して半径を変える
 //! - 接線: 中心が直線上の円（左側へ解ける）
@@ -62,8 +64,8 @@ fn system(doc: &Document, constraints: &[Constraint]) -> System {
 }
 
 fn solve_system(sys: &System) -> Result<Solution, SolveError> {
-    let weights = sys.unit_weights();
-    let admissible = |x: &[f64]| sys.admissible(x);
+    let weights = sys.weights();
+    let admissible = |x: &[f64]| sys.first_inadmissible(x).is_none();
     solve(
         &Problem::new(&sys.params, &sys.fixed, &weights, &sys.equations)
             .with_admissible(&admissible),
@@ -108,6 +110,25 @@ fn angle_between(a: LineSeg, b: LineSeg) -> f64 {
 
 fn wrap_pi(a: f64) -> f64 {
     a.sin().atan2(a.cos())
+}
+
+/// 周期 π で畳む残差（水平・垂直・平行・直交）の不連続点（解から 90° ずれた形）から離す
+/// 角度。中心差分の刻み（座標 1000 で 1e-3。長さ 5 以上の線分の向きを 4e-4 rad 程度振る）が
+/// 不連続点をまたがない余裕。
+const FOLD_MARGIN: f64 = 0.02;
+
+/// π/2 の倍数から [`FOLD_MARGIN`] 以上離れた角度（`[−π, π]` の全域）。
+fn off_axis_angle() -> impl Strategy<Value = f64> {
+    (-2i32..2, FOLD_MARGIN..FRAC_PI_2 - FOLD_MARGIN)
+        .prop_map(|(quarter, off)| f64::from(quarter) * FRAC_PI_2 + off)
+}
+
+/// `origin` から方向角 `angle`・長さ `len` の線分。
+fn segment(origin: Point2, len: f64, angle: f64) -> LineSeg {
+    LineSeg::new(
+        origin,
+        Point2::new(origin.x + len * angle.cos(), origin.y + len * angle.sin()),
+    )
 }
 
 /// すべての方程式について、添字に重複が無く、解析ヤコビアンが中心差分と合うこと。
@@ -240,25 +261,93 @@ proptest! {
         assert_jacobians(&sys)?;
     }
 
-    /// 線分どうしの拘束（水平・垂直・平行・直交・等長・角度）。
+    /// 線分どうしの拘束（水平・垂直・平行・直交・角度・等長）。
+    ///
+    /// 主値化の不連続点を避けて形を作る: 線分 1 の方向角 `α` と 2 線分のなす角 `φ` は π/2 の
+    /// 倍数から離す（周期 π で畳む残差は解から 90° ずれた形で不連続。水平と垂直、平行と直交の
+    /// 不連続点を合わせると π/2 おき）。角度拘束の `θ` は `φ − δ`（残差 `δ`。不連続点 ±π から離す）。
     #[test]
-    fn jacobian_line_constraints(s1 in line_shape(), s2 in line_shape(), theta in -PI..PI) {
+    fn jacobian_line_constraints(
+        origin1 in pt(),
+        origin2 in pt(),
+        len1 in 5.0f64..1000.0,
+        len2 in 5.0f64..1000.0,
+        alpha in off_axis_angle(),
+        phi in off_axis_angle(),
+        delta in -3.0f64..3.0,
+        // 線分 1 を後から足す（パラメータの添字が 4 から始まる）場合も確かめる。
+        first_is_second in any::<bool>(),
+    ) {
+        let (s1, s2) = (
+            Shape::Line(segment(origin1, len1, alpha)),
+            Shape::Line(segment(origin2, len2, alpha + phi)),
+        );
         let mut doc = Document::new();
-        let a = add(&mut doc, s1);
-        let b = add(&mut doc, s2);
-        let angle = Constraint::Angle { a, b, value: theta };
-        // 主値化の不連続点（φ − θ = ±π）の近くは避ける。
-        let probe = system(&doc, std::slice::from_ref(&angle));
-        prop_assume!(probe.equations[0].residual(&probe.params).abs() < 3.0);
+        let (a, b) = if first_is_second {
+            let b = add(&mut doc, s2);
+            (add(&mut doc, s1), b)
+        } else {
+            (add(&mut doc, s1), add(&mut doc, s2))
+        };
         let sys = system(&doc, &[
             Constraint::Horizontal { line: a },
-            Constraint::Vertical { line: b },
+            Constraint::Vertical { line: a },
             Constraint::Parallel { a, b },
             Constraint::Perpendicular { a, b },
+            Constraint::Angle { a, b, value: phi - delta },
             Constraint::EqualLength { a, b },
-            angle,
         ]);
         prop_assert_eq!(sys.equations.len(), 6);
+        // 生成した形が不連続点から離れていること（残差の大きさで確かめる）。
+        for eq in &sys.equations[..4] {
+            let residual = eq.residual(&sys.params);
+            prop_assert!(residual.abs() < FRAC_PI_2 - 0.5 * FOLD_MARGIN, "{residual} for {eq:?}");
+        }
+        let residual = sys.equations[4].residual(&sys.params);
+        prop_assert!((residual - delta).abs() < 1e-9, "{residual} vs {delta}");
+        assert_jacobians(&sys)?;
+    }
+
+    /// 向きの拘束（水平・垂直・平行・直交）の残差とヤコビアン: 解の近く（解から ±0.2 rad。
+    /// 0 側・π 側、+π/2 側・−π/2 側の両方）。残差は解までの回転角そのもので、0 と π
+    /// （反平行）のどちらの側でも跳ばない。
+    #[test]
+    fn jacobian_direction_constraints_near_the_solution(
+        origin1 in pt(),
+        origin2 in pt(),
+        len1 in 5.0f64..1000.0,
+        len2 in 5.0f64..1000.0,
+        // 線分 1 の方向角は k·π/2 + off1（k が偶数なら水平の解、奇数なら垂直の解の近く）。
+        k1 in -2i32..=2,
+        off1 in -0.2f64..0.2,
+        // 線分 2 は、線分 1 から j·π/2 + off2 だけ回した向き（j が偶数なら平行、奇数なら直交の
+        // 解の近く）。
+        j in -2i32..=2,
+        off2 in -0.2f64..0.2,
+    ) {
+        let alpha = f64::from(k1) * FRAC_PI_2 + off1;
+        let phi = f64::from(j) * FRAC_PI_2 + off2;
+        let mut doc = Document::new();
+        let a = add(&mut doc, Shape::Line(segment(origin1, len1, alpha)));
+        let b = add(&mut doc, Shape::Line(segment(origin2, len2, alpha + phi)));
+        let near_axis = if k1 % 2 == 0 {
+            Constraint::Horizontal { line: a }
+        } else {
+            Constraint::Vertical { line: a }
+        };
+        let near_line = if j % 2 == 0 {
+            Constraint::Parallel { a, b }
+        } else {
+            Constraint::Perpendicular { a, b }
+        };
+        let sys = system(&doc, &[near_axis, near_line]);
+        prop_assert_eq!(sys.equations.len(), 2);
+        // 端点の座標の丸め（座標 ≤ 2000、長さ ≥ 5）で向きは 1e-13 rad 程度ずれる。
+        for (eq, off) in sys.equations.iter().zip([off1, off2]) {
+            let residual = eq.residual(&sys.params);
+            prop_assert!((residual - off).abs() < 1e-9, "{residual} vs {off} for {eq:?}");
+            prop_assert_eq!(eq.kind(&sys.params), ResidualKind::Angle);
+        }
         assert_jacobians(&sys)?;
     }
 
@@ -448,11 +537,13 @@ fn length_scale_uses_every_referenced_entity_and_the_value() {
             coord: 9000.0
         }
     );
-    // 平行・直交・角度は角度型。
+    // 水平・垂直・平行・直交・角度は角度型（尺度を持たない）。
     let l2 = line(&mut doc, (0.0, 0.0), (1.0, 0.0));
     let sys = system(
         &doc,
         &[
+            Constraint::Horizontal { line: l },
+            Constraint::Vertical { line: l },
             Constraint::Parallel { a: l, b: l2 },
             Constraint::Perpendicular { a: l, b: l2 },
             Constraint::Angle {
@@ -462,6 +553,7 @@ fn length_scale_uses_every_referenced_entity_and_the_value() {
             },
         ],
     );
+    assert_eq!(sys.equations.len(), 5);
     assert!(
         sys.equations
             .iter()
@@ -477,6 +569,8 @@ fn degenerate_line_makes_direction_equations_non_finite() {
     let other = line(&mut doc, (0.0, 0.0), (5.0, 0.0));
     let c = circle(&mut doc, (0.0, 3.0), 3.0);
     for constraint in [
+        Constraint::Horizontal { line: dot },
+        Constraint::Vertical { line: dot },
         Constraint::Parallel { a: dot, b: other },
         Constraint::Perpendicular { a: other, b: dot },
         Constraint::Angle {
@@ -504,24 +598,208 @@ fn degenerate_line_makes_direction_equations_non_finite() {
         assert!(sys.first_unsatisfied().is_some(), "{constraint:?}");
         assert_eq!(constraint.is_satisfied(&doc), Ok(false));
         assert_eq!(solve_system(&sys), Err(SolveError::NonFinite));
-        assert!(!sys.admissible(&sys.params));
+        assert!(sys.first_inadmissible(&sys.params).is_some());
     }
-    // 方向を使わない拘束（水平・等長）は退化した線分でも有限。
-    let sys = system(
-        &doc,
-        &[
-            Constraint::Horizontal { line: dot },
-            Constraint::EqualLength { a: dot, b: other },
-        ],
-    );
-    assert!(
-        sys.equations
-            .iter()
-            .all(|eq| eq.residual(&sys.params).is_finite())
-    );
+    // 方向を使う方程式の偏微分も NaN（有限な値を返して、退化した形から解き始めない）。
+    let sys = system(&doc, &[Constraint::Horizontal { line: dot }]);
+    let mut grad = [0.0; 4];
+    sys.equations[0].gradient(&sys.params, &mut grad);
+    assert!(grad.iter().all(|g| g.is_nan()), "{grad:?}");
+    // 方向を使わない拘束（等長）は退化した線分でも有限。
+    let sys = system(&doc, &[Constraint::EqualLength { a: dot, b: other }]);
+    assert!(sys.equations[0].residual(&sys.params).is_finite());
     let mut grad = [0.0; 8];
-    sys.equations[1].gradient(&sys.params, &mut grad);
+    sys.equations[0].gradient(&sys.params, &mut grad);
     assert!(grad.iter().all(|g| g.is_finite()));
+}
+
+// ---------------------------------------------------------------------------
+// 向きの拘束（水平・垂直・平行・直交）: 周期 π で畳んだ残差
+// ---------------------------------------------------------------------------
+
+/// 拘束 1 件の方程式の残差。
+fn residual_of(doc: &Document, constraint: Constraint) -> f64 {
+    let sys = system(doc, &[constraint]);
+    assert_eq!(sys.equations.len(), 1);
+    sys.equations[0].residual(&sys.params)
+}
+
+#[test]
+fn folded_residual_is_exactly_zero_for_exactly_aligned_lines() {
+    // ちょうど水平（dy == 0.0）・ちょうど垂直（dx == 0.0）な線分は、向きがどちらでも、
+    // 原点から遠くても、残差がちょうど 0（解かずに通す経路が丸めに左右されない）。
+    for (a, b) in [
+        ((0.0, 0.0), (10.0, 0.0)),
+        ((10.0, 0.0), (0.0, 0.0)),
+        ((-3.5, 7.25), (1e6 + 0.1, 7.25)),
+        ((1e6 + 0.3, -1e6 - 0.7), (1e6 - 12.5, -1e6 - 0.7)),
+    ] {
+        let mut doc = Document::new();
+        let flat = line(&mut doc, a, b);
+        // 同じ線分を転置した（x と y を入れ替えた）ちょうど垂直な線分。
+        let upright = line(&mut doc, (a.1, a.0), (b.1, b.0));
+        assert_eq!(
+            residual_of(&doc, Constraint::Horizontal { line: flat }),
+            0.0
+        );
+        assert_eq!(
+            residual_of(&doc, Constraint::Vertical { line: upright }),
+            0.0
+        );
+        assert_eq!(
+            residual_of(
+                &doc,
+                Constraint::Perpendicular {
+                    a: flat,
+                    b: upright
+                }
+            ),
+            0.0
+        );
+        assert_eq!(
+            residual_of(
+                &doc,
+                Constraint::Perpendicular {
+                    a: upright,
+                    b: flat
+                }
+            ),
+            0.0
+        );
+        // 解から最も遠い形（90° ずれ）の残差は ±π/2。
+        let far = residual_of(&doc, Constraint::Vertical { line: flat });
+        assert_eq!(far.abs(), FRAC_PI_2);
+        let far = residual_of(&doc, Constraint::Horizontal { line: upright });
+        assert_eq!(far.abs(), FRAC_PI_2);
+        let far = residual_of(
+            &doc,
+            Constraint::Parallel {
+                a: flat,
+                b: upright,
+            },
+        );
+        assert_eq!(far.abs(), FRAC_PI_2);
+    }
+    // 外積がちょうど 0 になる 2 線分（同じ向き・反平行）は、軸に沿っていなくても平行の残差が
+    // ちょうど 0。内積がちょうど 0 になる 2 線分は直交の残差がちょうど 0。
+    let mut doc = Document::new();
+    let base = line(&mut doc, (1.0, 2.0), (4.0, 6.0)); // 方向 (3, 4)
+    let same = line(&mut doc, (-5.0, 0.0), (1.0, 8.0)); // (6, 8)
+    let opposite = line(&mut doc, (0.0, 9.0), (-9.0, -3.0)); // (−9, −12)
+    let normal = line(&mut doc, (2.0, 2.0), (-2.0, 5.0)); // (−4, 3)
+    let normal_back = line(&mut doc, (2.0, 2.0), (10.0, -4.0)); // (8, −6)
+    for other in [same, opposite] {
+        for (a, b) in [(base, other), (other, base)] {
+            assert_eq!(residual_of(&doc, Constraint::Parallel { a, b }), 0.0);
+            let far = residual_of(&doc, Constraint::Perpendicular { a, b });
+            assert_eq!(far.abs(), FRAC_PI_2);
+        }
+    }
+    for other in [normal, normal_back] {
+        for (a, b) in [(base, other), (other, base)] {
+            assert_eq!(residual_of(&doc, Constraint::Perpendicular { a, b }), 0.0);
+            let far = residual_of(&doc, Constraint::Parallel { a, b });
+            assert_eq!(far.abs(), FRAC_PI_2);
+        }
+    }
+}
+
+#[test]
+fn folded_residual_is_continuous_near_the_solution() {
+    // 線分を、解（水平なら α = 0 と π、垂直なら ±π/2。平行・直交は相手の線分に対して同じ）を
+    // またいで ±0.1 rad 回す。残差は解までの回転角そのもので、0 側でも π 側でも跳ばない
+    // （外積・内積の符号や atan2 の ±π の折り返しを持ち込まない）。
+    let steps = 200;
+    for quarter in -2..=2 {
+        let center = f64::from(quarter) * FRAC_PI_2;
+        let mut previous: Option<f64> = None;
+        for i in 0..=steps {
+            let off = -0.1 + 0.2 * f64::from(i) / f64::from(steps);
+            let mut doc = Document::new();
+            // 基準の線分は方向角 0.4。相手はそこから center + off だけ回した向き。
+            let reference = ray(&mut doc, (3.0, -2.0), 0.4);
+            let turned = ray(&mut doc, (-5.0, 7.0), 0.4 + center + off);
+            // 軸に対する向きは方向角 center + off。
+            let axis = ray(&mut doc, (1.0, 1.0), center + off);
+            let (to_axis, to_line) = if quarter % 2 == 0 {
+                (
+                    Constraint::Horizontal { line: axis },
+                    Constraint::Parallel {
+                        a: reference,
+                        b: turned,
+                    },
+                )
+            } else {
+                (
+                    Constraint::Vertical { line: axis },
+                    Constraint::Perpendicular {
+                        a: reference,
+                        b: turned,
+                    },
+                )
+            };
+            let sys = system(&doc, &[to_axis, to_line]);
+            for eq in &sys.equations {
+                let residual = eq.residual(&sys.params);
+                assert!(
+                    (residual - off).abs() < 1e-12,
+                    "quarter {quarter}, off {off}: {residual} for {eq:?}"
+                );
+                check_jacobian(eq, &sys.params, 1e-6, 1e-5)
+                    .unwrap_or_else(|m| panic!("quarter {quarter}, off {off}: {m:?}"));
+            }
+            let residual = sys.equations[1].residual(&sys.params);
+            if let Some(prev) = previous {
+                assert!(
+                    (residual - prev).abs() < 2.0 * 0.2 / f64::from(steps),
+                    "discontinuity between steps: {prev} -> {residual}"
+                );
+            }
+            previous = Some(residual);
+        }
+    }
+}
+
+#[test]
+fn folded_gradient_does_not_vanish_a_quarter_turn_from_the_solution() {
+    // 解から最も遠い形（残差 ±π/2 の不連続点）でも、勾配は有限で 0 にならない。以前の式
+    // （単位方向ベクトルの外積・内積）はここで勾配が 0 になり、どちらへ回すか決まらなかった。
+    let mut doc = Document::new();
+    let flat = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
+    let upright = line(&mut doc, (3.0, 2.0), (3.0, 9.0));
+    let flat2 = line(&mut doc, (0.0, 5.0), (10.0, 5.0));
+    let back = line(&mut doc, (10.0, -5.0), (0.0, -5.0));
+    for constraint in [
+        Constraint::Vertical { line: flat },
+        Constraint::Horizontal { line: upright },
+        Constraint::Parallel {
+            a: flat,
+            b: upright,
+        },
+        Constraint::Perpendicular { a: flat, b: flat2 },
+        Constraint::Perpendicular { a: flat, b: back },
+    ] {
+        let sys = system(&doc, std::slice::from_ref(&constraint));
+        let eq = &sys.equations[0];
+        assert_eq!(eq.residual(&sys.params).abs(), FRAC_PI_2, "{constraint:?}");
+        let mut grad = vec![0.0; eq.params().len()];
+        eq.gradient(&sys.params, &mut grad);
+        assert!(grad.iter().all(|g| g.is_finite()), "{constraint:?}");
+        let norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+        assert!(norm > 0.1, "{constraint:?}: {grad:?}");
+        // その形から解ける。線分は回るだけで、退化しない（長さは減らない）。
+        let x = solved(&sys);
+        for entity in constraint.entities() {
+            let (before, after) = (
+                line_at(&sys, entity, &sys.params),
+                line_at(&sys, entity, &x),
+            );
+            assert!(
+                after.direction().length() >= before.direction().length(),
+                "{constraint:?}: {before:?} -> {after:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -677,13 +955,13 @@ fn fixed_point_on_arc_leaves_three_degrees_of_freedom() {
     for kind in [PointKind::Start, PointKind::End, PointKind::Center] {
         let fix = Constraint::fix_point(&doc, PointRef::new(a, kind)).unwrap();
         let sys = system(&doc, &[fix]);
-        let weights = sys.unit_weights();
+        let weights = sys.weights();
         let problem = Problem::new(&sys.params, &sys.fixed, &weights, &sys.equations);
         assert_eq!(degrees_of_freedom(&problem), Ok(3), "{kind:?}");
     }
     // 図形の固定は全パラメータを固定集合へ入れる（自由度 0）。
     let sys = system(&doc, &[Constraint::FixEntity { entity: a }]);
-    let weights = sys.unit_weights();
+    let weights = sys.weights();
     let problem = Problem::new(&sys.params, &sys.fixed, &weights, &sys.equations);
     assert_eq!(degrees_of_freedom(&problem), Ok(0));
 }

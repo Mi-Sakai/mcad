@@ -1,7 +1,10 @@
 //! [`Document`] に拘束を適用したときのテスト（M13 タスク96 の完了条件 6・7）。
 //!
-//! 追加・削除・値の変更と undo/redo、充足検査による拒否と状態の完全一致、`Batch` での
+//! 追加・削除・値の変更と undo/redo、拒否されたコマンドの後の状態の完全一致、`Batch` での
 //! 一括移動、`RemoveEntity` の連鎖削除、構造検証の拒否、固定図形の変更拒否、`ReshapeEntity`。
+//! タスク97 で `apply` が拘束を解くようになったので、96 で「満たされていないから拒否」だった
+//! 操作の多くは「解かれて追従する」に変わっている。求解そのもののテストは
+//! `constraint_solve_tests.rs`。
 
 use std::f64::consts::PI;
 
@@ -14,22 +17,22 @@ use crate::{CircleTangency, LargerCircle, PointKind, PointRef, Side, TextGeom};
 // ヘルパー
 // ---------------------------------------------------------------------------
 
-fn line_geom(a: (f64, f64), b: (f64, f64)) -> EntityGeom {
+pub(super) fn line_geom(a: (f64, f64), b: (f64, f64)) -> EntityGeom {
     EntityGeom::Shape(Shape::Line(LineSeg::new(
         Point2::new(a.0, a.1),
         Point2::new(b.0, b.1),
     )))
 }
 
-fn circle_geom(c: (f64, f64), r: f64) -> EntityGeom {
+pub(super) fn circle_geom(c: (f64, f64), r: f64) -> EntityGeom {
     EntityGeom::Shape(Shape::Circle(Circle::new(Point2::new(c.0, c.1), r)))
 }
 
-fn arc_geom(c: (f64, f64), r: f64, start: f64, end: f64) -> EntityGeom {
+pub(super) fn arc_geom(c: (f64, f64), r: f64, start: f64, end: f64) -> EntityGeom {
     EntityGeom::Shape(Shape::Arc(Arc::new(Point2::new(c.0, c.1), r, start, end)))
 }
 
-fn add(doc: &mut Document, geom: EntityGeom) -> EntityId {
+pub(super) fn add(doc: &mut Document, geom: EntityGeom) -> EntityId {
     let layer = doc.current_layer();
     doc.apply(Command::AddEntity(Entity::new(
         geom,
@@ -40,48 +43,57 @@ fn add(doc: &mut Document, geom: EntityGeom) -> EntityId {
     .entities[0]
 }
 
-fn line(doc: &mut Document, a: (f64, f64), b: (f64, f64)) -> EntityId {
+pub(super) fn line(doc: &mut Document, a: (f64, f64), b: (f64, f64)) -> EntityId {
     add(doc, line_geom(a, b))
 }
 
-fn circle(doc: &mut Document, c: (f64, f64), r: f64) -> EntityId {
+pub(super) fn circle(doc: &mut Document, c: (f64, f64), r: f64) -> EntityId {
     add(doc, circle_geom(c, r))
 }
 
-/// テスト用: 拘束を追加して発行された ID を返す（満たされている前提）。
+/// 止める図形なし（`hold: None`）の `AddConstraint`。
+pub(super) fn add_constraint(constraint: Constraint) -> Command {
+    Command::AddConstraint {
+        constraint,
+        hold: None,
+    }
+}
+
+/// テスト用: 拘束を追加して発行された ID を返す（受理される前提。満たされていなければ
+/// 解かれて形が変わる）。
 ///
 /// メソッドにしてあるのは、引数の中で `Constraint::distance(&doc, ..)` のように文書を
 /// 読めるようにするため（レシーバの `&mut` は 2 相借用になる）。
-trait Constrain {
+pub(super) trait Constrain {
     fn constrain(&mut self, constraint: Constraint) -> ConstraintId;
 }
 
 impl Constrain for Document {
     fn constrain(&mut self, constraint: Constraint) -> ConstraintId {
-        let ids = self.apply(Command::AddConstraint(constraint)).unwrap();
+        let ids = self.apply(add_constraint(constraint)).unwrap();
         assert!(ids.entities.is_empty() && ids.layers.is_empty());
         assert_eq!(ids.constraints.len(), 1);
         ids.constraints[0]
     }
 }
 
-fn start(e: EntityId) -> PointRef {
+pub(super) fn start(e: EntityId) -> PointRef {
     PointRef::new(e, PointKind::Start)
 }
 
-fn end(e: EntityId) -> PointRef {
+pub(super) fn end(e: EntityId) -> PointRef {
     PointRef::new(e, PointKind::End)
 }
 
-fn center(e: EntityId) -> PointRef {
+pub(super) fn center(e: EntityId) -> PointRef {
     PointRef::new(e, PointKind::Center)
 }
 
-fn geom(doc: &Document, id: EntityId) -> EntityGeom {
+pub(super) fn geom(doc: &Document, id: EntityId) -> EntityGeom {
     doc.entity(id).unwrap().geom.clone()
 }
 
-fn translated(doc: &Document, id: EntityId, delta: (f64, f64)) -> Command {
+pub(super) fn translated(doc: &Document, id: EntityId, delta: (f64, f64)) -> Command {
     Command::ModifyEntity {
         id,
         new_geom: geom(doc, id).translated(Vec2::new(delta.0, delta.1)),
@@ -90,9 +102,9 @@ fn translated(doc: &Document, id: EntityId, delta: (f64, f64)) -> Command {
 
 /// 観測可能な状態の全体（失敗したコマンドの前後で一致することを確かめる）。
 #[derive(Debug, PartialEq)]
-struct Snapshot {
-    entities: Vec<(EntityId, Entity)>,
-    constraints: Vec<(ConstraintId, Constraint)>,
+pub(super) struct Snapshot {
+    pub(super) entities: Vec<(EntityId, Entity)>,
+    pub(super) constraints: Vec<(ConstraintId, Constraint)>,
     constraint_count: usize,
     layers: Vec<(LayerId, Layer)>,
     current_layer: LayerId,
@@ -102,7 +114,7 @@ struct Snapshot {
     next_generation: u64,
 }
 
-fn snapshot(doc: &Document) -> Snapshot {
+pub(super) fn snapshot(doc: &Document) -> Snapshot {
     Snapshot {
         entities: doc.entities().map(|(id, e)| (id, e.clone())).collect(),
         constraints: doc.constraints().map(|(id, c)| (id, c.clone())).collect(),
@@ -117,28 +129,68 @@ fn snapshot(doc: &Document) -> Snapshot {
 }
 
 /// コマンドが `expected` で拒否され、状態が適用前と完全に一致することを確かめる。
-fn assert_rejected(doc: &mut Document, cmd: Command, expected: impl Fn(&CoreError) -> bool) {
+pub(super) fn assert_rejected(
+    doc: &mut Document,
+    cmd: Command,
+    expected: impl Fn(&CoreError) -> bool,
+) {
     let before = snapshot(doc);
     let err = doc.apply(cmd).expect_err("command must be rejected");
     assert!(expected(&err), "unexpected error: {err:?}");
     assert_eq!(snapshot(doc), before, "state changed by a rejected command");
 }
 
-fn unsatisfied(err: &CoreError) -> bool {
-    matches!(err, CoreError::ConstraintUnsatisfied(_))
+/// 止められた図形だけに関わる拘束が満たされない。
+pub(super) fn blocked(err: &CoreError) -> bool {
+    matches!(err, CoreError::ConstraintBlockedByFixed(_))
 }
 
-fn invalid(err: &CoreError) -> bool {
+/// 図形が退化する（解く前から退化している場合を含む）。
+pub(super) fn degenerate(err: &CoreError) -> bool {
+    matches!(err, CoreError::DegenerateShape(_))
+}
+
+/// 2 つの図形（線分・円・円弧）のパラメータが `tol` 以内で一致する。
+pub(super) fn assert_close(actual: &EntityGeom, expected: &EntityGeom, tol: f64) {
+    let params = |g: &EntityGeom| -> Vec<f64> {
+        match g.as_shape() {
+            Some(Shape::Line(l)) => vec![l.a.x, l.a.y, l.b.x, l.b.y],
+            Some(Shape::Circle(c)) => vec![c.center.x, c.center.y, c.radius],
+            Some(Shape::Arc(a)) => {
+                vec![a.center.x, a.center.y, a.radius, a.start_angle, a.end_angle]
+            }
+            _ => panic!("not a constrainable shape: {g:?}"),
+        }
+    };
+    let (a, e) = (params(actual), params(expected));
+    assert_eq!(a.len(), e.len(), "{actual:?} vs {expected:?}");
+    for (x, y) in a.iter().zip(&e) {
+        assert!((x - y).abs() <= tol, "{actual:?} vs {expected:?}");
+    }
+}
+
+/// 文書のすべての拘束が満たされている（`apply` が受理した文書の不変条件）。
+pub(super) fn assert_all_satisfied(doc: &Document) {
+    for (id, constraint) in doc.constraints() {
+        assert_eq!(
+            constraint.is_satisfied(doc),
+            Ok(true),
+            "{id:?} {constraint:?}"
+        );
+    }
+}
+
+pub(super) fn invalid(err: &CoreError) -> bool {
     matches!(err, CoreError::InvalidConstraint(_))
 }
 
 /// 矩形（辺 4 本、反時計回り）。角の一致 4・水平 2・垂直 2 で拘束する。
-struct Rect {
-    sides: [EntityId; 4],
-    constraints: Vec<ConstraintId>,
+pub(super) struct Rect {
+    pub(super) sides: [EntityId; 4],
+    pub(super) constraints: Vec<ConstraintId>,
 }
 
-fn rectangle(doc: &mut Document) -> Rect {
+pub(super) fn rectangle(doc: &mut Document) -> Rect {
     let corners = [(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)];
     let sides: [EntityId; 4] = std::array::from_fn(|i| line(doc, corners[i], corners[(i + 1) % 4]));
     let mut constraints = Vec::new();
@@ -238,17 +290,19 @@ fn constraints_are_listed_in_id_order() {
 }
 
 #[test]
-fn unsatisfied_constraint_is_rejected() {
+fn unsatisfied_constraint_is_solved_on_add() {
     let mut doc = Document::new();
     let l1 = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
-    let l2 = line(&mut doc, (10.5, 0.0), (10.5, 5.0));
+    let l2 = line(&mut doc, (10.5, 0.5), (12.0, 5.0));
     let c = circle(&mut doc, (5.0, 4.0), 3.0);
+    let shapes = |doc: &Document| (geom(doc, l1), geom(doc, l2), geom(doc, c));
+    let before = shapes(&doc);
     for constraint in [
         Constraint::Coincident {
             a: end(l1),
             b: start(l2),
         },
-        Constraint::Vertical { line: l1 },
+        Constraint::Vertical { line: l2 },
         Constraint::Parallel { a: l1, b: l2 },
         Constraint::Distance {
             a: start(l1),
@@ -274,18 +328,30 @@ fn unsatisfied_constraint_is_rejected() {
             value: 1.0,
         },
     ] {
-        assert_rejected(&mut doc, Command::AddConstraint(constraint), unsatisfied);
+        // 満たされていない拘束は、解かれて形が変わる（96 では拒否だった）。
+        assert_eq!(constraint.is_satisfied(&doc), Ok(false), "{constraint:?}");
+        let id = doc.constrain(constraint.clone());
+        assert_eq!(constraint.is_satisfied(&doc), Ok(true), "{constraint:?}");
+        let solved = shapes(&doc);
+        assert_ne!(solved, before, "{constraint:?}");
+        // undo 1 回で拘束と形がそろって戻り、redo は解き直さずに同じ形を再現する。
+        assert!(doc.undo());
+        assert_eq!(doc.constraint(id), None);
+        assert_eq!(shapes(&doc), before, "{constraint:?}");
+        assert!(doc.redo());
+        assert_eq!(doc.constraint(id), Some(&constraint));
+        assert_eq!(shapes(&doc), solved, "{constraint:?}");
+        assert!(doc.undo());
     }
-    // 満たされている拘束は入る（解かないので形は変わらない）。
-    let before = (geom(&doc, l1), geom(&doc, l2), geom(&doc, c));
+    // 満たされている拘束は、何も動かさずに入る。
     doc.constrain(Constraint::Horizontal { line: l1 });
-    doc.constrain(Constraint::Perpendicular { a: l1, b: l2 });
     doc.constrain(Constraint::fix_point(&doc, center(c)).unwrap());
-    assert_eq!(before, (geom(&doc, l1), geom(&doc, l2), geom(&doc, c)));
+    doc.constrain(Constraint::radius(&doc, c).unwrap());
+    assert_eq!(shapes(&doc), before);
 }
 
 #[test]
-fn unsatisfied_error_reports_first_violation_in_id_order() {
+fn blocked_error_reports_first_violation_in_id_order() {
     let mut doc = Document::new();
     let l = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
     let horizontal = doc.constrain(Constraint::Horizontal { line: l });
@@ -295,29 +361,33 @@ fn unsatisfied_error_reports_first_violation_in_id_order() {
         value: 10.0,
     });
     assert!(horizontal < length);
-    // 両方に反する変更は、ID 順で最初の違反（水平）を返す。
+    // 両端を動かして両方の拘束に反する変更は、ID 順で最初の違反（水平）を返す
+    // （動かした点は止められるので、解く余地が無い）。
     assert_rejected(
         &mut doc,
         Command::ModifyEntity {
             id: l,
-            new_geom: line_geom((0.0, 0.0), (3.0, 4.0)),
+            new_geom: line_geom((1.0, 1.0), (4.0, 5.0)),
         },
-        |e| *e == CoreError::ConstraintUnsatisfied(horizontal),
+        |e| *e == CoreError::ConstraintBlockedByFixed(horizontal),
     );
     // 長さだけに反する変更は、長さの拘束を返す。
     assert_rejected(
         &mut doc,
         Command::ModifyEntity {
             id: l,
-            new_geom: line_geom((0.0, 0.0), (12.0, 0.0)),
+            new_geom: line_geom((1.0, 0.0), (13.0, 0.0)),
         },
-        |e| *e == CoreError::ConstraintUnsatisfied(length),
+        |e| *e == CoreError::ConstraintBlockedByFixed(length),
     );
-    // 追加した拘束が満たされないときは、その（発行されるはずだった）拘束を返す。
+    // 追加した拘束が満たせないときは、その（発行されるはずだった）拘束を返す: 水平・長さ 10 の
+    // 線分に垂直を足すと、満たす形が無い。その ID は文書に残らない。
+    let before = snapshot(&doc);
     let err = doc
-        .apply(Command::AddConstraint(Constraint::Vertical { line: l }))
+        .apply(add_constraint(Constraint::Vertical { line: l }))
         .unwrap_err();
-    let CoreError::ConstraintUnsatisfied(rejected) = err else {
+    assert_eq!(snapshot(&doc), before);
+    let CoreError::ConstraintUnsolvable(rejected) = err else {
         panic!("unexpected {err:?}");
     };
     assert!(rejected > length);
@@ -329,7 +399,7 @@ fn unsatisfied_error_reports_first_violation_in_id_order() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn modify_violating_constraint_is_rejected_with_state_intact() {
+fn modify_violating_own_constraint_is_rejected_with_state_intact() {
     let mut doc = Document::new();
     let rect = rectangle(&mut doc);
     // redo スタックも保たれることを見るため、undo 済みの操作を 1 つ残しておく。
@@ -338,18 +408,23 @@ fn modify_violating_constraint_is_rejected_with_state_intact() {
     assert!(doc.can_redo());
     assert_eq!(doc.entity(extra), None);
 
-    // 1 辺だけを動かすと角の一致が外れる。
-    let cmd = translated(&doc, rect.sides[0], (0.0, -5.0));
-    assert_rejected(&mut doc, cmd, unsatisfied);
-    // 水平な辺を回転する。
+    // 水平な辺を回転する: 動かした辺そのものが水平に反する（両端とも止められるので、
+    // ほかの辺が追従しても満たせない）。
     let rotated = geom(&doc, rect.sides[0]).rotated(Point2::new(20.0, 0.0), 0.3);
+    let horizontal = rect.constraints[4];
+    assert_eq!(
+        doc.constraint(horizontal),
+        Some(&Constraint::Horizontal {
+            line: rect.sides[0]
+        })
+    );
     assert_rejected(
         &mut doc,
         Command::ModifyEntity {
             id: rect.sides[0],
             new_geom: rotated,
         },
-        unsatisfied,
+        |e| *e == CoreError::ConstraintBlockedByFixed(horizontal),
     );
     // 拘束に関わらない変更（スタイル）は通る。
     doc.apply(Command::SetEntityStyle {
@@ -369,8 +444,8 @@ fn batch_translating_connected_shapes_is_accepted() {
     let before: Vec<EntityGeom> = rect.sides.iter().map(|&s| geom(&doc, s)).collect();
     let undo_depth = doc.undo_stack.len();
 
-    // 辺を 1 本ずつ動かす Batch は、全体として矩形を保てば通る
-    // （サブコマンドごとには検査しない）。
+    // 辺を 1 本ずつ動かす Batch は、全体として矩形を保てば、何も解かずにそのまま通る
+    // （サブコマンドごとには解かない）。
     let batch = Command::Batch(
         rect.sides
             .iter()
@@ -379,13 +454,16 @@ fn batch_translating_connected_shapes_is_accepted() {
     );
     assert_eq!(doc.apply(batch).unwrap(), NewIds::default());
     assert_eq!(doc.undo_stack.len(), undo_depth + 1);
+    // 追従する修正は足されない（履歴の記録は 4 つのサブコマンドだけ）。
+    assert!(matches!(
+        &doc.undo_stack.last().unwrap().applied,
+        Applied::Batch(subs) if subs.len() == 4
+    ));
     for (&s, b) in rect.sides.iter().zip(&before) {
         assert_eq!(geom(&doc, s), b.translated(Vec2::new(12.5, -7.25)));
     }
     assert_eq!(doc.constraint_count(), 8);
-    for (_, c) in doc.constraints() {
-        assert_eq!(c.is_satisfied(&doc), Ok(true));
-    }
+    assert_all_satisfied(&doc);
     // undo 1 回で全体が戻る。
     assert!(doc.undo());
     for (&s, b) in rect.sides.iter().zip(&before) {
@@ -403,14 +481,24 @@ fn batch_translating_connected_shapes_is_accepted() {
     ]);
     doc.apply(nested).unwrap();
 
-    // 3 辺だけ動かす Batch は拒否され、動かした 3 辺もすべて戻る。
+    // 3 辺だけ動かす Batch では、残りの 1 辺が追従する（96 では拒否だった）。
+    let moved: Vec<EntityGeom> = rect.sides[..3]
+        .iter()
+        .map(|&s| geom(&doc, s).translated(Vec2::new(5.0, 0.0)))
+        .collect();
+    let follower = geom(&doc, rect.sides[3]).translated(Vec2::new(5.0, 0.0));
     let partial = Command::Batch(
         rect.sides[..3]
             .iter()
             .map(|&s| translated(&doc, s, (5.0, 0.0)))
             .collect(),
     );
-    assert_rejected(&mut doc, partial, unsatisfied);
+    doc.apply(partial).unwrap();
+    for (&s, m) in rect.sides[..3].iter().zip(&moved) {
+        assert_eq!(&geom(&doc, s), m);
+    }
+    assert_close(&geom(&doc, rect.sides[3]), &follower, 1e-7);
+    assert_all_satisfied(&doc);
 }
 
 #[test]
@@ -455,21 +543,27 @@ fn batch_rotating_connected_shapes_is_accepted() {
                 .collect(),
         )
     };
-    // ±π をまたぐ回転を含め、何度回しても通る。
+    // ±π をまたぐ回転を含め、何度回しても通り、何も余計に動かない（bit 単位で回した形のまま）。
     for angle in [0.3, 2.9, 0.4, -4.0] {
+        let expected: Vec<EntityGeom> = all
+            .iter()
+            .map(|&id| geom(&doc, id).rotated(pivot, angle))
+            .collect();
         let cmd = rotate_all(&doc, angle);
         doc.apply(cmd).unwrap();
+        let actual: Vec<EntityGeom> = all.iter().map(|&id| geom(&doc, id)).collect();
+        assert_eq!(actual, expected, "angle {angle}");
     }
-    // 1 本だけ回すのは拒否。
+    assert_all_satisfied(&doc);
+    // 1 本だけ回すと、ほかの図形が追従する（96 では拒否だった）。回した線分は動かされない。
     let rotated = geom(&doc, a).rotated(pivot, 0.3);
-    assert_rejected(
-        &mut doc,
-        Command::ModifyEntity {
-            id: a,
-            new_geom: rotated,
-        },
-        unsatisfied,
-    );
+    doc.apply(Command::ModifyEntity {
+        id: a,
+        new_geom: rotated.clone(),
+    })
+    .unwrap();
+    assert_eq!(geom(&doc, a), rotated);
+    assert_all_satisfied(&doc);
 }
 
 // ---------------------------------------------------------------------------
@@ -539,25 +633,25 @@ fn batch_failure_restores_cascaded_constraints() {
         |e| *e == CoreError::EntityNotFound(ghost),
     );
 
-    // 最後の充足検査の失敗: 辺 0 を消した後、辺 2（水平）を傾ける。
+    // 最後の求解の失敗: 辺 0 を消した後、辺 2（水平）の両端を動かして傾ける。
     assert_rejected(
         &mut doc,
         Command::Batch(vec![
             Command::RemoveEntity(rect.sides[0]),
             Command::ModifyEntity {
                 id: rect.sides[2],
-                new_geom: line_geom((40.0, 30.0), (0.0, 31.0)),
+                new_geom: line_geom((41.0, 30.0), (0.0, 31.0)),
             },
         ]),
-        unsatisfied,
+        blocked,
     );
 
     // 同じ Batch の中で追加した拘束が、後続の RemoveEntity で消える場合。追加した拘束は
-    // 検査の対象にならず、undo で全体が戻る。
+    // 求解の対象にならず、undo で全体が戻る。
     let before = snapshot(&doc);
     let ids = doc
         .apply(Command::Batch(vec![
-            Command::AddConstraint(Constraint::EqualLength {
+            add_constraint(Constraint::EqualLength {
                 a: rect.sides[0],
                 b: rect.sides[2],
             }),
@@ -599,13 +693,17 @@ fn set_constraint_value_noop_and_rejections() {
     assert_eq!(snapshot(&doc), before);
 
     let set = |id, value| Command::SetConstraintValue { id, value };
-    // 形を変える値は、解かないので拒否。
-    assert_rejected(&mut doc, set(length, 12.0), |e| {
-        *e == CoreError::ConstraintUnsatisfied(length)
-    });
-    assert_rejected(&mut doc, set(radius, 5.0), |e| {
-        *e == CoreError::ConstraintUnsatisfied(radius)
-    });
+    // 形を変える値は、解かれて形が変わる（96 では拒否だった）。undo 1 回で値と形が戻る。
+    let shapes = (geom(&doc, l), geom(&doc, c));
+    for (id, value, old) in [(length, 12.0, 10.0), (radius, 5.0, 4.0), (offset, 0.0, 4.0)] {
+        doc.apply(set(id, value)).unwrap();
+        assert_eq!(doc.constraint(id).unwrap().value(), Some(value));
+        assert_ne!((geom(&doc, l), geom(&doc, c)), shapes);
+        assert_all_satisfied(&doc);
+        assert!(doc.undo());
+        assert_eq!(doc.constraint(id).unwrap().value(), Some(old));
+        assert_eq!((geom(&doc, l), geom(&doc, c)), shapes);
+    }
     // 範囲外の値は構造の検証で拒否（点どうしの距離 0 は一致拘束を使う）。
     assert_rejected(&mut doc, set(length, 0.0), invalid);
     assert_rejected(&mut doc, set(length, 1e-13), invalid);
@@ -614,8 +712,6 @@ fn set_constraint_value_noop_and_rejections() {
     assert_rejected(&mut doc, set(radius, 0.0), invalid);
     assert_rejected(&mut doc, set(radius, f64::INFINITY), invalid);
     assert_rejected(&mut doc, set(offset, -1.0), invalid);
-    // 点と線の距離は 0 を許す（ここでは形と合わないので充足検査で拒否）。
-    assert_rejected(&mut doc, set(offset, 0.0), unsatisfied);
     // 値を持たない拘束・存在しない拘束。
     assert_rejected(&mut doc, set(horizontal, 1.0), invalid);
     doc.apply(Command::RemoveConstraint(horizontal)).unwrap();
@@ -626,7 +722,7 @@ fn set_constraint_value_noop_and_rejections() {
 
 #[test]
 fn set_constraint_value_together_with_matching_geometry() {
-    // 形と値を同じ Batch で変えれば通る（検査は Batch の最後に 1 回）。
+    // 形と値を同じ Batch で変えれば、解かずにそのまま通る（求解は Batch の最後に 1 回）。
     let mut doc = Document::new();
     let l = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
     let length = doc.constrain(Constraint::distance(&doc, start(l), end(l)).unwrap());
@@ -727,12 +823,12 @@ fn structural_validation_rejects_bad_targets() {
     // 参照先が無い。
     assert_rejected(
         &mut doc,
-        Command::AddConstraint(Constraint::Horizontal { line: removed }),
+        add_constraint(Constraint::Horizontal { line: removed }),
         |e| *e == CoreError::EntityNotFound(removed),
     );
     assert_rejected(
         &mut doc,
-        Command::AddConstraint(Constraint::Parallel { a: l, b: removed }),
+        add_constraint(Constraint::Parallel { a: l, b: removed }),
         |e| *e == CoreError::EntityNotFound(removed),
     );
 
@@ -901,9 +997,7 @@ fn structural_validation_rejects_bad_targets() {
     for constraint in bad {
         let shown = format!("{constraint:?}");
         let before = snapshot(&doc);
-        let err = doc
-            .apply(Command::AddConstraint(constraint))
-            .expect_err(&shown);
+        let err = doc.apply(add_constraint(constraint)).expect_err(&shown);
         assert!(invalid(&err), "{shown}: {err:?}");
         assert_eq!(snapshot(&doc), before, "{shown}");
     }
@@ -1005,8 +1099,8 @@ fn fixed_entity_cannot_change_geometry() {
     );
     assert_eq!(snapshot(&doc), before);
 
-    // 形を変えない変更（スタイル）は通る。固定していない図形は従来どおり動かせない
-    // （一致拘束に反する）が、エラーは充足検査のもの。
+    // 形を変えない変更（スタイル）は通る。固定した図形と一致でつながった図形をまるごと
+    // 動かすと、一致の両側が止められるので拒否（エラーは求解のもの）。
     doc.apply(Command::SetEntityStyle {
         id: l,
         style: Style {
@@ -1016,7 +1110,15 @@ fn fixed_entity_cannot_change_geometry() {
     })
     .unwrap();
     let cmd = translated(&doc, other, (1.0, 0.0));
-    assert_rejected(&mut doc, cmd, unsatisfied);
+    assert_rejected(&mut doc, cmd, blocked);
+    // 一致していない側の端点だけを動かすのは通る（固定した図形は動かない）。
+    doc.apply(Command::ModifyEntity {
+        id: other,
+        new_geom: line_geom((10.0, 0.0), (12.0, 7.0)),
+    })
+    .unwrap();
+    assert_eq!(geom(&doc, l), line_geom((0.0, 0.0), (10.0, 0.0)));
+    assert!(doc.undo());
 
     // 固定を外してから動かす Batch は通る（判定はその時点の状態）。
     doc.apply(Command::Batch(vec![
@@ -1043,18 +1145,18 @@ fn fixed_entity_cannot_change_geometry() {
 }
 
 #[test]
-fn fixed_point_blocks_moves_through_satisfaction_check() {
+fn fixed_point_blocks_moving_that_point() {
     let mut doc = Document::new();
     let l = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
     let fix = doc.constrain(Constraint::fix_point(&doc, start(l)).unwrap());
-    // 固定した点が動く変更は、点の固定の方程式が満たされないので拒否。
+    // 固定した点を動かす変更は、点の固定の方程式が満たされず、動かした点は止められるので拒否。
     assert_rejected(
         &mut doc,
         Command::ModifyEntity {
             id: l,
             new_geom: line_geom((1.0, 0.0), (10.0, 0.0)),
         },
-        |e| *e == CoreError::ConstraintUnsatisfied(fix),
+        |e| *e == CoreError::ConstraintBlockedByFixed(fix),
     );
     // 固定した点を保つ変更（もう一方の端点を動かす）は通る。
     doc.apply(Command::ModifyEntity {
@@ -1170,15 +1272,25 @@ fn reshape_removes_moved_point_constraints_and_keeps_the_rest() {
     let original = geom(&doc, scene.l);
     let shorter = line_geom((0.0, 0.0), (7.0, 0.0));
 
-    // 同じ切り詰めを ModifyEntity で行うと、終点の一致に反して拒否される。
-    assert_rejected(
-        &mut doc,
-        Command::ModifyEntity {
-            id: scene.l,
-            new_geom: shorter.clone(),
-        },
-        unsatisfied,
+    // 同じ変更を ModifyEntity で行うと「動かした」扱いで、拘束は 1 件も消えず、ほかの図形が
+    // 追従する（96 では終点の一致に反して拒否だった）。
+    let everything = snapshot(&doc).entities;
+    doc.apply(Command::ModifyEntity {
+        id: scene.l,
+        new_geom: shorter.clone(),
+    })
+    .unwrap();
+    // 止められるのは動かした終点だけ（始点は自由なので、最小ノルムの解では始点も少し動く）。
+    assert_eq!(
+        end(scene.l).position(&doc),
+        Some(Point2::new(7.0, 0.0)),
+        "{:?}",
+        geom(&doc, scene.l)
     );
+    assert_eq!(doc.constraint_count(), 8);
+    assert_all_satisfied(&doc);
+    assert!(doc.undo());
+    assert_eq!(snapshot(&doc).entities, everything);
 
     let ids = doc
         .apply(Command::ReshapeEntity {
@@ -1346,10 +1458,10 @@ fn reshape_of_unconstrained_entity_accepts_any_change() {
 }
 
 #[test]
-fn reshape_is_rejected_when_remaining_constraints_break() {
+fn reshape_solves_the_remaining_constraints() {
     // 支持する直線の判定（許容値は変更前後の大きい方の長さで決まる）は通るが、残った拘束が
-    // 変更後の形（短くなって許容値が厳しくなる）では満たされない場合。最後の充足検査で
-    // 拒否され、消しかけた拘束も戻る。
+    // 変更後の形（短くなって許容値が厳しくなる）では満たされない場合。切り詰めた終点を
+    // 止めたまま、残った拘束を解く（96 では拒否だった）。
     let mut doc = Document::new();
     let long = line(&mut doc, (0.0, 0.0), (1000.0, 0.0));
     let post = line(&mut doc, (1000.0, 0.0), (1000.0, 5.0));
@@ -1358,17 +1470,34 @@ fn reshape_is_rejected_when_remaining_constraints_break() {
         a: end(long),
         b: start(post),
     });
-    assert_rejected(
-        &mut doc,
-        Command::ReshapeEntity {
-            id: long,
-            // 直線からのずれ 5e-7 は、長さ 1000 の許容値（1e-6）以内だが、長さ 10 の水平の
-            // 許容値（1e-8）を超える。
-            new_geom: line_geom((0.0, 0.0), (10.0, 5e-7)),
-        },
-        |e| *e == CoreError::ConstraintUnsatisfied(horizontal),
-    );
+    // 直線からのずれ 5e-7 は、長さ 1000 の許容値（1e-6）以内だが、長さ 10 の線分では
+    // 5e-8 rad の傾きになり、水平の許容値（1e-9 rad）を超える。
+    let trimmed = Command::ReshapeEntity {
+        id: long,
+        new_geom: line_geom((0.0, 0.0), (10.0, 5e-7)),
+    };
+    doc.apply(trimmed.clone()).unwrap();
+    // 終点の一致は消え、水平は始点が追従して保たれる。
+    assert_eq!(doc.constraint_count(), 1);
+    assert_all_satisfied(&doc);
+    let EntityGeom::Shape(Shape::Line(solved)) = geom(&doc, long) else {
+        panic!("expected a line");
+    };
+    assert_eq!(solved.b, Point2::new(10.0, 5e-7));
+    // 始点は、止まった終点のまわりに 5e-8 rad 回る（線分と直角に動くので、x も 2.5e-14 動く）。
+    assert!(solved.a.x.abs() <= 1e-12, "{solved:?}");
+    assert!((solved.a.y - 5e-7).abs() <= 1e-8, "{solved:?}");
+    // undo 1 回で、切り詰め・消えた拘束・追従がそろって戻る。
+    assert!(doc.undo());
+    assert_eq!(geom(&doc, long), line_geom((0.0, 0.0), (1000.0, 0.0)));
     assert_eq!(doc.constraint_count(), 2);
+
+    // 始点が点の固定で止まっていれば追従できず、拒否される。消しかけた拘束も戻る。
+    doc.constrain(Constraint::fix_point(&doc, start(long)).unwrap());
+    assert_rejected(&mut doc, trimmed, |e| {
+        *e == CoreError::ConstraintUnsolvable(horizontal)
+    });
+    assert_eq!(doc.constraint_count(), 3);
 
     // Batch の途中で失敗した場合も、先の ReshapeEntity が消した拘束が戻る。
     let scene = reshape_scene(&mut doc);
@@ -1529,7 +1658,7 @@ fn reshape_without_constraints_matches_modify() {
 }
 
 // ---------------------------------------------------------------------------
-// 退化した図形（ソルバーが受け入れない形は、満たされていない扱い）
+// 退化した図形（ソルバーが受け入れない形を参照する拘束は拒否）
 // ---------------------------------------------------------------------------
 
 /// `mcad_geom::solve::ATOL_LEN`（1e-12）を下回る長さ・半径。
@@ -1538,8 +1667,9 @@ const _: () = assert!(BELOW_ATOL < mcad_geom::solve::ATOL_LEN);
 
 #[test]
 fn degenerate_lines_do_not_satisfy_constraints() {
-    // 長さ 0・ATOL_LEN 未満の線分でも、水平・垂直・等長・一致の残差は 0 になる。通すと
-    // ソルバー（`admissible` が退化した形を棄却する）が初期状態として使えない文書になる。
+    // 長さ 0・ATOL_LEN 未満の線分でも、等長・一致の残差は 0 になる（水平・垂直は向きが
+    // 定まらず NaN）。通すとソルバー（`admissible` が退化した形を棄却する）が初期状態として
+    // 使えない文書になる。
     let mut doc = Document::new();
     let dot = line(&mut doc, (3.0, 3.0), (3.0, 3.0));
     let tiny = line(&mut doc, (3.0, 3.0), (3.0 + BELOW_ATOL, 3.0));
@@ -1585,10 +1715,8 @@ fn degenerate_lines_do_not_satisfy_constraints() {
         assert_eq!(constraint.is_satisfied(&doc), Ok(false), "{constraint:?}");
         let shown = format!("{constraint:?}");
         let before = snapshot(&doc);
-        let err = doc
-            .apply(Command::AddConstraint(constraint))
-            .expect_err(&shown);
-        assert!(unsatisfied(&err), "{shown}: {err:?}");
+        let err = doc.apply(add_constraint(constraint)).expect_err(&shown);
+        assert!(degenerate(&err), "{shown}: {err:?}");
         assert_eq!(snapshot(&doc), before, "{shown}");
     }
     // 退化していない線分の同じ拘束は入る。
@@ -1613,24 +1741,25 @@ fn degenerate_lines_do_not_satisfy_constraints() {
             }
         }
     };
-    let unsatisfied_horizontal = |e: &CoreError| *e == CoreError::ConstraintUnsatisfied(horizontal);
-    // ModifyEntity: 長さ 0・ATOL_LEN 未満とも、充足検査で拒否。
+    assert!(doc.constraint(horizontal).is_some());
+    let degenerate_normal = |e: &CoreError| *e == CoreError::DegenerateShape(normal);
+    // ModifyEntity: 長さ 0・ATOL_LEN 未満とも、退化として拒否。
     assert_rejected(
         &mut doc,
         collapse(line_geom((5.0, 3.0), (5.0, 3.0)), false),
-        unsatisfied_horizontal,
+        degenerate_normal,
     );
     assert_rejected(
         &mut doc,
         collapse(line_geom((5.0, 3.0), (5.0 + BELOW_ATOL, 3.0)), false),
-        unsatisfied_horizontal,
+        degenerate_normal,
     );
-    // ReshapeEntity: 向きを保ったまま ATOL_LEN 未満へ切り詰めると充足検査で拒否。
+    // ReshapeEntity: 向きを保ったまま ATOL_LEN 未満へ切り詰めると退化として拒否。
     // 長さ 0 は向きが定まらないので、切り詰めの判定で拒否。
     assert_rejected(
         &mut doc,
         collapse(line_geom((5.0, 3.0), (5.0 + BELOW_ATOL, 3.0)), true),
-        unsatisfied_horizontal,
+        degenerate_normal,
     );
     assert_rejected(
         &mut doc,
@@ -1684,11 +1813,11 @@ fn degenerate_rounds_do_not_satisfy_constraints() {
     for constraint in rejected {
         assert_eq!(constraint.validate(&doc), Ok(()), "{constraint:?}");
         assert_eq!(constraint.is_satisfied(&doc), Ok(false), "{constraint:?}");
-        assert_rejected(&mut doc, Command::AddConstraint(constraint), unsatisfied);
+        assert_rejected(&mut doc, add_constraint(constraint), degenerate);
     }
 
     // 中心に一致のついた円を、半径 0・ATOL_LEN 未満へつぶす変更は拒否。
-    let joint = doc.constrain(Constraint::Coincident {
+    doc.constrain(Constraint::Coincident {
         a: center(good),
         b: start(spoke),
     });
@@ -1699,7 +1828,7 @@ fn degenerate_rounds_do_not_satisfy_constraints() {
                 id: good,
                 new_geom: circle_geom((3.0, 3.0), radius),
             },
-            |e| *e == CoreError::ConstraintUnsatisfied(joint),
+            |e| *e == CoreError::DegenerateShape(good),
         );
     }
     // 退化しない半径の変更は通る（一致は中心だけを見る）。

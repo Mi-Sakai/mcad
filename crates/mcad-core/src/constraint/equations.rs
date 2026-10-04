@@ -3,8 +3,11 @@
 //!
 //! `mcad_geom::solve` はエンティティを知らない汎用ソルバーなので、ここで
 //! 「エンティティの集合 → パラメータの配列」「拘束 → [`Equation`] の列」「図形の固定 →
-//! 固定集合」へ落とす。タスク96 では充足検査（残差の評価）にだけ使い、解くのは
-//! タスク97（[`System`] の `fixed`・`unit_weights`・`admissible`・`shape` はそのための足場）。
+//! 固定集合」へ落とす。充足検査（残差の評価。[`System::first_unsatisfied`]）と、
+//! [`crate::Document::apply`] の中の求解（タスク97。`document/constraints.rs`）の両方が使う。
+//! 求解に渡すもの（[`System::weights`]・[`System::first_inadmissible`]）と、解いた後の検査
+//! （[`System::collapsed`]・[`System::first_structure_violation`]）、解いた結果の読み戻し
+//! （[`System::shape`]）もここに置く。
 //!
 //! # パラメータの並び
 //!
@@ -31,26 +34,64 @@
 //! 長さ型の方程式の `L` は、**拘束が参照するすべてのエンティティ**の大きさ（線分の長さ・
 //! 円と円弧の半径）と拘束の値の最大。`C` は拘束が対象にする点（指定された点、線分の両端、
 //! 円・円弧の中心、点の固定の `p₀`）の座標の絶対値の最大。半径だけを見る拘束（半径・等半径）は
-//! 座標を読まないので `C = 0`。どちらも現在のパラメータから計算する。平行・直交・角度は角度型。
+//! 座標を読まないので `C = 0`。どちらも現在のパラメータから計算する。水平・垂直・平行・直交・
+//! 角度は角度型（許容値は `ATOL_ANG`。尺度を持たない）。
+//!
+//! # 向きの拘束（水平・垂直・平行・直交）
+//!
+//! 向きを区別しない（平行は反平行も満たす）ので、角度を**周期 π で畳んだ**残差にする
+//! （[`Fold`]）。`α` を線分の方向角 `atan2(dy, dx)`、`φ` を 2 線分のなす角
+//! `atan2(d1 × d2, d1 · d2)`（角度拘束と同じ定義）として:
+//!
+//! | 拘束 | 残差 | 0 になる形 |
+//! |---|---|---|
+//! | 水平 | `½·atan2(sin 2α, cos 2α)` | `α = 0`・`π` |
+//! | 垂直 | `½·atan2(−sin 2α, −cos 2α)` | `α = ±π/2` |
+//! | 平行 | `½·atan2(sin 2φ, cos 2φ)` | `φ = 0`・`π` |
+//! | 直交 | `½·atan2(−sin 2φ, −cos 2φ)` | `φ = ±π/2` |
+//!
+//! 値は `[−π/2, π/2]` のラジアンで、解までの回転角そのもの。ヤコビアンは `∂α`・`∂φ` を
+//! そのまま使う（主値化は区分的に定数の差しか生まない）。不連続になるのは解から最も遠い形
+//! （平行ならちょうど直交、水平ならちょうど垂直）だけで、そこでも勾配は 0 にならない。
+//! 以前の式（平行・直交は単位方向ベクトルの外積・内積、水平・垂直は端点の座標の差）は、
+//! ちょうど 90° ずれた形で勾配が 0 になる・最小ノルム解が長さ 0 の線分になるため解けなかった。
+//!
+//! `sin 2t`・`cos 2t` は角度を経由せず成分から作る（`sin t ∝ s`・`cos t ∝ c` なら
+//! `sin 2t ∝ 2sc`・`cos 2t ∝ (c − s)(c + s)`）。ちょうど水平な線分（`dy == 0.0`）・外積が
+//! ちょうど 0 の 2 線分では `2sc` がちょうど 0 になり、残差もちょうど 0（`±0.0`）になる。
 //!
 //! # 特異点
 //!
 //! - ノルム（点どうしの距離・円の中心間距離・等長の線分の長さ）は、`ATOL_LEN` 未満のとき
 //!   微分の方向に `(1, 0)` を使う（設計判断2）。残差そのものは 0 でも有限。
-//! - **線分の方向**を使う方程式（平行・直交・角度・点と線の距離・線と円の接線）は、線分の長さが
+//! - **線分の方向**を使う方程式（水平・垂直・平行・直交・角度・点と線の距離・線と円の接線）は、線分の長さが
 //!   `ATOL_LEN` 未満のとき残差と偏微分に **NaN** を返す（方向が定まらない）。ソルバーは
-//!   開始時の NaN を `SolveError::NonFinite` で拒否し、反復中は [`System::admissible`] で
+//!   開始時の NaN を `SolveError::NonFinite` で拒否し、反復中は [`System::first_inadmissible`] で
 //!   その形へ入らない。充足検査（[`System::first_unsatisfied`]）は満たされていない扱いにする。
 //!
 //! # 退化した図形
 //!
 //! 長さが `ATOL_LEN` 未満の線分・半径が `ATOL_LEN` 未満の円と円弧は、ソルバーが試行点として
-//! 受け入れない形（[`System::admissible`]）。充足検査も同じ条件（[`Slot::admissible`] の
+//! 受け入れない形（[`System::first_inadmissible`]）。充足検査も同じ条件（[`Slot::admissible`] の
 //! 1 か所）を使い、**退化した図形を参照する拘束は、残差が 0 でも満たされていない扱い**にする
-//! （長さ 0 の線分でも水平・垂直・等長の残差は 0 になる。それを通すと、ソルバーが初期状態と
+//! （長さ 0 の線分でも等長・一致の残差は 0 になる。それを通すと、ソルバーが初期状態と
 //! して使えない文書ができる）。
+//!
+//! 求解ではこれに 2 つを足す（どちらも「解く前の形」との比較なので、充足検査には無い）:
+//!
+//! - **円弧の掃引**（[`System::first_inadmissible`]）: 開始角・終了角が動いた円弧は、掃引角
+//!   `end − start` を解く前の形から連続に追い、0 以下・2π 以上へ達した試行点を棄却する
+//!   （掃引が裏返った円弧 = 補弧へ飛び移らせない）。
+//! - **許容値に対する退化**（[`System::collapsed`]）: 解いた結果、図形の大きさが、それを
+//!   参照する長さ型の拘束の許容値以下へ落ちた形を拒否する。許容値は拘束が参照する図形の
+//!   大きさの最大で決まるので、長さ 10 mm の線分と一致でつながった線分は、長さが 1e-8 mm
+//!   以下になれば「両端が同じ点」と区別できない。`ATOL_LEN` だけで判定すると、線分を 1 点へ
+//!   つぶす系が、長さ 1e-11 mm 程度で「収束」して受理されてしまう。角度型の拘束（水平・垂直・
+//!   平行・直交・角度）は長さの物差しを持たないので、この判定には加わらない（残差が図形の
+//!   大きさに依らず、図形を縮めても減らないので、つぶす経路を作らない）。
 
 use std::collections::BTreeSet;
+use std::f64::consts::TAU;
 use std::ops::Range;
 
 use mcad_geom::solve::{ATOL_LEN, Equation, ResidualKind, SolveError, max_scaled_residual};
@@ -61,7 +102,7 @@ use crate::{ConstraintId, CoreError, Document, EntityGeom, EntityId};
 
 impl ShapeKind {
     /// この種類の図形が持つパラメータの数。
-    const fn param_count(self) -> usize {
+    pub(crate) const fn param_count(self) -> usize {
         match self {
             Self::Line => 4,
             Self::Circle => 3,
@@ -86,7 +127,7 @@ impl Slot {
     }
 
     /// パラメータ `x` でのこの図形が退化していないか: 線分は長さ、円・円弧は半径が
-    /// `ATOL_LEN` 以上。ソルバーの試行点の棄却（[`System::admissible`]）と充足検査
+    /// `ATOL_LEN` 以上。ソルバーの試行点の棄却（[`System::first_inadmissible`]）と充足検査
     /// （[`System::first_unsatisfied`]）が共有する唯一の判定。NaN は退化扱い。
     pub(crate) fn admissible(&self, x: &[f64]) -> bool {
         match self.kind {
@@ -177,6 +218,14 @@ impl Grad<'_> {
         self.add(l + 2, ex);
         self.add(l + 3, ey);
     }
+
+    /// 線分（先頭の添字 `l`）の方向角 `ang(d) = atan2(d_y, d_x)` の偏微分を `sign` 倍して足す。
+    /// `∂ang(d)/∂d = (−d_y, d_x) / |d|²`。線分が退化していないことは呼び出し側が確かめる。
+    fn add_direction_angle(&mut self, x: &[f64], l: usize, sign: f64) {
+        let (dx, dy) = dir(x, l);
+        let s = dx * dx + dy * dy;
+        self.add_dir(l, -sign * dy / s, sign * dx / s);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,10 +260,36 @@ enum Target {
     Radius { r: usize, sign: f64 },
 }
 
+/// 周期 π で畳んだ角度が 0 になる向き（モジュール doc「向きの拘束」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    /// 角度が 0・π のとき 0（水平・平行）。
+    Along,
+    /// 角度が ±π/2 のとき 0（垂直・直交）。
+    Across,
+}
+
+impl Fold {
+    /// 角度 `t` を周期 π で畳んだ残差。`s`・`c` は `sin t`・`cos t` に**共通の正の係数**を
+    /// 掛けたもの（線分の方向なら `dy`・`dx`、2 線分のなす角なら外積・内積）。
+    ///
+    /// [`Fold::Along`] は `½·atan2(sin 2t, cos 2t)`、[`Fold::Across`] は
+    /// `½·atan2(−sin 2t, −cos 2t)`（= `t ∓ π/2` を畳んだもの）。どちらも `∂/∂t = 1`。
+    /// `s`・`c` がともに 0（方向が定まらない）のときは呼ばない。
+    fn residual(self, s: f64, c: f64) -> f64 {
+        // sin 2t ∝ 2sc、cos 2t ∝ c² − s²。差は積の形で取る（c² − s² の桁落ちを避ける）。
+        let (sin2, cos2) = (2.0 * s * c, (c - s) * (c + s));
+        match self {
+            Self::Along => 0.5 * sin2.atan2(cos2),
+            Self::Across => 0.5 * (-sin2).atan2(-cos2),
+        }
+    }
+}
+
 /// 方程式の形。線分は先頭のパラメータの添字、円・円弧は中心の先頭の添字（半径は `+ 2`）で指す。
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Form {
-    /// `p[axis] − q[axis]`（一致の 1 成分、水平・垂直）。
+    /// `p[axis] − q[axis]`（一致の 1 成分）。
     CoordDiff {
         p: PointExpr,
         q: PointExpr,
@@ -234,10 +309,11 @@ enum Form {
         line: usize,
         target: Target,
     },
-    /// 単位方向ベクトルの外積（平行）。
-    Cross { l1: usize, l2: usize },
-    /// 単位方向ベクトルの内積（直交）。
-    Dot { l1: usize, l2: usize },
+    /// 線分 `l` の方向角 `α` を周期 π で畳んだ角度（水平・垂直。モジュール doc
+    /// 「向きの拘束」）。
+    Direction { l: usize, fold: Fold },
+    /// 線分 `l1` から `l2` へのなす角 `φ` を周期 π で畳んだ角度（平行・直交）。
+    Alignment { l1: usize, l2: usize, fold: Fold },
     /// 線分の長さの差（等長）。
     LengthDiff { l1: usize, l2: usize },
     /// `x[r1] − x[r2]`（等半径）。
@@ -347,8 +423,8 @@ impl ConstraintEq {
                     raw.push(r);
                 }
             }
-            Form::Cross { l1, l2 }
-            | Form::Dot { l1, l2 }
+            Form::Direction { l, .. } => line(l, &mut raw),
+            Form::Alignment { l1, l2, .. }
             | Form::LengthDiff { l1, l2 }
             | Form::Angle { l1, l2, .. } => {
                 line(l1, &mut raw);
@@ -372,6 +448,35 @@ impl ConstraintEq {
             form,
             params,
             scale,
+        }
+    }
+}
+
+impl ConstraintEq {
+    /// 長さ型の方程式が `x` の形から計算する許容値。角度型、または尺度が有限でなければ `None`。
+    fn length_tolerance(&self, x: &[f64]) -> Option<f64> {
+        match self.kind(x) {
+            kind @ ResidualKind::Length { .. } => kind.tolerance(),
+            ResidualKind::Angle => None,
+        }
+    }
+
+    /// 形に依存する構造条件を `x` の形が満たすか（設計判断2「値の範囲と特異点」）:
+    ///
+    /// - 点どうしの距離は、値 `d` がこの方程式の長さ型の許容値より大きい（許容値以下の距離は
+    ///   一致と区別できず、ノルムの微分が定まらない点が解になる）。
+    /// - 内接は `s(r1 − r2)` が許容値より大きい（等半径の内接 = 同心で同じ円、大小の逆転）。
+    ///
+    /// それ以外の方程式は常に `true`。許容値が有限にならなければ `false`。
+    /// [`Constraint::validate`]（追加・値の変更の前）と、解いた後の検査が共有する。
+    fn structure_holds(&self, x: &[f64]) -> bool {
+        match self.form {
+            Form::Distance { d, .. } => self.length_tolerance(x).is_some_and(|tol| d > tol),
+            // 外接は k1 = k2 = 1、内接は k1 = s・k2 = −s。
+            Form::CenterDistance { c1, c2, k1, k2 } if k1 != k2 => self
+                .length_tolerance(x)
+                .is_some_and(|tol| k1 * (x[c1 + 2] - x[c2 + 2]) > tol),
+            _ => true,
         }
     }
 }
@@ -401,14 +506,20 @@ impl Equation for ConstraintEq {
                 };
                 ux * wy - uy * wx - goal
             }
-            Form::Cross { l1, l2 } => match (unit_dir(x, l1), unit_dir(x, l2)) {
-                (Some((_, u1x, u1y)), Some((_, u2x, u2y))) => u1x * u2y - u1y * u2x,
-                _ => f64::NAN,
-            },
-            Form::Dot { l1, l2 } => match (unit_dir(x, l1), unit_dir(x, l2)) {
-                (Some((_, u1x, u1y)), Some((_, u2x, u2y))) => u1x * u2x + u1y * u2y,
-                _ => f64::NAN,
-            },
+            Form::Direction { l, fold } => {
+                if unit_dir(x, l).is_none() {
+                    return f64::NAN;
+                }
+                let (dx, dy) = dir(x, l);
+                fold.residual(dy, dx)
+            }
+            Form::Alignment { l1, l2, fold } => {
+                if unit_dir(x, l1).is_none() || unit_dir(x, l2).is_none() {
+                    return f64::NAN;
+                }
+                let ((d1x, d1y), (d2x, d2y)) = (dir(x, l1), dir(x, l2));
+                fold.residual(d1x * d2y - d1y * d2x, d1x * d2x + d1y * d2y)
+            }
             Form::LengthDiff { l1, l2 } => {
                 let ((d1x, d1y), (d2x, d2y)) = (dir(x, l1), dir(x, l2));
                 d1x.hypot(d1y) - d2x.hypot(d2y)
@@ -470,29 +581,13 @@ impl Equation for ConstraintEq {
                     g.add(r, -sign);
                 }
             }
-            Form::Cross { l1, l2 } => {
-                let (Some((n1, u1x, u1y)), Some((n2, u2x, u2y))) =
-                    (unit_dir(x, l1), unit_dir(x, l2))
-                else {
+            Form::Direction { l, .. } => {
+                if unit_dir(x, l).is_none() {
                     g.out.fill(f64::NAN);
                     return;
-                };
-                let f = u1x * u2y - u1y * u2x;
-                // ∂f/∂d1 = ((u2_y, −u2_x) − f·u1) / |d1|、∂f/∂d2 = ((−u1_y, u1_x) − f·u2) / |d2|。
-                g.add_dir(l1, (u2y - f * u1x) / n1, (-u2x - f * u1y) / n1);
-                g.add_dir(l2, (-u1y - f * u2x) / n2, (u1x - f * u2y) / n2);
-            }
-            Form::Dot { l1, l2 } => {
-                let (Some((n1, u1x, u1y)), Some((n2, u2x, u2y))) =
-                    (unit_dir(x, l1), unit_dir(x, l2))
-                else {
-                    g.out.fill(f64::NAN);
-                    return;
-                };
-                let f = u1x * u2x + u1y * u2y;
-                // ∂f/∂d1 = (u2 − f·u1) / |d1|、∂f/∂d2 = (u1 − f·u2) / |d2|。
-                g.add_dir(l1, (u2x - f * u1x) / n1, (u2y - f * u1y) / n1);
-                g.add_dir(l2, (u1x - f * u2x) / n2, (u1y - f * u2y) / n2);
+                }
+                // 畳んだ残差は α と区分的に定数の差しか無いので、∂α をそのまま使う。
+                g.add_direction_angle(x, l, 1.0);
             }
             Form::LengthDiff { l1, l2 } => {
                 let ((d1x, d1y), (d2x, d2y)) = (dir(x, l1), dir(x, l2));
@@ -506,18 +601,15 @@ impl Equation for ConstraintEq {
                 g.add(r2, -1.0);
             }
             Form::RadiusValue { r, .. } => g.add(r, 1.0),
-            Form::Angle { l1, l2, .. } => {
+            Form::Alignment { l1, l2, .. } | Form::Angle { l1, l2, .. } => {
                 if unit_dir(x, l1).is_none() || unit_dir(x, l2).is_none() {
                     g.out.fill(f64::NAN);
                     return;
                 }
-                // φ = ang(d2) − ang(d1)、∂ang(v)/∂v = (−v_y, v_x) / |v|²。主値化は定数の 2π の
-                // 差しか生まないので、∂φ をそのまま使う。
-                let ((d1x, d1y), (d2x, d2y)) = (dir(x, l1), dir(x, l2));
-                let s1 = d1x * d1x + d1y * d1y;
-                let s2 = d2x * d2x + d2y * d2y;
-                g.add_dir(l1, d1y / s1, -d1x / s1);
-                g.add_dir(l2, -d2y / s2, d2x / s2);
+                // φ = ang(d2) − ang(d1)。主値化（角度は周期 2π、平行・直交は周期 π）は
+                // 区分的に定数の差しか生まないので、∂φ をそのまま使う。
+                g.add_direction_angle(x, l1, -1.0);
+                g.add_direction_angle(x, l2, 1.0);
             }
             Form::CenterDistance { c1, c2, k1, k2 } => {
                 let (_, ux, uy) = norm_dir(x[c1] - x[c2], x[c1 + 1] - x[c2 + 1]);
@@ -545,8 +637,9 @@ pub(crate) struct System {
     pub(crate) slots: Vec<Slot>,
     /// パラメータの現在値。
     pub(crate) params: Vec<f64>,
-    /// 固定するパラメータ（図形の固定の対象の全パラメータ）。ロックされたレイヤー・
-    /// 利用者が動かしたパラメータはタスク97 が足す。
+    /// 固定するパラメータ。[`System::build`] が入れるのは図形の固定の対象の全パラメータ
+    /// だけで、ロックされたレイヤー・利用者が動かしたパラメータは呼び出し側が足す
+    /// （`document/constraints.rs`）。
     pub(crate) fixed: Vec<bool>,
     /// 方程式（拘束の [`ConstraintId`] の昇順、拘束ごとに連続）。
     pub(crate) equations: Vec<ConstraintEq>,
@@ -649,6 +742,11 @@ impl System {
         self.slot_index(entity).map(|i| self.slots[i])
     }
 
+    /// `entity` のパラメータの置き場所。この系に無ければ `None`。
+    pub(crate) fn slot_of(&self, entity: EntityId) -> Option<Slot> {
+        self.slot(entity).ok()
+    }
+
     /// 線分の先頭のパラメータの添字。
     fn line(&self, entity: EntityId) -> Result<usize, CoreError> {
         let slot = self.slot(entity)?;
@@ -721,16 +819,15 @@ impl System {
                     self.length_eq(Form::CoordDiff { p, q, axis }, &scale);
                 }
             }
-            Constraint::Horizontal { line } | Constraint::Vertical { line } => {
+            Constraint::Horizontal { line } => {
                 let l = self.line(line)?;
-                let [q, p] = ends(l);
-                scale.points = vec![p, q];
-                let axis = if matches!(constraint, Constraint::Horizontal { .. }) {
-                    Axis::Y
-                } else {
-                    Axis::X
-                };
-                self.length_eq(Form::CoordDiff { p, q, axis }, &scale);
+                let fold = Fold::Along;
+                self.angle_eq(Form::Direction { l, fold });
+            }
+            Constraint::Vertical { line } => {
+                let l = self.line(line)?;
+                let fold = Fold::Across;
+                self.angle_eq(Form::Direction { l, fold });
             }
             Constraint::Distance { a, b, value } => {
                 let (p, q) = (self.point(a)?, self.point(b)?);
@@ -750,26 +847,19 @@ impl System {
                 self.length_eq(Form::SignedDistance { p, line: l, target }, &scale);
             }
             Constraint::Parallel { a, b } => {
-                let form = Form::Cross {
-                    l1: self.line(a)?,
-                    l2: self.line(b)?,
-                };
-                self.equations.push(ConstraintEq::new(form, None));
+                let (l1, l2) = (self.line(a)?, self.line(b)?);
+                let fold = Fold::Along;
+                self.angle_eq(Form::Alignment { l1, l2, fold });
             }
             Constraint::Perpendicular { a, b } => {
-                let form = Form::Dot {
-                    l1: self.line(a)?,
-                    l2: self.line(b)?,
-                };
-                self.equations.push(ConstraintEq::new(form, None));
+                let (l1, l2) = (self.line(a)?, self.line(b)?);
+                let fold = Fold::Across;
+                self.angle_eq(Form::Alignment { l1, l2, fold });
             }
             Constraint::Angle { a, b, value } => {
-                let form = Form::Angle {
-                    l1: self.line(a)?,
-                    l2: self.line(b)?,
-                    theta: value,
-                };
-                self.equations.push(ConstraintEq::new(form, None));
+                let (l1, l2) = (self.line(a)?, self.line(b)?);
+                let theta = value;
+                self.angle_eq(Form::Angle { l1, l2, theta });
             }
             Constraint::EqualLength { a, b } => {
                 let (l1, l2) = (self.line(a)?, self.line(b)?);
@@ -831,33 +921,55 @@ impl System {
             .push(ConstraintEq::new(form, Some(scale.clone())));
     }
 
+    /// 角度型の方程式（許容値は `ATOL_ANG`。尺度を持たない）。
+    fn angle_eq(&mut self, form: Form) {
+        self.equations.push(ConstraintEq::new(form, None));
+    }
+
     /// 満たされていない拘束のうち [`ConstraintId`] 順で最初のもの。すべて満たされていれば
-    /// `None`。
+    /// `None`。形は組み立てたときのパラメータ（[`System::params`]）。
     ///
     /// 拘束が満たされているとは、次の両方:
     ///
     /// 1. 参照する図形がどれも退化していない（[`Slot::admissible`]。ソルバーが試行点を
     ///    受け入れる条件と同じ）。残差が 0 でも、退化した図形を参照する拘束は満たされて
     ///    いない扱いにする（図形の固定のように方程式を持たない拘束も同じ）。
-    /// 2. `mcad_geom::solve::is_satisfied` と同じ判定: **今の形から計算した許容値**で割った
+    /// 2. `mcad_geom::solve::is_satisfied` と同じ判定: **その形から計算した許容値**で割った
     ///    残差の絶対値の最大が 1 以下。残差が有限でない、許容値が有限にならない（座標が
     ///    極端に大きい）拘束は満たされていない扱いにする。
     pub(crate) fn first_unsatisfied(&self) -> Option<ConstraintId> {
+        self.first_unsatisfied_at(&self.params)
+    }
+
+    /// [`System::first_unsatisfied`] を、パラメータ `x` の形（解いた後の形）で判定する。
+    pub(crate) fn first_unsatisfied_at(&self, x: &[f64]) -> Option<ConstraintId> {
         self.rows
             .iter()
-            .find(|row| !self.satisfied(row))
+            .find(|row| !self.satisfied(row, x))
             .map(|row| row.constraint)
     }
 
-    fn satisfied(&self, row: &Row) -> bool {
-        if !row
-            .slots
+    /// 満たされておらず、しかも方程式が参照するパラメータがすべて `fixed` で固定されている
+    /// 拘束のうち、[`ConstraintId`] 順で最初のもの。そういう拘束は、固定を外さない限り
+    /// どう解いても満たせない（ソルバーの「自由なパラメータが無い」早期判定を拘束単位に
+    /// 細かくしたもの。反復せずに、原因の拘束を名指しで返せる）。
+    pub(crate) fn first_unsatisfied_held(&self, fixed: &[bool]) -> Option<ConstraintId> {
+        self.rows
             .iter()
-            .all(|&i| self.slots[i].admissible(&self.params))
-        {
+            .find(|row| {
+                let eqs = &self.equations[row.equations.clone()];
+                !eqs.is_empty()
+                    && eqs.iter().all(|eq| eq.params.iter().all(|&p| fixed[p]))
+                    && !self.satisfied(row, &self.params)
+            })
+            .map(|row| row.constraint)
+    }
+
+    fn satisfied(&self, row: &Row, x: &[f64]) -> bool {
+        if !row.slots.iter().all(|&i| self.slots[i].admissible(x)) {
             return false;
         }
-        match max_scaled_residual(&self.params, &self.equations[row.equations.clone()]) {
+        match max_scaled_residual(x, &self.equations[row.equations.clone()]) {
             Ok(ratio) => ratio <= 1.0,
             Err(SolveError::InvalidInput) => {
                 // 添字が範囲外・重複するのは方程式の組み立ての誤り（`ConstraintEq::new` が
@@ -869,22 +981,127 @@ impl System {
         }
     }
 
-    /// 重み（タスク96 ではすべて 1。角度パラメータの重みはタスク97 で決める）。
-    #[cfg_attr(not(test), expect(dead_code, reason = "求解（タスク97）で使う足場"))]
-    pub(crate) fn unit_weights(&self) -> Vec<f64> {
-        vec![1.0; self.params.len()]
+    /// 形に依存する構造条件（点どうしの距離 `d` > 許容値、内接の `s(r1 − r2)` > 許容値）を
+    /// `x` の形で満たさない拘束のうち、[`ConstraintId`] 順で最初のもの。
+    ///
+    /// [`Constraint::validate`] が追加・値の変更の前に確かめる条件と同じ式で、コマンドを
+    /// 適用した後・解いた後の形にも掛ける（`ModifyEntity` や求解で、内接の 2 円が同心・
+    /// 等半径になる経路を塞ぐ）。
+    pub(crate) fn first_structure_violation(&self, x: &[f64]) -> Option<ConstraintId> {
+        self.rows
+            .iter()
+            .find(|row| {
+                !self.equations[row.equations.clone()]
+                    .iter()
+                    .all(|eq| eq.structure_holds(x))
+            })
+            .map(|row| row.constraint)
     }
 
-    /// 試行点 `x` を受け入れてよいか（`Problem::admissible` 用）: すべての図形が退化して
-    /// いない（[`Slot::admissible`]）。方向を使う方程式の分母が 0 に近づくのを防ぐ。
-    #[cfg_attr(not(test), expect(dead_code, reason = "求解（タスク97）で使う足場"))]
-    pub(crate) fn admissible(&self, x: &[f64]) -> bool {
-        self.slots.iter().all(|slot| slot.admissible(x))
+    /// 最小ノルムの重み（設計判断1「角度パラメータは半径で重みづけする」）: 円弧の開始角・
+    /// 終了角は**求解開始時の半径**（下限 `ATOL_LEN`。重みは正でなければならない）、ほかは 1。
+    /// 角度の変化を弧長として、長さのパラメータと同じ物差しで測る。
+    pub(crate) fn weights(&self) -> Vec<f64> {
+        let mut weights = vec![1.0; self.params.len()];
+        for slot in &self.slots {
+            if slot.kind == ShapeKind::Arc {
+                let radius = self.params[slot.offset + 2].abs().max(ATOL_LEN);
+                weights[slot.offset + 3] = radius;
+                weights[slot.offset + 4] = radius;
+            }
+        }
+        weights
+    }
+
+    /// 試行点 `x` を受け入れてよいか（`Problem::admissible` 用）。受け入れられない図形の
+    /// うち [`EntityId`] 順で最初のものを返す（すべて受け入れられるなら `None`）。
+    ///
+    /// - 図形が退化していない（[`Slot::admissible`]）。方向を使う方程式の分母が 0 に
+    ///   近づくのを防ぐ。
+    /// - 開始角か終了角が動いた円弧は、組み立てたときの形から連続に追った掃引角が
+    ///   `(0, 2π)` に収まる（モジュール doc「退化した図形」）。角度が動いていない円弧は
+    ///   確かめない（掃引 0 の円弧は幾何として正当で、求解が作ったものではない）。
+    pub(crate) fn first_inadmissible(&self, x: &[f64]) -> Option<EntityId> {
+        self.slots
+            .iter()
+            .find(|slot| !slot.admissible(x) || !self.sweep_kept(slot, x))
+            .map(|slot| slot.entity)
+    }
+
+    /// 円弧 `slot` の `x` での掃引角。組み立てたときの形の掃引角（`[0, 2π)`）に、開始角・
+    /// 終了角の変化を足したもの（`[0, 2π)` へ畳まないので、0 や 2π を越えたことが分かる）。
+    fn sweep(&self, slot: &Slot, x: &[f64]) -> f64 {
+        let (s, e) = (slot.offset + 3, slot.offset + 4);
+        let base = Arc::new(Point2::ORIGIN, 1.0, self.params[s], self.params[e]).sweep();
+        base + ((x[e] - self.params[e]) - (x[s] - self.params[s]))
+    }
+
+    fn sweep_kept(&self, slot: &Slot, x: &[f64]) -> bool {
+        if slot.kind != ShapeKind::Arc {
+            return true;
+        }
+        let (s, e) = (slot.offset + 3, slot.offset + 4);
+        if x[s] == self.params[s] && x[e] == self.params[e] {
+            return true;
+        }
+        let sweep = self.sweep(slot, x);
+        sweep > 0.0 && sweep < TAU
+    }
+
+    /// 図形の大きさ（[`System::collapsed`] 用）: 線分は長さ、円は半径、円弧は半径・弧長・
+    /// 残りの弧長（補弧）。使わない枠は先頭の値で埋める。
+    fn measures(&self, slot: &Slot, x: &[f64]) -> [f64; 3] {
+        let o = slot.offset;
+        match slot.kind {
+            ShapeKind::Line => {
+                let (dx, dy) = dir(x, o);
+                [dx.hypot(dy); 3]
+            }
+            ShapeKind::Circle => [x[o + 2]; 3],
+            ShapeKind::Arc => {
+                let (radius, sweep) = (x[o + 2], self.sweep(slot, x));
+                [radius, radius * sweep, radius * (TAU - sweep)]
+            }
+        }
+    }
+
+    /// 求解が退化させた図形のうち [`EntityId`] 順で最初のもの（モジュール doc「退化した図形」）。
+    ///
+    /// 図形の大きさ（[`System::measures`]）が、それを参照する長さ型の拘束の許容値に対して
+    /// 「組み立てたときの形では大きかったのに、`x` では許容値以下」になったら退化。
+    /// 許容値はそれぞれの形から計算する。もとから許容値以下の図形（巨大な図形につないだ
+    /// 微小な図形）や、求解が大きさを変えていない図形は数えない。角度型の拘束は長さの
+    /// 物差しを持たないので見ない（`ATOL_LEN` の下限は [`System::first_inadmissible`] が守る）。
+    pub(crate) fn collapsed(&self, x: &[f64]) -> Option<EntityId> {
+        let mut found: Option<usize> = None;
+        for row in &self.rows {
+            let Some(eq) = self.equations[row.equations.clone()].first() else {
+                continue;
+            };
+            let (Some(before), Some(after)) =
+                (eq.length_tolerance(&self.params), eq.length_tolerance(x))
+            else {
+                continue;
+            };
+            for &i in &row.slots {
+                let slot = &self.slots[i];
+                let was = self.measures(slot, &self.params);
+                let now = self.measures(slot, x);
+                // NaN は「許容値より大きくない」に倒す。
+                let collapsed = was
+                    .iter()
+                    .zip(&now)
+                    .any(|(was, now)| *was > before && (now.is_nan() || *now <= after));
+                if collapsed {
+                    found = Some(found.map_or(i, |j| j.min(i)));
+                }
+            }
+        }
+        found.map(|i| self.slots[i].entity)
     }
 
     /// パラメータ `x` から `entity` の図形を組み立てる（解いた結果の読み戻し）。
     /// `entity` がこの系に無ければ `None`。
-    #[cfg_attr(not(test), expect(dead_code, reason = "求解（タスク97）で使う足場"))]
     pub(crate) fn shape(&self, entity: EntityId, x: &[f64]) -> Option<Shape> {
         let slot = self.slot(entity).ok()?;
         let o = slot.offset;
@@ -917,15 +1134,23 @@ pub(crate) fn length_tolerance(doc: &Document, constraint: &Constraint) -> Resul
     let sys = System::for_constraint(doc, constraint)?;
     sys.equations
         .first()
-        .and_then(|eq| match eq.kind(&sys.params) {
-            kind @ ResidualKind::Length { .. } => kind.tolerance(),
-            ResidualKind::Angle => None,
-        })
+        .and_then(|eq| eq.length_tolerance(&sys.params))
         .ok_or_else(|| {
             CoreError::InvalidConstraint(
                 "the length tolerance of the constraint is not finite".to_owned(),
             )
         })
+}
+
+/// `constraint` が、文書の現在の形で形に依存する構造条件を満たすか
+/// （[`System::first_structure_violation`] と同じ式。[`Constraint::validate`] 用）。
+///
+/// # Errors
+///
+/// 参照先が無い・種類が合わないとき。
+pub(crate) fn structure_holds(doc: &Document, constraint: &Constraint) -> Result<bool, CoreError> {
+    let sys = System::for_constraint(doc, constraint)?;
+    Ok(sys.first_structure_violation(&sys.params).is_none())
 }
 
 #[cfg(test)]

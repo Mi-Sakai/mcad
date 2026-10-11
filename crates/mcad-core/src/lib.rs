@@ -34,7 +34,9 @@
 //!   `aabb` は基点だけの箱。M12 タスク91）
 //! - 幾何拘束（M13 タスク96・97）: [`Constraint`]（対象は [`EntityId`] と [`PointRef`] /
 //!   [`PointKind`]。側は [`Side`]、円どうしの接線の種類は [`CircleTangency`] /
-//!   [`LargerCircle`]）。追加・削除・値の変更・差し替えは [`Command::AddConstraint`]
+//!   [`LargerCircle`]。`Constraint` 自体は生キーを持つので serde を導出せず、`PointKind` と
+//!   この 3 つだけが `Serialize`/`Deserialize`。`Constraint` は `#[non_exhaustive]` でもない）。
+//!   追加・削除・値の変更・差し替えは [`Command::AddConstraint`]
 //!   （`hold` = 止めておく図形）/ [`Command::RemoveConstraint`] /
 //!   [`Command::SetConstraintValue`] / [`Command::ReplaceConstraint`]、切り詰め・延長は
 //!   [`Command::ReshapeEntity`]。現在の形から側・値を決めるコンストラクタは

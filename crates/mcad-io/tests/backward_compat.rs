@@ -1,10 +1,10 @@
-//! `.mcad` v1〜v8 の後方互換 fixture テスト（M11 タスク65、v7 はタスク68、v8 と
+//! `.mcad` v1〜v9 の後方互換 fixture テスト（M11 タスク65、v7 はタスク68、v8 と
 //! `v7_legacy_boms.mcad` は M12 タスク81 で追加、`v8_before_col_aligns.mcad` は
-//! M12 タスク93 で追加、`v8.mcad` の構築線は M12 タスク91 で追加）。
+//! M12 タスク93 で追加、`v8.mcad` の構築線は M12 タスク91 で追加、v9 は M13 タスク98）。
 //!
 //! # fixture について
 //!
-//! `tests/fixtures/v{1..8}.mcad` は各バージョンのスキーマが表現できる要素を
+//! `tests/fixtures/v{1..9}.mcad` は各バージョンのスキーマが表現できる要素を
 //! 一通り含む実ファイル（レイヤー2枚・複数ジオメトリ種・その版で表現可能な
 //! メタデータ）。各版のスキーマの一次情報は
 //! `crates/mcad-io/src/mcad_file.rs` のモジュール doc と DTO 定義
@@ -20,31 +20,36 @@
 //! crates/mcad-io/tests/fixtures/v8.mcad` の内容そのもの）。「その時期の v8 ファイルが
 //! タスク93 後も読める」ことの回帰（Codex レビュー指摘）。
 //!
+//! `v9.mcad` は手書きせず、exporter（`to_json`）の出力を一度書き出して作った
+//! （組み立て手順は `tests/fixtures/README.md`）。
+//!
 //! 「不正な JSON の拒否」「偽装 `Table` の拒否」「v6 に `direction` を混ぜた
 //! ファイルの拒否」のような**壊れた入力**のテストはここへは置かない
 //! （`mcad_file.rs` の `#[cfg(test)]` に残す）。fixture ディレクトリは
 //! 「正規のサンプル」という位置づけを保つため。
 //!
-//! # v9 を追加するとき
+//! # v10 を追加するとき
 //!
-//! `.mcad` フォーマットが v9 へ上がったら:
+//! `.mcad` フォーマットが v10 へ上がったら:
 //!
-//! 1. 現行版の mcad で保存したファイル（または本ファイルと同じ流儀で手作りした
-//!    JSON）を `tests/fixtures/v9.mcad` として追加する。新フィールドを含めること。
-//! 2. 本ファイルに `v9_*` の名前で新しいバージョンの検証項目
+//! 1. 現行版の mcad で保存したファイル（または exporter の出力を一度書き出したもの。
+//!    `tests/fixtures/README.md` の v9 の手順）を `tests/fixtures/v10.mcad` として追加する。
+//!    新フィールドを含めること。
+//! 2. 本ファイルに `v10_*` の名前で新しいバージョンの検証項目
 //!    （新フィールドの既定値補完・ラウンドトリップ）を1ケース足す。
 //! 3. `all_fixtures_declare_their_own_version_and_reexport_as_current` は
 //!    `1..=FORMAT_VERSION` を回すだけなので、`FORMAT_VERSION` を上げれば自動で対象に入る。
-//! 4. 旧版（このときは v8）が変わらず読めることは、既存の `v8_*` テストが
-//!    そのまま回帰網として働く。`v8_fixture_is_exactly_what_the_exporter_writes` は
-//!    「現行版の書き出しと一致」を見るので、v9 では「v8 として読めて内容が保たれる」
-//!    検査へ書き換える。
+//! 4. 旧版（このときは v9）が変わらず読めることは、既存の `v9_*` テストが
+//!    そのまま回帰網として働く。`v9_fixture_is_exactly_what_the_exporter_writes` は
+//!    「現行版の書き出しと一致」を見るので、v10 では「v9 として読めて内容が保たれる」
+//!    検査へ書き換える（`v8_fixture_still_loads_and_is_upgraded_on_export` の形）。
 
 use std::fs;
 use std::path::PathBuf;
 
 use mcad_core::{
-    ArrowPlacement, DimDirection, Document, EntityGeom, HorizontalAlign, Linetype, TableKind,
+    ArrowPlacement, CircleTangency, Constraint, DimDirection, Document, EntityGeom,
+    HorizontalAlign, LargerCircle, Linetype, PointKind, Side, TableKind,
 };
 use mcad_geom::{ArrowKind, DimSymbol, Point2, Vec2};
 use mcad_io::{FORMAT_VERSION, export_document, from_json};
@@ -511,7 +516,7 @@ fn v7_legacy_boms_fixture_loads_as_plain_tables() {
 
 #[test]
 fn v8_fixture_loads_with_expected_content() {
-    // v8(現行): 表の種類（TableKind）と「部品表を使う」（SheetMeta::use_bom）。M12 タスク81。
+    // v8: 表の種類（TableKind）と「部品表を使う」（SheetMeta::use_bom）。M12 タスク81。
     // 表の列ごとの揃え（TableGeom::col_aligns）が M12 タスク93 で相乗りした。
     let summary = from_json(&fixture(8)).expect("v8 fixture は読めるべき");
     let doc = summary.document;
@@ -571,14 +576,22 @@ fn v8_fixture_loads_with_expected_content() {
 }
 
 #[test]
-fn v8_fixture_is_exactly_what_the_exporter_writes() {
-    // v8 往復の無損失性を最も強い形で固定する: fixture を読んで書き出した JSON が、
-    // fixture そのものと（キーの並び・空白を除いて）一致する。数値は文字列を解析して
-    // 比べる（f32 の線幅を `to_value` 経由にすると f64 へ広げた誤差が出るため）。
+fn v8_fixture_still_loads_and_is_upgraded_on_export() {
+    // v9 から、v8 fixture は「現行版の書き出しと一致」ではなく「v8 として読めて内容が
+    // 保たれる」ことを見る。書き出しは v9 になり、違いは `version` と空の `constraints`
+    // だけ（数値は文字列を解析して比べる。f32 の線幅を `to_value` 経由にすると f64 へ
+    // 広げた誤差が出るため）。
     let text = fixture(8);
-    let doc = from_json(&text).unwrap().document;
-    let written = mcad_io::to_json(&doc).unwrap();
-    let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let summary = from_json(&text).expect("v8 fixture は読めるべき");
+    assert_eq!(
+        summary.document.constraint_count(),
+        0,
+        "v8 は拘束を持たない"
+    );
+    let written = mcad_io::to_json(&summary.document).unwrap();
+    let mut expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+    expected["version"] = serde_json::json!(9);
+    expected["constraints"] = serde_json::json!([]);
     let actual: serde_json::Value = serde_json::from_str(&written).unwrap();
     assert_eq!(actual, expected, "書き出し: {written}");
 }
@@ -605,11 +618,10 @@ fn v8_before_col_aligns_fixture_is_backfilled_as_left() {
         );
     }
 
-    // 書き出すと col_aligns 付きの現行 v8 になる（現行 fixture とはバージョン番号・
-    // スキーマが一致するが、値そのものは補完した左揃えのまま）。
+    // 書き出すと col_aligns 付きの現行版（v9）になる（値そのものは補完した左揃えのまま）。
     let written = mcad_io::to_json(&doc).unwrap();
     let written: serde_json::Value = serde_json::from_str(&written).unwrap();
-    assert_eq!(written["version"], 8);
+    assert_eq!(written["version"], 9);
     let table_entities: Vec<&serde_json::Value> = written["entities"]
         .as_array()
         .unwrap()
@@ -629,6 +641,124 @@ fn v8_before_col_aligns_fixture_is_backfilled_as_left() {
 }
 
 // ---------------------------------------------------------------------
+// v9
+// ---------------------------------------------------------------------
+
+#[test]
+fn v9_fixture_loads_with_expected_content() {
+    // v9(現行): 幾何拘束（M13 タスク98）。エンティティは `entities` 配列の添字で指す。
+    // fixture は v8.mcad の 5 要素（部品表・表・構築線・長さ寸法など）に、線分 5・円 3・
+    // 円弧 1・ポリライン 1 と、全 15 種の拘束 20 件を足したもの。
+    let summary = from_json(&fixture(9)).expect("v9 fixture は読めるべき");
+    let doc = summary.document;
+
+    assert_eq!(doc.layer_count(), 2);
+    assert_eq!(doc.entity_count(), 15);
+    assert_eq!(doc.constraint_count(), 20);
+    assert!(!doc.can_undo(), "読込操作は undo できない");
+
+    // v8 までの要素も v9 のまま読める。
+    assert!(!doc.sheet().use_bom);
+    assert_eq!(table_kinds(&doc), vec![TableKind::Bom, TableKind::Table]);
+    assert!(doc.bom().is_some());
+
+    // 15 種すべてが 1 件以上ある（種類の数え上げは網羅 match なので、新しい種類を
+    // 足すとここがコンパイルエラーになる）。
+    let mut seen = [false; 15];
+    for (_, c) in doc.constraints() {
+        let slot = match c {
+            Constraint::Coincident { .. } => 0,
+            Constraint::Horizontal { .. } => 1,
+            Constraint::Vertical { .. } => 2,
+            Constraint::Distance { .. } => 3,
+            Constraint::PointLineDistance { .. } => 4,
+            Constraint::Parallel { .. } => 5,
+            Constraint::Perpendicular { .. } => 6,
+            Constraint::EqualLength { .. } => 7,
+            Constraint::EqualRadius { .. } => 8,
+            Constraint::Radius { .. } => 9,
+            Constraint::Angle { .. } => 10,
+            Constraint::TangentLineCircle { .. } => 11,
+            Constraint::TangentCircles { .. } => 12,
+            Constraint::FixPoint { .. } => 13,
+            Constraint::FixEntity { .. } => 14,
+        };
+        seen[slot] = true;
+    }
+    assert_eq!(seen, [true; 15]);
+
+    // 値・側・外接/内接・点の種類・固定座標がファイルのとおりに戻る。
+    let all: Vec<&Constraint> = doc.constraints().map(|(_, c)| c).collect();
+    assert!(all.iter().any(|c| matches!(
+        c,
+        Constraint::Distance { a, b, value }
+            if a.kind == PointKind::Start && b.kind == PointKind::End && *value == 100.0
+    )));
+    assert!(all.iter().any(|c| matches!(
+        c,
+        Constraint::Angle { value, .. } if *value == std::f64::consts::FRAC_PI_2
+    )));
+    assert!(all.iter().any(|c| matches!(
+        c,
+        Constraint::PointLineDistance { side: Side::Right, value, .. } if *value == 30.0
+    )));
+    assert!(all.iter().any(|c| matches!(
+        c,
+        Constraint::TangentCircles {
+            kind: CircleTangency::External,
+            ..
+        }
+    )));
+    assert!(all.iter().any(|c| matches!(
+        c,
+        Constraint::TangentCircles {
+            kind: CircleTangency::Internal(LargerCircle::First),
+            ..
+        }
+    )));
+    assert!(all.iter().any(|c| matches!(
+        c,
+        Constraint::FixPoint { point, at }
+            if point.kind == PointKind::End && *at == Point2::new(230.0, 90.0)
+    )));
+    // どの拘束も、生きたエンティティを指している（添字 → EntityId の対応が正しい）。
+    for c in &all {
+        for id in c.entities() {
+            assert!(doc.entity(id).is_some(), "{c:?}");
+        }
+        assert_eq!(c.is_satisfied(&doc), Ok(true), "{c:?}");
+    }
+}
+
+#[test]
+fn v9_fixture_is_exactly_what_the_exporter_writes() {
+    // v9 往復の無損失性を最も強い形で固定する: fixture を読んで書き出した JSON が、
+    // fixture そのものと（キーの並び・空白を除いて）一致する。
+    let text = fixture(9);
+    let doc = from_json(&text).unwrap().document;
+    let written = mcad_io::to_json(&doc).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(actual, expected, "書き出し: {written}");
+}
+
+#[test]
+fn fixtures_before_v9_have_no_constraints() {
+    // v8 以前は拘束を持たない。読むと空で、書き出すと `constraints` が空配列で付く。
+    for version in 1..9 {
+        let doc = from_json(&fixture(version))
+            .unwrap_or_else(|e| panic!("v{version} fixture が読めない: {e}"))
+            .document;
+        assert_eq!(doc.constraint_count(), 0, "v{version}");
+        assert!(export_document(&doc).constraints.is_empty(), "v{version}");
+    }
+    for name in ["v7_legacy_boms.mcad", "v8_before_col_aligns.mcad"] {
+        let doc = from_json(&fixture_named(name)).unwrap().document;
+        assert_eq!(doc.constraint_count(), 0, "{name}");
+    }
+}
+
+// ---------------------------------------------------------------------
 // バージョン横断
 // ---------------------------------------------------------------------
 
@@ -637,7 +767,7 @@ fn fixtures_before_v8_read_tables_as_table_and_use_bom_as_on() {
     // v7 以前は種類・「部品表を使う」・列ごとの揃えを持たないので、表はすべて Table、
     // 「部品表を使う」は ON（DESIGN.md M12 設計判断1）、揃えはすべての列で左
     // （DESIGN.md M12 設計判断11）。
-    for version in 1..FORMAT_VERSION {
+    for version in 1..8 {
         let doc = from_json(&fixture(version))
             .unwrap_or_else(|e| panic!("v{version} fixture が読めない: {e}"))
             .document;

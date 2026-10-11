@@ -21,12 +21,17 @@
 //! 線分・円・円弧（[`mcad_geom::Shape`] の `Line`・`Circle`・`Arc`）だけ。ポリライン・点・
 //! 構築線・文字・寸法・表は対象外（M13 スコープ外）。
 //!
-//! # serde を付けない
+//! # serde の扱い
 //!
-//! [`Constraint`] は対象を `slotmap` の生キーで指すため、[`crate::Entity`] と同じく
-//! `Serialize`/`Deserialize` を導出しない。`.mcad` への保存は mcad-io が DTO で行う。
+//! [`Constraint`] と [`PointRef`] は対象を `slotmap` の生キー（[`EntityId`]）で指すため、
+//! [`crate::Entity`] と同じく `Serialize`/`Deserialize` を導出しない。`.mcad` への保存は
+//! mcad-io が io 専用の DTO（エンティティはファイル上の配列の添字で指す）で行う。
+//! 生キーを持たない値の型（[`PointKind`]・[`Side`]・[`LargerCircle`]・[`CircleTangency`]）
+//! だけは、その DTO が直接使えるよう `Serialize`/`Deserialize` を導出する。
 
 use std::f64::consts::PI;
+
+use serde::{Deserialize, Serialize};
 
 use mcad_geom::solve::{ATOL_LEN, ResidualKind};
 use mcad_geom::{Arc, EPS, LineSeg, Point2, Shape, Vec2};
@@ -36,7 +41,7 @@ use crate::{ConstraintId, CoreError, Document, EntityGeom, EntityId};
 pub(crate) mod equations;
 
 /// 図形の上の点の種類（[`PointRef`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PointKind {
     /// 始点（線分の `a`、円弧の開始角の点）。
     Start,
@@ -75,7 +80,7 @@ impl PointRef {
 }
 
 /// 線分の向き（始点 → 終点）に対する側。値は必ず ±1 のどちらか（設計判断2「側の符号」）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
     /// 始点 → 終点の向きに対して左側（符号付き距離が正）。
     Left,
@@ -95,7 +100,7 @@ impl Side {
 }
 
 /// 内接する 2 円のどちらが大きいか（[`CircleTangency::Internal`]）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LargerCircle {
     /// 1 つ目（[`Constraint::TangentCircles`] の `a`）が大きい（`s = +1`）。
     First,
@@ -115,7 +120,7 @@ impl LargerCircle {
 }
 
 /// 円どうしの接線の種類。作成時の形から決めて保存する（解くたびに決め直さない）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CircleTangency {
     /// 外接（`‖c1 − c2‖ = r1 + r2`）。
     External,
@@ -148,7 +153,11 @@ pub enum CircleTangency {
 /// 0 と π で 0 になる `½·atan2(sin 2t, cos 2t)` か、±π/2 で 0 になる
 /// `½·atan2(−sin 2t, −cos 2t)`。残差は解までの回転角で、解からちょうど 90° ずれた形でも
 /// 勾配が 0 にならない（その形へ拘束を足しても解ける）。
-#[non_exhaustive]
+///
+/// # `#[non_exhaustive]` にしない
+///
+/// 種類が増えたとき、mcad-io の DTO 変換（`.mcad` への保存・読込）の網羅 `match` で
+/// コンパイラに追従を強制するため（[`crate::DimKind`] と同じ判断）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constraint {
     /// 一致: 2 点の x・y の差（方程式 2 本）。

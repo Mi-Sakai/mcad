@@ -1206,6 +1206,27 @@ fn open_status(clamped_widths: usize) -> String {
     }
 }
 
+/// DXF 書き出し成功時のステータス文言。`skipped` は `save_dxf` が返したスキップ件数、
+/// `has_constraints` は書き出した文書に拘束があるか。
+///
+/// 寸法（長さ/半径）は DXF 未対応でスキップされる（Text はタスク25で export 対応済み）。
+/// 拘束は DXF に対応する表現が無く書き出されない（DESIGN.md M13 設計判断5）。どちらも
+/// 黙って消えるとデータロスに気づけないため、ステータスへ出す（併発したら両方出す）。
+/// ステータスバーはまだ日本語化していない領域なので、文言は英語。
+fn dxf_export_status(skipped: usize, has_constraints: bool) -> String {
+    let mut status = "Exported DXF file".to_string();
+    if skipped > 0 {
+        status.push_str(&format!(
+            ": {skipped} entity(ies) skipped (dimension not supported)"
+        ));
+    }
+    if has_constraints {
+        status.push_str(if skipped > 0 { "; " } else { ": " });
+        status.push_str("Constraints are not saved to DXF");
+    }
+    status
+}
+
 /// 新規文書（起動直後・Ctrl+N）用のドキュメントを作る。
 ///
 /// [`Document::new()`] の `"0"` 1枚だけの文書に、[`DEFAULT_EXTRA_LAYERS`] の既定
@@ -2105,20 +2126,12 @@ impl McadApp {
         self.remember_dialog_dir(&path);
         let path = ensure_dxf_extension(path);
         match save_dxf(&self.document, &path) {
-            Ok(0) => {
-                set_status_important(&mut self.status, now, "Exported DXF file");
-            }
             Ok(skipped) => {
-                // 寸法（長さ/半径）は DXF 未対応でスキップされる（Text はタスク25で
-                // export 対応済み）。黙って消えるとデータロスに気づけないため、件数を
-                // ステータスへ出す（import 側メッセージと同書式）。
+                let has_constraints = self.document.constraint_count() > 0;
                 set_status_important(
                     &mut self.status,
                     now,
-                    format!(
-                        "Exported DXF file: {skipped} entity(ies) skipped \
-                         (dimension not supported)"
-                    ),
+                    dxf_export_status(skipped, has_constraints),
                 );
             }
             Err(err) => {
@@ -11331,6 +11344,25 @@ mod tests {
         let noisy = open_status(3);
         assert!(noisy.contains('3'), "件数が出るべき: {noisy}");
         assert!(noisy.contains("clamped"), "丸めたことが分かるべき: {noisy}");
+    }
+
+    #[test]
+    fn dxf_export_status_covers_skipped_entities_and_constraints() {
+        assert_eq!(dxf_export_status(0, false), "Exported DXF file");
+        assert_eq!(
+            dxf_export_status(2, false),
+            "Exported DXF file: 2 entity(ies) skipped (dimension not supported)"
+        );
+        assert_eq!(
+            dxf_export_status(0, true),
+            "Exported DXF file: Constraints are not saved to DXF"
+        );
+        // 併発したら両方出る。
+        assert_eq!(
+            dxf_export_status(2, true),
+            "Exported DXF file: 2 entity(ies) skipped (dimension not supported); \
+             Constraints are not saved to DXF"
+        );
     }
 
     #[test]

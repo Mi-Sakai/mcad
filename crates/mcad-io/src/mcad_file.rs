@@ -12,7 +12,7 @@
 //!   （[`FileLayer`]）として書く。core 側の型変更がファイル形式へ直接漏れないように
 //!   するため。
 //! - 生存中のレイヤー・エンティティのみを列挙する。undo/redo 履歴・墓標は保存しない。
-//! - `version` フィールド必須（現行は `8`）。書き出しは常に v8。読込は v1〜v7 を
+//! - `version` フィールド必須（現行は `9`）。書き出しは常に v9。読込は v1〜v8 を
 //!   後方互換で受理し、それ以外の未知バージョンは拒否する（[`from_json`]）。
 //!
 //! # バージョン履歴と後方互換の変換規則
@@ -26,7 +26,8 @@
 //! | 5 | 寸法注記（[`mcad_core::DimAnnotation`]）・文書単位の寸法スタイル（`dim_style`）を永続化（M9 タスク48） | `arrow_kind = ClosedFilled`。表（[`EntityGeom::Table`]）は概念自体が無いため、凍結 DTO（[`EntityGeomV5`]）が `Table` タグを拒否する |
 //! | 6 | 汎用テーブル（[`EntityGeom::Table`]、M10）・[`mcad_core::DimStyle::arrow_kind`]（矢先種別。M10 タスク57で `.mcad` へ導入、形状生成は M10 タスク63）を追加 | `direction = Aligned`（凍結 DTO [`DimLinearV6`] が `direction` キーを拒否する） |
 //! | 7 | 長さ寸法の向き [`mcad_core::DimDirection`]（`DimLinear::direction`。回転寸法。M11 タスク68）、角度寸法 [`EntityGeom::DimAngular`]・座標寸法 [`EntityGeom::DimOrdinate`]（M11 タスク69）、長さ寸法の補助線の傾き（`DimLinear::ext_angle`。M11 タスク78）を追加 | `kind = Table`・`col_aligns = すべて Left`・`use_bom = true`（凍結 DTO [`TableGeomV7`] / [`SheetMetaV7`] が 3 キーを拒否する。**中身から部品表を推測しない**） |
-//! | 8 | 表の種類 [`TableKind`]（`TableGeom::kind`。表 / 部品表）・図面の「部品表を使う」（`SheetMeta::use_bom`）を追加（M12 タスク81）、表の列ごとの揃え（`TableGeom::col_aligns`。M12 タスク93）、構築線 [`EntityGeom::XLine`]（M12 タスク91）を追加。現行 | なし |
+//! | 8 | 表の種類 [`TableKind`]（`TableGeom::kind`。表 / 部品表）・図面の「部品表を使う」（`SheetMeta::use_bom`）を追加（M12 タスク81）、表の列ごとの揃え（`TableGeom::col_aligns`。M12 タスク93）、構築線 [`EntityGeom::XLine`]（M12 タスク91）を追加 | 拘束なし（`constraints = []`）。凍結 DTO [`FileDocumentV8`]。`constraints` キーを持つ v8 は拒否する |
+//! | 9 | 幾何拘束の配列 [`FileDocument::constraints`]（[`FileConstraint`]。エンティティは `entities` の添字で指す。M13 タスク98）。現行 | なし |
 //!
 //! **v7 は M11-1 の中で 3 度拡張した（タスク68 → 69 → 78）が、版は上げていない。**
 //! タスク68 の v7 は未リリースで、同じマイルストーンの中で版を刻む意味がないため
@@ -39,16 +40,17 @@
 //! 引き上げる。段ごとに補完する値を 1 箇所へ閉じるためで、飛び級の変換は書かない。
 //!
 //! ```text
-//! v1 → v2 → v3 → v4 → v5 → v6 → v7 → v8(= FileDocument)
-//!      ^    ^    ^    ^    ^    ^    ^
-//!      |    |    |    |    |    |    +-- TableGeomV7 → TableGeom（kind = Table・col_aligns = 左）、
-//!      |    |    |    |    |    |        SheetMetaV7 → SheetMeta（use_bom = true）
-//!      |    |    |    |    |    +------- DimLinearV6 → DimLinear（direction = Aligned・ext_angle = None）
-//!      |    |    |    |    +------------ EntityGeomV5 → EntityGeomV6（Table は現れない）
-//!      |    |    |    +----------------- dim_style = LEGACY_DIM_STYLE
-//!      |    |    +---------------------- sheet = 既定（SheetMetaV7）、style.width(px) → width_mm
-//!      |    +--------------------------- order = 配列インデックス
-//!      +-------------------------------- Shape → EntityGeomV5::Shape
+//! v1 → v2 → v3 → v4 → v5 → v6 → v7 → v8 → v9(= FileDocument)
+//!      ^    ^    ^    ^    ^    ^    ^    ^
+//!      |    |    |    |    |    |    |    +-- FileDocumentV8 → FileDocument（constraints = 空）
+//!      |    |    |    |    |    |    +------- TableGeomV7 → TableGeom（kind = Table・col_aligns = 左）、
+//!      |    |    |    |    |    |             SheetMetaV7 → SheetMeta（use_bom = true）
+//!      |    |    |    |    |    +------------ DimLinearV6 → DimLinear（direction = Aligned・ext_angle = None）
+//!      |    |    |    |    +----------------- EntityGeomV5 → EntityGeomV6（Table は現れない）
+//!      |    |    |    +---------------------- dim_style = LEGACY_DIM_STYLE
+//!      |    |    +--------------------------- sheet = 既定（SheetMetaV7）、style.width(px) → width_mm
+//!      |    +-------------------------------- order = 配列インデックス
+//!      +------------------------------------- Shape → EntityGeomV5::Shape
 //! ```
 //!
 //! 幾何の凍結 DTO は 5 つある。[`DimLinearV6`]（`direction` を持たない長さ寸法。
@@ -309,17 +311,41 @@
 //! - **v7 以前は凍結 enum がタグごと拒否する**（[`EntityGeomV7`] 以前は閉じた enum。
 //!   角度寸法を v6 以前が拒否するのと同じ構造で、新しい凍結 DTO は要らない。回帰は
 //!   `v7_file_with_construction_line_is_rejected`）。
+//!
+//! # 幾何拘束の永続化（v9・M13 タスク98）
+//!
+//! M13 で [`mcad_core::Constraint`] を足した。**v9 でこれを永続化する**（DESIGN.md M13
+//! 設計判断5）:
+//!
+//! - core の `Constraint` は対象を `EntityId` で指すため serde を導出せず、io 専用の DTO
+//!   [`FileConstraint`]（`Constraint` の鏡像）と [`FilePointRef`] で書く。エンティティは
+//!   [`FileDocument::entities`] の**添字**で指す。`Constraint` の種類が増えたら DTO 変換の
+//!   網羅 `match` がコンパイルエラーになる（core は `#[non_exhaustive]` を外してある）。
+//! - [`FileDocument::constraints`] は **v9 の必須キー**で、拘束が無くても空配列を書く。
+//!   欠けた v9 は [`IoError::Json`]。
+//! - **読込時は解かない**。[`import_document`] は全エンティティを投入したあと、拘束を配列順に
+//!   1 件ずつ、添字の範囲検査（[`IoError::BadConstraintRef`]）→
+//!   [`mcad_core::Constraint::is_satisfied`]（`Err` は [`IoError::InvalidConstraint`]、
+//!   `Ok(false)` は [`IoError::UnsatisfiedConstraint`]）→ `AddConstraint`（値の範囲違反は
+//!   コアが拒否して [`IoError::Core`]）の順に通す。保存された形のまま満たされていない拘束を
+//!   解いて形を変えることはしない（「値や位置が変わる取り込みはしない」）。
+//! - **v8 以前は拘束なし**。凍結 DTO [`FileDocumentV8`] は `constraints` を持たず、
+//!   [`from_json`] の v8 腕は `constraints` キーがあれば拒否する（黙って捨てると拘束が消えた図面を
+//!   無警告で開くことになる）。`col_aligns` の補完もこの v8 腕だけで行う。
+//! - DXF には書き出さない（`dxf_file` 側は拘束を扱わない）。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use mcad_core::{
-    Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimOrdinate,
-    DimRadial, DimStyle, Document, Entity, EntityGeom, HorizontalAlign, Layer, LayerId, Linetype,
-    Orientation, PaperSize, Rgb, Scale, SheetMeta, Style, TableGeom, TableKind, TextGeom,
-    TitleBlockFields, TitleBlockKind, Unit, WidthMm,
+    CircleTangency, Command, Constraint, DimAngular, DimAnnotation, DimDiameter, DimDirection,
+    DimLinear, DimOrdinate, DimRadial, DimStyle, Document, Entity, EntityGeom, EntityId,
+    HorizontalAlign, Layer, LayerId, Linetype, Orientation, PaperSize, PointKind, PointRef, Rgb,
+    Scale, SheetMeta, Side, Style, TableGeom, TableKind, TextGeom, TitleBlockFields,
+    TitleBlockKind, Unit, WidthMm,
 };
 use mcad_geom::{Point2, Shape};
 
@@ -340,11 +366,13 @@ use crate::IoError;
 ///   （[`SheetMeta::use_bom`]）を追加。同じ v8 に表の列ごとの揃え
 ///   （`TableGeom::col_aligns`。M12 タスク93）と構築線（[`EntityGeom::XLine`]。
 ///   M12 タスク91）が相乗りした（v8 は未リリースのため版を上げていない）。
+/// - v9（M13 タスク98）で幾何拘束の配列（[`FileDocument::constraints`]、[`FileConstraint`]）を
+///   追加。
 ///
-/// 書き出しは常に v8。v1〜v7 のファイルは [`from_json`] が後方互換で読み込む
+/// 書き出しは常に v9。v1〜v8 のファイルは [`from_json`] が後方互換で読み込む
 /// （[`FileDocumentV1`] / [`FileDocumentV2`] / [`FileDocumentV3`] / [`FileDocumentV4`] /
-/// [`FileDocumentV5`] / [`FileDocumentV6`] / [`FileDocumentV7`] 参照）。
-pub const FORMAT_VERSION: u32 = 8;
+/// [`FileDocumentV5`] / [`FileDocumentV6`] / [`FileDocumentV7`] / [`FileDocumentV8`] 参照）。
+pub const FORMAT_VERSION: u32 = 9;
 
 /// v1〜v4(`dim_style` を持たない版)の読込で補完する寸法スタイル。
 ///
@@ -358,7 +386,7 @@ const LEGACY_DIM_STYLE: DimStyle = DimStyle {
     ..DimStyle::DEFAULT
 };
 
-/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v8）。
+/// `.mcad` ファイル全体を表すポータブルな DTO（現行 v9）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDocument {
     /// フォーマットバージョン。[`FORMAT_VERSION`] 以外は読込を拒否する。
@@ -389,6 +417,292 @@ pub struct FileDocument {
     /// `ArrowKind::ClosedFilled` へ既定値補完される。
     #[serde(default)]
     pub dim_style: DimStyle,
+    /// 幾何拘束の一覧（v9 で追加。M13 タスク98）。`Document::constraints` の列挙順。
+    ///
+    /// エンティティは [`FileDocument::entities`] の添字で指す。**v9 では必須キー**
+    /// （`#[serde(default)]` を付けない。拘束が無くても空配列を常に書く）。v8 以前の
+    /// ファイルはこのキーを持たず、[`from_json`] が空として読む。
+    pub constraints: Vec<FileConstraint>,
+}
+
+/// [`FileConstraint`] が指す図形の上の点（[`FileDocument::entities`] の添字と点の種類）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePointRef {
+    /// 点を持つエンティティ（[`FileDocument::entities`] の添字）。
+    pub entity: usize,
+    /// そのエンティティのどの点か。
+    pub kind: PointKind,
+}
+
+/// `.mcad` ファイル内の幾何拘束 1 件（v9）。core の [`Constraint`] の鏡像で、対象を
+/// `EntityId` ではなく [`FileDocument::entities`] の添字で指す（`FileLayer` と同じく、
+/// core の型変更がファイル形式へ直接漏れないようにする io 専用 DTO）。各バリアントの意味と
+/// 値の単位は [`Constraint`] を参照。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FileConstraint {
+    /// [`Constraint::Coincident`]。
+    Coincident {
+        /// 1 つ目の点。
+        a: FilePointRef,
+        /// 2 つ目の点。
+        b: FilePointRef,
+    },
+    /// [`Constraint::Horizontal`]。
+    Horizontal {
+        /// 対象の線分。
+        line: usize,
+    },
+    /// [`Constraint::Vertical`]。
+    Vertical {
+        /// 対象の線分。
+        line: usize,
+    },
+    /// [`Constraint::Distance`]。
+    Distance {
+        /// 1 つ目の点。
+        a: FilePointRef,
+        /// 2 つ目の点。
+        b: FilePointRef,
+        /// 距離。
+        value: f64,
+    },
+    /// [`Constraint::PointLineDistance`]。
+    PointLineDistance {
+        /// 対象の点。
+        point: FilePointRef,
+        /// 対象の線分。
+        line: usize,
+        /// 点のある側。
+        side: Side,
+        /// 距離。
+        value: f64,
+    },
+    /// [`Constraint::Parallel`]。
+    Parallel {
+        /// 1 つ目の線分。
+        a: usize,
+        /// 2 つ目の線分。
+        b: usize,
+    },
+    /// [`Constraint::Perpendicular`]。
+    Perpendicular {
+        /// 1 つ目の線分。
+        a: usize,
+        /// 2 つ目の線分。
+        b: usize,
+    },
+    /// [`Constraint::EqualLength`]。
+    EqualLength {
+        /// 1 つ目の線分。
+        a: usize,
+        /// 2 つ目の線分。
+        b: usize,
+    },
+    /// [`Constraint::EqualRadius`]。
+    EqualRadius {
+        /// 1 つ目の円・円弧。
+        a: usize,
+        /// 2 つ目の円・円弧。
+        b: usize,
+    },
+    /// [`Constraint::Radius`]。
+    Radius {
+        /// 対象の円・円弧。
+        entity: usize,
+        /// 半径。
+        value: f64,
+    },
+    /// [`Constraint::Angle`]。
+    Angle {
+        /// 1 つ目の線分。
+        a: usize,
+        /// 2 つ目の線分。
+        b: usize,
+        /// 角度（ラジアン）。
+        value: f64,
+    },
+    /// [`Constraint::TangentLineCircle`]。
+    TangentLineCircle {
+        /// 対象の線分。
+        line: usize,
+        /// 対象の円・円弧。
+        circle: usize,
+        /// 中心のある側。
+        side: Side,
+    },
+    /// [`Constraint::TangentCircles`]。
+    TangentCircles {
+        /// 1 つ目の円・円弧。
+        a: usize,
+        /// 2 つ目の円・円弧。
+        b: usize,
+        /// 外接か内接か。
+        kind: CircleTangency,
+    },
+    /// [`Constraint::FixPoint`]。
+    FixPoint {
+        /// 対象の点。
+        point: FilePointRef,
+        /// 固定する座標。
+        at: Point2,
+    },
+    /// [`Constraint::FixEntity`]。
+    FixEntity {
+        /// 対象の線分・円・円弧。
+        entity: usize,
+    },
+}
+
+impl FilePointRef {
+    fn from_core(point: PointRef, index_of: &HashMap<EntityId, usize>) -> Self {
+        Self {
+            entity: file_index(point.entity, index_of),
+            kind: point.kind,
+        }
+    }
+
+    fn to_core(self, ids: &[EntityId]) -> PointRef {
+        PointRef::new(ids[self.entity], self.kind)
+    }
+}
+
+/// エンティティの添字を引く。`Document` の不変条件（拘束の対象は必ず生存）により失敗しない。
+fn file_index(id: EntityId, index_of: &HashMap<EntityId, usize>) -> usize {
+    *index_of
+        .get(&id)
+        .expect("Document invariant: constraint target must be alive")
+}
+
+impl FileConstraint {
+    /// core の [`Constraint`] から DTO を作る（網羅 `match`。種類が増えたらここで
+    /// コンパイルエラーになる）。
+    fn from_core(constraint: &Constraint, index_of: &HashMap<EntityId, usize>) -> Self {
+        let e = |id: &EntityId| file_index(*id, index_of);
+        let p = |point: &PointRef| FilePointRef::from_core(*point, index_of);
+        match constraint {
+            Constraint::Coincident { a, b } => Self::Coincident { a: p(a), b: p(b) },
+            Constraint::Horizontal { line } => Self::Horizontal { line: e(line) },
+            Constraint::Vertical { line } => Self::Vertical { line: e(line) },
+            Constraint::Distance { a, b, value } => Self::Distance {
+                a: p(a),
+                b: p(b),
+                value: *value,
+            },
+            Constraint::PointLineDistance {
+                point,
+                line,
+                side,
+                value,
+            } => Self::PointLineDistance {
+                point: p(point),
+                line: e(line),
+                side: *side,
+                value: *value,
+            },
+            Constraint::Parallel { a, b } => Self::Parallel { a: e(a), b: e(b) },
+            Constraint::Perpendicular { a, b } => Self::Perpendicular { a: e(a), b: e(b) },
+            Constraint::EqualLength { a, b } => Self::EqualLength { a: e(a), b: e(b) },
+            Constraint::EqualRadius { a, b } => Self::EqualRadius { a: e(a), b: e(b) },
+            Constraint::Radius { entity, value } => Self::Radius {
+                entity: e(entity),
+                value: *value,
+            },
+            Constraint::Angle { a, b, value } => Self::Angle {
+                a: e(a),
+                b: e(b),
+                value: *value,
+            },
+            Constraint::TangentLineCircle { line, circle, side } => Self::TangentLineCircle {
+                line: e(line),
+                circle: e(circle),
+                side: *side,
+            },
+            Constraint::TangentCircles { a, b, kind } => Self::TangentCircles {
+                a: e(a),
+                b: e(b),
+                kind: *kind,
+            },
+            Constraint::FixPoint { point, at } => Self::FixPoint {
+                point: p(point),
+                at: *at,
+            },
+            Constraint::FixEntity { entity } => Self::FixEntity { entity: e(entity) },
+        }
+    }
+
+    /// この拘束が指すエンティティの添字すべて（範囲検査用。網羅 `match`）。
+    fn entity_indices(&self) -> Vec<usize> {
+        match self {
+            Self::Coincident { a, b } | Self::Distance { a, b, .. } => vec![a.entity, b.entity],
+            Self::Horizontal { line } | Self::Vertical { line } => vec![*line],
+            Self::PointLineDistance { point, line, .. } => vec![point.entity, *line],
+            Self::Parallel { a, b }
+            | Self::Perpendicular { a, b }
+            | Self::EqualLength { a, b }
+            | Self::EqualRadius { a, b }
+            | Self::Angle { a, b, .. }
+            | Self::TangentCircles { a, b, .. } => vec![*a, *b],
+            Self::Radius { entity, .. } | Self::FixEntity { entity } => vec![*entity],
+            Self::TangentLineCircle { line, circle, .. } => vec![*line, *circle],
+            Self::FixPoint { point, .. } => vec![point.entity],
+        }
+    }
+
+    /// DTO から core の [`Constraint`] を作る。`ids` は `entities` の添字 → `EntityId`。
+    /// 添字の範囲は呼び出し側が [`FileConstraint::entity_indices`] で検査済みであること。
+    fn to_core(&self, ids: &[EntityId]) -> Constraint {
+        let e = |index: &usize| ids[*index];
+        let p = |point: &FilePointRef| point.to_core(ids);
+        match self {
+            Self::Coincident { a, b } => Constraint::Coincident { a: p(a), b: p(b) },
+            Self::Horizontal { line } => Constraint::Horizontal { line: e(line) },
+            Self::Vertical { line } => Constraint::Vertical { line: e(line) },
+            Self::Distance { a, b, value } => Constraint::Distance {
+                a: p(a),
+                b: p(b),
+                value: *value,
+            },
+            Self::PointLineDistance {
+                point,
+                line,
+                side,
+                value,
+            } => Constraint::PointLineDistance {
+                point: p(point),
+                line: e(line),
+                side: *side,
+                value: *value,
+            },
+            Self::Parallel { a, b } => Constraint::Parallel { a: e(a), b: e(b) },
+            Self::Perpendicular { a, b } => Constraint::Perpendicular { a: e(a), b: e(b) },
+            Self::EqualLength { a, b } => Constraint::EqualLength { a: e(a), b: e(b) },
+            Self::EqualRadius { a, b } => Constraint::EqualRadius { a: e(a), b: e(b) },
+            Self::Radius { entity, value } => Constraint::Radius {
+                entity: e(entity),
+                value: *value,
+            },
+            Self::Angle { a, b, value } => Constraint::Angle {
+                a: e(a),
+                b: e(b),
+                value: *value,
+            },
+            Self::TangentLineCircle { line, circle, side } => Constraint::TangentLineCircle {
+                line: e(line),
+                circle: e(circle),
+                side: *side,
+            },
+            Self::TangentCircles { a, b, kind } => Constraint::TangentCircles {
+                a: e(a),
+                b: e(b),
+                kind: *kind,
+            },
+            Self::FixPoint { point, at } => Constraint::FixPoint {
+                point: p(point),
+                at: *at,
+            },
+            Self::FixEntity { entity } => Constraint::FixEntity { entity: e(entity) },
+        }
+    }
 }
 
 /// `.mcad` ファイル内のレイヤー 1 枚（現行 v4）。
@@ -665,12 +979,12 @@ impl FileDocumentV3 {
         )
     }
 
-    /// v3 DTO を現行の v8 [`FileDocument`] へ変換する（[`FileDocumentV3::into_v4`] の
-    /// あと [`FileDocumentV4::into_v8`] を通す）。
-    fn into_v8(self) -> MigratedFile {
+    /// v3 DTO を現行の v9 [`FileDocument`] へ変換する（[`FileDocumentV3::into_v4`] の
+    /// あと [`FileDocumentV4::into_v9`] を通す）。
+    fn into_v9(self) -> MigratedFile {
         let (v4, clamped_widths) = self.into_v4();
         MigratedFile {
-            file: v4.into_v8(),
+            file: v4.into_v9(),
             clamped_widths,
         }
     }
@@ -687,15 +1001,15 @@ struct FileDocumentV2 {
 }
 
 impl FileDocumentV2 {
-    /// v2 DTO を v3 相当へ引き上げてから v8 へ変換する。
-    fn into_v8(self) -> MigratedFile {
+    /// v2 DTO を v3 相当へ引き上げてから v9 へ変換する。
+    fn into_v9(self) -> MigratedFile {
         FileDocumentV3 {
             version: 3,
             layers: layers_v2_into_v3(self.layers),
             current_layer: self.current_layer,
             entities: self.entities,
         }
-        .into_v8()
+        .into_v9()
     }
 }
 
@@ -718,9 +1032,9 @@ struct FileEntityV1 {
 }
 
 impl FileDocumentV1 {
-    /// v1 DTO を v2 相当へ引き上げてから v8 へ変換する（各 `Shape` を
+    /// v1 DTO を v2 相当へ引き上げてから v9 へ変換する（各 `Shape` を
     /// [`EntityGeomV5::Shape`] で包む）。
-    fn into_v8(self) -> MigratedFile {
+    fn into_v9(self) -> MigratedFile {
         FileDocumentV2 {
             version: 2,
             layers: self.layers,
@@ -735,7 +1049,7 @@ impl FileDocumentV1 {
                 })
                 .collect(),
         }
-        .into_v8()
+        .into_v9()
     }
 }
 
@@ -1113,9 +1427,9 @@ impl FileDocumentV4 {
         }
     }
 
-    /// v4 DTO を現行の v8 [`FileDocument`] へ変換する（v5 → v6 → v7 → v8 と 1 段ずつ）。
-    fn into_v8(self) -> FileDocument {
-        self.into_v5().into_v6().into_v7().into_v8()
+    /// v4 DTO を現行の v9 [`FileDocument`] へ変換する（v5 → v6 → v7 → v8 → v9 と 1 段ずつ）。
+    fn into_v9(self) -> FileDocument {
+        self.into_v5().into_v6().into_v7().into_v8().into_v9()
     }
 }
 
@@ -1203,16 +1517,49 @@ struct FileDocumentV7 {
 }
 
 impl FileDocumentV7 {
-    /// v7 DTO を現行の v8 [`FileDocument`] へ変換する（表は [`TableKind::Table`]、
-    /// 「部品表を使う」は ON で補う以外は無変換。**中身から部品表を推測しない**）。
-    fn into_v8(self) -> FileDocument {
-        FileDocument {
-            version: FORMAT_VERSION,
+    /// v7 DTO を v8 相当の凍結 DTO（[`FileDocumentV8`]）へ変換する（表は
+    /// [`TableKind::Table`]、「部品表を使う」は ON で補う以外は無変換。**中身から部品表を
+    /// 推測しない**）。
+    fn into_v8(self) -> FileDocumentV8 {
+        FileDocumentV8 {
             sheet: self.sheet.into(),
             layers: self.layers,
             current_layer: self.current_layer,
             entities: self.entities.into_iter().map(FileEntityV7::into).collect(),
             dim_style: self.dim_style,
+        }
+    }
+}
+
+/// v8 ファイル全体を表す凍結 DTO（後方互換読込専用。M13 タスク98 で凍結）。v9 との差は
+/// `constraints`（拘束の配列）を持たないこと。それ以外（`sheet`・`entities`・`dim_style`）は
+/// v9 と同じ現行の型を共有する。
+///
+/// `dim_style` の `#[serde(default)]` は v8 当時の [`FileDocument`] と同じ（v8 として
+/// 受理していた範囲を狭めない）。`version` フィールドを持たない（[`FileDocumentV4`] と
+/// 同じ理由）。**`deny_unknown_fields` は付けない**（v8 は他の未知キーを無視して受理して
+/// いた）。代わりに [`from_json`] が v8 腕で `constraints` キーだけを JSON 値の段階で拒否する。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct FileDocumentV8 {
+    sheet: SheetMeta,
+    layers: Vec<FileLayer>,
+    current_layer: usize,
+    entities: Vec<FileEntity>,
+    #[serde(default)]
+    dim_style: DimStyle,
+}
+
+impl FileDocumentV8 {
+    /// v8 DTO を現行の v9 [`FileDocument`] へ変換する（拘束は無し = 空配列）。
+    fn into_v9(self) -> FileDocument {
+        FileDocument {
+            version: FORMAT_VERSION,
+            sheet: self.sheet,
+            layers: self.layers,
+            current_layer: self.current_layer,
+            entities: self.entities,
+            dim_style: self.dim_style,
+            constraints: Vec::new(),
         }
     }
 }
@@ -1237,6 +1584,16 @@ pub fn export_document(doc: &Document) -> FileDocument {
     };
 
     let current_layer = layer_index(doc.current_layer());
+    // 拘束が指すエンティティは `entities` 配列の添字（墓標は列挙されないので詰まる）。
+    let index_of: HashMap<EntityId, usize> = doc
+        .entities()
+        .enumerate()
+        .map(|(index, (id, _))| (id, index))
+        .collect();
+    let constraints = doc
+        .constraints()
+        .map(|(_, c)| FileConstraint::from_core(c, &index_of))
+        .collect();
     let entities = doc
         .entities()
         .map(|(_, e)| FileEntity {
@@ -1256,6 +1613,7 @@ pub fn export_document(doc: &Document) -> FileDocument {
         current_layer,
         entities,
         dim_style: *doc.dim_style(),
+        constraints,
     }
 }
 
@@ -1267,8 +1625,12 @@ pub fn export_document(doc: &Document) -> FileDocument {
 /// # Errors
 ///
 /// 未知バージョン・レイヤーなし・範囲外のレイヤー参照・不正ジオメトリで
-/// [`IoError`] を返す。図面メタデータ（ユーザー定義の表題欄様式の寸法）が不正な
-/// 場合はコアが拒否し [`IoError::Core`] になる。
+/// [`IoError`] を返す。拘束は [`IoError::BadConstraintRef`]（添字が範囲外）・
+/// [`IoError::InvalidConstraint`]（対象外の種類・合わない点の種類）・
+/// [`IoError::UnsatisfiedConstraint`]（保存された形で満たされていない。読込時は解かない）で
+/// 拒否する。満たされてはいるが値が範囲外の拘束（同じ位置の 2 点に距離 0 など）は
+/// `AddConstraint` の検証が [`IoError::Core`] で拒否する。図面メタデータ（ユーザー定義の
+/// 表題欄様式の寸法）が不正な場合はコアが拒否し [`IoError::Core`] になる。
 pub fn import_document(file: &FileDocument) -> Result<Document, IoError> {
     if file.version != FORMAT_VERSION {
         return Err(IoError::UnsupportedVersion(file.version));
@@ -1326,12 +1688,43 @@ pub fn import_document(file: &FileDocument) -> Result<Document, IoError> {
 
     doc.apply(Command::SetCurrentLayer(layer_ids[file.current_layer]))?;
 
+    let mut entity_ids: Vec<EntityId> = Vec::with_capacity(file.entities.len());
     for entity in &file.entities {
-        doc.apply(Command::AddEntity(Entity::new(
+        let new_ids = doc.apply(Command::AddEntity(Entity::new(
             entity.geom.clone(),
             layer_ids[entity.layer],
             entity.style,
         )))?;
+        entity_ids.push(new_ids.entities[0]);
+    }
+
+    // 拘束。読込時は解かない: 保存された形のまま満たされていなければ読込エラー
+    // （DESIGN.md M13 設計判断5）。レイヤーのロックはまだ適用していないが、拘束の追加は
+    // どのみちロックを見ない。
+    for (index, constraint) in file.constraints.iter().enumerate() {
+        if let Some(&entity) = constraint
+            .entity_indices()
+            .iter()
+            .find(|&&i| i >= entity_ids.len())
+        {
+            return Err(IoError::BadConstraintRef { index, entity });
+        }
+        let constraint = constraint.to_core(&entity_ids);
+        match constraint.is_satisfied(&doc) {
+            Err(e) => {
+                return Err(IoError::InvalidConstraint {
+                    index,
+                    reason: e.to_string(),
+                });
+            }
+            Ok(false) => return Err(IoError::UnsatisfiedConstraint { index }),
+            Ok(true) => {
+                doc.apply(Command::AddConstraint {
+                    constraint,
+                    hold: None,
+                })?;
+            }
+        }
     }
 
     // ロックの適用（エンティティ投入後）。
@@ -1394,9 +1787,11 @@ pub struct LoadSummary {
 /// - `7`: [`FileDocumentV7`]（長さ寸法の向きはあるが、表は [`TableGeomV7`]・図面
 ///   メタデータは [`SheetMetaV7`] に固定＝種類・「部品表を使う」を持たない →
 ///   [`TableKind::Table`]・ON 補完）
-/// - `8`（[`FORMAT_VERSION`]）: 現行の [`FileDocument`]（表の種類・「部品表を使う」を含む）
+/// - `8`: [`FileDocumentV8`]（表の種類・「部品表を使う」はあるが、拘束を持たない →
+///   空として読む。`constraints` キーを持つ v8 は [`IoError::Json`] で拒否する）
+/// - `9`（[`FORMAT_VERSION`]）: 現行の [`FileDocument`]（幾何拘束を含む）
 ///
-/// それ以外は [`IoError::UnsupportedVersion`] を返す。書き出しは常に v8。
+/// それ以外は [`IoError::UnsupportedVersion`] を返す。書き出しは常に v9。
 ///
 /// v3 以前の旧線幅はモジュール doc の規則で移行し、クランプ件数を
 /// [`LoadSummary::clamped_widths`] で返す。
@@ -1430,13 +1825,11 @@ pub struct LoadSummary {
 /// `v8_file_with_mismatched_col_aligns_is_rejected`）。`kind`・`use_bom` の欠落は
 /// 対象外（従来どおり [`IoError::Json`] で拒否する）。
 ///
-/// JSON 値の段階で補うのは、[`FileDocument`] が v8 の表に core の [`TableGeom`] を
-/// そのまま使っており（`col_aligns` は serde 必須）、その契約を緩めると
-/// 「要素数を列数へ合わせて補う」という today-specific な移行規則を書けないため
-/// （既定値 1 つに広げる `#[serde(default)]` では列数を知りようがない）。v7 以前のように
-/// 専用の凍結 DTO を挟む手もあるが、v8 は現行バージョンそのものなので別の型を
-/// 常設すると「現行の表の型」が 2 つ並んでしまう。壊れた入力の補正はこの関数へ閉じ、
-/// [`FileDocument`] 自体の型・serde 契約は変えない。
+/// JSON 値の段階で補うのは、v8 の表が core の [`TableGeom`] をそのまま使っており
+/// （`col_aligns` は serde 必須）、その契約を緩めると「要素数を列数へ合わせて補う」という
+/// 移行規則を書けないため（既定値 1 つに広げる `#[serde(default)]` では列数を知りようが
+/// ない）。壊れた入力の補正はこの関数へ閉じ、型・serde 契約は変えない。v9 でこの補完は
+/// [`from_json`] の v8 腕（[`FileDocumentV8`] へ読む前）だけに移った — v9 はキーを常に書く。
 ///
 /// タスク93 より前の v8 fixture は `tests/fixtures/v8_before_col_aligns.mcad`
 /// （回帰は `v8_before_col_aligns_fixture_is_backfilled_as_left`）。
@@ -1474,38 +1867,55 @@ pub fn from_json(json: &str) -> Result<LoadSummary, IoError> {
     }
     let probe: VersionProbe = serde_json::from_str(json)?;
     let migrated = match probe.version {
-        1 => serde_json::from_str::<FileDocumentV1>(json)?.into_v8(),
-        2 => serde_json::from_str::<FileDocumentV2>(json)?.into_v8(),
-        3 => serde_json::from_str::<FileDocumentV3>(json)?.into_v8(),
+        1 => serde_json::from_str::<FileDocumentV1>(json)?.into_v9(),
+        2 => serde_json::from_str::<FileDocumentV2>(json)?.into_v9(),
+        3 => serde_json::from_str::<FileDocumentV3>(json)?.into_v9(),
         4 => MigratedFile {
-            file: serde_json::from_str::<FileDocumentV4>(json)?.into_v8(),
+            file: serde_json::from_str::<FileDocumentV4>(json)?.into_v9(),
             clamped_widths: 0,
         },
         5 => MigratedFile {
             file: serde_json::from_str::<FileDocumentV5>(json)?
                 .into_v6()
                 .into_v7()
-                .into_v8(),
+                .into_v8()
+                .into_v9(),
             clamped_widths: 0,
         },
         6 => MigratedFile {
             file: serde_json::from_str::<FileDocumentV6>(json)?
                 .into_v7()
-                .into_v8(),
+                .into_v8()
+                .into_v9(),
             clamped_widths: 0,
         },
         7 => MigratedFile {
-            file: serde_json::from_str::<FileDocumentV7>(json)?.into_v8(),
+            file: serde_json::from_str::<FileDocumentV7>(json)?
+                .into_v8()
+                .into_v9(),
             clamped_widths: 0,
         },
-        FORMAT_VERSION => {
+        8 => {
             let mut value: serde_json::Value = serde_json::from_str(json)?;
+            // v8 は拘束を持たない。`constraints` を混ぜた v8 は、黙って捨てると拘束が
+            // 消えた図面を無警告で開くことになるので拒否する（他の未知キーは従来どおり無視）。
+            if value.get("constraints").is_some() {
+                return Err(IoError::Json(
+                    <serde_json::Error as serde::de::Error>::custom(
+                        "version 8 file must not have a `constraints` key (constraints need version 9)",
+                    ),
+                ));
+            }
             backfill_missing_v8_col_aligns(&mut value);
             MigratedFile {
-                file: serde_json::from_value::<FileDocument>(value)?,
+                file: serde_json::from_value::<FileDocumentV8>(value)?.into_v9(),
                 clamped_widths: 0,
             }
         }
+        FORMAT_VERSION => MigratedFile {
+            file: serde_json::from_str::<FileDocument>(json)?,
+            clamped_widths: 0,
+        },
         other => return Err(IoError::UnsupportedVersion(other)),
     };
     Ok(LoadSummary {
@@ -1702,13 +2112,18 @@ mod tests {
 
     #[test]
     fn unsupported_version_fails() {
-        // 現行は v8。未知の将来バージョン（9）は拒否する。
+        // 現行は v9。未知の将来バージョン（10）は拒否する。
         let mut file = export_document(&Document::new());
-        file.version = 9;
+        file.version = 10;
         assert!(matches!(
             import_document(&file),
-            Err(IoError::UnsupportedVersion(9))
+            Err(IoError::UnsupportedVersion(10))
         ));
+        // 文言は読める版の範囲を現行の版番号から作る（版を上げても古くならない）。
+        assert_eq!(
+            IoError::UnsupportedVersion(10).to_string(),
+            format!("unsupported format version: 10 (supported: 1..={FORMAT_VERSION})")
+        );
     }
 
     #[test]
@@ -2355,12 +2770,12 @@ mod tests {
     }
 
     #[test]
-    fn exported_json_declares_version_8() {
+    fn exported_json_declares_version_9() {
         let (doc, _geom) = document_with_annotated_dim_linear();
         let json = to_json(&doc).unwrap();
         assert!(
-            json.contains(r#""version": 8"#),
-            "export した JSON は version 8 を書くべき: {json}"
+            json.contains(r#""version": 9"#),
+            "export した JSON は version 9 を書くべき: {json}"
         );
     }
 
@@ -3320,7 +3735,7 @@ mod tests {
         }
 
         let exported = export_document(&doc);
-        assert_eq!(exported.version, 8);
+        assert_eq!(exported.version, 9);
         let json = to_json(&doc).unwrap();
         assert!(json.contains(r#""kind": "Bom""#), "部品表の種類: {json}");
         assert!(
@@ -3503,6 +3918,9 @@ mod tests {
         )))
         .unwrap();
         let mut value: serde_json::Value = serde_json::from_str(&to_json(&doc).unwrap()).unwrap();
+        // v8 として読ませる（v8 は `constraints` を持たない）。
+        value["version"] = serde_json::json!(8);
+        value.as_object_mut().unwrap().remove("constraints");
         value["entities"][0]["geom"]["Table"]
             .as_object_mut()
             .unwrap()
@@ -3824,5 +4242,511 @@ mod tests {
         assert_eq!(export_document(&loaded), export_document(&doc));
 
         fs::remove_file(&path).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // 幾何拘束（v9・M13 タスク98）
+    // -----------------------------------------------------------------
+
+    /// 図形を 1 つ足して `EntityId` を返す（拘束テスト用）。
+    fn add_geom(doc: &mut Document, layer: LayerId, geom: EntityGeom) -> EntityId {
+        doc.apply(Command::AddEntity(Entity::new(
+            geom,
+            layer,
+            Style::inherited(),
+        )))
+        .unwrap()
+        .entities[0]
+    }
+
+    fn add_shape(doc: &mut Document, layer: LayerId, shape: Shape) -> EntityId {
+        add_geom(doc, layer, EntityGeom::Shape(shape))
+    }
+
+    fn seg(a: (f64, f64), b: (f64, f64)) -> Shape {
+        Shape::Line(LineSeg::new(Point2::new(a.0, a.1), Point2::new(b.0, b.1)))
+    }
+
+    fn add_constraint(doc: &mut Document, constraint: Constraint) {
+        doc.apply(Command::AddConstraint {
+            constraint,
+            hold: None,
+        })
+        .unwrap();
+    }
+
+    fn pref(entity: EntityId, kind: PointKind) -> PointRef {
+        PointRef::new(entity, kind)
+    }
+
+    /// 拘束の全 15 種を含む文書。先頭に**消した図形**を置き、墓標があっても
+    /// 拘束の添字が（生存エンティティだけで）詰まることを確かめられるようにする。
+    fn document_with_all_constraints() -> Document {
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        let dead = add_shape(&mut doc, layer, seg((-5.0, -5.0), (-6.0, -7.0)));
+        let l1 = add_shape(&mut doc, layer, seg((0.0, 0.0), (100.0, 0.0)));
+        let l2 = add_shape(&mut doc, layer, seg((100.0, 0.0), (100.0, 60.0)));
+        let l3 = add_shape(&mut doc, layer, seg((100.0, 60.0), (0.0, 60.0)));
+        let l4 = add_shape(&mut doc, layer, seg((0.0, 60.0), (0.0, 0.0)));
+        let l5 = add_shape(&mut doc, layer, seg((150.0, 10.0), (300.0, 10.0)));
+        let c1 = add_shape(
+            &mut doc,
+            layer,
+            Shape::Circle(Circle::new(Point2::new(200.0, 30.0), 20.0)),
+        );
+        let c2 = add_shape(
+            &mut doc,
+            layer,
+            Shape::Circle(Circle::new(Point2::new(240.0, 30.0), 20.0)),
+        );
+        let c3 = add_shape(
+            &mut doc,
+            layer,
+            Shape::Circle(Circle::new(Point2::new(240.0, 100.0), 20.0)),
+        );
+        let a1 = add_shape(
+            &mut doc,
+            layer,
+            Shape::Arc(Arc::new(
+                Point2::new(240.0, 90.0),
+                10.0,
+                0.0,
+                std::f64::consts::PI,
+            )),
+        );
+        // 内接で 2 つ目が大きい形（`LargerCircle::Second`）用。
+        let c4 = add_shape(
+            &mut doc,
+            layer,
+            Shape::Circle(Circle::new(Point2::new(400.0, 0.0), 5.0)),
+        );
+        let c5 = add_shape(
+            &mut doc,
+            layer,
+            Shape::Circle(Circle::new(Point2::new(400.0, 10.0), 15.0)),
+        );
+        // 右側の接線用（線の向きの右に中心がある）。
+        let l6 = add_shape(&mut doc, layer, seg((400.0, 200.0), (500.0, 200.0)));
+        let c6 = add_shape(
+            &mut doc,
+            layer,
+            Shape::Circle(Circle::new(Point2::new(450.0, 180.0), 20.0)),
+        );
+        doc.apply(Command::RemoveEntity(dead)).unwrap();
+
+        add_constraint(&mut doc, Constraint::Horizontal { line: l1 });
+        add_constraint(&mut doc, Constraint::Vertical { line: l2 });
+        add_constraint(
+            &mut doc,
+            Constraint::Coincident {
+                a: pref(l1, PointKind::End),
+                b: pref(l2, PointKind::Start),
+            },
+        );
+        let k = Constraint::distance(&doc, pref(l1, PointKind::Start), pref(l1, PointKind::End))
+            .unwrap();
+        add_constraint(&mut doc, k);
+        add_constraint(&mut doc, Constraint::Parallel { a: l1, b: l3 });
+        add_constraint(&mut doc, Constraint::Perpendicular { a: l1, b: l2 });
+        add_constraint(&mut doc, Constraint::EqualLength { a: l2, b: l4 });
+        let k = Constraint::fix_point(&doc, pref(l1, PointKind::Start)).unwrap();
+        add_constraint(&mut doc, k);
+        let k = Constraint::angle(&doc, l1, l2).unwrap();
+        add_constraint(&mut doc, k);
+        let k = Constraint::point_line_distance(&doc, pref(l3, PointKind::Start), l1).unwrap();
+        add_constraint(&mut doc, k);
+        add_constraint(
+            &mut doc,
+            Constraint::PointLineDistance {
+                point: pref(a1, PointKind::End),
+                line: l3,
+                side: Side::Right,
+                value: 30.0,
+            },
+        );
+        add_constraint(&mut doc, Constraint::EqualRadius { a: c1, b: c2 });
+        let k = Constraint::radius(&doc, c1).unwrap();
+        add_constraint(&mut doc, k);
+        let k = Constraint::tangent_circles(&doc, c1, c2).unwrap();
+        add_constraint(&mut doc, k);
+        let k = Constraint::tangent_line_circle(&doc, l5, c1).unwrap();
+        add_constraint(&mut doc, k);
+        let k = Constraint::tangent_circles(&doc, c3, a1).unwrap();
+        add_constraint(&mut doc, k);
+        let k = Constraint::tangent_circles(&doc, c4, c5).unwrap();
+        assert!(matches!(
+            k,
+            Constraint::TangentCircles {
+                kind: CircleTangency::Internal(mcad_core::LargerCircle::Second),
+                ..
+            }
+        ));
+        add_constraint(&mut doc, k);
+        let k = Constraint::tangent_line_circle(&doc, l6, c6).unwrap();
+        assert!(matches!(
+            k,
+            Constraint::TangentLineCircle {
+                side: Side::Right,
+                ..
+            }
+        ));
+        add_constraint(&mut doc, k);
+        let k = Constraint::radius(&doc, a1).unwrap();
+        add_constraint(&mut doc, k);
+        let k = Constraint::fix_point(&doc, pref(a1, PointKind::End)).unwrap();
+        add_constraint(&mut doc, k);
+        let k = Constraint::fix_point(&doc, pref(c1, PointKind::Center)).unwrap();
+        add_constraint(&mut doc, k);
+        add_constraint(&mut doc, Constraint::FixEntity { entity: c3 });
+        doc
+    }
+
+    #[test]
+    fn constraints_round_trip_through_json() {
+        let doc = document_with_all_constraints();
+        assert_eq!(doc.constraint_count(), 22);
+
+        let json = to_json(&doc).unwrap();
+        let loaded = load(&json).unwrap();
+
+        // EntityId は変わるので Constraint を直接は比べず、DTO で比べる。
+        assert_eq!(export_document(&loaded), export_document(&doc));
+        assert_eq!(loaded.constraint_count(), doc.constraint_count());
+        assert_eq!(loaded.entity_count(), doc.entity_count());
+        // 読込操作は undo できない（読込後は履歴が空）。
+        assert!(!loaded.can_undo());
+        assert!(!loaded.can_redo());
+        // 墓標（消した先頭の図形）があっても添字は生存エンティティの並びで詰まり、
+        // 読込後のどの拘束も満たされている。
+        let file = export_document(&doc);
+        assert_eq!(file.entities.len(), doc.entity_count());
+        for (_, c) in loaded.constraints() {
+            assert_eq!(c.is_satisfied(&loaded), Ok(true), "{c:?}");
+        }
+        // DTO の 15 種すべてが現れる。
+        let mut tags: Vec<String> = file
+            .constraints
+            .iter()
+            .map(|c| {
+                let v = serde_json::to_value(c).unwrap();
+                v.as_object().unwrap().keys().next().unwrap().clone()
+            })
+            .collect();
+        tags.sort();
+        tags.dedup();
+        assert_eq!(tags.len(), 15, "{tags:?}");
+    }
+
+    #[test]
+    fn constraints_round_trip_through_a_file_document() {
+        // JSON を経由しない DTO 直渡しの経路（import_document は公開 API）。
+        let doc = document_with_all_constraints();
+        let file = export_document(&doc);
+        let loaded = import_document(&file).unwrap();
+        assert_eq!(export_document(&loaded), file);
+    }
+
+    #[test]
+    fn exported_constraints_key_is_always_written() {
+        // v9 では必須キー: 拘束が無くても空配列を書く。
+        let json = to_json(&Document::new()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["constraints"], serde_json::json!([]));
+    }
+
+    /// 線分 2 本（0: 水平、1: 斜め）・円・ポリライン・文字を持つ文書の DTO。
+    /// インデックスは 0 = 水平線、1 = 斜めの線、2 = 円、3 = ポリライン、4 = 文字。
+    fn base_file() -> FileDocument {
+        let mut doc = Document::new();
+        let layer = doc.default_layer();
+        add_shape(&mut doc, layer, seg((0.0, 0.0), (10.0, 0.0)));
+        add_shape(&mut doc, layer, seg((0.0, 0.0), (10.0, 5.0)));
+        add_shape(
+            &mut doc,
+            layer,
+            Shape::Circle(Circle::new(Point2::new(50.0, 50.0), 5.0)),
+        );
+        add_shape(
+            &mut doc,
+            layer,
+            Shape::Polyline(Polyline::new(
+                vec![Point2::new(0.0, 0.0), Point2::new(1.0, 1.0)],
+                false,
+            )),
+        );
+        add_geom(
+            &mut doc,
+            layer,
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::new(0.0, 0.0),
+                content: "t".to_owned(),
+                height: 3.0,
+                angle: 0.0,
+            }),
+        );
+        export_document(&doc)
+    }
+
+    fn import_with(constraints: Vec<FileConstraint>) -> Result<Document, IoError> {
+        let mut file = base_file();
+        file.constraints = constraints;
+        import_document(&file)
+    }
+
+    fn fp(entity: usize, kind: PointKind) -> FilePointRef {
+        FilePointRef { entity, kind }
+    }
+
+    #[test]
+    fn valid_constraints_in_base_file_are_accepted() {
+        // 以降の拒否テストの対照: 満たされている正しい拘束は読める。
+        let doc = import_with(vec![
+            FileConstraint::Horizontal { line: 0 },
+            FileConstraint::Radius {
+                entity: 2,
+                value: 5.0,
+            },
+        ])
+        .unwrap();
+        assert_eq!(doc.constraint_count(), 2);
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn constraint_with_out_of_range_entity_index_is_rejected() {
+        // 範囲外の検査は拘束を組む前に io で行う。index は constraints 配列内の位置。
+        let err = import_with(vec![
+            FileConstraint::Horizontal { line: 0 },
+            FileConstraint::Horizontal { line: 99 },
+        ])
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                err,
+                IoError::BadConstraintRef {
+                    index: 1,
+                    entity: 99
+                }
+            ),
+            "{err:?}"
+        );
+        // 2 つ目以降の参照（点の entity・2 つ目の線）も見る。
+        let err = import_with(vec![FileConstraint::Coincident {
+            a: fp(0, PointKind::Start),
+            b: fp(5, PointKind::Start),
+        }])
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                err,
+                IoError::BadConstraintRef {
+                    index: 0,
+                    entity: 5
+                }
+            ),
+            "{err:?}"
+        );
+        let err = import_with(vec![FileConstraint::Parallel { a: 0, b: 7 }])
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                IoError::BadConstraintRef {
+                    index: 0,
+                    entity: 7
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn constraint_on_unsupported_entity_kind_is_rejected() {
+        // ポリライン（3）・文字（4）は拘束の対象外。
+        for target in [3, 4] {
+            let err = import_with(vec![FileConstraint::Horizontal { line: target }])
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, IoError::InvalidConstraint { index: 0, .. }),
+                "target {target}: {err:?}"
+            );
+        }
+        // 円は水平拘束の対象ではない（種類違い）。
+        let err = import_with(vec![FileConstraint::Horizontal { line: 2 }])
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, IoError::InvalidConstraint { index: 0, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn constraint_with_mismatched_point_kind_is_rejected() {
+        // 線分に Center は無い。
+        let err = import_with(vec![FileConstraint::Coincident {
+            a: fp(0, PointKind::Center),
+            b: fp(1, PointKind::Start),
+        }])
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, IoError::InvalidConstraint { index: 0, .. }),
+            "{err:?}"
+        );
+        // 円に Start は無い。
+        let err = import_with(vec![FileConstraint::FixPoint {
+            point: fp(2, PointKind::Start),
+            at: Point2::new(55.0, 50.0),
+        }])
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, IoError::InvalidConstraint { index: 0, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn unsatisfied_constraint_is_rejected_not_solved() {
+        // 斜めの線分に水平拘束: 読込時は解かず、読込エラーにする。
+        let err = import_with(vec![FileConstraint::Horizontal { line: 1 }])
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, IoError::UnsatisfiedConstraint { index: 0 }),
+            "{err:?}"
+        );
+        // 値の合わない距離（実際は 10）。
+        let err = import_with(vec![
+            FileConstraint::Horizontal { line: 0 },
+            FileConstraint::Distance {
+                a: fp(0, PointKind::Start),
+                b: fp(0, PointKind::End),
+                value: 11.0,
+            },
+        ])
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, IoError::UnsatisfiedConstraint { index: 1 }),
+            "{err:?}"
+        );
+        // 半径も値が合わなければ未充足（円の実際の半径は 5）。
+        let err = import_with(vec![FileConstraint::Radius {
+            entity: 2,
+            value: 6.0,
+        }])
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, IoError::UnsatisfiedConstraint { index: 0 }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn constraint_with_out_of_range_value_is_rejected_by_core() {
+        // 満たされてはいる（同じ位置の 2 点の距離 0）が、距離の値は長さ許容値より大きい
+        // 正でなければならない: `AddConstraint` が拒否し、IoError::Core になる。
+        let err = import_with(vec![FileConstraint::Distance {
+            a: fp(0, PointKind::Start),
+            b: fp(1, PointKind::Start),
+            value: 0.0,
+        }])
+        .err()
+        .unwrap();
+        assert!(matches!(err, IoError::Core(_)), "{err:?}");
+        // 半径 ≤ 0 は、満たされている形が存在しない（図形の半径は正）ので
+        // 未充足として拒否される。いずれにせよ読込エラーで、黙って丸めない。
+        for value in [0.0, -5.0] {
+            assert!(
+                import_with(vec![FileConstraint::Radius { entity: 2, value }]).is_err(),
+                "radius {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn v9_file_missing_constraints_key_is_rejected() {
+        let json = to_json(&Document::new()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("constraints");
+        let err = load(&serde_json::to_string(&value).unwrap()).err().unwrap();
+        assert!(matches!(err, IoError::Json(_)), "{err:?}");
+    }
+
+    #[test]
+    fn v8_file_with_constraints_key_is_rejected() {
+        // v8 は拘束を持たない。混ぜた v8 は黙って捨てず、読込ごと拒否する。
+        let json = to_json(&Document::new()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["version"] = serde_json::json!(8);
+        // 空配列でも拒否する（キーの存在で判定する）。
+        let err = load(&serde_json::to_string(&value).unwrap()).err().unwrap();
+        assert!(matches!(err, IoError::Json(_)), "{err:?}");
+        value["constraints"] =
+            serde_json::to_value(&export_document(&document_with_all_constraints()).constraints)
+                .unwrap();
+        let err = load(&serde_json::to_string(&value).unwrap()).err().unwrap();
+        assert!(matches!(err, IoError::Json(_)), "{err:?}");
+    }
+
+    #[test]
+    fn v8_file_ignores_other_unknown_keys_as_before() {
+        // v8 として受理していた範囲を狭めない: `constraints` 以外の未知キーは無視する。
+        let json = to_json(&Document::new()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["version"] = serde_json::json!(8);
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("constraints");
+        obj.insert("future_key".to_owned(), serde_json::json!(1));
+        let loaded = load(&serde_json::to_string(&value).unwrap()).unwrap();
+        assert_eq!(loaded.constraint_count(), 0);
+        assert_eq!(loaded.entity_count(), 0);
+    }
+
+    #[test]
+    fn constraint_on_locked_layer_entities_loads() {
+        // ロックは全エンティティと拘束の投入後に適用するので、ロック済みレイヤー上の
+        // 図形への拘束も読める。
+        let mut doc = Document::new();
+        let locked = doc
+            .apply(Command::AddLayer(Layer::new(
+                "locked",
+                Rgb::new(10, 20, 30),
+            )))
+            .unwrap()
+            .layers[0];
+        let l = add_shape(&mut doc, locked, seg((0.0, 0.0), (10.0, 0.0)));
+        let c = add_shape(
+            &mut doc,
+            locked,
+            Shape::Circle(Circle::new(Point2::new(5.0, 5.0), 5.0)),
+        );
+        add_constraint(&mut doc, Constraint::Horizontal { line: l });
+        let k = Constraint::tangent_line_circle(&doc, l, c).unwrap();
+        add_constraint(&mut doc, k);
+        doc.apply(Command::SetLayerProps {
+            id: locked,
+            props: Layer {
+                locked: true,
+                ..doc.layer(locked).unwrap().clone()
+            },
+        })
+        .unwrap();
+
+        let file = export_document(&doc);
+        assert!(file.layers[1].locked);
+        let loaded = load(&to_json(&doc).unwrap()).unwrap();
+        assert_eq!(export_document(&loaded), file);
+        assert_eq!(loaded.constraint_count(), 2);
+        let layer = loaded.entities().next().unwrap().1.layer;
+        assert!(loaded.layer(layer).unwrap().locked);
     }
 }

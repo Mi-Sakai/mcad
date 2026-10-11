@@ -20,6 +20,13 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
   解き直す(`Problem::with_initial_damping`・`LAMBDA_RETRY`)。詳細は DESIGN.md「M13」設計判断3 の実装時追記
 - **ミラーのコピー**(`crates/mcad-app`): `Shift+M` の確定時に、元の図形を残すか削除するかをモーダルで選べる。
   残した場合は鏡映した図形を新しく追加し、拘束は複製しない
+- **`.mcad` v9 で拘束を保存**(`crates/mcad-io`・`crates/mcad-core`・`crates/mcad-app`、M13 タスク98): `FileDocument` に
+  `constraints`(必須キー)を足し、`FileConstraint`/`FilePointRef` でエンティティを `entities` 配列の添字で指す。
+  読込時は解かず、添字が範囲外・対象外の種類・`PointKind` 不一致・保存された形で満たされない拘束は読込エラー
+  (`IoError::BadConstraintRef`/`InvalidConstraint`/`UnsatisfiedConstraint`)。v1〜v8 は拘束なしで読める(v8 に
+  `constraints` キーを混ぜたファイルは拒否)。core は `Constraint` の `#[non_exhaustive]` を外し、`PointKind`・
+  `Side`・`LargerCircle`・`CircleTangency` に serde を導出。拘束のある図面を DXF へ書き出すとステータスバーに
+  `Constraints are not saved to DXF` が出る。詳細は DESIGN.md「M13」設計判断5 の実装時追記
 
 ## [0.12.0] - 2026-09-27 — 作図補助
 

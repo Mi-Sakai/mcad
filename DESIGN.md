@@ -1540,7 +1540,44 @@ M13 以降の詳細設計は、各マイルストーン着手時に本章へ追�
      `AddConstraint` 相当を積み、最後に `clear_history()`。
    - 添字が範囲外・対象外の種類(ポリライン等)・`PointKind` が合わない拘束も読込エラー。
    - **DXF には書き出さない**(DXF に対応する表現が無い)。拘束のある図面を DXF へ書き出したときは
-     ステータスバーに「拘束は DXF に保存されません」と出す。DXF 読込では拘束は作らない。
+     ステータスバーに `Constraints are not saved to DXF` と出す(下の実装時追記)。DXF 読込では拘束は作らない。
+   - **実装時の設計方針追記(2026-10-11、タスク98)**: `crates/mcad-io/src/mcad_file.rs`。
+     - **`Constraint` の `#[non_exhaustive]` を外した**: 種類が増えたとき、mcad-io の DTO 変換
+       (`FileConstraint::from_core` / `to_core` / `entity_indices`。ワイルドカード腕なし)の網羅 `match` で
+       コンパイラに追従を強制するため(`DimKind` と同じ判断。ワークスペース内に到達不能になる腕は無かった)。
+       core の serde は `PointKind`・`Side`・`LargerCircle`・`CircleTangency` に `Serialize`/`Deserialize` を
+       足しただけ(`Constraint`・`PointRef` は `EntityId` を持つので付けない)。~/tcad の path 依存に対しては
+       非破壊(型の追加と属性の除去のみ)。
+     - **DTO**: `FileConstraint`(`Constraint` の全 15 種の鏡像)と `FilePointRef { entity: usize, kind }`。
+       エンティティは `FileDocument::entities` の添字で指し、書き出しは `doc.entities()` の列挙順で
+       `EntityId` → 添字を作る(墓標は列挙されないので添字は詰まる)。拘束は `doc.constraints()` の順。
+       `FileDocument::constraints` は **v9 の必須キー**(`#[serde(default)]` なし、空でも書く)。
+     - **読込の三分岐**(`import_document`、全エンティティ投入後・ロック適用の前に、配列順に 1 件ずつ):
+       添字が範囲外 → `IoError::BadConstraintRef { index, entity }`(拘束を組む前に io で検査)。
+       組んだ拘束の `is_satisfied` が `Err`(対象外の種類・`PointKind` 不一致) →
+       `IoError::InvalidConstraint { index, reason }`、`Ok(false)` → `IoError::UnsatisfiedConstraint { index }`、
+       `Ok(true)` → `AddConstraint { hold: None }`。値の範囲違反(距離が長さ許容値以下など)は `is_satisfied` が
+       見ないので `apply` が拒否し `IoError::Core` になる。`index` は `constraints` 配列内の添字。
+       半径 ≤ 0 は、図形の半径が正なので値が合わず未充足として拒否される(いずれも読込エラー)。
+     - **v8 の読込**: 凍結 DTO `FileDocumentV8`(`deny_unknown_fields` は付けず、v8 として受理していた範囲を
+       狭めない)から `into_v9`(拘束は空)。`from_json` の v8 腕は JSON 値の段階で、トップレベルに
+       `constraints` キーがあれば **`IoError::Json` で拒否**する(黙って捨てると拘束が消えた図面を無警告で
+       開くことになる。v7 以前の凍結 DTO が `kind` 等を拒否するのと同じ防御)。`col_aligns` の補完
+       (`backfill_missing_v8_col_aligns`)も v8 腕だけで行い、v9 腕は `FileDocument` を素直に読む。
+     - **DXF 書き出しの通知は英語にした**: ステータスバーは英語の領域(AGENTS.md の日本語化規約: 領域内で
+       言語を混在させない)。上の判断の文言「拘束は DXF に保存されません」は `Constraints are not saved to DXF`
+       に改めた。文言の組み立ては純関数 `dxf_export_status(skipped, has_constraints)`(`open_status` と同じ流儀)で、
+       スキップ件数の文言と併発する。`save_dxf` の戻り値は変えていない。
+     - **fixture `v9.mcad` は手書きせず exporter から作った**: `v8.mcad` を読み、線分 5・円 3・円弧 1・ポリライン 1 と
+       全 15 種の拘束 20 件を `Document::apply` で足して `to_json` の出力を書き出した(手順は
+       `tests/fixtures/README.md`)。`v8_fixture_is_exactly_what_the_exporter_writes` は
+       `v8_fixture_still_loads_and_is_upgraded_on_export`(v8 として読めて、書き出しは `version` と空の
+       `constraints` だけが違う)へ書き換えた。
+     - **手動スモークテスト(2026-10-11、ユーザー実施、全 6 項目合格)**: 拘束ツールはタスク99 なので、
+       拘束つきの図面は `tests/fixtures/v9.mcad` を開いて確かめた。`v9.mcad` の読込と読込直後に undo が
+       効かないこと、別名保存と開き直し、DXF 書き出しで `Exported DXF file: Constraints are not saved to DXF`
+       が出てステータスバーに収まること、`v8.mcad` の読込と DXF 書き出しに拘束の文言が出ないこと、新規図面の
+       DXF 書き出しが `Exported DXF file` だけになること。Codex review(同日)は指摘なし。
 6. **拘束の表示と編集 UI**(タスク99・100)。
    - **拘束記号**: 対象の近くに小さな記号(水平 `H`・垂直 `V`・平行 `∥`・直交 `⊥`・等長/等半径 `=`・
      接線 `T`・固定は錠前の簡易図形・一致は点の丸印)を画面上の固定ピクセルサイズで描く。距離・半径・

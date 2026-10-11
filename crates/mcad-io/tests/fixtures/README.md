@@ -2,7 +2,7 @@
 
 | ファイル | 用途 | テスト |
 |---|---|---|
-| `v1.mcad`〜`v8.mcad` | `.mcad` の後方互換 | `tests/backward_compat.rs` |
+| `v1.mcad`〜`v9.mcad` | `.mcad` の後方互換 | `tests/backward_compat.rs` |
 | `v7_legacy_boms.mcad` | v7 以前の旧部品表を表として読む(推測しない) | `tests/backward_compat.rs` |
 | `v8_before_col_aligns.mcad` | `col_aligns` が無いタスク93以前の v8 を左揃え補完で読む | `tests/backward_compat.rs` |
 | `synthetic_dimensions.dxf` | 他 CAD が書いた DXF の DIMENSION import | `tests/dxf_dimensions.rs` |
@@ -34,11 +34,11 @@ fixture 自体の役割は「今後の実装変更で読込結果が変わらな
 
 ## `.mcad` 後方互換 fixture
 
-`v1.mcad` 〜 `v8.mcad` は各フォーマットバージョンのスキーマが表現できる要素を
+`v1.mcad` 〜 `v9.mcad` は各フォーマットバージョンのスキーマが表現できる要素を
 一通り含む実ファイル。テストは `crates/mcad-io/tests/backward_compat.rs`。
 
 各版のスキーマの一次情報は `crates/mcad-io/src/mcad_file.rs` のモジュール doc と
-DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
+DTO 定義（`FileDocument` / `FileDocumentV8` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
 `EntityGeomV7` / `DimLinearV6` / `TableGeomV7` / `SheetMetaV7` 等）。fixture を手で
 書くときは必ずそちらを見て、その版のスキーマに存在しないキーを混ぜないこと
 （**v6 以前に `DimLinear.direction` を、v7 以前に表の `kind`・`col_aligns`・`sheet` の
@@ -50,7 +50,7 @@ DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
 
 ## 次の版を追加するとき
 
-手順は `backward_compat.rs` のモジュール doc「v9 を追加するとき」を参照。
+手順は `backward_compat.rs` のモジュール doc「v10 を追加するとき」を参照。
 
 `v7.mcad` は M11 タスク68 で追加。同じ斜辺 `(0,0)`–`(120,30)` に整列・水平回転・
 鉛直回転の 3 通りの長さ寸法を付けてあり、向きによって表示値が実距離 123.693…・
@@ -61,9 +61,10 @@ DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
 - `v8.mcad` は部品表(`"kind": "Bom"`、ロック済みレイヤー上)・表(`"kind": "Table"`)・
   `"use_bom": false` を持つ。M12 タスク93 で列ごとの揃え(`col_aligns`)を足した(v8 に
   相乗り): 部品表は部品表プリセットの既定(部番・個数・材質・質量[kg] = 中央、品番・名称・
-  備考 = 左)、表は中央・右。**現行版の書き出しと JSON として完全に一致する**ように
-  書いてある(`v8_fixture_is_exactly_what_the_exporter_writes` が固定。キーの過不足・
-  整数と小数の書き分けまで一致させること)。M12 タスク91 で構築線(`XLine`、基点
+  備考 = 左)、表は中央・右。**v8 の書き出しと JSON として完全に一致する**ように
+  書いてある(v9 以前は `v8_fixture_is_exactly_what_the_exporter_writes` が固定していた。キーの
+  過不足・整数と小数の書き分けまで一致させること。v9 の exporter が書くのは `version` と空の
+  `constraints` だけが違う形で、`v8_fixture_still_loads_and_is_upgraded_on_export` が固定する)。M12 タスク91 で構築線(`XLine`、基点
   `(10,20)`・単位方向 `(0.6,0.8)`・線種上書き `DashDot`)を 1 本足した(v8 に相乗り)。
 - `v7_legacy_boms.mcad` は v0.11.0 以前の旧 5 列部品表と v0.11.1 の様式A/C 7 列部品表を
   1 つずつ持つ v7。どちらも表として読まれ(中身から部品表を推測しない)、読込が
@@ -75,5 +76,24 @@ DTO 定義（`FileDocument` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
 `.mcad` v8」）の `v8.mcad` そのもの）。**手で書き換えないこと**
 （過去のビルドが実際に書いた形を保つのが目的）。読込は列数ぶんの左揃えで補って受理し
 （Codex レビュー指摘。その時期の v8 は中央・右揃えを表現できなかったので情報を失わない）、
-書き出すと `col_aligns` 付きの現行 v8 になることを `v8_before_col_aligns_fixture_is_backfilled_as_left`
+書き出すと `col_aligns` 付きの現行版(v9)になることを `v8_before_col_aligns_fixture_is_backfilled_as_left`
 が固定する。
+
+`v9.mcad` は M13 タスク98 で追加。**手書きせず、exporter（`to_json`）の出力を一度書き出して作った**
+(キーの過不足・数値の書き分けまで exporter と一致する)。組み立て手順:
+
+1. `v8.mcad` を `from_json` で読み、`Document` を得る(部品表・表・構築線・長さ寸法などの v8 の要素を引き継ぐ)。
+2. 既定レイヤーに線分 5(うち 4 本は閉じた四辺形、1 本は円に接する横線)・円 3・円弧 1・ポリライン 1 を
+   `Command::AddEntity` で足す。
+3. 拘束を `Command::AddConstraint { hold: None }` で足す。全 15 種を 1 件以上、計 20 件: 水平・垂直・一致・
+   点どうしの距離・平行・直交・等長・点の固定(線分の始点・円弧の終点・円の中心)・角度(90°)・点と線の距離
+   (左側 60 と右側 30)・等半径・半径(円と円弧)・接線(線と円、外接する 2 円、円と円弧の内接)・図形の固定。
+   値・側・外接/内接は `Constraint::distance` / `angle` / `point_line_distance` / `radius` /
+   `tangent_line_circle` / `tangent_circles` / `fix_point` のコンストラクタが現在の形から決める。
+4. `to_json` の出力を `v9.mcad` として保存する。生成に使ったコードは残していない(上の手順で再現できる)。
+
+テストは `backward_compat.rs` の `v9_fixture_loads_with_expected_content`(内容)と
+`v9_fixture_is_exactly_what_the_exporter_writes`(書き出しとの完全一致)。**手で書き換えないこと**
+(書き換えるなら手順を再実行して作り直す。v9 のまま exporter の出力だけが変わって完全一致のテストが
+落ちたときは、現在の `v9.mcad` を `from_json` で読み `to_json` で書き直せば足りる)。v8 以前に拘束が無いことは `fixtures_before_v9_have_no_constraints`、
+v8 が v9 へ引き上がって書き出されることは `v8_fixture_still_loads_and_is_upgraded_on_export`。

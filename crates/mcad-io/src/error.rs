@@ -18,7 +18,10 @@ pub enum IoError {
     File(#[from] std::io::Error),
 
     /// 対応していないフォーマットバージョン。
-    #[error("unsupported format version: {0} (supported: 1)")]
+    #[error(
+        "unsupported format version: {0} (supported: 1..={max})",
+        max = crate::FORMAT_VERSION
+    )]
     UnsupportedVersion(u32),
 
     /// レイヤーが 1 つもない（`Document` はデフォルトレイヤーを必ず持つため、
@@ -46,6 +49,33 @@ pub enum IoError {
         index: usize,
         /// 不正の内容。
         reason: String,
+    },
+
+    /// 拘束が指すエンティティの添字が `entities` 配列の範囲外（v9）。
+    #[error("constraint {index} references missing entity {entity}")]
+    BadConstraintRef {
+        /// constraints 配列内のインデックス。
+        index: usize,
+        /// 参照していたエンティティの添字。
+        entity: usize,
+    },
+
+    /// 拘束が対象にできない図形（ポリライン・文字など）や合わない点の種類を指している
+    /// （v9。例: 線分の `Center`、円の `Start`）。
+    #[error("constraint {index} is invalid: {reason}")]
+    InvalidConstraint {
+        /// constraints 配列内のインデックス。
+        index: usize,
+        /// 不正の内容。
+        reason: String,
+    },
+
+    /// 拘束が保存された形のままでは満たされていない（v9）。読込時は解かないので、
+    /// 手編集等で壊れたファイルは読込エラーにする。
+    #[error("constraint {index} is not satisfied by the saved geometry")]
+    UnsatisfiedConstraint {
+        /// constraints 配列内のインデックス。
+        index: usize,
     },
 
     /// import 中の再構築コマンドをコアが拒否した（バリデーション通過後は

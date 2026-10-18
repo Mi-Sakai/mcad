@@ -9,6 +9,7 @@
 
 mod bom;
 mod config;
+mod constraint_panel;
 mod constraint_symbols;
 mod constraint_tool;
 #[cfg(test)]
@@ -31,13 +32,13 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Key, Pos2, Rect, Stroke};
 
 use mcad_core::{
-    ArrowPlacement, Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimExpansion,
-    DimKind, DimLinear, DimOrdinate, DimRadial, DimRender, DimStyle, Document, Entity, EntityGeom,
-    EntityId, FitClass, HorizontalAlign, Layer, LayerId, Linetype, MAX_DIM_DECIMALS, Orientation,
-    PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta, SizeTolerance, Style, TableGeom, TableKind,
-    TextGeom, TitleBlockFields, TitleBlockKind, ValueStyle, WidthMm, XLineGeom,
-    arrow_kind_occupies_line, expand_dim, expand_table, label_box_center, label_box_contains,
-    linear_pick_segments, table_world_aabb,
+    ArrowPlacement, Command, ConstraintId, DimAngular, DimAnnotation, DimDiameter, DimDirection,
+    DimExpansion, DimKind, DimLinear, DimOrdinate, DimRadial, DimRender, DimStyle, Document,
+    Entity, EntityGeom, EntityId, FitClass, HorizontalAlign, Layer, LayerId, Linetype,
+    MAX_DIM_DECIMALS, Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta,
+    SizeTolerance, Style, TableGeom, TableKind, TextGeom, TitleBlockFields, TitleBlockKind,
+    ValueStyle, WidthMm, XLineGeom, arrow_kind_occupies_line, expand_dim, expand_table,
+    label_box_center, label_box_contains, linear_pick_segments, table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, ArrowKind, DimSymbol, LineSeg, Point2, Polyline, Shape, clip_line_to_aabb,
@@ -55,7 +56,7 @@ use numeric_input::{KeyRouting, NumericInputState};
 // [`dim_sizes`] 参照）。
 use plot::dash_pattern_mm;
 
-use constraint_tool::{ConstraintKind, ConstraintTool};
+use constraint_tool::{ConstraintKind, ConstraintTool, ValueUnit};
 use tool::{
     ArcTool, ChamferDistInput, ChamferTool, CircleTool, DIM_DEGENERATE_EPSILON, DimAngularTool,
     DimDiameterTool, DimLinearTool, DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput,
@@ -818,6 +819,12 @@ struct McadApp {
     /// （[`constraint_tool::parse_value_input`]）。フィレット半径欄と同じく文字列は
     /// セッション中保持し、新規・読込で [`McadApp::reset_transient_ui_state`] がクリアする。
     constraint_value_input: String,
+    /// 右パネル「拘束」セクションの状態（自由度のキャッシュと値の編集バッファ。
+    /// M13 タスク100）。
+    constraint_panel: constraint_panel::ConstraintPanelState,
+    /// 右パネル「拘束」の行にマウスが乗っている拘束（ビューポートでハイライトする）。
+    /// 毎フレーム右パネルが決め直す。
+    hovered_constraint: Option<ConstraintId>,
     /// アプリ設定（トグル・既定用紙/尺度/様式・最近使ったファイル）。実行時の唯一の
     /// 置き場（M8 タスク41）。スナップ有効/無効（`F3`）・直交モード（`F8`、v0.7.1。
     /// `Line`/`Polyline`/`Arc` の作図中、スナップ候補が無い場所でだけ直前の点から
@@ -1352,6 +1359,8 @@ impl McadApp {
             select_tool: SelectTool::default(),
             constraint_tool: ConstraintTool::default(),
             constraint_value_input: String::new(),
+            constraint_panel: constraint_panel::ConstraintPanelState::default(),
+            hovered_constraint: None,
             config: startup.config,
             config_path: startup.path,
             snap_marker: None,
@@ -1478,6 +1487,10 @@ impl McadApp {
         self.select_tool.cancel_text_drag();
         self.select_tool.cancel_grip_drag();
         self.constraint_tool.reset();
+        // 選択中の拘束は `clear_selection` が捨てる。自由度のキャッシュは世代が `0` へ戻る
+        // ので持ち越さない。
+        self.constraint_panel.reset();
+        self.hovered_constraint = None;
         // 読込前の距離・半径入力は持ち越さない（別図面では意味が変わるため）。
         self.offset_distance_input.clear();
         self.constraint_value_input.clear();
@@ -1615,6 +1628,9 @@ impl McadApp {
         // 拘束ツールの選んだ対象も捨てる（undo/redo で消えた図形を指したまま確定させない。
         // 種類は保つ）。
         self.constraint_tool.reset();
+        // 選択中の拘束も捨てる（undo/redo の後は拘束の有無・値が変わりうる）。
+        self.select_tool.clear_constraint();
+        self.constraint_panel.reset();
         self.select_tool.cancel_placement();
         // オフセットモードも解除する（対象が undo/redo で消えたり、選択の意図が崩れたら
         // 宙ぶらりんのオフセットを残さない。設計判断2 と同じ思想）。
@@ -2923,11 +2939,18 @@ impl eframe::App for McadApp {
                         self.constraint_tool.set_kind(selected);
                         if let Some(unit) = selected.value_unit() {
                             ui.label("Value:");
-                            ui.add(
+                            let response = ui.add(
                                 egui::TextEdit::singleline(&mut self.constraint_value_input)
                                     .desired_width(56.0)
                                     .hint_text("current"),
                             );
+                            if unit == ValueUnit::Deg {
+                                // 角度の符号は今の形に合わせる（`constraint_tool::align_angle_sign`）。
+                                response.on_hover_text(
+                                    "Angle from the 1st line to the 2nd, CCW; \
+                                     the sign follows the current shape",
+                                );
+                            }
                             ui.label(unit.label());
                         }
                         ui.label(self.constraint_tool.prompt());
@@ -3050,6 +3073,10 @@ impl eframe::App for McadApp {
         }
 
         let mut xlines_deleted = false;
+        // 選んだ拘束が墓標になっていたら（右パネルの削除・undo 等）選択を捨てる。
+        // ホバーは右パネルが毎フレーム決め直す。
+        self.select_tool.retain_constraint_alive(&self.document);
+        self.hovered_constraint = None;
         egui::Panel::right("layer_panel").show(ui, |ui| {
             layer_panel(ui, &mut self.document, &mut self.status, now);
             xlines_deleted =
@@ -3103,6 +3130,23 @@ impl eframe::App for McadApp {
                 self.select_tool.selection(),
                 &mut self.table_dialog,
             );
+            let constraint_outcome = constraint_panel::constraint_panel(
+                ui,
+                &mut self.document,
+                &self.select_tool,
+                &mut self.constraint_panel,
+                &mut self.hovered_constraint,
+                &mut self.config.constraint_symbols_visible,
+                &mut self.status,
+                now,
+            );
+            if constraint_outcome.visibility_changed {
+                // 記号を隠したら、記号で選んだ拘束も捨てる。
+                if !self.config.constraint_symbols_visible {
+                    self.select_tool.clear_constraint();
+                }
+                self.persist_config(now);
+            }
             let (sheet_changed, plot_color_mode_changed) = sheet_panel(
                 ui,
                 &mut self.document,
@@ -3196,6 +3240,7 @@ impl eframe::App for McadApp {
                         dim_scale_k,
                         &mut self.numeric_input,
                         numeric_submit,
+                        self.config.constraint_symbols_visible,
                     );
                 } else if self.tool_kind == ToolKind::Constraint {
                     // 拘束ツール（M13 タスク99）はスナップ・極トラッキングを使わず、端点・中心と
@@ -3295,12 +3340,32 @@ impl eframe::App for McadApp {
                 &self.select_tool,
             );
             // 拘束記号（M13 タスク99、設計判断6）。画面固定サイズで図形・選択の上に描く。
-            // 拘束が無ければ `constraint_symbols` が即座に空を返す（検収 (xiii)）。表示の
-            // ON/OFF はタスク100。
-            constraint_symbols::draw_constraint_symbols(
-                &painter,
-                &constraint_symbols::constraint_symbols(&self.document, &self.viewport, rect),
-            );
+            // 拘束が無ければ `constraint_symbols` が即座に空を返す（検収 (xiii)）。右パネルの
+            // チェックボックスが OFF の間は計算も描画もしない（タスク100）。
+            if self.config.constraint_symbols_visible {
+                let symbols =
+                    constraint_symbols::constraint_symbols(&self.document, &self.viewport, rect);
+                constraint_symbols::draw_constraint_symbols(&painter, &symbols);
+                for id in [
+                    self.select_tool.selected_constraint(),
+                    self.hovered_constraint,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    constraint_symbols::draw_symbol_highlight(&painter, &symbols, id);
+                }
+            }
+            // 選択中・ホバー中の拘束の対象図形をハイライトする（記号を隠していても対象は示す）。
+            for id in [
+                self.select_tool.selected_constraint(),
+                self.hovered_constraint,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                draw_constraint_targets(&painter, rect, &self.document, &self.viewport, id);
+            }
             if self.tool_kind == ToolKind::Constraint {
                 draw_constraint_tool(
                     &painter,
@@ -3839,6 +3904,8 @@ fn handle_tool_shortcut_keys(
         // 拘束ツールの選んだ対象もツールの切り替え（同じ `Q` の再押下を含む）で捨てる
         // （作図ツールが `spawn()` で初期状態へ戻るのと同じ。種類は保つ）。
         constraint_tool.reset();
+        // 選んだ拘束もツールの切り替えで捨てる（エンティティの選択は従来どおり）。
+        select_tool.clear_constraint();
         // ツール切替は進行中の配置モード（Ctrl+D 複製等）・オフセットモードを解除する。
         // Select のままの再選択（S）でも確定させずに畳む（DESIGN.md 設計判断2・5）。
         select_tool.cancel_placement();
@@ -3961,6 +4028,34 @@ fn handle_constraint_input(
 
     if ui.input(|i| i.key_pressed(Key::Escape)) && !constraint_tool.cancel() {
         *tool_kind = ToolKind::Select;
+    }
+}
+
+/// 拘束 `id` の対象図形を拘束記号の色の太線で重ね描きする（選択中・右パネルのホバー中の
+/// ハイライト。M13 タスク100）。
+fn draw_constraint_targets(
+    painter: &egui::Painter,
+    rect: Rect,
+    document: &Document,
+    viewport: &Viewport,
+    id: ConstraintId,
+) {
+    let Some(constraint) = document.constraint(id) else {
+        return;
+    };
+    let stroke = Stroke::new(2.5, constraint_symbols::CONSTRAINT_COLOR);
+    for entity in constraint.entities() {
+        if let Some(shape) = document.entity(entity).and_then(|e| e.geom.as_shape()) {
+            draw_shape(
+                painter,
+                rect,
+                viewport,
+                shape,
+                stroke,
+                Linetype::Continuous,
+                1.0,
+            );
+        }
     }
 }
 
@@ -8377,6 +8472,7 @@ fn handle_select_input(
     dim_scale_k: f64,
     numeric: &mut NumericInputState,
     numeric_submit: bool,
+    constraint_symbols_visible: bool,
 ) {
     // オフセットモード中は専用経路が入力を占有する（配置モードと同じ入力ゲート思想）。
     if select_tool.is_offsetting() {
@@ -8495,13 +8591,19 @@ fn handle_select_input(
     // テキスト入力欄にフォーカスがある間は無効（差し戻し対応C。欄の編集キーがそのまま
     // ドキュメント操作へ漏れないようにする）。
     let canvas_key_shortcuts_enabled = select_canvas_key_shortcuts_enabled(text_focused);
+    // 拘束記号を選んでいるときは、その拘束だけを消す（エンティティは消さない。M13 タスク100）。
     if canvas_key_shortcuts_enabled
         && ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
-        && let Some(cmd) = select_tool.delete_command()
     {
-        match document.apply(cmd) {
-            Ok(_) => select_tool.clear_selection(),
-            Err(err) => set_status(status, now, format!("Delete failed: {err}")),
+        if let Some(id) = select_tool.selected_constraint() {
+            if constraint_panel::remove_constraint(document, id, status, now) {
+                select_tool.clear_constraint();
+            }
+        } else if let Some(cmd) = select_tool.delete_command() {
+            match document.apply(cmd) {
+                Ok(_) => select_tool.clear_selection(),
+                Err(err) => set_status(status, now, format!("Delete failed: {err}")),
+            }
         }
     }
 
@@ -8654,8 +8756,25 @@ fn handle_select_input(
                 select_tool.on_drag_end(document, world);
             }
         } else if response.clicked_by(egui::PointerButton::Primary) {
-            let shift = ui.input(|i| i.modifiers.shift);
-            select_tool.on_click(document, world, tol, shift);
+            // 優先順位は 寸法グリップ > 拘束記号 > エンティティのピック（M13 タスク100）。
+            // グリップが当たる位置では記号を選ばず、従来のピックへ進む。拘束が無い文書や
+            // 記号を隠している間は記号を数えない。
+            let symbol = if constraint_symbols_visible
+                && dim_grip_hit(document, select_tool.selection(), rect, viewport, pos).is_none()
+            {
+                constraint_panel::hit_symbol(
+                    &constraint_symbols::constraint_symbols(document, viewport, rect),
+                    pos,
+                )
+            } else {
+                None
+            };
+            if let Some(id) = symbol {
+                select_tool.select_constraint(id);
+            } else {
+                let shift = ui.input(|i| i.modifiers.shift);
+                select_tool.on_click(document, world, tol, shift);
+            }
         }
     }
 }
@@ -13153,6 +13272,7 @@ mod tests {
                 plot_color_mode: plot::PlotColorMode::default(),
                 grid_mode: config::GridMode::default(),
                 snap_kinds: snap::SnapKinds::default(),
+                constraint_symbols_visible: true,
             },
             path: Some(PathBuf::from("/tmp/mcad-app-test/config.json")),
             warning: Some("something went wrong".to_owned()),
@@ -16813,6 +16933,197 @@ mod numeric_input_app_tests {
         // 種類はツールを抜けても保つ。
         h.press(Key::Q);
         assert_eq!(h.app.constraint_tool.kind(), ConstraintKind::Parallel);
+    }
+
+    /// 拘束記号のテスト用の場面。水平な線分 1 本（中点が `CANVAS_POS`）と水平拘束 1 件を作り、
+    /// `(線分, 拘束, 記号の中心, 線分の中点, キャンバス矩形)` を返す。キャンバスの矩形は
+    /// アプリが保持しないので、点ツールのクリックで実測した原点から、`world_to_screen` が
+    /// 矩形の中心だけに依ることを使って組み直す。
+    fn constrained_line_scene(h: &mut Harness) -> (EntityId, ConstraintId, Pos2, Pos2, Rect) {
+        h.app.config.snap_enabled = false;
+        h.type_text("1");
+        click_at(h, CANVAS_POS);
+        let origin = match h.shapes().as_slice() {
+            [Shape::Point(p)] => *p,
+            other => panic!("expected one point, got {other:?}"),
+        };
+        assert!(h.app.document.undo());
+        h.press(Key::Escape);
+        let zoom = h.app.viewport.zoom;
+        let world = |pos: Pos2| {
+            Point2::new(
+                origin.x + f64::from(pos.x - CANVAS_POS.x) / zoom,
+                origin.y - f64::from(pos.y - CANVAS_POS.y) / zoom,
+            )
+        };
+        let layer = h.app.document.current_layer();
+        let id = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(
+                    world(Pos2::new(CANVAS_POS.x - 80.0, CANVAS_POS.y)),
+                    world(Pos2::new(CANVAS_POS.x + 80.0, CANVAS_POS.y)),
+                )),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        let constraint = h
+            .app
+            .document
+            .apply(Command::AddConstraint {
+                constraint: mcad_core::Constraint::Horizontal { line: id },
+                hold: None,
+            })
+            .unwrap()
+            .constraints[0];
+        h.run(Vec::new());
+        // 矩形の中心だけが効く。適当な矩形で原点の画面位置を求め、`CANVAS_POS` に合わせて動かす。
+        let guess = Rect::from_center_size(Pos2::new(400.0, 400.0), egui::vec2(800.0, 600.0));
+        let at = h.app.viewport.world_to_screen(guess, origin);
+        let rect = guess.translate(CANVAS_POS - at);
+        let symbols =
+            constraint_symbols::constraint_symbols(&h.app.document, &h.app.viewport, rect);
+        assert_eq!(symbols.len(), 1);
+        (id, constraint, symbols[0].center, CANVAS_POS, rect)
+    }
+
+    /// 選択モードで拘束記号をクリックするとその拘束を選び、エンティティの選択は外れる。
+    /// `Delete` はその拘束だけを消し（図形は残る）、undo 1 回で戻る。
+    #[test]
+    fn clicking_a_constraint_symbol_selects_it_and_delete_removes_only_the_constraint() {
+        let mut h = Harness::new();
+        let (id, constraint, symbol, mid, _) = constrained_line_scene(&mut h);
+
+        click_at(&mut h, mid);
+        assert_eq!(h.app.select_tool.selection(), &[id]);
+        assert_eq!(h.app.select_tool.selected_constraint(), None);
+
+        click_at(&mut h, symbol);
+        assert_eq!(h.app.select_tool.selected_constraint(), Some(constraint));
+        assert!(h.app.select_tool.selection().is_empty(), "排他");
+
+        h.press(Key::Delete);
+        assert_eq!(h.app.document.constraint_count(), 0);
+        assert!(h.app.document.entity(id).is_some(), "図形は消さない");
+        assert_eq!(h.app.select_tool.selected_constraint(), None);
+        assert_eq!(
+            h.app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Removed constraint")
+        );
+
+        // undo 1 回で拘束だけが戻る（図形の削除は履歴に無い）。
+        h.run_with(
+            vec![key_press_with(Key::Z, egui::Modifiers::COMMAND)],
+            egui::Modifiers::COMMAND,
+        );
+        assert_eq!(h.app.document.constraint_count(), 1);
+        assert!(h.app.document.entity(id).is_some());
+    }
+
+    /// 記号と図形が重なる位置では記号が優先。表示 OFF の間は記号に当たらず、図形のピックになる。
+    #[test]
+    fn constraint_symbol_wins_over_entity_pick_and_hides_when_off() {
+        let mut h = Harness::new();
+        let (id, constraint, symbol, _, rect) = constrained_line_scene(&mut h);
+        // 記号の中心を通る縦の線分（記号の真下の水平線ではなく、記号の位置そのものに重ねる）。
+        let origin_world = |pos: Pos2| h.app.viewport.screen_to_world(rect, pos);
+        let (a, b) = (
+            origin_world(Pos2::new(symbol.x, symbol.y - 30.0)),
+            origin_world(Pos2::new(symbol.x, symbol.y + 3.0)),
+        );
+        let layer = h.app.document.current_layer();
+        let vertical = h
+            .app
+            .document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(a, b)),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap()
+            .entities[0];
+        assert_ne!(vertical, id);
+
+        click_at(&mut h, symbol);
+        assert_eq!(h.app.select_tool.selected_constraint(), Some(constraint));
+        assert!(h.app.select_tool.selection().is_empty());
+
+        // 表示 OFF: 選択は捨てられ、同じクリックは図形のピックになる。
+        h.app.config.constraint_symbols_visible = false;
+        h.app.select_tool.clear_constraint();
+        click_at(&mut h, symbol);
+        assert_eq!(h.app.select_tool.selected_constraint(), None);
+        assert_eq!(h.app.select_tool.selection(), &[vertical]);
+    }
+
+    /// 拘束の選択は、空所クリック・図形のクリック・`Esc`・ツール切替・undo で捨てる。
+    /// 選んだ拘束が墓標になっても外れる。
+    #[test]
+    fn constraint_selection_is_discarded_by_other_actions() {
+        let mut h = Harness::new();
+        let (_, constraint, symbol, mid, _) = constrained_line_scene(&mut h);
+        let far = Pos2::new(CANVAS_POS.x + 150.0, CANVAS_POS.y + 150.0);
+
+        click_at(&mut h, symbol);
+        assert_eq!(h.app.select_tool.selected_constraint(), Some(constraint));
+        click_at(&mut h, far);
+        assert_eq!(
+            h.app.select_tool.selected_constraint(),
+            None,
+            "空所クリック"
+        );
+
+        click_at(&mut h, symbol);
+        click_at(&mut h, mid);
+        assert_eq!(
+            h.app.select_tool.selected_constraint(),
+            None,
+            "図形のクリック"
+        );
+        h.press(Key::Escape);
+
+        click_at(&mut h, symbol);
+        h.press(Key::Escape);
+        assert_eq!(h.app.select_tool.selected_constraint(), None, "Esc");
+
+        click_at(&mut h, symbol);
+        h.press(Key::Q);
+        assert_eq!(h.app.select_tool.selected_constraint(), None, "ツール切替");
+        h.press(Key::Escape);
+        h.press(Key::Escape);
+        assert_eq!(h.app.tool_kind, ToolKind::Select);
+
+        click_at(&mut h, symbol);
+        h.run_with(
+            vec![key_press_with(Key::Z, egui::Modifiers::COMMAND)],
+            egui::Modifiers::COMMAND,
+        );
+        assert_eq!(h.app.select_tool.selected_constraint(), None, "undo");
+
+        // 外から墓標にされた（右パネルの削除と同じ）拘束は次のフレームで外れる。
+        h.app.document.redo();
+        click_at(&mut h, symbol);
+        assert_eq!(h.app.select_tool.selected_constraint(), Some(constraint));
+        h.app
+            .document
+            .apply(Command::RemoveConstraint(constraint))
+            .unwrap();
+        h.run(Vec::new());
+        assert_eq!(h.app.select_tool.selected_constraint(), None, "墓標");
+    }
+
+    /// 拘束の無い文書ではクリックが従来どおり（記号の走査をしない）。
+    #[test]
+    fn clicking_without_constraints_keeps_the_entity_pick() {
+        let mut h = Harness::new();
+        let (id, _, _, mid, _) = constrained_line_scene(&mut h);
+        h.app.document.undo();
+        assert_eq!(h.app.document.constraint_count(), 0);
+        click_at(&mut h, mid);
+        assert_eq!(h.app.select_tool.selection(), &[id]);
     }
 
     /// 構築線を 1 本選んで `O` を押すとオフセットモードに入る（M12 タスク91 のスモークテスト後の

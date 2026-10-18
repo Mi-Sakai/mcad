@@ -279,12 +279,30 @@ pub fn parse_value_input(text: &str) -> ValueInput {
 }
 
 /// `(−π, π]` へ正規化する（すでに範囲内なら値を変えない。core の正規化と同じ規則）。
-fn normalize_angle(a: f64) -> f64 {
+pub(crate) fn normalize_angle(a: f64) -> f64 {
     if a > -PI && a <= PI {
         return a;
     }
     let w = a.sin().atan2(a.cos());
     if w <= -PI { PI } else { w }
+}
+
+/// 打った角度 `typed` の符号を現在の角度 `current` の符号にそろえる（ともに `(−π, π]` の
+/// ラジアン。2026-10-18 タスク100 スモーク時のユーザー決定）。
+///
+/// 角度拘束の値は「1 本目から 2 本目への反時計回りの角」で、選んだ順で符号が変わる。利用者は
+/// 符号を意識せず `90` と打つため、符号が逆だと最小ノルム解が線分を 180° 近く余分に回し、
+/// 線分が大きく伸びる（判断3 タスク97 追記の既知の制約 (b)）。そこで大きさだけを打った値から
+/// 取り、向きは今の形に合わせる。`current` が 0 か π（向きが無い）、または `typed` が 0 か π
+/// なら打った値のまま。
+pub(crate) fn align_angle_sign(typed: f64, current: f64) -> f64 {
+    const NO_DIRECTION: f64 = 1e-9;
+    let directed = |a: f64| a.abs() > NO_DIRECTION && PI - a.abs() > NO_DIRECTION;
+    if directed(typed) && directed(current) && typed.signum() != current.signum() {
+        -typed
+    } else {
+        typed
+    }
 }
 
 /// [`ConstraintTool::click`] の結果。
@@ -679,7 +697,7 @@ pub fn build_command(
             let mut c =
                 Constraint::angle(document, entity(first)?, entity(second)?).map_err(fail)?;
             if let (Some(v), Constraint::Angle { value, .. }) = (typed, &mut c) {
-                *value = v;
+                *value = align_angle_sign(v, *value);
             }
             c
         }

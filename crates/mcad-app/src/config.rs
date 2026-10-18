@@ -105,6 +105,11 @@ pub struct Config {
     /// OFF、他は ON）へ補完される。フィールド単位でも `#[serde(default)]` を持つため、
     /// 種別が増えても同じ経路で前方互換になる（[`SnapKinds`] の doc 参照）。
     pub snap_kinds: SnapKinds,
+    /// 拘束記号を描くか（右パネル「拘束」セクションのチェックボックス。M13 タスク100、
+    /// DESIGN.md M13 設計判断6）。画面表示のみで図面データには無関係。旧バージョンの
+    /// config.json（このフィールドが存在しない）はコンテナの `#[serde(default)]` により
+    /// [`Config::default`] の `true` へ補完される。
+    pub constraint_symbols_visible: bool,
 }
 
 impl Default for Config {
@@ -123,6 +128,7 @@ impl Default for Config {
             plot_color_mode: PlotColorMode::default(),
             grid_mode: GridMode::default(),
             snap_kinds: SnapKinds::default(),
+            constraint_symbols_visible: true,
         }
     }
 }
@@ -399,6 +405,7 @@ mod tests {
         assert!(!config.polar_enabled);
         assert_eq!(config.polar_step, PolarStep::Fifteen);
         assert_eq!(config.snap_kinds, SnapKinds::default());
+        assert!(config.constraint_symbols_visible);
     }
 
     #[test]
@@ -428,6 +435,7 @@ mod tests {
                 nearest: true,
                 grid: false,
             },
+            constraint_symbols_visible: false,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let parsed: Config = serde_json::from_str(&json).unwrap();
@@ -472,6 +480,17 @@ mod tests {
         let config: Config =
             serde_json::from_str(r#"{"snap_enabled": false, "default_paper": "A1"}"#).unwrap();
         assert_eq!(config.plot_color_mode, PlotColorMode::Monochrome);
+    }
+
+    /// 旧バージョンの config.json（`constraint_symbols_visible` フィールドが存在しない）を
+    /// 読み込んだとき、`true`（記号を表示）へ補完される。`false` の保存は往復する
+    /// （M13 タスク100）。
+    #[test]
+    fn missing_constraint_symbols_visible_field_defaults_to_true() {
+        let config: Config = serde_json::from_str(r#"{"snap_enabled": false}"#).unwrap();
+        assert!(config.constraint_symbols_visible);
+        let off: Config = serde_json::from_str(r#"{"constraint_symbols_visible": false}"#).unwrap();
+        assert!(!off.constraint_symbols_visible);
     }
 
     /// `plot_color_mode` に存在しない値（不正値）が入っている config.json は、

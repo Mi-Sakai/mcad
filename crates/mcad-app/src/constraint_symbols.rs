@@ -36,6 +36,8 @@ use crate::viewport::Viewport;
 /// テーマに依らず暗色（`from_gray(30)`）で、記号は暗い下地の上に描くので図形の色とも
 /// 重ならない。
 pub const CONSTRAINT_COLOR: Color32 = Color32::from_rgb(255, 120, 190);
+/// 選択中・ホバー中の記号を囲む枠の色（拘束ツールの選んだ対象と同じ作図プレビューの暖色）。
+const HIGHLIGHT_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 /// 記号の下地（図形の上でも読めるよう不透明に近い暗色）。
 const SYMBOL_BG_COLOR: Color32 = Color32::from_rgba_premultiplied(20, 20, 20, 220);
 /// 記号の文字の大きさ（px）。
@@ -89,7 +91,7 @@ pub struct ConstraintSymbol {
 }
 
 /// 値の表示（mm は小数 3 桁、度は小数 2 桁まで。末尾の 0 は落とす）。
-fn format_number(v: f64, decimals: usize) -> String {
+pub(crate) fn format_number(v: f64, decimals: usize) -> String {
     let s = format!("{v:.decimals$}");
     let s = if s.contains('.') {
         s.trim_end_matches('0').trim_end_matches('.').to_owned()
@@ -467,6 +469,16 @@ pub fn draw_constraint_symbols(painter: &Painter, symbols: &[ConstraintSymbol]) 
                 );
             }
         }
+    }
+}
+
+/// 拘束 `id` の記号を強調する（選択中・右パネルのホバー中。M13 タスク100）。
+/// 記号の矩形（`center`±`size/2`）を一回り大きい暖色の枠で囲む。
+pub fn draw_symbol_highlight(painter: &Painter, symbols: &[ConstraintSymbol], id: ConstraintId) {
+    let stroke = Stroke::new(2.0, HIGHLIGHT_COLOR);
+    for symbol in symbols.iter().filter(|s| s.id == id) {
+        let rect = Rect::from_center_size(symbol.center, symbol.size).expand(3.0);
+        painter.rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Outside);
     }
 }
 

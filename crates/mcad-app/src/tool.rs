@@ -41,10 +41,10 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation, DimDiameter, DimDirection,
-    DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom, EntityId,
-    HorizontalAlign, LayerId, Linetype, NewIds, OrdinateAxis, Style, TableGeom, TableKind,
-    XLineGeom, diameter_pick_segments, dim_distance, expand_angular, expand_diameter,
+    Command, ConstraintId, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation, DimDiameter,
+    DimDirection, DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom,
+    EntityId, HorizontalAlign, LayerId, Linetype, NewIds, OrdinateAxis, Style, TableGeom,
+    TableKind, XLineGeom, diameter_pick_segments, dim_distance, expand_angular, expand_diameter,
     expand_linear, expand_ordinate, expand_radial, linear_pick_segments, radial_pick_segments,
     table_world_aabb,
 };
@@ -5158,6 +5158,9 @@ pub struct SelectTool {
     /// 掴む優先順はグリップ > 文字ブロック > 矩形選択（DESIGN.md タスク75）なので、
     /// ヒット判定自体は呼び出し側（`main.rs`）がグリップを最初に試す。
     grip_drag: Option<GripDragState>,
+    /// 選択中の拘束（拘束記号のクリックで選ぶ。M13 タスク100、DESIGN.md M13 設計判断6）。
+    /// エンティティの選択 `selection` とは排他: 一方を選ぶともう一方は捨てる。
+    constraint: Option<ConstraintId>,
 }
 
 /// エンティティの所属レイヤーが可視か（非表示レイヤーは描画・ヒットテスト対象外）。
@@ -5224,9 +5227,37 @@ impl SelectTool {
         &self.selection
     }
 
-    /// 選択を空にする。
+    /// 選択を空にする（選択中の拘束も捨てる）。
     pub fn clear_selection(&mut self) {
         self.selection.clear();
+        self.constraint = None;
+    }
+
+    /// 選択中の拘束。
+    #[must_use]
+    pub fn selected_constraint(&self) -> Option<ConstraintId> {
+        self.constraint
+    }
+
+    /// 拘束を選ぶ。エンティティの選択は解除する（両者は排他）。
+    pub fn select_constraint(&mut self, id: ConstraintId) {
+        self.selection.clear();
+        self.constraint = Some(id);
+    }
+
+    /// 拘束の選択だけを捨てる（エンティティの選択は変えない）。
+    pub fn clear_constraint(&mut self) {
+        self.constraint = None;
+    }
+
+    /// 選んだ拘束が墓標になっていたら選択を捨てる（undo や右パネルの削除の後）。
+    pub fn retain_constraint_alive(&mut self, document: &Document) {
+        if self
+            .constraint
+            .is_some_and(|id| document.constraint(id).is_none())
+        {
+            self.constraint = None;
+        }
     }
 
     /// ドキュメントに存在しなくなったエンティティを選択集合から取り除く。
@@ -5324,6 +5355,9 @@ impl SelectTool {
     ///   （[`SelectTool::on_cancel`]）を使う。
     /// - ヒットなし・`shift` あり: 選択を**全解除**する。
     pub fn on_click(&mut self, document: &Document, world: Point2, tol: f64, shift: bool) {
+        // 拘束記号のクリックは呼び出し側が先に処理する。ここへ来たクリックは拘束の選択を
+        // 捨てる（空所クリックを含む）。
+        self.constraint = None;
         match (self.pick(document, world, tol), shift) {
             (Some(id), false) => {
                 if !self.selection.contains(&id) {
@@ -5483,6 +5517,7 @@ impl SelectTool {
         let Some(DragState { start, .. }) = self.drag.take() else {
             return;
         };
+        self.constraint = None;
         let rect = Aabb::from_corners(start, world);
         let k = document.sheet().scale.world_mm_per_paper_mm();
         // 内包判定は表示上のワールド AABB（`crate::entity_world_aabb`）。Text は紙基準
@@ -5529,6 +5564,7 @@ impl SelectTool {
             self.drag = None;
         } else {
             self.selection.clear();
+            self.constraint = None;
         }
     }
 
@@ -5658,6 +5694,7 @@ impl SelectTool {
     /// 選択集合を丸ごと置き換える。複製確定後に `NewIds.entities`（コマンド順）を
     /// 新しい選択にする用途。イテレータ比較で ID を推測せず、コア側が返した ID を使う。
     pub fn set_selection(&mut self, ids: Vec<EntityId>) {
+        self.constraint = None;
         self.selection = ids;
     }
 

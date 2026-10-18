@@ -324,12 +324,13 @@ fn angle_converts_degrees_to_radians_in_the_half_open_range() {
             Some(a)
         )
     );
+    // 打った値の符号は現在の向き（+45°）へそろえる（`align_angle_sign`）。
     for (deg, rad) in [
         (90.0, FRAC_PI_2),
-        (270.0, -FRAC_PI_2),
+        (270.0, FRAC_PI_2),
         (180.0, PI),
         (-180.0, PI),
-        (-30.0, -PI / 6.0),
+        (-30.0, PI / 6.0),
     ] {
         let cmd = commit(&doc, ConstraintKind::Angle, &clicks, ValueInput::Value(deg));
         let Constraint::Angle { value, .. } = added(&cmd).0 else {
@@ -344,6 +345,42 @@ fn angle_converts_degrees_to_radians_in_the_half_open_range() {
         ValueInput::Value(60.0),
     );
     apply_then_undo(&mut doc, ConstraintKind::Angle, cmd);
+}
+
+/// 選ぶ順を逆にすると現在の角は −45° になり、打った `90` は −90° として扱う
+/// （2026-10-18 タスク100 スモークで、順序によって線分が大きく伸びた件の対処）。
+#[test]
+fn typed_angle_follows_the_current_direction_in_either_pick_order() {
+    let mut doc = Document::new();
+    line(&mut doc, 0.0, 0.0, 10.0, 0.0);
+    line(&mut doc, 0.0, 5.0, 10.0, 15.0);
+    let reversed = [p(5.0, 10.0), p(5.0, 0.0)];
+    let cmd = commit(&doc, ConstraintKind::Angle, &reversed, ValueInput::Empty);
+    let Constraint::Angle { value, .. } = added(&cmd).0 else {
+        panic!();
+    };
+    assert!((value + PI / 4.0).abs() < 1e-12, "{value}");
+    let cmd = commit(
+        &doc,
+        ConstraintKind::Angle,
+        &reversed,
+        ValueInput::Value(90.0),
+    );
+    let Constraint::Angle { value, .. } = added(&cmd).0 else {
+        panic!();
+    };
+    assert!((value + FRAC_PI_2).abs() < 1e-12, "{value}");
+}
+
+#[test]
+fn align_angle_sign_keeps_magnitude_and_takes_the_current_sign() {
+    assert_eq!(align_angle_sign(FRAC_PI_2, -0.5), -FRAC_PI_2);
+    assert_eq!(align_angle_sign(-FRAC_PI_2, 0.5), FRAC_PI_2);
+    assert_eq!(align_angle_sign(FRAC_PI_2, 0.5), FRAC_PI_2);
+    // 現在が 0・π（向きが無い）、打った値が π なら打った値のまま。
+    assert_eq!(align_angle_sign(-FRAC_PI_2, 0.0), -FRAC_PI_2);
+    assert_eq!(align_angle_sign(-FRAC_PI_2, PI), -FRAC_PI_2);
+    assert_eq!(align_angle_sign(PI, -0.5), PI);
 }
 
 #[test]

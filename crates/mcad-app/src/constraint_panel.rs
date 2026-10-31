@@ -6,7 +6,8 @@
 //!
 //! # 自由度のキャッシュ
 //!
-//! `Document::degrees_of_freedom` はヤコビアンの階数計算を伴うので毎フレーム呼ばない。
+//! `Document::degrees_of_freedom_bounded` はヤコビアンの階数計算を伴うので毎フレーム呼ばない
+//! （階数の計算が約 200 ms 相当を超える成分は計算せず、その旨を出す。M13 タスク101 後半）。
 //! 文書の世代番号（[`Document::generation`]）と対象図形の並びをキーに一覧・自由度を持つ
 //! （世代は undo/redo でも履歴時点の値へ戻るので、同じ世代 = 同じ内容）。ファイル読込・新規は
 //! 世代が `0` へ戻るため、`McadApp::reset_transient_ui_state` が [`ConstraintPanelState::reset`]
@@ -15,7 +16,7 @@
 use std::collections::HashMap;
 
 use egui::Pos2;
-use mcad_core::{Command, Constraint, ConstraintId, Document, EntityId};
+use mcad_core::{Command, Constraint, ConstraintId, Document, DofOutcome, EntityId};
 use mcad_geom::Shape;
 
 use crate::constraint_symbols::{ConstraintSymbol, format_number};
@@ -81,8 +82,10 @@ pub fn rows_for(document: &Document, targets: &[EntityId]) -> Vec<ConstraintId> 
 pub struct ComponentDof {
     /// この成分に属する対象図形（`targets` の順）。
     pub members: Vec<EntityId>,
-    /// 自由度。求められなければ `None`。
+    /// 自由度。求められなければ（大きすぎて計算していない場合を含む）`None`。
     pub dof: Option<usize>,
+    /// 成分が大きすぎて階数を計算していない（`dof` は `None`。M13 タスク101 後半）。
+    pub too_large: bool,
 }
 
 /// `targets` を連結成分ごとにまとめ、成分ごとの自由度を求める。
@@ -143,18 +146,30 @@ pub fn dof_components(document: &Document, targets: &[EntityId]) -> Vec<Componen
     groups
         .into_iter()
         .map(|(_, members)| {
-            let dof = document.degrees_of_freedom(members[0]);
-            ComponentDof { members, dof }
+            let (dof, too_large) = match document.degrees_of_freedom_bounded(members[0]) {
+                DofOutcome::Known(dof) => (Some(dof), false),
+                DofOutcome::TooLarge => (None, true),
+                DofOutcome::Unknown => (None, false),
+            };
+            ComponentDof {
+                members,
+                dof,
+                too_large,
+            }
         })
         .collect()
 }
 
 /// 自由度の表示行。成分が 1 つなら `自由度: n`、複数なら成分ごとに 1 行。
 pub fn dof_lines(components: &[ComponentDof]) -> Vec<String> {
-    let value = |dof: Option<usize>| dof.map_or_else(|| "不明".to_owned(), |n| n.to_string());
+    let value = |c: &ComponentDof| match c.dof {
+        Some(n) => n.to_string(),
+        None if c.too_large => "大きすぎるため計算していません".to_owned(),
+        None => "不明".to_owned(),
+    };
     match components {
         [] => Vec::new(),
-        [only] => vec![format!("自由度: {}", value(only.dof))],
+        [only] => vec![format!("自由度: {}", value(only))],
         many => many
             .iter()
             .enumerate()
@@ -163,7 +178,7 @@ pub fn dof_lines(components: &[ComponentDof]) -> Vec<String> {
                     "成分 {}(図形 {} 個): 自由度 {}",
                     i + 1,
                     c.members.len(),
-                    value(c.dof)
+                    value(c)
                 )
             })
             .collect(),

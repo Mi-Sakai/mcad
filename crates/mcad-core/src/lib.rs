@@ -45,11 +45,13 @@
 //!   （[`TangentContact`]）、ミラーしたときに同じ関係を表す拘束は [`Constraint::mirrored`]。
 //!   読み取りは [`Document::constraint`] / [`Document::constraints`] /
 //!   [`Document::constraints_of`] / [`Document::constraint_count`]、連結成分の自由度は
-//!   [`Document::degrees_of_freedom`]。
+//!   [`Document::degrees_of_freedom`]（大きな成分を計算しない入口は
+//!   [`Document::degrees_of_freedom_bounded`] / [`DofOutcome`]）。`ModifyEntity` の結果を文書を変えずに求めるのは
+//!   [`Document::preview_modify`]（グリップのドラッグ中のプレビュー）。
 //!   **[`Document::apply`] が拘束を解く**: コマンドを適用した後の形が拘束を満たさなければ、
 //!   利用者が動かした点を止めたままほかの図形を追従させ、同じ undo 単位に入れる。解けなければ
 //!   コマンド全体を拒否する（[`CoreError::ConstraintUnsolvable`] /
-//!   [`CoreError::ConstraintBlockedByFixed`] / [`CoreError::DegenerateShape`] /
+//!   [`CoreError::ConstraintBlockedByFixed`] / [`CoreError::ConstraintBudgetExceeded`] / [`CoreError::DegenerateShape`] /
 //!   [`CoreError::DegenerateConstraint`]）
 //! - ドキュメント: [`Document`]（エンティティ・レイヤー・カレントレイヤー・
 //!   図面メタデータ・拘束と履歴を保持）
@@ -93,7 +95,7 @@ pub use dim::{
     ArrowPlacement, DimAnnotation, DimKind, DimStyle, FitClass, MAX_DIM_AFFIX_LEN,
     MAX_DIM_DECIMALS, MAX_DIM_STYLE_MM, SizeTolerance, ValueStyle,
 };
-pub use document::{Document, NewIds};
+pub use document::{Document, DofOutcome, NewIds};
 pub use entity::Entity;
 pub use entity_geom::{
     DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimDiameter, DimDirection, DimLinear, DimOrdinate,

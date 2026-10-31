@@ -28,6 +28,8 @@ use crate::{
 
 mod constraints;
 
+pub use constraints::DofOutcome;
+
 /// 実行済みコマンドの逆操作可能な記録（内部専用）。
 ///
 /// 公開 [`Command`] が「意図」を表すのに対し、こちらは実際に起きた変更を
@@ -436,6 +438,10 @@ impl Document {
     ///
     /// 受理した文書では、すべての拘束が [`Constraint::is_satisfied`] を満たす。拘束が 1 件も
     /// 無い文書では何もしない。
+    ///
+    /// 求解には演算量の予算（約 2 秒相当。演算回数で数えるので決定的）があり、使い切ったら
+    /// [`CoreError::ConstraintBudgetExceeded`] でコマンド全体を拒否する。すでに満たされている拘束は
+    /// 予算を使わない。
     pub fn apply(&mut self, cmd: Command) -> Result<NewIds, CoreError> {
         // 原子性（検証→変更、失敗時のロールバック）の保証内容は [`Command::Batch`] の
         // doc（「# 原子性」節）を参照。no-op 判定の仕組みは [`ExecuteOutcome`] の doc を参照。
@@ -766,16 +772,7 @@ impl Document {
         new_geom: EntityGeom,
         reshape: bool,
     ) -> Result<ExecuteOutcome, CoreError> {
-        // NaN/∞座標・負半径などの不正ジオメトリへの差し替えは拒否する
-        // （DESIGN.md M4 タスク15）。
-        new_geom.validate().map_err(CoreError::InvalidGeometry)?;
-        self.require_editable_entity(id)?;
-        // 部品表は 1 図面に 1 つ（M12 タスク81）。対象自身が既に部品表なら数えない
-        // （部品表の移動・編集は通す）。部品表 → 表は常に通る。
-        self.ensure_single_bom(&new_geom, Some(id))?;
-        // 拘束（M13）: 固定された図形の変更・拘束が指せなくなる種類の変更を拒否し、
-        // ReshapeEntity なら消す拘束を決める。ここまでは状態を変えない。
-        let doomed = self.geom_change_effects(id, &new_geom, reshape)?;
+        let doomed = self.check_replace_geom(id, &new_geom, reshape)?;
         let removed_constraints: Vec<(ConstraintId, Constraint)> = doomed
             .into_iter()
             .map(|cid| (cid, self.take_constraint(cid)))
@@ -793,6 +790,26 @@ impl Document {
             },
             changed,
         ))
+    }
+
+    /// [`Document::replace_geom`] の適用前の検証（状態は変えない）。戻り値は消す拘束の ID。
+    /// [`Document::preview_modify`] も通すので、`ModifyEntity` と同じ順で同じ拒否になる。
+    fn check_replace_geom(
+        &self,
+        id: EntityId,
+        new_geom: &EntityGeom,
+        reshape: bool,
+    ) -> Result<Vec<ConstraintId>, CoreError> {
+        // NaN/∞座標・負半径などの不正ジオメトリへの差し替えは拒否する
+        // （DESIGN.md M4 タスク15）。
+        new_geom.validate().map_err(CoreError::InvalidGeometry)?;
+        self.require_editable_entity(id)?;
+        // 部品表は 1 図面に 1 つ（M12 タスク81）。対象自身が既に部品表なら数えない
+        // （部品表の移動・編集は通す）。部品表 → 表は常に通る。
+        self.ensure_single_bom(new_geom, Some(id))?;
+        // 拘束（M13）: 固定された図形の変更・拘束が指せなくなる種類の変更を拒否し、
+        // ReshapeEntity なら消す拘束を決める。
+        self.geom_change_effects(id, new_geom, reshape)
     }
 
     /// [`Applied`] を逆転（undo 方向）に適用する。履歴は一貫しているものとして扱う。

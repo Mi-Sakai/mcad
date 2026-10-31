@@ -442,11 +442,44 @@ pub fn snap(
     extra_points: &[Point2],
     base: Option<Point2>,
 ) -> Option<SnapResult> {
+    snap_excluding(
+        document,
+        cursor,
+        radius,
+        grid,
+        kinds,
+        extra_points,
+        base,
+        None,
+    )
+}
+
+/// [`snap`] の本体。`exclude` のエンティティをスナップ源（端点・中点・交点・仮想交点・近接点
+/// などすべて）から外す。図形のグリップのドラッグ中の図形自身を渡す（M13 タスク101。自分の
+/// 中点や反対の端点へ吸着すると形が退化するため）。`None` なら [`snap`] と同じ。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn snap_excluding(
+    document: &Document,
+    cursor: Point2,
+    radius: f64,
+    grid: GridSpec,
+    kinds: SnapKinds,
+    extra_points: &[Point2],
+    base: Option<Point2>,
+    exclude: Option<EntityId>,
+) -> Option<SnapResult> {
     if !radius.is_finite() || radius <= 0.0 {
         return None;
     }
     let r2 = radius * radius;
     let mut best = Best::new(kinds);
+    // スナップ源になりうるエンティティ（可視レイヤーで、除外されていないもの）。
+    let sources = || {
+        document
+            .entities()
+            .filter(move |(id, e)| Some(*id) != exclude && layer_visible(document, e))
+    };
 
     // 作図中(未確定)ツールの頂点: Document にはまだ無いが端点として最優先で扱う。
     for &p in extra_points {
@@ -454,10 +487,7 @@ pub fn snap(
     }
 
     // 端点・中点・中心: 可視レイヤーの全エンティティを走査（O(n)）。
-    for (_, entity) in document.entities() {
-        if !layer_visible(document, entity) {
-            continue;
-        }
+    for (_, entity) in sources() {
         match &entity.geom {
             EntityGeom::Shape(shape) => enumerate_features(shape, cursor, r2, &mut best),
             // Text はアンカー点のみをスナップ源にする（端点扱い。DESIGN.md M6 設計判断1）。
@@ -483,9 +513,7 @@ pub fn snap(
     // （モジュール doc「構築線」）。使う種別がすべて無効なら集めない。
     let near_xlines: Vec<XLineGeom> =
         if kinds.intersection || kinds.nearest || (base.is_some() && kinds.perpendicular) {
-            document
-                .entities()
-                .filter(|(_, e)| layer_visible(document, e))
+            sources()
                 .filter_map(|(_, e)| match &e.geom {
                     EntityGeom::XLine(xline) => Some(*xline),
                     _ => None,
@@ -496,9 +524,7 @@ pub fn snap(
             Vec::new()
         };
     let near: Vec<&Shape> = if kinds.intersection || kinds.nearest || wants_perp_or_tangent {
-        document
-            .entities()
-            .filter(|(_, e)| layer_visible(document, e))
+        sources()
             .filter(|(_, e)| e.geom.aabb().intersects(&cursor_box))
             // M6: 交点計算は Shape 系のみを対象にする（寸法・テキストは交点源にしない）。
             .filter_map(|(_, e)| e.geom.as_shape())
@@ -590,7 +616,7 @@ pub fn snap(
     // 無損失である理由はモジュール doc 参照）で線要素・円要素を集め、組（線×線・線×円）を
     // 総当たりする。種別が無効なら走査自体を行わない。
     if kinds.virtual_intersection {
-        collect_virtual_intersections(document, cursor, radius, &mut best, r2);
+        collect_virtual_intersections(document, cursor, radius, &mut best, r2, exclude);
     }
 
     // 近接点: 既定 OFF（モジュール doc）なので、無効なら計算自体を省く。有効なら
@@ -1098,13 +1124,14 @@ fn collect_virtual_intersections(
     radius: f64,
     best: &mut Best,
     r2: f64,
+    exclude: Option<EntityId>,
 ) {
     let mut lines: Vec<LineSeg> = Vec::new();
     // (|カーソル-中心間距離 − 半径|, 候補) の組で集め、後で上限まで切り詰める。
     let mut circles: Vec<(f64, CircleCandidate)> = Vec::new();
 
-    for (_, entity) in document.entities() {
-        if !layer_visible(document, entity) {
+    for (id, entity) in document.entities() {
+        if Some(id) == exclude || !layer_visible(document, entity) {
             continue;
         }
         let EntityGeom::Shape(shape) = &entity.geom else {
@@ -1359,6 +1386,86 @@ mod tests {
 
     fn line(ax: f64, ay: f64, bx: f64, by: f64) -> Shape {
         Shape::Line(LineSeg::new(Point2::new(ax, ay), Point2::new(bx, by)))
+    }
+
+    /// 除外したエンティティはどの種別のスナップ源にもならない（M13 タスク101）。除外なしは
+    /// [`snap`] と同じ結果。
+    #[test]
+    fn snap_excluding_removes_every_candidate_of_the_excluded_entity() {
+        let no_grid = GridSpec::new(0.0, GridMode::Rectangular);
+        let kinds = SnapKinds {
+            nearest: true,
+            ..SnapKinds::default()
+        };
+        let snap_with = |doc: &Document, cursor: Point2, exclude| {
+            snap_excluding(doc, cursor, 1.0, no_grid, kinds, &[], None, exclude)
+        };
+
+        // 端点・中点・近接点: 図形が 1 本だけなら、除外すると候補が無い。
+        let mut doc = Document::new();
+        let a = add_id(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        for (cursor, kind) in [
+            (Point2::new(0.1, 0.1), SnapKind::Endpoint),
+            (Point2::new(5.1, 0.1), SnapKind::Midpoint),
+            (Point2::new(2.5, 0.1), SnapKind::Nearest),
+        ] {
+            let found = snap_with(&doc, cursor, None).expect("a candidate");
+            assert_eq!(found.kind, kind);
+            assert_eq!(
+                snap(&doc, cursor, 1.0, no_grid, kinds, &[], None).map(|r| r.point),
+                Some(found.point)
+            );
+            assert_eq!(snap_with(&doc, cursor, Some(a)).map(|r| r.point), None);
+        }
+
+        // 交点: 相手の線分を除外すると交点が消え、自分の近接点だけが残る。
+        let b = add_id(&mut doc, line(3.0, -5.0, 3.0, 15.0));
+        let cursor = Point2::new(3.2, 0.2);
+        assert_eq!(
+            snap_with(&doc, cursor, None).expect("a candidate").kind,
+            SnapKind::Intersection
+        );
+        for exclude in [a, b] {
+            let kind = snap_with(&doc, cursor, Some(exclude)).map(|r| r.kind);
+            assert_eq!(kind, Some(SnapKind::Nearest), "{exclude:?}");
+        }
+
+        // 仮想交点: 片方を除外すると延長どうしの交点が消える。
+        let mut doc = Document::new();
+        let a = add_id(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        let b = add_id(&mut doc, line(20.0, -30.0, 20.0, -5.0));
+        let cursor = Point2::new(20.1, 0.1);
+        assert_eq!(
+            snap_with(&doc, cursor, None).expect("a candidate").kind,
+            SnapKind::VirtualIntersection
+        );
+        for exclude in [a, b] {
+            assert_eq!(
+                snap_with(&doc, cursor, Some(exclude)).map(|r| r.point),
+                None
+            );
+        }
+
+        // 除外した図形があっても、ほかの図形の候補とグリッドは残る。
+        let mut doc = Document::new();
+        let a = add_id(&mut doc, line(0.0, 0.0, 10.0, 0.0));
+        add_id(&mut doc, line(0.5, 0.5, 0.5, 9.0));
+        let found = snap_with(&doc, Point2::new(0.4, 0.4), Some(a)).expect("a candidate");
+        assert_eq!(found.point, Point2::new(0.5, 0.5));
+        let grid = GridSpec::new(5.0, GridMode::Rectangular);
+        let found = snap_excluding(
+            &doc,
+            Point2::new(9.8, 0.2),
+            1.0,
+            grid,
+            SnapKinds::default(),
+            &[],
+            None,
+            Some(a),
+        )
+        .expect("a candidate");
+        assert_eq!(found.kind, SnapKind::Grid);
+        assert_eq!(found.point, Point2::new(10.0, 0.0));
     }
 
     /// グリッド無効（`grid_step = 0`）・`extra_points` 無し・基点無し・全種別 ON で

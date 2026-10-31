@@ -3,7 +3,7 @@
 use std::f64::consts::{FRAC_PI_2, PI};
 
 use egui::{Rect, vec2};
-use mcad_core::{Entity, Style};
+use mcad_core::{Entity, PointKind, PointRef, Style};
 use mcad_geom::{LineSeg, Point2};
 
 use super::*;
@@ -267,4 +267,68 @@ fn decide_commit_uses_the_dirty_flag_not_the_displayed_text() {
         decide_commit(ValueUnit::Deg, -0.5, "90", true, false),
         EditCommit::Set(-FRAC_PI_2)
     );
+}
+
+/// 階数の計算が重すぎる成分は計算せず、その旨を出す（M13 タスク101 後半）。
+#[test]
+fn huge_components_are_reported_without_computing_the_rank() {
+    let mut doc = Document::new();
+    let layer = doc.current_layer();
+    let node = |i: u32| p(10.0 * f64::from(i), if i % 2 == 1 { 5.0 } else { 0.0 });
+    let links = doc
+        .apply(Command::Batch(
+            (0..200)
+                .map(|i| {
+                    Command::AddEntity(Entity::new(
+                        Shape::Line(LineSeg::new(node(i), node(i + 1))),
+                        layer,
+                        Style::inherited(),
+                    ))
+                })
+                .collect(),
+        ))
+        .unwrap()
+        .entities;
+    let mut constraints: Vec<Command> = links
+        .windows(2)
+        .map(|pair| Command::AddConstraint {
+            constraint: Constraint::Coincident {
+                a: PointRef::new(pair[0], PointKind::End),
+                b: PointRef::new(pair[1], PointKind::Start),
+            },
+            hold: None,
+        })
+        .collect();
+    for &link in &links {
+        constraints.push(Command::AddConstraint {
+            constraint: Constraint::distance(
+                &doc,
+                PointRef::new(link, PointKind::Start),
+                PointRef::new(link, PointKind::End),
+            )
+            .unwrap(),
+            hold: None,
+        });
+    }
+    doc.apply(Command::Batch(constraints)).unwrap();
+
+    let comps = dof_components(&doc, &[links[0]]);
+    assert_eq!(comps.len(), 1);
+    assert_eq!(comps[0].dof, None);
+    assert!(comps[0].too_large);
+    assert_eq!(
+        dof_lines(&comps),
+        vec!["自由度: 大きすぎるため計算していません".to_owned()]
+    );
+
+    // 小さい成分と並ぶと、成分ごとの行で区別できる。
+    let small = line(&mut doc, (0.0, 500.0), (10.0, 500.0));
+    let comps = dof_components(&doc, &[links[0], small]);
+    assert_eq!(comps.len(), 2);
+    let lines = dof_lines(&comps);
+    assert_eq!(
+        lines[0],
+        "成分 1(図形 1 個): 自由度 大きすぎるため計算していません"
+    );
+    assert_eq!(lines[1], "成分 2(図形 1 個): 自由度 4");
 }

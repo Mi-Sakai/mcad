@@ -153,6 +153,12 @@ pub enum CoreError {
     #[error("the constraint degenerates in the resulting shape: {0:?}")]
     DegenerateConstraint(ConstraintId),
 
+    /// 拘束でつながった図形のまとまりが大きすぎて、演算量の予算の範囲で解き切れなかったため、
+    /// コマンド全体を拒否した（M13 タスク101。解の有無は分からない）。予算は演算回数で数えるので、
+    /// 同じ編集なら機械の速さに関わらず同じ結果になる。
+    #[error("the connected constraints are too large to solve within the work budget")]
+    ConstraintBudgetExceeded,
+
     /// 固定の拘束（図形の固定、または動かそうとした点の固定）がついた図形の幾何を
     /// 変える操作を拒否した。値は対象のエンティティ。
     ///

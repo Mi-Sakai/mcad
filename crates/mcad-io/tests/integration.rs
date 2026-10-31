@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use mcad_core::{
-    Command, CoreError, Document, Entity, EntityGeom, EntityId, Layer, Linetype, Rgb, Style,
-    WidthMm,
+    Command, Constraint, CoreError, Document, Entity, EntityGeom, EntityId, Layer, Linetype,
+    PointKind, PointRef, Rgb, Style, WidthMm,
 };
 use mcad_geom::{Arc, Circle, LineSeg, Point2, Polyline, Shape, Vec2};
 use mcad_io::{load_dxf, load_mcad, save_dxf, save_mcad};
@@ -309,6 +309,71 @@ fn mcad_file_round_trip_through_real_file_path() {
     assert!(!loaded.can_redo());
 
     fs::remove_file(&path).ok();
+}
+
+/// 開始時の `A Aᵀ` だけで求解の演算量の予算を超える大きさの連鎖でも、満たされていれば 1 演算も
+/// 数えないので、保存と読込を通る（M13 タスク101 後半。予算で図面が開けなくなってはいけない）。
+#[test]
+fn a_huge_satisfied_constraint_component_round_trips() {
+    let mut doc = Document::new();
+    let layer = doc.current_layer();
+    let count = 450_u32;
+    let node = |i: u32| Point2::new(10.0 * f64::from(i), if i % 2 == 1 { 5.0 } else { 0.0 });
+    let links = doc
+        .apply(Command::Batch(
+            (0..count)
+                .map(|i| {
+                    Command::AddEntity(Entity::new(
+                        Shape::Line(LineSeg::new(node(i), node(i + 1))),
+                        layer,
+                        Style::inherited(),
+                    ))
+                })
+                .collect(),
+        ))
+        .unwrap()
+        .entities;
+    let mut constraints: Vec<Command> = links
+        .windows(2)
+        .map(|pair| Command::AddConstraint {
+            constraint: Constraint::Coincident {
+                a: PointRef::new(pair[0], PointKind::End),
+                b: PointRef::new(pair[1], PointKind::Start),
+            },
+            hold: None,
+        })
+        .collect();
+    for &link in &links {
+        constraints.push(Command::AddConstraint {
+            constraint: Constraint::distance(
+                &doc,
+                PointRef::new(link, PointKind::Start),
+                PointRef::new(link, PointKind::End),
+            )
+            .unwrap(),
+            hold: None,
+        });
+    }
+    doc.apply(Command::Batch(constraints)).unwrap();
+    // この大きさは、解こうとすれば予算で拒否される（解かずに通っていることの裏づけ）。
+    let first = links[0];
+    let moved = LineSeg::new(node(0), node(1) + Vec2::new(1.0, 0.5));
+    assert_eq!(
+        doc.apply(Command::ModifyEntity {
+            id: first,
+            new_geom: EntityGeom::Shape(Shape::Line(moved)),
+        }),
+        Err(CoreError::ConstraintBudgetExceeded)
+    );
+
+    let dir = std::env::temp_dir().join("mcad-io-integration-test");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("huge-constraints-{}.mcad", std::process::id()));
+    save_mcad(&doc, &path).unwrap();
+    let loaded = load_mcad(&path).unwrap().document;
+    fs::remove_file(&path).ok();
+    assert_eq!(loaded.entity_count(), doc.entity_count());
+    assert_eq!(loaded.constraint_count(), doc.constraint_count());
 }
 
 #[test]

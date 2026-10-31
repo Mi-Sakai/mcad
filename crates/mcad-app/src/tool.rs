@@ -41,12 +41,12 @@
 use egui::{Color32, Painter, Rect, Stroke};
 
 use mcad_core::{
-    Command, ConstraintId, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation, DimDiameter,
-    DimDirection, DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity, EntityGeom,
-    EntityId, HorizontalAlign, LayerId, Linetype, NewIds, OrdinateAxis, Style, TableGeom,
-    TableKind, XLineGeom, diameter_pick_segments, dim_distance, expand_angular, expand_diameter,
-    expand_linear, expand_ordinate, expand_radial, linear_pick_segments, radial_pick_segments,
-    table_world_aabb,
+    Command, ConstraintId, CoreError, DIM_ANGULAR_ANTIPARALLEL_EPS, DimAngular, DimAnnotation,
+    DimDiameter, DimDirection, DimLinear, DimOrdinate, DimRadial, DimRender, Document, Entity,
+    EntityGeom, EntityId, HorizontalAlign, LayerId, Linetype, NewIds, OrdinateAxis, Style,
+    TableGeom, TableKind, XLineGeom, diameter_pick_segments, dim_distance, expand_angular,
+    expand_diameter, expand_linear, expand_ordinate, expand_radial, linear_pick_segments,
+    radial_pick_segments, table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, ChamferError, FilletError, LineSeg, OffsetError, Point2, Polyline, Shape,
@@ -58,6 +58,7 @@ use mcad_geom::{
 use crate::bom::{BOM_STYLE_AC_WIDTH_MM, default_bom_table};
 use crate::draw_shape;
 use crate::iso::{IsoFace, iso_circle_arcs};
+use crate::shape_grip::{ShapeGripKind, apply_shape_grip};
 use crate::viewport::Viewport;
 
 /// プレビュー線の色（確定済みエンティティと区別しやすい暖色）。
@@ -4625,16 +4626,71 @@ pub(crate) fn apply_dim_grip(
     Ok(new_geom)
 }
 
-/// 進行中の寸法グリップドラッグ（M11 タスク75）。ドラッグ対象は「ドラッグ開始点で
-/// ヒットしたグリップ」1つに固定し、確定時に [`apply_dim_grip`] へ渡す。
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// グリップの種別。寸法のグリップと図形のグリップ（M13 タスク101）を同じドラッグの枠組みに
+/// 載せる（[`GripDragState`]・[`DragPreview::Grip`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GripKind {
+    /// 寸法のグリップ（確定は [`apply_dim_grip`]）。
+    Dim(DimGripKind),
+    /// 図形のグリップ（確定は [`apply_shape_grip`]。ドラッグ中は拘束を解いてプレビューする）。
+    Shape(ShapeGripKind),
+}
+
+impl From<DimGripKind> for GripKind {
+    fn from(kind: DimGripKind) -> Self {
+        Self::Dim(kind)
+    }
+}
+
+impl From<ShapeGripKind> for GripKind {
+    fn from(kind: ShapeGripKind) -> Self {
+        Self::Shape(kind)
+    }
+}
+
+/// 図形のグリップのドラッグ中に解いた形のキャッシュ（M13 タスク101、設計判断7）。解くのは
+/// カーソル位置か文書が変わったときだけで、動かないフレームでは解かない
+/// （[`SelectTool::refresh_shape_grip_preview`]）。
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ShapeGripPreview {
+    /// 最後に解いたカーソル位置と文書の世代とピック許容量（ズームで変わり、退化の判定に効く）。
+    solved_for: Option<(Point2, u64, f64)>,
+    /// 表示する形の一覧。最後に解けた位置での形が変わる図形（解けない位置ではこれを表示し
+    /// 続ける）か、予算で打ち切られた位置での掴んだ図形だけ。
+    shapes: Vec<(EntityId, EntityGeom)>,
+    /// 最後に解いた位置についてステータスバーへ出す文言（解けない理由か、プレビューの打ち切り）。
+    /// 解けていれば `None`。
+    notice: Option<String>,
+    /// 解いた回数（キャッシュのテスト用）。
+    #[cfg(test)]
+    solves: usize,
+}
+
+/// 進行中のグリップドラッグ（寸法は M11 タスク75、図形は M13 タスク101）。ドラッグ対象は
+/// 「ドラッグ開始点でヒットしたグリップ」1つに固定し、確定時に [`apply_dim_grip`] か
+/// [`apply_shape_grip`] へ渡す。
+#[derive(Debug, Clone, PartialEq)]
 struct GripDragState {
     id: EntityId,
-    kind: DimGripKind,
+    kind: GripKind,
     /// ドラッグ開始時のグリップ位置（移動量判定の基準。[`SelectTool::end_grip_drag`]）。
     origin: Point2,
     /// カーソル追従用の現在位置（スナップ適用済み。`main.rs` 側で毎フレーム更新する）。
     current: Point2,
+    /// 図形のグリップのプレビュー（寸法のグリップでは使わない）。ドラッグ状態の一部に
+    /// することで、ドラッグを捨てるすべての経路でキャッシュも捨てられる。
+    preview: ShapeGripPreview,
+}
+
+/// プレビューが演算量の予算で打ち切られたときにステータスバーへ出す文言（M13 タスク101 後半）。
+pub const SHAPE_GRIP_PREVIEW_TOO_LARGE: &str =
+    "つながった拘束が大きすぎてプレビューできません。離すと確定を試みます";
+
+/// グリップ編集の失敗をステータスバーへ出す文言（プレビュー・解放の前の拒否・`apply` の拒否で
+/// 共通）。
+#[must_use]
+pub fn grip_failure_message(reason: &str) -> String {
+    format!("グリップ編集に失敗しました: {reason}")
 }
 
 /// [`SelectTool::end_grip_drag`] の結果。呼び出し側（`McadApp`）が確定・拒否表示を処理する。
@@ -4727,10 +4783,11 @@ pub enum DragPreview {
     DimText { id: EntityId, anchor: Point2 },
     /// 寸法のグリップドラッグのプレビュー（M11 タスク75）。`id` の寸法へ
     /// [`apply_dim_grip`] を通した一時コピーで描く（`main.rs` 側の責務。退化して
-    /// 作れない場合は `main.rs` が何も描かない）。
+    /// 作れない場合は `main.rs` が何も描かない）。図形のグリップ（M13 タスク101）は
+    /// [`SelectTool::shape_grip_preview`] の解いた形を重ねて描く。
     Grip {
         id: EntityId,
-        kind: DimGripKind,
+        kind: GripKind,
         point: Point2,
     },
 }
@@ -5153,9 +5210,10 @@ pub struct SelectTool {
     /// 進行中の寸法文字ブロックドラッグ（M9 タスク51）。無ければ `None`。矩形選択ドラッグ
     /// とは排他（[`SelectTool::start_text_drag`] が `drag` を破棄する）。
     text_drag: Option<TextDragState>,
-    /// 進行中の寸法グリップドラッグ（M11 タスク75）。無ければ `None`。矩形選択・文字
-    /// ブロックドラッグとは排他（[`SelectTool::start_grip_drag`] が両方を破棄する）。
-    /// 掴む優先順はグリップ > 文字ブロック > 矩形選択（DESIGN.md タスク75）なので、
+    /// 進行中のグリップドラッグ（寸法は M11 タスク75、図形は M13 タスク101）。無ければ
+    /// `None`。矩形選択・文字ブロックドラッグとは排他（[`SelectTool::start_grip_drag`] が
+    /// 両方を破棄する）。掴む優先順は寸法グリップ > 図形グリップ > 文字ブロック > 矩形選択
+    /// （DESIGN.md タスク75、M13 設計判断7）なので、
     /// ヒット判定自体は呼び出し側（`main.rs`）がグリップを最初に試す。
     grip_drag: Option<GripDragState>,
     /// 選択中の拘束（拘束記号のクリックで選ぶ。M13 タスク100、DESIGN.md M13 設計判断6）。
@@ -5277,12 +5335,12 @@ impl SelectTool {
     pub fn drag_preview(&self) -> Option<DragPreview> {
         if let Some(GripDragState {
             id, kind, current, ..
-        }) = self.grip_drag
+        }) = &self.grip_drag
         {
             return Some(DragPreview::Grip {
-                id,
-                kind,
-                point: current,
+                id: *id,
+                kind: *kind,
+                point: *current,
             });
         }
         if let Some(TextDragState {
@@ -5443,19 +5501,100 @@ impl SelectTool {
         Some(Command::ModifyEntity { id, new_geom })
     }
 
-    /// 寸法のグリップドラッグを開始する（M11 タスク75）。`origin` はドラッグ開始時点の
-    /// グリップ位置（[`dim_grips`] が返すワールド座標。ヒット判定は `main.rs` の
-    /// `dim_grip_hit` が担う）。矩形選択・文字ブロックドラッグとは排他なので、
-    /// 進行中の `drag`/`text_drag` は破棄する（掴む優先順1位。DESIGN.md タスク75）。
-    pub fn start_grip_drag(&mut self, id: EntityId, kind: DimGripKind, origin: Point2) {
+    /// グリップドラッグを開始する（寸法は M11 タスク75、図形は M13 タスク101）。`origin` は
+    /// ドラッグ開始時点のグリップ位置（[`dim_grips`]・[`crate::shape_grip::shape_grips`] が
+    /// 返すワールド座標。ヒット判定は `main.rs` の `grip_hit` が担う）。矩形選択・文字
+    /// ブロックドラッグとは排他なので、進行中の `drag`/`text_drag` は破棄する（掴む優先順
+    /// 1位。DESIGN.md タスク75）。
+    pub fn start_grip_drag(&mut self, id: EntityId, kind: impl Into<GripKind>, origin: Point2) {
         self.drag = None;
         self.text_drag = None;
         self.grip_drag = Some(GripDragState {
             id,
-            kind,
+            kind: kind.into(),
             origin,
             current: origin,
+            preview: ShapeGripPreview::default(),
         });
+    }
+
+    /// 図形のグリップをドラッグ中なら、その図形（スナップ候補から除外する）。寸法のグリップの
+    /// ドラッグ中は `None`（寸法はスナップ源にならないので除外するものが無い）。
+    #[must_use]
+    pub fn shape_grip_target(&self) -> Option<EntityId> {
+        self.grip_drag
+            .as_ref()
+            .filter(|state| matches!(state.kind, GripKind::Shape(_)))
+            .map(|state| state.id)
+    }
+
+    /// 図形のグリップのドラッグ中のプレビューを、今のカーソル位置まで進める（M13 タスク101、
+    /// 設計判断7）。カーソル位置か文書（世代番号）が変わったときだけ解き、常に文書の形から
+    /// 解く（前のフレームの解から始めない。離したときの `apply` と結果が一致するため）。
+    ///
+    /// 戻り値はステータスバーへ出す文言:
+    ///
+    /// - 解けない位置（下記以外の `Err`・退化）: 理由。直前の解けた形を保つ。
+    /// - 演算量の予算で打ち切られた位置（[`CoreError::ConstraintBudgetExceeded`]）: 掴んだ図形だけを
+    ///   カーソルへ追従させて描き（追従する図形は描かない）、[`SHAPE_GRIP_PREVIEW_TOO_LARGE`] を
+    ///   返す。離すと確定の予算で `apply` する（M13 設計判断7 の改訂、タスク101 後半）。
+    ///
+    /// 解けていれば、または図形のグリップをドラッグ中でなければ `None`。`tol` はピック許容量
+    /// （ワールド単位。[`apply_shape_grip`] の退化の判定に使う）。
+    pub fn refresh_shape_grip_preview(&mut self, document: &Document, tol: f64) -> Option<String> {
+        let state = self.grip_drag.as_mut()?;
+        let GripKind::Shape(kind) = state.kind else {
+            return None;
+        };
+        let key = (state.current, document.generation(), tol);
+        if state.preview.solved_for != Some(key) {
+            state.preview.solved_for = Some(key);
+            #[cfg(test)]
+            {
+                state.preview.solves += 1;
+            }
+            let preview = &mut state.preview;
+            match document.entity(state.id) {
+                // 対象が消えた（確定しても何も起きない）。
+                None => {
+                    preview.shapes.clear();
+                    preview.notice = None;
+                }
+                Some(entity) => match apply_shape_grip(&entity.geom, kind, state.current, tol) {
+                    Err(reason) => preview.notice = Some(grip_failure_message(&reason)),
+                    Ok(new_geom) => match document.preview_modify(state.id, new_geom.clone()) {
+                        Ok(shapes) => {
+                            preview.shapes = shapes;
+                            preview.notice = None;
+                        }
+                        Err(CoreError::ConstraintBudgetExceeded) => {
+                            preview.shapes = vec![(state.id, new_geom)];
+                            preview.notice = Some(SHAPE_GRIP_PREVIEW_TOO_LARGE.to_owned());
+                        }
+                        Err(err) => {
+                            preview.notice = Some(grip_failure_message(&err.to_string()));
+                        }
+                    },
+                },
+            }
+        }
+        state.preview.notice.clone()
+    }
+
+    /// 今のドラッグでプレビューを解いた回数（キャッシュのテスト用）。
+    #[cfg(test)]
+    pub(crate) fn shape_grip_preview_solves(&self) -> usize {
+        self.grip_drag
+            .as_ref()
+            .map_or(0, |state| state.preview.solves)
+    }
+
+    /// 図形のグリップのドラッグ中に解いた形（形が変わる図形の一覧）。ドラッグ中でなければ空。
+    #[must_use]
+    pub fn shape_grip_preview(&self) -> &[(EntityId, EntityGeom)] {
+        self.grip_drag
+            .as_ref()
+            .map_or(&[], |state| state.preview.shapes.as_slice())
     }
 
     /// 進行中のグリップドラッグか。
@@ -5487,6 +5626,9 @@ impl SelectTool {
     /// [`GripDragOutcome::Rejected`]、成功すれば `Command::ModifyEntity` を包んだ
     /// [`GripDragOutcome::Commit`] を返す（呼び出し側が `Document::apply` する）。
     /// いずれの場合もドラッグ状態は解除する。
+    ///
+    /// 図形のグリップも同じで、形は解放位置から [`apply_shape_grip`] で作り直す（直前の解けた
+    /// 形では確定しない。解けない位置なら `apply` が拒否する。M13 検収基準 (iii)）。
     #[must_use]
     pub fn end_grip_drag(&mut self, document: &Document, tol: f64) -> GripDragOutcome {
         let Some(GripDragState {
@@ -5494,6 +5636,7 @@ impl SelectTool {
             kind,
             origin,
             current,
+            ..
         }) = self.grip_drag.take()
         else {
             return GripDragOutcome::None;
@@ -5504,7 +5647,12 @@ impl SelectTool {
         let Some(entity) = document.entity(id) else {
             return GripDragOutcome::None;
         };
-        match apply_dim_grip(&entity.geom, kind, current) {
+        let new_geom = match kind {
+            GripKind::Dim(kind) => apply_dim_grip(&entity.geom, kind, current),
+            GripKind::Shape(kind) => apply_shape_grip(&entity.geom, kind, current, tol)
+                .map_err(|reason| grip_failure_message(&reason)),
+        };
+        match new_geom {
             Ok(new_geom) => GripDragOutcome::Commit(Command::ModifyEntity { id, new_geom }),
             Err(reason) => GripDragOutcome::Rejected(reason),
         }
@@ -12492,7 +12640,7 @@ mod tests {
             tool.drag_preview(),
             Some(DragPreview::Grip {
                 id,
-                kind: DimGripKind::LinearP1,
+                kind: DimGripKind::LinearP1.into(),
                 point: Point2::new(0.0, 0.0),
             })
         );

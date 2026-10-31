@@ -91,6 +91,28 @@
 //! - `μ > LAMBDA_MAX` で [`SolveError::Stalled`]（残差を減らす方向が無い: 解の無い系・
 //!   局所解）、試行回数（受理と棄却の合計）が [`MAX_TRIALS`] に達したら
 //!   [`SolveError::TrialLimit`]。
+//! - 演算量の予算（[`Problem::with_work_budget`]）を使い切ったら [`SolveError::BudgetExceeded`]。
+//!   **開始時に満たされている系は予算に関わらず成功する**（数える演算が 1 つも無く、ヤコビアンも
+//!   作らない）。
+//!
+//! # 演算量の予算（タスク101）
+//!
+//! [`MAX_TRIALS`] は試行回数の上限で、1 試行の重さ（成分の大きさ）を制限しない。実時間では
+//! なく**演算回数**で打ち切る（実時間だと同じ入力の結果が機械の負荷で変わり、「同じ入力からは
+//! 同じ結果か同じ失敗」を破る）。数えるのは実測で費用の大半を占める項で、単位は掛け算 1 回:
+//!
+//! - `A Aᵀ` を作る（開始時と受理した試行）: `m (m + 1) / 2 × n`（実装のとおり
+//!   下三角だけを計算する）。実測で費用のほとんどはこれ（受理と棄却を分けた測定は
+//!   DESIGN.md M13 設計判断7 の実装時追記）。
+//! - ガウス消去（全試行）: **実際に消去した行**ごとに `n − k`（列の残り + 右辺）。係数が
+//!   ちょうど 0 の行は実装が読み飛ばすので数えない（帯行列になる連鎖で、`m³ / 3` と数えると
+//!   実際の何十倍にも過大になる）。
+//! - `Δy = −Aᵀ z`（全試行）: `m × n`。棄却が続く間の費用の大半はこれと行列の複製で、棄却の
+//!   試行にも費用がかかることを数えに入れるための項。
+//!
+//! ヤコビアンと残差の評価、ピボットの探索、行列の複製、後退代入は省く（それぞれ 1 回で多くて
+//! `m²` か `m × n` 程度）。数えたぶんは必ず実行前に予算と比べるので、使った演算量は予算を
+//! 超えない。[`solve_metered`] が成功・失敗の両方で使った演算量を返す。
 //!
 //! # 自由度
 //!
@@ -220,6 +242,11 @@ pub const LAMBDA_MAX: f64 = 1e20;
 /// 近づいてから停滞と判定されるまで 34〜116 回。最悪の停滞の約 1.7 倍を上限にして、
 /// 解けない系でも決定的に止める（上限に達したときも [`SolveError::TrialLimit`] で失敗する）。
 ///
+/// **主要な演算の回数の上限は演算量の予算（[`Problem::with_work_budget`]）が担う**（タスク101。
+/// 決定的な回数の上限で、実時間の上限ではない。数えない処理と機械の状態で実時間は変わる）。下の段落の
+/// 「方程式の本数の 3 乗に比例する」はタスク101 の実測で改訂: 費用の大半は受理した試行の
+/// `A Aᵀ`（`m² n` に比例）で、棄却の試行は連鎖のような帯行列ではその 1/100 未満。
+///
 /// 上限は 1 回の [`solve`] に対するもの。呼び出し側（mcad-core）は、停滞・上限で失敗した
 /// 成分を [`LAMBDA_RETRY`] で 1 回解き直すので、1 成分につき最大 400 試行、先に選んだ図形を
 /// 止めて解き、だめなら止めずに解き直す拘束の追加では最大 800 試行になる。
@@ -232,6 +259,10 @@ pub const LAMBDA_MAX: f64 = 1e20;
 /// 拒否は 72 試行・約 0.06 ms だが、50 本の連鎖（方程式 148 本）の拒否は 400 試行・約 0.8 秒
 /// （release ビルドの実測）。
 pub const MAX_TRIALS: usize = 200;
+
+/// 演算量の予算の既定（無制限）。[`Problem::with_work_budget`] を呼ばない入力はこれで、
+/// 予算の無い従来の動作と同じ結果になる。
+pub const UNLIMITED_WORK: u64 = u64::MAX;
 
 /// [`degrees_of_freedom`] で階数を数えるときのピボットの相対閾値。
 ///
@@ -363,6 +394,10 @@ pub struct Problem<'a, E> {
     /// [`LAMBDA_0`]。有限で [`LAMBDA_MIN`] 以上 [`LAMBDA_MAX`] 以下でなければ、[`solve`] は
     /// [`SolveError::InvalidInput`] を返す。[`degrees_of_freedom`] は使わない（検査もしない）。
     pub initial_damping: f64,
+    /// 演算量の予算（モジュール doc「演算量の予算」）。既定は [`UNLIMITED_WORK`]。
+    /// [`solve`] は超えそうになったら [`SolveError::BudgetExceeded`] を返し、
+    /// [`degrees_of_freedom`] は階数の計算の見積もり（[`rank_work`]）が超えるなら計算しない。
+    pub work_budget: u64,
 }
 
 // 借用だけを持つので、`E: Clone` を求めずに複製できる（derive だと `E: Clone` が付く）。
@@ -390,6 +425,7 @@ impl<'a, E> Problem<'a, E> {
             equations,
             admissible: None,
             initial_damping: LAMBDA_0,
+            work_budget: UNLIMITED_WORK,
         }
     }
 
@@ -406,6 +442,13 @@ impl<'a, E> Problem<'a, E> {
     #[must_use]
     pub fn with_initial_damping(mut self, mu: f64) -> Self {
         self.initial_damping = mu;
+        self
+    }
+
+    /// 演算量の予算を付ける（[`Problem::work_budget`]）。
+    #[must_use]
+    pub fn with_work_budget(mut self, work: u64) -> Self {
+        self.work_budget = work;
         self
     }
 }
@@ -446,6 +489,8 @@ pub enum SolveError {
     Stalled,
     /// 試行回数が [`MAX_TRIALS`] に達した。
     TrialLimit,
+    /// 演算量の予算（[`Problem::with_work_budget`]）を使い切った。解の有無は分からない。
+    BudgetExceeded,
 }
 
 /// 方程式の系を解く（モジュール doc 参照）。
@@ -454,6 +499,60 @@ pub enum SolveError {
 ///
 /// [`SolveError`] の各場合。入力の `params` は書き換えない。
 pub fn solve<E: Equation>(problem: &Problem<'_, E>) -> Result<Solution, SolveError> {
+    solve_metered(problem).0
+}
+
+/// [`solve`] と同じ。使った演算量（モジュール doc「演算量の予算」。予算を超えない）も返す。
+///
+/// 同じ入力からは同じ結果と同じ演算量になる。開始時に満たされていれば演算量は 0。
+pub fn solve_metered<E: Equation>(problem: &Problem<'_, E>) -> (Result<Solution, SolveError>, u64) {
+    let mut meter = WorkMeter::new(problem.work_budget);
+    let result = solve_within(problem, &mut meter);
+    (result, meter.used)
+}
+
+/// 演算量の計数器。`used` は予算を超えない（超える分は数えずに `false` を返す）。
+struct WorkMeter {
+    used: u64,
+    budget: u64,
+}
+
+impl WorkMeter {
+    fn new(budget: u64) -> Self {
+        Self { used: 0, budget }
+    }
+
+    /// これから行う `work` 回の演算を数える。予算を超えるなら数えず `false`。
+    fn charge(&mut self, work: u64) -> bool {
+        let used = self.used.saturating_add(work);
+        if used > self.budget {
+            return false;
+        }
+        self.used = used;
+        true
+    }
+}
+
+/// `A Aᵀ` を 1 回作る演算量（`gram` の内積の掛け算の回数）。
+fn gram_work(m: usize, n: usize) -> u64 {
+    let (m, n) = (m as u64, n as u64);
+    (m * (m + 1) / 2).saturating_mul(n)
+}
+
+/// 階数の計算（[`degrees_of_freedom`]）の演算量の見積もり: 行数 `m`・列数 `n` で
+/// `min(m, n)² × max(m, n) / 2`。完全ピボットの探索と消去が残りの部分行列の全体を読むため、
+/// [`solve`] の演算量と違って実際の値を数えるまでもなく形だけで決まる。1 単位の時間は
+/// [`solve`] の演算量より少し重い（実測の係数は DESIGN.md M13 設計判断7 の実装時追記）。
+#[must_use]
+pub fn rank_work(m: usize, n: usize) -> u64 {
+    let (small, large) = (m.min(n) as u64, m.max(n) as u64);
+    small.saturating_mul(small).saturating_mul(large) / 2
+}
+
+fn solve_within<E: Equation>(
+    problem: &Problem<'_, E>,
+    meter: &mut WorkMeter,
+) -> Result<Solution, SolveError> {
     validate(problem)?;
     // NaN は範囲に入らないので、有限性もこの 1 つの判定で確かめられる。
     if !(LAMBDA_MIN..=LAMBDA_MAX).contains(&problem.initial_damping) {
@@ -468,20 +567,14 @@ pub fn solve<E: Equation>(problem: &Problem<'_, E>) -> Result<Solution, SolveErr
         return Err(SolveError::NonFinite);
     }
     let tol0 = eval_tolerances(eqs, &x)?;
-    let cols = Columns::new(problem);
-    let n = cols.len();
-    let mut grad = vec![0.0; max_arity(eqs)];
-    let mut a = vec![0.0; m * n];
-    if !eval_scaled_jacobian(eqs, &x, &tol0, problem.weights, &cols, &mut grad, &mut a) {
-        return Err(SolveError::NonFinite);
-    }
     let mut fx = objective(&f, &tol0);
     if !fx.is_finite() {
         return Err(SolveError::NonFinite);
     }
     let mut trace = vec![fx];
 
-    // 開始時は tol₀ が今の形の許容値そのものなので、1 つの判定で両方を満たす。
+    // 開始時は tol₀ が今の形の許容値そのものなので、1 つの判定で両方を満たす。ヤコビアンを
+    // 使わないので、行列を確保する前に返す。
     if max_ratio(&f, &tol0) <= 1.0 {
         return Ok(Solution {
             params: x,
@@ -489,8 +582,22 @@ pub fn solve<E: Equation>(problem: &Problem<'_, E>) -> Result<Solution, SolveErr
             trials: 0,
         });
     }
+    let cols = Columns::new(problem);
+    let n = cols.len();
     if n == 0 {
         return Err(SolveError::NoFreeParameters);
+    }
+    let gram_cost = gram_work(m, n);
+    let step_cost = (m as u64).saturating_mul(n as u64);
+    // 最初の `A Aᵀ` の分は、`m × n` の行列を確保する前に数える。予算を超える大きさの系を、
+    // 確保と評価の時間・メモリを使わずに打ち切るため。
+    if !meter.charge(gram_cost) {
+        return Err(SolveError::BudgetExceeded);
+    }
+    let mut grad = vec![0.0; max_arity(eqs)];
+    let mut a = vec![0.0; m * n];
+    if !eval_scaled_jacobian(eqs, &x, &tol0, problem.weights, &cols, &mut grad, &mut a) {
+        return Err(SolveError::NonFinite);
     }
     let mut aat = vec![0.0; m * m];
     gram(&a, m, n, &mut aat);
@@ -511,6 +618,9 @@ pub fn solve<E: Equation>(problem: &Problem<'_, E>) -> Result<Solution, SolveErr
             return Err(SolveError::TrialLimit);
         }
         trials += 1;
+        if !meter.charge(step_cost) {
+            return Err(SolveError::BudgetExceeded);
+        }
 
         let lambda = mu * damping_unit(&aat, m);
         sys.copy_from_slice(&aat);
@@ -518,7 +628,11 @@ pub fn solve<E: Equation>(problem: &Problem<'_, E>) -> Result<Solution, SolveErr
             sys[i * m + i] += lambda;
             z[i] = f[i] / tol0[i];
         }
-        let mut accepted = gauss_solve(&mut sys, &mut z, m);
+        let mut accepted = match gauss_solve_metered(&mut sys, &mut z, m, meter) {
+            GaussOutcome::Solved => true,
+            GaussOutcome::Singular => false,
+            GaussOutcome::OutOfBudget => return Err(SolveError::BudgetExceeded),
+        };
         if accepted {
             // Δy = −Aᵀ z、Δx = Δy / w。固定・未参照のパラメータは触らない。
             x_try.copy_from_slice(&x);
@@ -546,6 +660,9 @@ pub fn solve<E: Equation>(problem: &Problem<'_, E>) -> Result<Solution, SolveErr
                 );
         }
         if accepted {
+            if !meter.charge(gram_cost) {
+                return Err(SolveError::BudgetExceeded);
+            }
             gram(&a_try, m, n, &mut aat_try);
             accepted = all_finite(&aat_try);
         }
@@ -624,7 +741,8 @@ pub fn is_satisfied<E: Equation>(params: &[f64], equations: &[E]) -> Result<bool
 /// # Errors
 ///
 /// 入力の形が不正なら [`SolveError::InvalidInput`]、パラメータかヤコビアンが有限でなければ
-/// [`SolveError::NonFinite`]。
+/// [`SolveError::NonFinite`]、階数の計算の見積もり（[`rank_work`]）が予算
+/// （[`Problem::with_work_budget`]）を超えるなら計算せずに [`SolveError::BudgetExceeded`]。
 pub fn degrees_of_freedom<E: Equation>(problem: &Problem<'_, E>) -> Result<usize, SolveError> {
     validate(problem)?;
     let eqs = problem.equations;
@@ -632,6 +750,9 @@ pub fn degrees_of_freedom<E: Equation>(problem: &Problem<'_, E>) -> Result<usize
     let free = problem.fixed.iter().filter(|&&fixed| !fixed).count();
     let cols = Columns::new(problem);
     let n = cols.len();
+    if rank_work(m, n) > problem.work_budget {
+        return Err(SolveError::BudgetExceeded);
+    }
     let mut grad = vec![0.0; max_arity(eqs)];
     let mut mat = vec![0.0; m * n];
     // 行・列の尺度は階数に効かないので、許容値でも重みでも割らない（`rank` で正規化する）。
@@ -863,9 +984,25 @@ fn max_ratio(f: &[f64], tol: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// [`gauss_solve_metered`] の結果。
+enum GaussOutcome {
+    /// 解けた（`b` が解）。
+    Solved,
+    /// ピボットが 0・非有限、または解が非有限。
+    Singular,
+    /// 消去の途中で予算を使い切った。
+    OutOfBudget,
+}
+
 /// `a`（`n × n`、行優先）`· z = b` を部分ピボット付きのガウス消去で解き、`b` を解で
-/// 上書きする。ピボットが 0・非有限、または解が非有限なら `false`。
-fn gauss_solve(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
+/// 上書きする。消去した行ごとに演算量を数える（係数が 0 の行は飛ばすので数えない。モジュール
+/// doc「演算量の予算」）。
+fn gauss_solve_metered(
+    a: &mut [f64],
+    b: &mut [f64],
+    n: usize,
+    meter: &mut WorkMeter,
+) -> GaussOutcome {
     for k in 0..n {
         // 同じ大きさなら先の行を選ぶ（決定性）。
         let mut piv = k;
@@ -878,7 +1015,7 @@ fn gauss_solve(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
             }
         }
         if best == 0.0 || !best.is_finite() {
-            return false;
+            return GaussOutcome::Singular;
         }
         if piv != k {
             for c in 0..n {
@@ -887,10 +1024,14 @@ fn gauss_solve(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
             b.swap(k, piv);
         }
         let d = a[k * n + k];
+        let row_cost = (n - k) as u64;
         for r in k + 1..n {
             let factor = a[r * n + k] / d;
             if factor == 0.0 {
                 continue;
+            }
+            if !meter.charge(row_cost) {
+                return GaussOutcome::OutOfBudget;
             }
             a[r * n + k] = 0.0;
             for c in k + 1..n {
@@ -903,7 +1044,21 @@ fn gauss_solve(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
         let tail: f64 = (k + 1..n).map(|c| a[k * n + c] * b[c]).sum();
         b[k] = (b[k] - tail) / a[k * n + k];
     }
-    all_finite(b)
+    if all_finite(b) {
+        GaussOutcome::Solved
+    } else {
+        GaussOutcome::Singular
+    }
+}
+
+/// 予算なしの [`gauss_solve_metered`]（単体テスト用）。
+#[cfg(test)]
+fn gauss_solve(a: &mut [f64], b: &mut [f64], n: usize) -> bool {
+    let mut meter = WorkMeter::new(UNLIMITED_WORK);
+    matches!(
+        gauss_solve_metered(a, b, n, &mut meter),
+        GaussOutcome::Solved
+    )
 }
 
 /// `a`（`rows × cols`、行優先）の階数。`a` は壊す。

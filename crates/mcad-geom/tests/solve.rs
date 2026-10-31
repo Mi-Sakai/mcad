@@ -20,7 +20,7 @@ use std::f64::consts::PI;
 use mcad_geom::solve::{
     ATOL_ANG, ATOL_LEN, Equation, LAMBDA_0, LAMBDA_MAX, LAMBDA_MIN, LAMBDA_RETRY, MAX_TRIALS,
     Problem, RTOL, ResidualKind, Solution, SolveError, check_jacobian, degrees_of_freedom,
-    is_satisfied, max_scaled_residual, solve,
+    is_satisfied, max_scaled_residual, rank_work, solve, solve_metered,
 };
 use proptest::prelude::*;
 
@@ -1623,5 +1623,146 @@ fn trial_counts_stay_well_below_limit() {
     assert!(
         worst_stalled < MAX_TRIALS,
         "停滞の判定に {worst_stalled} 回"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 演算量の予算（タスク101）
+// ---------------------------------------------------------------------------
+
+/// `sys` を予算つきで解く。
+fn metered(sys: &Sys, budget: u64) -> (Result<Solution, SolveError>, u64) {
+    let problem = Problem::new(&sys.x, &sys.fixed, &sys.w, &sys.eqs).with_work_budget(budget);
+    solve_metered(&problem)
+}
+
+/// 既定（予算なし）の結果は従来どおりで、十分な予算でも変わらない。足りなければ打ち切り、
+/// 使った量は予算を超えず、同じ入力からは同じ量になる。
+#[test]
+fn work_budget_cuts_deterministically() {
+    for (name, build) in scenarios() {
+        let sys = build((0.0, 0.0), 1.0);
+        let plain = sys.solve();
+        let problem = Problem::new(&sys.x, &sys.fixed, &sys.w, &sys.eqs);
+        let (result, used) = solve_metered(&problem);
+        assert_eq!(result, plain, "{name}");
+        assert_eq!(metered(&sys, used), (plain.clone(), used), "{name}");
+        if used == 0 {
+            continue;
+        }
+        for budget in [used - 1, used / 2, 1, 0] {
+            let (cut, cut_used) = metered(&sys, budget);
+            assert_eq!(cut, Err(SolveError::BudgetExceeded), "{name}");
+            assert!(cut_used <= budget);
+            assert_eq!(metered(&sys, budget), (cut, cut_used));
+        }
+    }
+}
+
+/// 予算を超える大きさの系は、`m × n` の行列を確保する前に打ち切る（m = 120,000・n = 240,000 で、
+/// 確保すれば約 230 GB。Codex adversarial review の指摘）。満たされた系はこの経路を通らない。
+#[test]
+fn oversized_systems_are_cut_before_allocating_matrices() {
+    let mut sys = Sys::default();
+    for i in 0..60_000 {
+        let x = f64::from(i);
+        let (p, q) = (sys.point((x, 0.0)), sys.point((x, 1.0)));
+        sys.coincident(p, q, &[]);
+    }
+    assert_eq!(
+        metered(&sys, 1_200_000_000),
+        (Err(SolveError::BudgetExceeded), 0)
+    );
+}
+
+/// 満たされた系は、大きくても予算 0 でも、行列を確保せずに成功する（Codex adversarial review の
+/// 指摘）。
+#[test]
+fn oversized_satisfied_systems_succeed_without_allocating_matrices() {
+    let mut sys = Sys::default();
+    for i in 0..60_000 {
+        let x = f64::from(i);
+        let (p, q) = (sys.point((x, 0.0)), sys.point((x, 0.0)));
+        sys.coincident(p, q, &[]);
+    }
+    let (result, used) = metered(&sys, 0);
+    let solution = result.unwrap();
+    assert_eq!(solution.trials, 0);
+    assert_eq!(solution.params, sys.x);
+    assert_eq!(used, 0);
+}
+
+/// 解の無い系は、演算量も失敗の結果と一緒に返る。
+#[test]
+fn work_is_reported_for_failures() {
+    let sys = inconsistent((0.0, 0.0), 1.0);
+    let (result, used) = metered(&sys, u64::MAX);
+    assert_eq!(result, Err(SolveError::Stalled));
+    assert!(used > 0);
+}
+
+/// 開始時に満たされている系は、予算 0 でも成功して 1 演算も数えない。自由なパラメータの無い
+/// 未充足の系も、数える前に従来の失敗を返す。
+#[test]
+fn a_satisfied_system_uses_no_work() {
+    let mut sys = Sys::default();
+    let (p, q) = (sys.point((1.0, 2.0)), sys.point((1.0, 2.0)));
+    sys.coincident(p, q, &[]);
+    let (result, used) = metered(&sys, 0);
+    let solution = result.unwrap();
+    assert_eq!(solution.trials, 0);
+    assert_eq!(used, 0);
+
+    let mut sys = Sys::default();
+    let (p, q) = (sys.point((1.0, 2.0)), sys.point((3.0, 2.0)));
+    sys.fix_point(p);
+    sys.fix_point(q);
+    sys.coincident(p, q, &[]);
+    assert_eq!(metered(&sys, 0), (Err(SolveError::NoFreeParameters), 0));
+}
+
+/// `A Aᵀ` は `m (m + 1) / 2 × n`、消去は実際に消した行だけを数える: 互いに参照を共有しない
+/// 方程式（`A Aᵀ` が対角）は消去の演算量が 0 で、共有する系より少ない。
+#[test]
+fn elimination_counts_only_the_rows_it_touches() {
+    // 独立な 2 点の一致を 3 組（方程式 6 本、未知数 12。線形なので受理のたびに `A Aᵀ`）。
+    let separate = || {
+        let mut sys = Sys::default();
+        for i in 0..3 {
+            let y = f64::from(i) * 100.0;
+            let (p, q) = (sys.point((0.0, y)), sys.point((1.0, y + 1.0)));
+            sys.coincident(p, q, &[]);
+        }
+        sys
+    };
+    let sys = separate();
+    let problem = Problem::new(&sys.x, &sys.fixed, &sys.w, &sys.eqs);
+    let (result, used) = solve_metered(&problem);
+    let solution = result.unwrap();
+    let (m, n) = (6_u64, 12_u64);
+    let gram = m * (m + 1) / 2 * n;
+    let accepted = (solution.objective.len() - 1) as u64;
+    let step = m * n;
+    // 開始時 + 受理ごとの A Aᵀ、試行ごとの Δy。消去は 0。
+    assert_eq!(used, (accepted + 1) * gram + solution.trials as u64 * step);
+}
+
+/// 階数の計算は、見積もりが予算を超えるなら計算しない。見積もりちょうどなら計算する。
+#[test]
+fn degrees_of_freedom_respect_the_work_budget() {
+    let mut sys = Sys::default();
+    let (p, q) = (sys.point((1.0, 2.0)), sys.point((3.0, 2.0)));
+    sys.coincident(p, q, &[]);
+    let estimate = rank_work(2, 4);
+    assert_eq!(estimate, 2 * 2 * 4 / 2);
+    let problem = Problem::new(&sys.x, &sys.fixed, &sys.w, &sys.eqs);
+    assert_eq!(degrees_of_freedom(&problem), Ok(2));
+    assert_eq!(
+        degrees_of_freedom(&problem.with_work_budget(estimate)),
+        Ok(2)
+    );
+    assert_eq!(
+        degrees_of_freedom(&problem.with_work_budget(estimate - 1)),
+        Err(SolveError::BudgetExceeded)
     );
 }

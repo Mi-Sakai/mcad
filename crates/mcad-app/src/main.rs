@@ -23,6 +23,7 @@ mod ortho;
 #[cfg(test)]
 mod perf_tests;
 mod plot;
+mod shape_grip;
 mod snap;
 mod tool;
 mod viewport;
@@ -60,10 +61,10 @@ use constraint_tool::{ConstraintKind, ConstraintTool, ValueUnit};
 use tool::{
     ArcTool, ChamferDistInput, ChamferTool, CircleTool, DIM_DEGENERATE_EPSILON, DimAngularTool,
     DimDiameterTool, DimLinearTool, DimOrdinateTool, DimRadialTool, DragPreview, ExtAngleInput,
-    ExtendTool, FilletTool, GripDragOutcome, InputEvent, IsoCircleTool, LineTool, MirrorChoice,
-    OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview, PointTool, PolygonTool,
-    PolylineTool, RectangleTool, SelectTool, SplitTool, TableTool, TextTool, Tool, ToolCtx,
-    ToolResult, TrimTool, XLineTool, layer_visible,
+    ExtendTool, FilletTool, GripDragOutcome, GripKind, InputEvent, IsoCircleTool, LineTool,
+    MirrorChoice, OffsetOutcome, PlacementKind, PlacementOutcome, PlacementPreview, PointTool,
+    PolygonTool, PolylineTool, RectangleTool, SelectTool, SplitTool, TableTool, TextTool, Tool,
+    ToolCtx, ToolResult, TrimTool, XLineTool, grip_failure_message, layer_visible,
 };
 use viewport::Viewport;
 
@@ -3330,9 +3331,16 @@ impl eframe::App for McadApp {
                 self.config.paper_display_enabled,
                 k,
             );
-            // 選択中の寸法のグリップ（M11 タスク75）。選択ハイライトの後・作図プレビューの
+            // 選択中の寸法・図形のグリップ（M11 タスク75、M13 タスク101）。選択ハイライトの後・作図プレビューの
             // 前に描く（グリップは既存寸法の編集起点であり、進行中の作図とは独立）。
             draw_dim_grips(
+                &painter,
+                rect,
+                &self.document,
+                &self.viewport,
+                &self.select_tool,
+            );
+            draw_shape_grips(
                 &painter,
                 rect,
                 &self.document,
@@ -8108,6 +8116,27 @@ fn apply_snap(
     }
 }
 
+/// グリップドラッグのスナップ（M11 タスク75、M13 タスク101）。[`apply_snap`] と同じだが、
+/// 図形のグリップではドラッグ中の図形自身を候補から外す（`exclude`、
+/// [`SelectTool::shape_grip_target`]）。
+fn apply_grip_snap(
+    document: &Document,
+    enabled: bool,
+    raw: Point2,
+    radius: f64,
+    grid: snap::GridSpec,
+    kinds: snap::SnapKinds,
+    exclude: Option<EntityId>,
+) -> (Point2, Option<snap::SnapResult>) {
+    if !enabled {
+        return (raw, None);
+    }
+    match snap::snap_excluding(document, raw, radius, grid, kinds, &[], None, exclude) {
+        Some(result) => (result.point, Some(result)),
+        None => (raw, None),
+    }
+}
+
 /// スナップ・直交モード（ortho、v0.7.1。アイソメ-2でグリッドモードに応じた軸切替に
 /// 対応）・極トラッキング（M12 タスク84）を「スナップ > 直交 > 極」の優先で合成する
 /// （`ortho.rs` §2）。
@@ -8670,49 +8699,40 @@ fn handle_select_input(
     if let Some(pos) = pointer {
         let world = world_at(pos);
         if response.drag_started_by(egui::PointerButton::Primary) {
-            // ドラッグ開始点の掴む優先順（DESIGN.md タスク75）: グリップ（スクリーン座標
-            // ヒット）> 選択済み寸法の文字ブロック（M9 タスク51、設計判断7）> 矩形選択。
             // 当たり判定・掴んだ点・矩形の始点はすべて押下点で決める。`drag_started_by` の
             // 時点の `pos` は egui のドラッグ閾値ぶん動いた後の位置で、判定ごとに基準点が
             // 違うと小さなグリップや文字ブロックの端で優先順が崩れるため。
             let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
-            let press_world = world_at(press);
-            match dim_grip_hit(document, select_tool.selection(), rect, viewport, press) {
-                Some((id, kind, origin)) => {
-                    select_tool.start_grip_drag(id, kind, origin);
-                }
-                None => {
-                    let render = dim_render(
-                        document.dim_style(),
-                        paper_display,
-                        dim_scale_k,
-                        viewport.zoom,
-                    );
-                    match dim_label_hit(document, select_tool.selection(), press_world, render) {
-                        Some((id, label_center)) => {
-                            select_tool.start_text_drag(id, label_center, press_world);
-                        }
-                        None => select_tool.on_drag_start(press_world),
-                    }
-                }
-            }
+            start_select_drag(
+                document,
+                select_tool,
+                rect,
+                viewport,
+                press,
+                paper_display,
+                dim_scale_k,
+            );
         } else if response.dragged_by(egui::PointerButton::Primary) {
             if select_tool.is_grip_dragging() {
                 // グリップドラッグはスナップを効かせる（DESIGN.md タスク75「ドラッグ中」）。
                 // 直交モード（F8）は基準点が定まらないので効かせない（既存の作図ツールの
                 // ortho とは別経路であり、ここでは合成しない）。
-                let (snapped, marker) = apply_snap(
+                let (snapped, marker) = apply_grip_snap(
                     document,
                     snap_enabled,
                     world,
                     snap_radius,
                     grid,
                     snap_kinds,
-                    &[],
-                    None,
+                    select_tool.shape_grip_target(),
                 );
                 *snap_marker = marker;
                 select_tool.on_grip_drag(snapped);
+                // 図形のグリップ: 解けない位置では理由を出し続ける（M13 設計判断7）。同じ
+                // 位置では解き直さないので、毎フレーム同じ文言の表示時間を延ばすだけ。
+                if let Some(failure) = select_tool.refresh_shape_grip_preview(document, tol) {
+                    set_status(status, now, failure);
+                }
             } else {
                 select_tool.on_drag(world);
             }
@@ -8720,15 +8740,14 @@ fn handle_select_input(
             if select_tool.is_grip_dragging() {
                 // 最後の移動と解放が同じフレームに届くと `dragged_by` 分岐を通らないため、
                 // 解放位置にもスナップを掛けてから確定する（直前フレームの位置で確定しない）。
-                let (snapped, _) = apply_snap(
+                let (snapped, _) = apply_grip_snap(
                     document,
                     snap_enabled,
                     world,
                     snap_radius,
                     grid,
                     snap_kinds,
-                    &[],
-                    None,
+                    select_tool.shape_grip_target(),
                 );
                 select_tool.on_grip_drag(snapped);
                 *snap_marker = None;
@@ -8736,7 +8755,7 @@ fn handle_select_input(
                     GripDragOutcome::None => {}
                     GripDragOutcome::Commit(cmd) => {
                         if let Err(err) = document.apply(cmd) {
-                            set_status(status, now, format!("グリップ編集に失敗しました: {err}"));
+                            set_status(status, now, grip_failure_message(&err.to_string()));
                         }
                     }
                     GripDragOutcome::Rejected(reason) => {
@@ -9684,6 +9703,75 @@ fn dim_grip_hit(
     None
 }
 
+/// スクリーン座標 `pointer_screen` が、グリップを出す図形（[`shape_grip::shape_grip_targets`]）の
+/// グリップのヒット範囲に入っていれば `(EntityId, グリップ種別, グリップのワールド座標)` を返す
+/// （M13 タスク101、設計判断7）。順は [`dim_grip_hit`] と同じ（選択順 → 定義順）。
+fn shape_grip_hit(
+    document: &Document,
+    selection: &[EntityId],
+    rect: Rect,
+    viewport: &Viewport,
+    pointer_screen: Pos2,
+) -> Option<(EntityId, shape_grip::ShapeGripKind, Point2)> {
+    for (id, entity) in shape_grip::shape_grip_targets(document, selection) {
+        for (kind, point) in shape_grip::shape_grips(&entity.geom) {
+            let screen = viewport.world_to_screen(rect, point);
+            if screen.distance(pointer_screen) <= GRIP_HIT_PX {
+                return Some((id, kind, point));
+            }
+        }
+    }
+    None
+}
+
+/// ドラッグを始めるときに掴むグリップ。寸法のグリップが図形のグリップに優先する。
+fn grip_hit(
+    document: &Document,
+    selection: &[EntityId],
+    rect: Rect,
+    viewport: &Viewport,
+    pointer_screen: Pos2,
+) -> Option<(EntityId, GripKind, Point2)> {
+    if let Some((id, kind, point)) =
+        dim_grip_hit(document, selection, rect, viewport, pointer_screen)
+    {
+        return Some((id, kind.into(), point));
+    }
+    shape_grip_hit(document, selection, rect, viewport, pointer_screen)
+        .map(|(id, kind, point)| (id, kind.into(), point))
+}
+
+/// 押下点 `press` からドラッグを始める。掴む優先順（DESIGN.md タスク75、M13 設計判断7）:
+/// 寸法グリップ > 図形グリップ（スクリーン座標ヒット）> 選択済み寸法の文字ブロック（M9
+/// タスク51、設計判断7）> 矩形選択。
+fn start_select_drag(
+    document: &Document,
+    select_tool: &mut SelectTool,
+    rect: Rect,
+    viewport: &Viewport,
+    press: Pos2,
+    paper_display: bool,
+    dim_scale_k: f64,
+) {
+    if let Some((id, kind, origin)) =
+        grip_hit(document, select_tool.selection(), rect, viewport, press)
+    {
+        select_tool.start_grip_drag(id, kind, origin);
+        return;
+    }
+    let press_world = viewport.screen_to_world(rect, press);
+    let render = dim_render(
+        document.dim_style(),
+        paper_display,
+        dim_scale_k,
+        viewport.zoom,
+    );
+    match dim_label_hit(document, select_tool.selection(), press_world, render) {
+        Some((id, label_center)) => select_tool.start_text_drag(id, label_center, press_world),
+        None => select_tool.on_drag_start(press_world),
+    }
+}
+
 /// `world` が、**選択集合に含まれる**寸法いずれかの文字ブロック（表示サイズ依存の
 /// `label_box`）に入っていれば、その `(EntityId, 現在のラベル中心)` を返す（M9 タスク51）。
 ///
@@ -10017,10 +10105,32 @@ fn draw_selection(
                 paper_display,
                 k,
             );
-            if let Some(entity) = document.entity(id)
-                && let Ok(new_geom) = tool::apply_dim_grip(&entity.geom, kind, point)
-            {
-                draw_dim_geom(painter, rect, viewport, &new_geom, highlight, render);
+            match kind {
+                GripKind::Dim(kind) => {
+                    if let Some(entity) = document.entity(id)
+                        && let Ok(new_geom) = tool::apply_dim_grip(&entity.geom, kind, point)
+                    {
+                        draw_dim_geom(painter, rect, viewport, &new_geom, highlight, render);
+                    }
+                }
+                // 図形のグリップ（M13 タスク101、設計判断7）: 元の図形はそのまま描き、解いた
+                // 形（追従する図形を含む）をプレビュー色で重ねる。
+                GripKind::Shape(_) => {
+                    let preview = Stroke::new(SELECTION_WIDTH, OFFSET_PREVIEW_COLOR);
+                    for (_, geom) in select_tool.shape_grip_preview() {
+                        if let Some(shape) = geom.as_shape() {
+                            draw_shape(
+                                painter,
+                                rect,
+                                viewport,
+                                shape,
+                                preview,
+                                Linetype::Continuous,
+                                1.0,
+                            );
+                        }
+                    }
+                }
             }
         }
         None => draw_selected(
@@ -10462,7 +10572,11 @@ fn draw_dim_grips(
     select_tool: &SelectTool,
 ) {
     let dragging = match select_tool.drag_preview() {
-        Some(DragPreview::Grip { id, kind, point }) => Some((id, kind, point)),
+        Some(DragPreview::Grip {
+            id,
+            kind: GripKind::Dim(kind),
+            point,
+        }) => Some((id, kind, point)),
         _ => None,
     };
     for &id in select_tool.selection() {
@@ -10477,6 +10591,38 @@ fn draw_dim_grips(
                 Some((drag_id, drag_kind, drag_point)) if drag_id == id && drag_kind == kind => {
                     (drag_point, GRIP_DRAG_COLOR)
                 }
+                _ => (point, GRIP_COLOR),
+            };
+            draw_grip_square(painter, rect, viewport, point, color);
+        }
+    }
+}
+
+/// 選択中の図形のグリップを描く（M13 タスク101）。見た目は寸法のグリップと同じで、掴んでいる
+/// グリップだけをドラッグ中の位置・強調色で描く。出す対象は
+/// [`shape_grip::shape_grip_targets`]（ロック中のレイヤー・固定した図形には出さない）。
+fn draw_shape_grips(
+    painter: &egui::Painter,
+    rect: Rect,
+    document: &Document,
+    viewport: &Viewport,
+    select_tool: &SelectTool,
+) {
+    let dragging = match select_tool.drag_preview() {
+        Some(DragPreview::Grip {
+            id,
+            kind: GripKind::Shape(kind),
+            point,
+        }) => Some((id, kind, point)),
+        _ => None,
+    };
+    for (id, entity) in shape_grip::shape_grip_targets(document, select_tool.selection()) {
+        for (kind, point) in shape_grip::shape_grips(&entity.geom) {
+            let (point, color) = match dragging {
+                Some((drag_id, drag_kind, drag_point)) if drag_id == id && drag_kind == kind => (
+                    shape_grip::dragged_grip_point(&entity.geom, kind, drag_point),
+                    GRIP_DRAG_COLOR,
+                ),
                 _ => (point, GRIP_COLOR),
             };
             draw_grip_square(painter, rect, viewport, point, color);

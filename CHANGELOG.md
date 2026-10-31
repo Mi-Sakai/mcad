@@ -40,6 +40,19 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
   クリックして選び、`Delete` でその拘束だけを消せる(優先順位は寸法グリップ > 拘束記号 > 図形のピック)。
   値の編集と削除は `Command::SetConstraintValue`/`RemoveConstraint` を 1 回 `apply`(undo 1 回)。詳細は
   DESIGN.md「M13」設計判断6 の実装時追記(タスク100)
+- **図形のグリップ編集**(`crates/mcad-core`・`crates/mcad-app`、M13 タスク101 前半): 選択中の線分の端点、円・円弧の
+  中心と半径、円弧の端点をドラッグして編集する(寸法グリップと同じ見た目・同じスナップの扱い。自分自身へは
+  吸着しない)。ドラッグ中は `Document::preview_modify` で拘束を解き、追従する図形を含めてプレビューする。解けない
+  位置では直前の形を表示して理由を出し、そこで離すと図面は変わらない。確定は `Command::ModifyEntity` 1 回で、
+  undo 1 回で戻る。ロック中のレイヤー・固定した図形・100 個を超える選択にはグリップを出さない。詳細は DESIGN.md
+  「M13」設計判断7 の実装時追記
+- **求解の演算量の予算**(`crates/mcad-geom`・`crates/mcad-core`・`crates/mcad-app`、M13 タスク101 後半): 拘束の求解を演算回数で
+  打ち切る(`Problem::with_work_budget`・`solve_metered`・`SolveError::BudgetExceeded`。既定は無制限)。`Document::apply` は約 2 秒
+  相当、`Document::preview_modify` は約 16 ms 相当(目標値で、実時間の上限ではない)で、使い切ると `CoreError::ConstraintBudgetExceeded` で拒否する(図面は変わらない)。
+  すでに満たされた拘束は予算を使わないので、大きな図面も開ける。グリップのドラッグ中にプレビューが打ち切られたら、掴んだ図形
+  だけを描いて理由を出し、離すと確定を試みる。右パネルは階数の計算が約 200 ms 相当を超える成分で「自由度: 大きすぎるため
+  計算していません」と出す(`Document::degrees_of_freedom_bounded`・`DofOutcome`)。詳細は DESIGN.md「M13」設計判断7 の実装時追記
+  (タスク101 後半)
 
 ## [0.12.0] - 2026-09-27 — 作図補助
 

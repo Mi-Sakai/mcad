@@ -1335,7 +1335,7 @@ fn dragging_one_end_keeps_the_length_by_moving_the_other_end() {
 
 /// 一致と長さでつないだ線分 `count` 本の連鎖（一致 `count − 1`・各線分の長さ `count`）。
 /// 線分は x 方向へ 10 mm ずつ進み、`zigzag` なら 1 本おきに y = 5 へ上がる。
-fn chain(doc: &mut Document, count: u32, zigzag: bool) -> Vec<EntityId> {
+pub(super) fn chain(doc: &mut Document, count: u32, zigzag: bool) -> Vec<EntityId> {
     let node = |i: u32| {
         let y = if zigzag && i % 2 == 1 { 5.0 } else { 0.0 };
         (10.0 * f64::from(i), y)
@@ -2047,4 +2047,224 @@ fn mirroring_a_fixed_point_is_rejected_unless_it_lies_on_the_axis() {
     doc.apply(batch).unwrap();
     assert_all_satisfied(&doc);
     assert_eq!(line_of(&doc, l).a, Point2::new(20.0, -5.0));
+}
+
+// ---------------------------------------------------------------------------
+// 14. プレビュー（`Document::preview_modify`、タスク101）
+// ---------------------------------------------------------------------------
+
+/// 図形のパラメータの bit 列（`==` は `-0.0` と `0.0` を区別しないので、bit で比べる）。
+fn geom_bits(geom: &EntityGeom) -> Vec<u64> {
+    let values: Vec<f64> = match geom.as_shape().expect("a shape") {
+        Shape::Line(l) => vec![l.a.x, l.a.y, l.b.x, l.b.y],
+        Shape::Circle(c) => vec![c.center.x, c.center.y, c.radius],
+        Shape::Arc(a) => vec![a.center.x, a.center.y, a.radius, a.start_angle, a.end_angle],
+        other => panic!("unexpected shape {other:?}"),
+    };
+    values.into_iter().map(f64::to_bits).collect()
+}
+
+/// `preview_modify` が文書・世代・履歴を変えないこと、`Ok` の形が同じ編集を `apply` した結果と
+/// bit 単位で一致すること、`Err` が `apply` の `Err` と同じことを確かめる。返すのは形が変わる
+/// 図形の一覧（`apply` の結果を undo で戻した文書のまま）。
+fn assert_preview_matches_apply(
+    doc: &mut Document,
+    id: EntityId,
+    new_geom: EntityGeom,
+) -> Result<Vec<(EntityId, EntityGeom)>, CoreError> {
+    let before = snapshot(doc);
+    let before_bits: Vec<(EntityId, Vec<u64>)> = doc
+        .entities()
+        .filter(|(_, e)| e.geom.as_shape().is_some())
+        .map(|(entity, e)| (entity, geom_bits(&e.geom)))
+        .collect();
+    let (undo_depth, redo_depth, generation) =
+        (doc.undo_stack.len(), doc.redo_stack.len(), doc.generation());
+
+    let previewed = doc.preview_modify(id, new_geom.clone());
+    assert_eq!(snapshot(doc), before, "the preview changed the document");
+    assert_eq!(doc.undo_stack.len(), undo_depth);
+    assert_eq!(doc.redo_stack.len(), redo_depth);
+    assert_eq!(doc.generation(), generation);
+
+    let cmd = Command::ModifyEntity { id, new_geom };
+    match &previewed {
+        Err(err) => {
+            assert_eq!(doc.apply(cmd).unwrap_err(), *err);
+            assert_eq!(snapshot(doc), before);
+        }
+        Ok(shapes) => {
+            doc.apply(cmd).unwrap();
+            for (entity, bits) in &before_bits {
+                let after = geom_bits(&doc.entity(*entity).unwrap().geom);
+                match shapes.iter().find(|(e, _)| e == entity) {
+                    Some((_, shape)) => assert_eq!(geom_bits(shape), after, "{entity:?}"),
+                    None => assert_eq!(*bits, after, "{entity:?} moved unannounced"),
+                }
+            }
+            // 形が変わる図形だけを、EntityId 順に返している。
+            for pair in shapes.windows(2) {
+                assert!(pair[0].0 < pair[1].0);
+            }
+            if !shapes.is_empty() {
+                assert!(doc.undo());
+            }
+            // redo の深さと世代の高水位は増えている（apply して undo したので）。形だけ比べる。
+            assert_eq!(snapshot(doc).entities, before.entities);
+        }
+    }
+    previewed
+}
+
+#[test]
+fn preview_without_constraints_returns_the_edit_itself() {
+    let mut doc = Document::new();
+    let l = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
+    let c = circle(&mut doc, (20.0, 0.0), 3.0);
+    let a = add(&mut doc, arc_geom((40.0, 0.0), 5.0, 0.0, 1.0));
+    for (id, new_geom) in [
+        (l, line_geom((0.0, 0.0), (7.0, 8.0))),
+        (c, circle_geom((20.0, 0.0), 4.5)),
+        (a, arc_geom((40.0, 0.0), 5.0, 0.0, 2.0)),
+    ] {
+        let shapes = assert_preview_matches_apply(&mut doc, id, new_geom.clone()).unwrap();
+        assert_eq!(shapes, vec![(id, new_geom)]);
+    }
+    // 同じ形への編集は apply で何も起きない。
+    let same = geom(&doc, l);
+    assert_eq!(assert_preview_matches_apply(&mut doc, l, same), Ok(vec![]));
+}
+
+#[test]
+fn preview_includes_followers_and_the_solved_shape_of_the_edited_entity() {
+    // 矩形の 1 辺の終点を動かす: 追従あり。動かした点は止まり、もう片端は拘束に従う。
+    let mut doc = Document::new();
+    let rect = rectangle(&mut doc);
+    let side = rect.sides[0];
+    let shapes =
+        assert_preview_matches_apply(&mut doc, side, line_geom((0.0, 0.0), (55.0, 12.0))).unwrap();
+    assert!(shapes.len() >= 2, "{shapes:?}");
+    let (_, shape) = shapes.iter().find(|(id, _)| *id == side).unwrap();
+    let Some(Shape::Line(solved)) = shape.as_shape() else {
+        panic!("{shape:?}");
+    };
+    assert_eq!(solved.b, Point2::new(55.0, 12.0));
+    // 水平拘束に従って始点が動いている = 渡した形そのものではない。
+    assert_ne!(solved.a, Point2::new(0.0, 0.0));
+
+    // 円と円弧: 追従あり（等半径・中心の一致）。
+    let mut doc = Document::new();
+    let c = circle(&mut doc, (0.0, 0.0), 5.0);
+    let a = add(&mut doc, arc_geom((30.0, 0.0), 5.0, 0.0, 1.5));
+    let l = line(&mut doc, (0.0, 0.0), (0.0, 20.0));
+    doc.constrain(Constraint::EqualRadius { a: c, b: a });
+    doc.constrain(Constraint::Coincident {
+        a: center(c),
+        b: start(l),
+    });
+    doc.constrain(Constraint::Coincident {
+        a: PointRef::new(a, crate::PointKind::End),
+        b: end(l),
+    });
+    // 円の半径グリップ相当: 円弧の半径が追従する。
+    let shapes = assert_preview_matches_apply(&mut doc, c, circle_geom((0.0, 0.0), 7.5)).unwrap();
+    assert!(shapes.iter().any(|(id, _)| *id == a), "{shapes:?}");
+    // 円弧の終点グリップ相当（角度だけ）: 線分が追従する。
+    let shapes =
+        assert_preview_matches_apply(&mut doc, a, arc_geom((30.0, 0.0), 5.0, 0.0, 2.5)).unwrap();
+    assert!(shapes.iter().any(|(id, _)| *id == l), "{shapes:?}");
+    // 円の中心グリップ相当: 線分が追従する。
+    let shapes = assert_preview_matches_apply(&mut doc, c, circle_geom((2.0, 3.0), 5.0)).unwrap();
+    assert!(shapes.iter().any(|(id, _)| *id == l), "{shapes:?}");
+
+    // 連鎖: 解き直しを通る遠い編集も一致する。
+    let mut doc = Document::new();
+    let links = chain(&mut doc, 12, true);
+    let first = line_of(&doc, links[0]);
+    let far = LineSeg::new(first.a, first.b + Vec2::new(60.0, 80.0));
+    let shapes =
+        assert_preview_matches_apply(&mut doc, links[0], EntityGeom::Shape(Shape::Line(far)))
+            .unwrap();
+    assert!(shapes.len() > 2);
+}
+
+#[test]
+fn preview_rejects_exactly_what_apply_rejects() {
+    // ロックされたレイヤー。
+    let mut doc = Document::new();
+    let locked = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
+    let layer = lock_on_new_layer(&mut doc, locked);
+    let err = assert_preview_matches_apply(&mut doc, locked, line_geom((0.0, 0.0), (5.0, 5.0)));
+    assert_eq!(err, Err(CoreError::LayerLocked(layer)));
+
+    // 図形の固定。
+    let mut doc = Document::new();
+    let fixed = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
+    doc.constrain(Constraint::FixEntity { entity: fixed });
+    let err = assert_preview_matches_apply(&mut doc, fixed, line_geom((0.0, 0.0), (5.0, 5.0)));
+    assert_eq!(err, Err(CoreError::EntityFixed(fixed)));
+
+    // 種類の変更で拘束が指せなくなる。
+    let mut doc = Document::new();
+    let l = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
+    doc.constrain(Constraint::Horizontal { line: l });
+    let err = assert_preview_matches_apply(&mut doc, l, circle_geom((0.0, 0.0), 5.0));
+    assert!(
+        matches!(err, Err(CoreError::InvalidConstraint(_))),
+        "{err:?}"
+    );
+
+    // 不正な幾何・存在しないエンティティ。
+    let mut doc = Document::new();
+    let l = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
+    let err = assert_preview_matches_apply(&mut doc, l, line_geom((f64::NAN, 0.0), (5.0, 5.0)));
+    assert!(matches!(err, Err(CoreError::InvalidGeometry(_))), "{err:?}");
+    assert_eq!(
+        doc.preview_modify(EntityId::default(), line_geom((0.0, 0.0), (5.0, 5.0))),
+        Err(CoreError::EntityNotFound(EntityId::default()))
+    );
+
+    // 解けない: 下の辺を固定した矩形で、右上の角を右へ動かす（右の辺は垂直のまま届かない）。
+    let mut doc = Document::new();
+    let rect = rectangle(&mut doc);
+    doc.constrain(Constraint::FixEntity {
+        entity: rect.sides[0],
+    });
+    let err = assert_preview_matches_apply(
+        &mut doc,
+        rect.sides[1],
+        line_geom((40.0, 0.0), (50.0, 30.0)),
+    );
+    assert!(err.is_err(), "{err:?}");
+
+    // 退化: 線分を 1 点へつぶす編集は長さの拘束で拒否される。
+    let mut doc = Document::new();
+    let l = line(&mut doc, (0.0, 0.0), (10.0, 0.0));
+    let m = line(&mut doc, (10.0, 0.0), (20.0, 0.0));
+    doc.constrain(Constraint::EqualLength { a: l, b: m });
+    let err = assert_preview_matches_apply(&mut doc, l, line_geom((0.0, 0.0), (0.0, 0.0)));
+    assert!(err.is_err(), "{err:?}");
+}
+
+/// 解いた後の `apply` と同じコード経路である以上、編集の順に依らない: 拒否の後でも、
+/// 別の編集の後でも一致する。
+#[test]
+fn preview_matches_apply_after_other_edits_and_rejections() {
+    let mut doc = Document::new();
+    let rect = rectangle(&mut doc);
+    let side = rect.sides[2];
+    doc.apply(translated(&doc, rect.sides[0], (3.0, 4.0)))
+        .unwrap();
+    let new_geom = {
+        let l = line_of(&doc, side);
+        EntityGeom::Shape(Shape::Line(LineSeg::new(l.a, l.b + Vec2::new(1.5, -2.5))))
+    };
+    assert_preview_matches_apply(&mut doc, side, new_geom).unwrap();
+    assert!(doc.undo());
+    assert!(doc.redo());
+    let new_geom = {
+        let l = line_of(&doc, side);
+        EntityGeom::Shape(Shape::Line(LineSeg::new(l.a + Vec2::new(2.0, 0.0), l.b)))
+    };
+    assert_preview_matches_apply(&mut doc, side, new_geom).unwrap();
 }

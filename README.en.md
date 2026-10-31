@@ -2,7 +2,7 @@
 
 *[日本語版 README](./README.md)*
 
-A 2D CAD application built with Rust and egui. Current version: **v0.12.0**.
+A 2D CAD application built with Rust and egui. Current version: **v0.13.0**.
 
 > **Note on language.** The project's design documents (`DESIGN.md`, `AGENTS.md`,
 > `CHANGELOG.md`) are written in Japanese, and the application UI is being migrated
@@ -24,7 +24,8 @@ for the design and [`AGENTS.md`](./AGENTS.md) for the development conventions
 ## Features
 
 - **Drawing**: points, line segments, circles, arcs (three-point: start / through / end), polylines, rectangles (two corners), regular polygons (center → vertex, inscribed/circumscribed toggle, 3–64 sides), construction lines (infinite in both directions, a drafting aid), text (CJK supported), **dimensions** (linear, radial, diameter, angular and ordinate; linear dimensions support aligned/horizontal/vertical/oblique direction; angular dimensions can be defined by three points or by two lines — including lines meeting at a corner cut by a fillet or chamfer; ordinate dimensions auto-detect X/Y; auxiliary symbols φ/Sφ/□/R/SR/CR/C/t; tolerance support; annotation value style (reference/theoretically-exact), prefix/suffix and text rotation (auto/horizontal/oblique); style editing; seven arrowhead styles; drag text position; chained/parallel continuous input)
-- **Editing**: selection (click, rubber band, additive), move, duplicate, rotate, mirror, offset, **trim, extend (both can use a construction line as the boundary), fillet, chamfer, join, explode, split**, dimension grip editing (drag endpoints or the dimension line position; a right-panel button clears appearance overrides in bulk), delete
+- **Editing**: selection (click, rubber band, additive), move, duplicate, rotate, mirror, offset, **trim, extend (both can use a construction line as the boundary), fillet, chamfer, join, explode, split**, dimension grip editing (drag endpoints or the dimension line position; a right-panel button clears appearance overrides in bulk), shape grip editing (for the selected lines, circles and arcs, drag a line's endpoints, a circle's or arc's center and radius, or an arc's endpoints; constrained shapes that follow are previewed, the edit commits on release, and one undo reverts it), delete
+- **Geometric constraints**: lines, circles and arcs can be given coincident, horizontal, vertical, distance, parallel, perpendicular, equal-length, equal-radius, radius, angle, tangent and fix constraints (`Q`), and shapes follow when edited. An edit that cannot be solved is rejected with a reason and leaves the drawing unchanged. The right panel's "拘束" (constraints) section lists constraints and lets you change values, delete them and read the degrees of freedom. Constraint symbols appear on screen only. Solving stops at a work budget, so edits can be rejected in drawings with very large connected constraints (rough targets: about 2 s on commit, about 16 ms for the preview while dragging)
 - **Numeric input**: while a drawing tool that accepts a point is active (point, line, circle, arc, polyline, isometric circle, rectangle, polygon, construction line) or during the move/duplicate placement in selection mode, typing opens an input box next to the cursor for `x,y` (absolute), `@dx,dy` (relative to the base point), `L<A` (length `L` and angle `A` degrees from the base point; `@L<A` is the same), or `L` (length only, along the cursor direction from the base point, snapping to the polar-tracking direction while it is active) — equivalent to AutoCAD's dynamic input
 - **Polar tracking** (`F10`): snaps the cursor direction from the base point to the nearest multiple of a step angle (15°/30°/45°/90°, default 15°, saved to `config.json`), showing a dotted guide line and the angle. Mutually exclusive with orthogonal mode (`F8`)
 - **Isometric drawing aids**: isometric grid (`F5`), isometric axes for orthogonal mode, and an isometric circle tool (`I`, four-centre method). No Z axis or true ellipse; everything stays 2D arcs
@@ -71,6 +72,7 @@ For everyday use, a release build is recommended: `cargo run --release -p mcad-a
 | `F` | Fillet (enter a radius in the top panel, then click the first and second segments on the side you want to keep; `Esc` cancels) |
 | `Shift+F` | Chamfer (line segments only; enter distances in the top panel — two distances, equal by default — then click the first and second segments on the side you want to keep) |
 | `B` | Split (click a target; it is split at the clicked point) |
+| `Q` | Constraint tool (choose the type in the top-panel combo, then click endpoints/centers or lines, circles and arcs in turn. The first pick stays put and the later one moves. Distance, radius and angle come from the top panel's `Value` field (mm and degrees; empty means the current value). The first `Esc` discards the picks, the second exits) |
 | `1` | Point tool |
 | `L` / `C` / `A` / `P` | Line / circle / arc / polyline |
 | `Shift+L` | Construction line (infinite in both directions; two clicks — base point, then a point it passes through — after which further through-points can be placed from the same base point; the first `Esc` restarts from the base point, the second ends the tool. The through-point click accepts numeric input, orthogonal mode, polar tracking and snapping. Drawn clipped to the visible area on screen and to the paper on SVG/PDF export; it round-trips through DXF `XLINE`. Snaps to intersections with other shapes and construction lines. The base point is marked on screen only, with a short tick perpendicular to the line. Placed on a "構築線" (construction line) layer when one exists. Move/rotate/mirror/duplicate work; it can be used as a trim/extend boundary; offsetting it produces a line segment as described above. A construction line itself is not a target for trim/extend/fillet/chamfer/split/join/explode. Box selection picks it when the base point falls inside the box) |
@@ -106,7 +108,7 @@ a settings file and restored on the next launch (see "Settings" below).
 
 ## File formats
 
-- **`.mcad`**: the native JSON format. As of v0.12.0 the schema is v8; v1 through v7 files still load (backward compatible: v7 has no table kind, per-column alignment or "use a parts list" flag, so tables load as ordinary tables, all columns left-aligned, and "use a parts list" as ON — a legacy parts list is never guessed from its contents. v6 files get the dimension types and annotation fields added in v7 filled in with defaults, v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era). v8 added the table kind (table / parts list, `TableGeom.kind`), a per-drawing "use a parts list" flag (`SheetMeta.use_bom`), per-column text alignment for tables (`TableGeom.col_aligns`), and construction lines (`EntityGeom::XLine`)
+- **`.mcad`**: the native JSON format. As of v0.13.0 the schema is v9, which stores geometric constraints; v1 through v8 files still load, with no constraints (backward compatible: v7 has no table kind, per-column alignment or "use a parts list" flag, so tables load as ordinary tables, all columns left-aligned, and "use a parts list" as ON — a legacy parts list is never guessed from its contents. v6 files get the dimension types and annotation fields added in v7 filled in with defaults, v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era). v8 added the table kind (table / parts list, `TableGeom.kind`), a per-drawing "use a parts list" flag (`SheetMeta.use_bom`), per-column text alignment for tables (`TableGeom.col_aligns`), and construction lines (`EntityGeom::XLine`)
 - **New drawings** start with `"0"` plus five layers matching the drafting standard's line table (centre line, hidden line, outline, dimension line, text, with their linetypes and widths) and a bottommost `構築線` (construction line) layer (continuous, 0.13mm), six layers in all, and the current layer is the outline layer. Dimensions, text and construction lines are placed automatically on layers named `寸法線` (dimension line), `文字` (text) and `構築線` (construction line) when those exist (in a loaded drawing without them, the current layer is used). The standard layers can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
 
 ## Settings
@@ -117,6 +119,7 @@ on Linux). No drawing content is ever stored there.
 
 - Snap (`F3`) / orthogonal mode (`F8`) / paper-based display (`F9`) / polar tracking (`F10`, including its step angle) on/off state
 - Per-kind snap on/off state (top-panel "Snap types" menu; nearest-point defaults to OFF)
+- Constraint symbol visibility (a checkbox in the right panel's "拘束" section; default ON)
 - Default paper size, orientation, scale and title-block style for new documents
 - Recently used files (the "Recent" menu in the top panel, up to 5 entries; updated on every open/save, missing files are excluded)
 - Dimension trailing-zero trimming (default ON; toggled in the dimension style dialog and saved with the document. `120.00` displays as `120`)
@@ -138,6 +141,7 @@ format — the original DXF file is never overwritten. Be aware of the following
 - **DIMENSION**: since DXF has no primitive that corresponds to an mcad dimension, dimensions are exported decomposed into their dimension line, extension lines, arrowheads and text, written as `LINE`/`SOLID`/`ARC`/`TEXT` (the same **one-way round trip** as tables — reimporting does not rebuild the dimension entity; the `SOLID` used for the filled arrowhead is counted in the skipped-entity total on reimport). They are saved normally in `.mcad`. Importing DXF `DIMENSION` written by other CAD software is supported (aligned, rotated, radial, diameter, three-point angular and ordinate dimensions; two-line angular and arc-length dimensions are not)
 - **Tables**: a table is exported decomposed into its rules (`LINE`) and cell texts (`TEXT`). This is a **one-way trip** — reimporting does not rebuild the table entity (the distinction in rule thickness is also lost). Centered/right-aligned columns are written using `TEXT` horizontal justification (group 72/11), so on reimport that column's cell text counts as a skipped non-standard-justification `TEXT` (left-aligned columns still import as ordinary text). `ACAD_TABLE` written by other software is skipped, since the `dxf` crate 0.6.1 has no type for it (it is not even counted as skipped)
 - **Construction lines (XLINE)**: written and read as `XLINE` (base point and unit direction) — a **symmetric** round trip. The direction is written rounded to 12 decimal digits and renormalized on import. An `XLINE` with a zero direction is counted as skipped. The half-line `RAY` entity is not supported and is counted as skipped without being read
+- **Geometric constraints**: not saved to DXF (a status bar notice appears on export)
 - **Drawing frame and title block**: these are not exported to DXF, because DXF has nowhere to carry the sheet metadata. A reimported drawing draws its frame from the default paper and scale, so the frame no longer lines up with the geometry the way it did in the original
 - **CJK text in other applications**: CJK written by mcad may appear garbled in other CAD software (confirmed with LibreCAD). DXF cannot embed the font itself, so rendering depends on the fonts installed on the receiving side
 
@@ -156,7 +160,7 @@ mcad/
 
 | Crate | Role |
 |---|---|
-| **mcad-geom** | Geometric primitives (`Point2`, `Vec2`, `LineSeg`, `Circle`, `Arc`, `Polyline`, `Shape`) and calculations (nearest point, distance, intersection). GUI-independent, pure functions only |
+| **mcad-geom** | Geometric primitives (`Point2`, `Vec2`, `LineSeg`, `Circle`, `Arc`, `Polyline`, `Shape`) and calculations (nearest point, distance, intersection, the general constraint solver `solve`). GUI-independent, pure functions only |
 | **mcad-core** | The CAD document model (`Document` / `Entity` / `Layer`) and command-pattern undo/redo |
 | **mcad-io** | Saving and loading `.mcad` (JSON) and DXF I/O via the `dxf` crate |
 | **mcad-app** | The egui GUI: tools, viewport, snapping engine, layer panel and file operations |
@@ -169,7 +173,7 @@ Key design decisions:
 
 - **f64 world coordinates**: coordinate precision matters in CAD. f32 accumulates error on large drawings, so the conversion to f32 happens only at the egui drawing boundary
 - **Command-pattern undo**: cheaper in memory than snapshots and viable for large drawings. Every change goes through `Document::apply(Command)`
-- **Keeping geom GUI-independent**: geometry stays testable as pure functions, which also makes a future constraint solver easier to add
+- **Keeping geom GUI-independent**: geometry stays testable as pure functions, and the constraint solver sits on this layer too
 - **No spatial index**: a full scan with AABB culling is used (measured in v0.11.0: picking, box selection and culling stay around 3 ms even at 20,000 entities)
 
 ## Development

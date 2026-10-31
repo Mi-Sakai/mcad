@@ -4,8 +4,16 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-31 — 幾何拘束ソルバー
+
+線分・円・円弧への永続的な幾何拘束を追加した。`Document::apply` の中で解いて追従を同じ undo 単位に入れ、拘束ツール
+(`Q`)・拘束記号・右パネル「拘束」・図形のグリップ編集から使える(M13 タスク95〜102)。`.mcad` スキーマを v8 → v9 へ
+更新(拘束)。
+
 ### 追加
 
+- **汎用ソルバー**(`crates/mcad-geom/src/solve.rs`、M13 タスク95): `mcad_geom::solve` の最小ノルム減衰ガウス・ニュートン法と
+  `degrees_of_freedom`。外部クレートは足していない。詳細は DESIGN.md「M13」設計判断1
 - **幾何拘束のデータモデル**(`crates/mcad-core`、M13 タスク96): `Constraint`(一致・水平・垂直・距離・平行・
   直交・等長・等半径・半径・角度・接線・固定)と `ConstraintId`・`PointRef`、`Command::AddConstraint` /
   `RemoveConstraint` / `SetConstraintValue` / `ReshapeEntity`。エンティティを削除するとその拘束も消え、undo で
@@ -53,6 +61,10 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
   だけを描いて理由を出し、離すと確定を試みる。右パネルは階数の計算が約 200 ms 相当を超える成分で「自由度: 大きすぎるため
   計算していません」と出す(`Document::degrees_of_freedom_bounded`・`DofOutcome`)。詳細は DESIGN.md「M13」設計判断7 の実装時追記
   (タスク101 後半)
+
+### テスト
+
+- 1528本 → 1817本(うち ignored 6本)
 
 ## [0.12.0] - 2026-09-27 — 作図補助
 

@@ -93,7 +93,7 @@ use std::f64::consts::FRAC_PI_2;
 
 use mcad_core::{
     DimExpansion, DimRender, Document, Entity, EntityGeom, Layer, Linetype, Rgb, TableCellText,
-    TableGeom, TextGeom, XLineGeom, expand_dim, expand_table,
+    TableGeom, TextGeom, XLineGeom, expand_dim, expand_table, label_mask_quad,
 };
 use mcad_geom::{Aabb, Arc, LineSeg, Point2, Polyline, Shape, Vec2, clip_line_to_aabb};
 use serde::{Deserialize, Serialize};
@@ -451,7 +451,8 @@ fn push_entity(
         | EntityGeom::DimAngular(_)
         | EntityGeom::DimOrdinate(_) => {
             if let Some(ex) = expand_dim(&entity.geom, dim_render) {
-                push_dim(paths, &ex, color, width_mm, k, outliner);
+                let mask = dim_label_mask_path(&ex, dim_render, background_for_mode(mode), k);
+                push_dim(paths, &ex, mask, color, width_mm, k, outliner);
             }
         }
         // 表の罫線は幅も線種も固定の定数（表題欄と同じ。core の `expand` が持つ）なので、`width_mm` も
@@ -527,7 +528,31 @@ fn push_text(
     );
 }
 
-/// 寸法の展開結果（線分・矢先・記号ストローク・文字）をパスへ展開する。
+/// 寸法の文字の下を用紙の背景色で塗るパス（[`label_mask_quad`]。画面の `draw_entities` と同じ
+/// 領域）。[`push_dim`] が寸法自身の線と文字の間へ積む。
+///
+/// 背景色を塗るのは PDF でも同じ（[`PlotPage::background`] が白のときに省略されるのは用紙
+/// 全面の塗りだけで、このパスは他の塗りと同じく常に書かれる）。
+fn dim_label_mask_path(
+    ex: &DimExpansion,
+    render: DimRender<'_>,
+    background: Rgb,
+    k: f64,
+) -> Option<PlotPath> {
+    let quad = ex.label_box?;
+    let [a, b, c, d] = label_mask_quad(&quad, render).map(|p| world_to_paper(p, k));
+    let cmds = vec![
+        PathCmd::MoveTo(a),
+        PathCmd::LineTo(b),
+        PathCmd::LineTo(c),
+        PathCmd::LineTo(d),
+        PathCmd::Close,
+    ];
+    Some(PlotPath::filled(cmds, background))
+}
+
+/// 寸法の展開結果をパスへ展開する。順序は [`DimExpansion`] の「描画の層」（線分・矢先・弧 →
+/// `mask` → 文字に付く線分・記号ストローク・文字）で、文字の下にある寸法自身の線は塗りで消える。
 ///
 /// [`DimExpansion`] の座標・長さ・文字高さは **すべてワールド長** なので `÷ k` して
 /// 紙 mm へ戻す。呼び出し側が `style.arrow_len_mm * k` / `style.text_height_mm * k` を
@@ -540,6 +565,7 @@ fn push_text(
 fn push_dim(
     paths: &mut Vec<PlotPath>,
     ex: &DimExpansion,
+    mask: Option<PlotPath>,
     color: Rgb,
     width_mm: f32,
     k: f64,
@@ -580,6 +606,17 @@ fn push_dim(
             ];
             paths.push(PlotPath::stroked(cmds, stroke));
         }
+    }
+    for shape in &ex.line_strokes {
+        push_shape(paths, shape, stroke, k);
+    }
+    paths.extend(mask);
+    for seg in &ex.label_segments {
+        let cmds = vec![
+            PathCmd::MoveTo(world_to_paper(seg[0], k)),
+            PathCmd::LineTo(world_to_paper(seg[1], k)),
+        ];
+        paths.push(PlotPath::stroked(cmds, stroke));
     }
     // 記号（φ・□）は値と同じラベルの一部なので、文字の直前へ置いて描画順を揃える。
     for shape in &ex.symbol_strokes {
@@ -840,9 +877,9 @@ mod tests {
     use super::*;
     use crate::frame::{CELL_TEXT_PAD_MM, FRAME_BORDER_WIDTH_MM, FRAME_DIVIDER_WIDTH_MM};
     use mcad_core::{
-        Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial, DimStyle,
-        HorizontalAlign, Layer, Scale, SheetMeta, SizeTolerance, Style, TableKind, WidthMm,
-        expand_linear,
+        Command, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimLinear, DimRadial,
+        DimStyle, HorizontalAlign, Layer, Scale, SheetMeta, SizeTolerance, Style, TableKind,
+        ValueStyle, WidthMm, expand_linear,
     };
     use mcad_geom::{ArrowKind, Circle, LineSeg, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
@@ -904,8 +941,20 @@ mod tests {
     }
 
     /// 塗りだけのパス（塗りあり・ストロークなし）を順序どおり取り出す。
+    /// 背景色の塗り（寸法の文字の下の塗り、[`dim_label_mask_path`]）は含めない。
     fn filled(page: &PlotPage) -> Vec<&PlotPath> {
-        page.paths.iter().filter(|p| p.fill.is_some()).collect()
+        page.paths
+            .iter()
+            .filter(|p| p.fill.is_some_and(|fill| fill != page.background))
+            .collect()
+    }
+
+    /// 寸法の文字の下の塗り（用紙の背景色の塗りパス）を順序どおり取り出す。
+    fn label_masks(page: &PlotPage) -> Vec<&PlotPath> {
+        page.paths
+            .iter()
+            .filter(|p| p.fill == Some(page.background))
+            .collect()
     }
 
     /// 線分パス（`MoveTo`+`LineTo`）の 2 端点。
@@ -2117,10 +2166,14 @@ mod tests {
             if let Some(stroke) = path.stroke {
                 assert_eq!(stroke.color, Rgb::WHITE, "stroke must be white");
             }
-            if let Some(fill) = path.fill {
+            // 白以外の塗りは寸法の文字の下の塗りだけで、色は背景と同じ（下の assert）。
+            if let Some(fill) = path.fill
+                && fill != BLUEPRINT_BACKGROUND
+            {
                 assert_eq!(fill, Rgb::WHITE, "fill must be white");
             }
         }
+        assert_eq!(label_masks(&page).len(), 1, "寸法 1 つぶんの文字の下の塗り");
         // 枠（罫線+欄文字）・作図線・寸法（線+矢先+文字）がいずれも存在すること。
         assert!(!stroked(&page).is_empty());
         assert!(!filled(&page).is_empty());
@@ -2310,5 +2363,273 @@ mod tests {
         let (a, b) = endpoints(lines[0]);
         assert!(a.distance(Point2::new(100.0, 0.0)) < T, "{a:?}");
         assert!(b.distance(Point2::new(100.0, 210.0)) < T, "{b:?}");
+    }
+
+    // ---- 寸法の文字の下の塗りと接続線（実使用 1 枚目を受けた修正、2026-11-01）----
+
+    fn plain_dim(annotation: DimAnnotation) -> DimLinear {
+        DimLinear {
+            p1: Point2::new(20.0, 20.0),
+            p2: Point2::new(120.0, 20.0),
+            offset: 10.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation,
+        }
+    }
+
+    fn close_points(a: Point2, b: Point2) {
+        assert!(a.distance(b) < T, "{a:?} != {b:?}");
+    }
+
+    /// 塗りのパスの位置（寸法 1 つの図面用）。
+    fn mask_index(page: &PlotPage) -> usize {
+        let masks: Vec<usize> = page
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.fill == Some(page.background))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(masks.len(), 1, "塗りは寸法 1 つにつき 1 本");
+        masks[0]
+    }
+
+    /// 線だけのパスの本数。
+    fn stroke_count(paths: &[PlotPath]) -> usize {
+        paths.iter().filter(|p| p.stroke.is_some()).count()
+    }
+
+    #[test]
+    fn dimension_on_its_own_line_is_plotted_as_lines_then_mask_then_text() {
+        // 文字を自分の寸法線の上へ置く（Codex adversarial review high 指摘の再現）。
+        // 尺度 1:2 で、先に描く線分 → 寸法の順に積む。
+        let mut document = document_with_scale(1, 2);
+        add(
+            &mut document,
+            Shape::Line(LineSeg::new(Point2::ORIGIN, Point2::new(10.0, 0.0))),
+        );
+        let dim = plain_dim(DimAnnotation {
+            text_anchor: Some(Point2::new(70.0, 30.0)),
+            ..DimAnnotation::default()
+        });
+        add(&mut document, EntityGeom::DimLinear(dim.clone()));
+        let page = plot_page(&document, PlotColorMode::Monochrome);
+
+        // 先行の線分 1 + 寸法線 1 + 補助線 2 + 矢先 2 → 塗り → 文字 1（線は残らない）。
+        let mask = mask_index(&page);
+        assert_eq!(mask, 6, "{:?}", page.paths);
+        assert_eq!(stroke_count(&page.paths[..mask]), 4);
+        assert_eq!(page.paths.len(), mask + 2);
+        assert!(page.paths[mask + 1].stroke.is_none());
+        assert_eq!(
+            page.paths[mask + 1].fill,
+            Some(Rgb::BLACK),
+            "文字は塗りの後"
+        );
+        assert!(page.paths[mask].stroke.is_none(), "塗りに輪郭は引かない");
+
+        // 形は core の `label_mask_quad` を `÷ k` したもの（紙の上で 0.5mm 膨らむ）。
+        let style = DimStyle::DEFAULT;
+        let render = DimRender {
+            style: &style,
+            scale_world_per_paper_mm: 2.0,
+            arrow_len_world: style.arrow_len_mm * 2.0,
+            text_height_world: style.text_height_mm * 2.0,
+        };
+        let quad = expand_linear(&dim, render).label_box.unwrap();
+        let expected = label_mask_quad(&quad, render).map(|p| world_to_paper(p, 2.0));
+        let [
+            PathCmd::MoveTo(a),
+            PathCmd::LineTo(b),
+            PathCmd::LineTo(c),
+            PathCmd::LineTo(d),
+            PathCmd::Close,
+        ] = page.paths[mask].cmds.as_slice()
+        else {
+            panic!("expected a closed quad, got {:?}", page.paths[mask].cmds);
+        };
+        for (got, want) in [a, b, c, d].into_iter().zip(expected) {
+            close_points(*got, want);
+        }
+        close_to(a.distance(*b), quad[0].distance(quad[1]) / 2.0 + 2.0 * 0.5);
+    }
+
+    #[test]
+    fn angular_arc_is_plotted_under_the_mask() {
+        let mut document = document_with_scale(1, 1);
+        add(
+            &mut document,
+            EntityGeom::DimAngular(DimAngular {
+                vertex: Point2::new(50.0, 50.0),
+                p1: Point2::new(60.0, 50.0),
+                p2: Point2::new(50.0, 60.0),
+                arc_radius: 30.0,
+                // 45° 方向の弧の上。
+                annotation: DimAnnotation {
+                    text_anchor: Some(Point2::new(
+                        50.0 + 30.0 * FRAC_PI_4.cos(),
+                        50.0 + 30.0 * FRAC_PI_4.sin(),
+                    )),
+                    ..DimAnnotation::default()
+                },
+            }),
+        );
+        let page = plot_page(&document, PlotColorMode::Monochrome);
+        let mask = mask_index(&page);
+        let is_curve = |p: &PlotPath| {
+            p.stroke.is_some() && p.cmds.iter().any(|c| matches!(c, PathCmd::CurveTo(..)))
+        };
+        assert!(page.paths[..mask].iter().any(is_curve), "弧は塗りの下");
+        assert_eq!(
+            stroke_count(&page.paths[mask + 1..]),
+            0,
+            "塗りの上に線は無い"
+        );
+        assert!(page.paths[mask + 1].fill.is_some(), "文字は塗りの上");
+    }
+
+    #[test]
+    fn phi_symbol_is_plotted_over_the_mask_and_the_diameter_line_under_it() {
+        let mut document = document_with_scale(1, 1);
+        add(
+            &mut document,
+            EntityGeom::DimDiameter(DimDiameter {
+                center: Point2::new(100.0, 50.0),
+                radius: 20.0,
+                angle: 0.0,
+                annotation: DimAnnotation {
+                    text_anchor: Some(Point2::new(100.0, 50.0)),
+                    ..DimAnnotation::default()
+                },
+            }),
+        );
+        let page = plot_page(&document, PlotColorMode::Monochrome);
+        let mask = mask_index(&page);
+        assert_eq!(stroke_count(&page.paths[..mask]), 1, "直径線だけ");
+        // φ の円 + φ の斜線。
+        assert_eq!(stroke_count(&page.paths[mask + 1..]), 2);
+    }
+
+    #[test]
+    fn underline_frame_and_connector_are_plotted_over_the_mask() {
+        let plotted = |annotation: DimAnnotation| {
+            let mut document = document_with_scale(1, 1);
+            add(&mut document, EntityGeom::DimLinear(plain_dim(annotation)));
+            let page = plot_page(&document, PlotColorMode::Monochrome);
+            let mask = mask_index(&page);
+            // 下の層は常に 寸法線 + 補助線 2。上の層の線の本数を返す。
+            assert_eq!(stroke_count(&page.paths[..mask]), 3);
+            stroke_count(&page.paths[mask + 1..])
+        };
+        let on_line = Some(Point2::new(70.0, 30.0));
+        // 下線（文字を寸法線の上へ置いても文字側の線は欠けない）。
+        assert_eq!(
+            plotted(DimAnnotation {
+                value_override: Some("50".to_owned()),
+                text_anchor: on_line,
+                ..DimAnnotation::default()
+            }),
+            1
+        );
+        // 理論的に正確な寸法の枠 4 辺。
+        assert_eq!(
+            plotted(DimAnnotation {
+                value_style: ValueStyle::TheoreticallyExact,
+                text_anchor: on_line,
+                ..DimAnnotation::default()
+            }),
+            4
+        );
+        // 接続線（文字を離したとき）。
+        assert_eq!(
+            plotted(DimAnnotation {
+                text_anchor: Some(Point2::new(70.0, 60.0)),
+                ..DimAnnotation::default()
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn every_dimension_kind_gets_a_label_mask_but_text_and_tables_do_not() {
+        let mut document = document_with_scale(1, 1);
+        add(
+            &mut document,
+            EntityGeom::DimRadial(DimRadial {
+                center: Point2::new(50.0, 50.0),
+                radius: 10.0,
+                leader_angle: 0.0,
+                annotation: DimAnnotation::default(),
+            }),
+        );
+        add(
+            &mut document,
+            EntityGeom::DimDiameter(DimDiameter {
+                center: Point2::new(100.0, 50.0),
+                radius: 10.0,
+                angle: 0.0,
+                annotation: DimAnnotation::default(),
+            }),
+        );
+        add(
+            &mut document,
+            EntityGeom::DimLinear(plain_dim(DimAnnotation::default())),
+        );
+        assert_eq!(
+            label_masks(&plot_page(&document, PlotColorMode::Monochrome)).len(),
+            3
+        );
+
+        let mut text_only = document_with_scale(1, 1);
+        add(
+            &mut text_only,
+            EntityGeom::Text(TextGeom {
+                anchor: Point2::new(10.0, 10.0),
+                content: "A".to_owned(),
+                height: 3.5,
+                angle: 0.0,
+            }),
+        );
+        assert!(label_masks(&plot_page(&text_only, PlotColorMode::Monochrome)).is_empty());
+    }
+
+    #[test]
+    fn blueprint_label_mask_uses_the_prussian_blue_background() {
+        let mut document = document_with_scale(1, 1);
+        add(
+            &mut document,
+            EntityGeom::DimLinear(plain_dim(DimAnnotation::default())),
+        );
+        let page = plot_page(&document, PlotColorMode::Blueprint);
+        assert_eq!(
+            page.paths[mask_index(&page)].fill,
+            Some(BLUEPRINT_BACKGROUND)
+        );
+        // Color モードの背景は白。
+        let page = plot_page(&document, PlotColorMode::Color);
+        assert_eq!(page.paths[mask_index(&page)].fill, Some(Rgb::WHITE));
+    }
+
+    #[test]
+    fn label_connector_is_plotted_with_the_dimension_line_stroke() {
+        let mut document = document_with_scale(1, 1);
+        add(
+            &mut document,
+            EntityGeom::DimLinear(plain_dim(DimAnnotation {
+                text_anchor: Some(Point2::new(70.0, 60.0)),
+                ..DimAnnotation::default()
+            })),
+        );
+        let page = plot_page(&document, PlotColorMode::Monochrome);
+        // 寸法線 1 + 補助線 2 + 接続線 1。接続線は塗りより後なので最後の線。
+        let lines = stroked(&page);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[3].stroke, lines[0].stroke, "同じ線幅・実線");
+        assert_eq!(lines[3].stroke.unwrap().dash_mm, None);
+        let (a, b) = endpoints(lines[3]);
+        close_points(a, Point2::new(70.0, 30.0));
+        close_to(b.x, 70.0);
+        assert!(b.y > 30.0 && b.y < 60.0, "{b:?}");
     }
 }

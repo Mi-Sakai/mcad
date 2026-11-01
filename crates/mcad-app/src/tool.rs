@@ -1286,6 +1286,14 @@ impl Tool for PolylineTool {
                         ctx.style,
                     )));
                 }
+                // 直前の頂点と一致する連続重複点は追加しない（エラー表示もしない）。
+                if self
+                    .vertices
+                    .last()
+                    .is_some_and(|last| last.distance(p) <= AUTO_CLOSE_EPSILON)
+                {
+                    return ToolResult::Continue;
+                }
                 self.vertices.push(p);
                 ToolResult::Continue
             }
@@ -6993,6 +7001,26 @@ mod tests {
                 // 始点の重複頂点は作らない（頂点数は3のまま）。
                 assert_eq!(pl.vertices, vec![a, b, c]);
             }
+            other => panic!("expected Polyline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn polyline_tool_ignores_click_on_the_previous_vertex() {
+        let (_doc, ctx) = ctx();
+        let mut tool = PolylineTool::default();
+        let a = Point2::new(0.0, 0.0);
+        let b = Point2::new(90.0, 92.0);
+        tool.on_input(&ctx, InputEvent::Click(a));
+        tool.on_input(&ctx, InputEvent::Click(b));
+        // 直前の頂点と同じ点のクリックは頂点にならず、Continue のまま。
+        assert!(matches!(
+            tool.on_input(&ctx, InputEvent::Click(b)),
+            ToolResult::Continue
+        ));
+        let result = tool.on_input(&ctx, InputEvent::Confirm);
+        match shape_of(result) {
+            Shape::Polyline(pl) => assert_eq!(pl.vertices, vec![a, b]),
             other => panic!("expected Polyline, got {other:?}"),
         }
     }

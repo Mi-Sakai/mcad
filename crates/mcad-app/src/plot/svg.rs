@@ -387,6 +387,34 @@ mod tests {
 
     // ---- 8: 背景色は PlotPage::background に従う（青図モード） ----
 
+    // ---- 8b: 寸法は 線 → 背景色の塗り → 文字 の順で出る ----
+
+    #[test]
+    fn dimension_label_mask_reaches_the_svg_between_the_lines_and_the_label() {
+        // 値上書きの直径寸法（下線と φ が塗りの上に来る）。
+        let document = document_with_annotated_diameter();
+        for (mode, color) in [
+            (PlotColorMode::Monochrome, "#ffffff"),
+            (PlotColorMode::Blueprint, "#003153"),
+        ] {
+            let svg = to_svg(&plot_page(&document, mode));
+            let paths: Vec<&str> = svg.split("<path").skip(1).collect();
+            let fill = format!("fill=\"{color}\"");
+            let mask = paths
+                .iter()
+                .position(|p| p.contains(&fill))
+                .unwrap_or_else(|| panic!("{mode:?}: 塗りが無い: {svg}"));
+            assert!(paths[0].contains("fill=\"none\""), "{mode:?}: 先頭は直径線");
+            // 塗りの下は直径線 1 + 矢先 2、塗りの上は下線 + φ の円・斜線 + 値。
+            assert_eq!(mask, 3, "{mode:?}: {svg}");
+            assert_eq!(paths.len() - mask - 1, 4, "{mode:?}: {svg}");
+            assert!(
+                paths[mask + 1].contains("fill=\"none\""),
+                "{mode:?}: 下線は塗りの上"
+            );
+        }
+    }
+
     // ---- 9: 寸法の記号ストローク・下線が SVG まで届く（M9 タスク49-3）----
 
     /// 寸法補助記号（φ）のストロークと非比例寸法の下線が `<path>` として書き出される。
@@ -399,9 +427,10 @@ mod tests {
         let document = document_with_annotated_diameter();
         let page = plot_page(&document, PlotColorMode::Monochrome);
 
-        // ストローク 4 本（寸法線・下線・φ の円・φ の斜線）+ 塗り 3 つ（矢先 2・値 1）。
+        // ストローク 4 本（寸法線・下線・φ の円・φ の斜線）+ 塗り 4 つ（文字の下の塗り 1・
+        // 矢先 2・値 1）。
         assert_eq!(page.paths.iter().filter(|p| p.stroke.is_some()).count(), 4);
-        assert_eq!(page.paths.iter().filter(|p| p.fill.is_some()).count(), 3);
+        assert_eq!(page.paths.iter().filter(|p| p.fill.is_some()).count(), 4);
 
         let svg = to_svg(&page);
         assert_eq!(svg.matches("<path").count(), page.paths.len());

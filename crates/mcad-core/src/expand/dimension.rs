@@ -38,6 +38,13 @@
 //! 「掴める場所を見た目どおりに掴む」操作であり、ズームで当たり外れが変わっても
 //! 実害がない（選択そのものを左右しない）ため。
 //!
+//! # 文字と寸法線をつなぐ線（実使用 1 枚目を受けた修正、2026-11-01）
+//!
+//! 文字を手で動かして寸法線から離すと、[`DimExpansion::label_segments`] に接続線が足される
+//! （`push_label_connector`）。**表示サイズ依存の形**（ラベル外形から決まる）なので、
+//! `*_pick_segments` には混ぜない。pick 形状が保存データだけで決まる上記の契約を保つ。
+//! 引出線エンティティ（M9 設計判断8、G3）とは別物で、保存されない寸法の見た目の一部である。
+//!
 //! # 展開パラメータ（M9 タスク49-2）
 //!
 //! 展開関数は [`DimRender`] を受け取る。**このモジュールは紙基準表示トグル（F9）も
@@ -52,7 +59,7 @@
 //! 返す点でこのモジュールの展開関数とは責務が分かれている。ワールドへの合流は
 //! [`place_label`]（タスク49-2）が担う。
 
-use mcad_geom::{Arc, ArrowGlyph, ArrowKind, LineSeg, Point2, Shape, Vec2, arrow_glyph};
+use mcad_geom::{Arc, ArrowGlyph, ArrowKind, LineSeg, Point2, Shape, Vec2, arrow_glyph, intersect};
 
 use crate::{
     ArrowPlacement, DimAngular, DimAnnotation, DimDiameter, DimDirection, DimKind, DimLinear,
@@ -62,17 +69,32 @@ use crate::{
 use super::dim_label::{DimLabel, layout_dim_label};
 
 /// 寸法を描画・プレビュー可能な要素へ展開した結果（すべてワールド座標）。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// # 描画の層
+///
+/// 画面の通常描画（`mcad-app` の `draw_entities`）と SVG/PDF（`plot::push_dim`）は次の順で描く。
+///
+/// 1. 塗りの下: [`segments`](Self::segments)・[`arrows`](Self::arrows)・
+///    [`line_strokes`](Self::line_strokes)
+/// 2. 文字の下の塗り: [`label_box`](Self::label_box) を [`label_mask_quad`] で膨らませた領域
+/// 3. 塗りの上: [`label_segments`](Self::label_segments)・
+///    [`symbol_strokes`](Self::symbol_strokes)・[`texts`](Self::texts)
+///
+/// 寸法自身の線に文字が重なっても、文字の下の線は塗りで消え、文字を横切らない。
 pub struct DimExpansion {
-    /// 線分（寸法線・補助線・引出線・非比例寸法の下線）。
+    /// 文字の下の塗りより**下**に描く線分（寸法線・補助線・引出線）。
     ///
-    /// 非比例寸法（規定 5-10）の下線をここへ混ぜているのは、下線が寸法線とまったく
-    /// 同じ実線ストロークで描かれるべきものであり、consumers（`mcad-app` の
-    /// `draw_dim_expansion`・`plot::push_dim`）へ描画分岐を 1 つも増やさずに済むため。
+    /// 文字に付く線分（下線・枠・接続線）は [`DimExpansion::label_segments`] にある。
+    /// 描く層をフィールドで分けているのは、並び順や添字に層の意味を持たせないため
+    /// （型の末尾の「描画の層」節）。
     ///
-    /// 並び順は **寸法線（または引出線）→ 非比例寸法の下線（あれば）→ 補助線**。
-    /// `segments[0]` が寸法線であることだけは全種別で共通。
+    /// 並び順は **寸法線（または引出線）→ 補助線**。`segments[0]` が寸法線であることは、
+    /// 寸法線が直線の種別で共通する（角度寸法の寸法線は弧なので
+    /// [`DimExpansion::line_strokes`] にあり、`segments` は補助線だけになる）。
     pub segments: Vec<[Point2; 2]>,
+    /// 文字の下の塗りより**下**に描く曲線の寸法線（角度寸法の弧 [`Shape::Arc`]）。
+    /// 消費側は寸法線と同じストロークで描く。
+    pub line_strokes: Vec<Shape>,
     /// 矢先（各要素は 1 個ぶんの形状を**ワールド座標へ写した** [`ArrowGlyph`]）。
     ///
     /// 形そのものは geom の純関数 [`mcad_geom::arrow_glyph`] が種別
@@ -102,7 +124,12 @@ pub struct DimExpansion {
     /// のまま歪まない）。**M9 タスク51**（文字位置の後編集）の当たり判定・ドラッグ対象の
     /// 可視化に使う。`place_label` を呼ばない経路は素通しで `None` のまま
     /// （現状すべての展開関数が `place_label` を通るため実質常に `Some`）。
+    /// 文字の下の塗りはこれを [`label_mask_quad`] で膨らませた領域を使う。
     pub label_box: Option<[Point2; 4]>,
+    /// 文字の下の塗りより**上**に描く線分。非比例寸法（規定 5-10）の下線・理論的に正確な
+    /// 寸法の枠・文字と寸法線をつなぐ線（`push_label_connector`）。
+    /// 消費側は寸法線と同じ実線ストロークで描く。
+    pub label_segments: Vec<[Point2; 2]>,
 }
 
 impl DimExpansion {
@@ -113,7 +140,9 @@ impl DimExpansion {
             arrows,
             texts: Vec::new(),
             symbol_strokes: Vec::new(),
+            line_strokes: Vec::new(),
             label_box: None,
+            label_segments: Vec::new(),
         }
     }
 }
@@ -148,6 +177,42 @@ pub fn label_box_contains(quad: &[Point2; 4], p: Point2) -> bool {
 #[must_use]
 pub fn label_box_center(quad: &[Point2; 4]) -> Point2 {
     quad[0].midpoint(quad[2])
+}
+
+/// 文字の下の塗りを、文字ブロックの外形より外へ広げる量（紙 mm）。
+const LABEL_MASK_MARGIN_MM: f64 = 0.5;
+
+/// 文字の下を背景色で塗る領域（[`DimExpansion::label_box`] を紙 [`LABEL_MASK_MARGIN_MM`]
+/// ぶん、ラベルのローカル軸に沿って 4 辺とも外へ膨らませた四角形）。頂点順は入力と同じ。
+///
+/// 画面（`mcad-app` の `draw_entities`）と出力（`plot`）が共有する。塗りはその寸法自身の
+/// 線・矢先・文字より**前**に描くので、消えるのは先に描かれたものだけである。
+/// `label_box` の当たり判定の用途はこの関数と無関係で、当たり判定は膨らませない。
+///
+/// 膨らませ量の換算は [`DimRender`] の注記の表示倍率（すきま・突き出しと同じ）。紙基準表示
+/// OFF でも文字と同じ比率で画面に現れる。幅または高さが 0 に潰れた四角形でも、残る軸の
+/// 直交方向へ広げるので面積のある四角形を返す。
+#[must_use]
+pub fn label_mask_quad(quad: &[Point2; 4], render: DimRender<'_>) -> [Point2; 4] {
+    let (u, v) = match (
+        (quad[1] - quad[0]).normalize(),
+        (quad[3] - quad[0]).normalize(),
+    ) {
+        (Some(u), Some(v)) => (u, v),
+        (Some(u), None) => (u, u.perp()),
+        (None, Some(v)) => (Vec2::new(v.y, -v.x), v),
+        (None, None) => (Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)),
+    };
+    // `max` は NaN も 0 へ倒す（検証を通っていないスタイルで NaN を撒かない）。
+    let margin = render.paper_mm_to_world(LABEL_MASK_MARGIN_MM).max(0.0);
+    let du = u * margin;
+    let dv = v * margin;
+    [
+        quad[0] - du - dv,
+        quad[1] + du - dv,
+        quad[2] + du + dv,
+        quad[3] - du + dv,
+    ]
 }
 
 // ---------------------------------------------------------------------
@@ -383,7 +448,7 @@ fn arrows_point_outward(
 /// ずれる（ラベルが寸法線側へ寄る）。外形の中心を基準にすれば、公差や下線が付いても
 /// 「寸法線から text_gap だけ離す」が正しく保たれる。
 ///
-/// 非比例寸法の下線は [`DimExpansion::segments`] へ入れる（型の doc 参照）。
+/// 非比例寸法の下線と理論寸法の枠は [`DimExpansion::label_segments`] へ入れる（型の doc 参照）。
 ///
 /// # 文字姿勢の手動固定（[`DimAnnotation::text_rotation`]、M11 タスク70）
 ///
@@ -425,7 +490,7 @@ fn place_label(
             .map(|shape| shape.rotated(Point2::ORIGIN, angle).translated(delta)),
     );
     if let Some([a, b]) = label.underline {
-        out.segments.push([to_world(a), to_world(b)]);
+        out.label_segments.push([to_world(a), to_world(b)]);
     }
     // 理論的に正確な寸法の枠（M11 タスク70）。4 辺を線分として足す（下線と同じ扱い）。
     if let Some([p0, p1, p2, p3]) = label.frame {
@@ -433,10 +498,10 @@ fn place_label(
         let w1 = to_world(p1);
         let w2 = to_world(p2);
         let w3 = to_world(p3);
-        out.segments.push([w0, w1]);
-        out.segments.push([w1, w2]);
-        out.segments.push([w2, w3]);
-        out.segments.push([w3, w0]);
+        out.label_segments.push([w0, w1]);
+        out.label_segments.push([w1, w2]);
+        out.label_segments.push([w2, w3]);
+        out.label_segments.push([w3, w0]);
     }
     let bounds = label.bounds;
     out.label_box = Some([
@@ -445,6 +510,107 @@ fn place_label(
         to_world(Point2::new(bounds.max.x, bounds.max.y)),
         to_world(Point2::new(bounds.min.x, bounds.max.y)),
     ]);
+}
+
+/// 文字と寸法線をつなぐ線（`push_label_connector`）の相手。描画上の寸法線の形。
+enum DimLineShape {
+    /// 直線の寸法線（長さ・直径・半径）。外向き矢印の延長を含む `segments[0]` そのもの。
+    Segment(LineSeg),
+    /// 角度寸法の弧。外向き矢印の延長を含む。
+    Arc(Arc),
+}
+
+impl DimLineShape {
+    /// `p` に最も近い寸法線上の点。
+    fn closest_point(&self, p: Point2) -> Point2 {
+        match self {
+            Self::Segment(seg) => seg.closest_point(p),
+            Self::Arc(arc) => arc.closest_point(p),
+        }
+    }
+
+    /// 線分 `edge` との最短距離。交わるなら 0。
+    ///
+    /// 交わらないときの最短は、次のいずれかの組で実現する: `edge` の端点と寸法線上の点、
+    /// 寸法線の端点と `edge` 上の点、弧では加えて「中心から `edge` へ下ろした足」と弧上の点
+    /// （両方の内点で距離が極小になるのは、2 点を結ぶ線が `edge` に直交し弧の中心を通るとき
+    /// だけなので）。
+    fn distance_to_segment(&self, edge: &LineSeg) -> f64 {
+        let (shape, start, end) = match self {
+            Self::Segment(seg) => (Shape::Line(*seg), seg.a, seg.b),
+            Self::Arc(arc) => (Shape::Arc(*arc), arc.start_point(), arc.end_point()),
+        };
+        if !intersect(&shape, &Shape::Line(*edge)).is_empty() {
+            return 0.0;
+        }
+        let to_line = |q: Point2| self.closest_point(q).distance(q);
+        let to_edge = |q: Point2| edge.closest_point(q).distance(q);
+        let ends = to_line(edge.a)
+            .min(to_line(edge.b))
+            .min(to_edge(start))
+            .min(to_edge(end));
+        match self {
+            Self::Segment(_) => ends,
+            Self::Arc(arc) => ends.min(to_line(edge.closest_point(arc.center))),
+        }
+    }
+
+    /// 凸四角形 `quad`（[`DimExpansion::label_box`]）との最短距離。重なるなら 0。
+    fn distance_to_quad(&self, quad: &[Point2; 4]) -> f64 {
+        let start = match self {
+            Self::Segment(seg) => seg.a,
+            Self::Arc(arc) => arc.start_point(),
+        };
+        // 全体が内側に収まると辺とは交わらないので、1 点の内外も見る。
+        if label_box_contains(quad, start) {
+            return 0.0;
+        }
+        (0..4)
+            .map(|i| self.distance_to_segment(&LineSeg::new(quad[i], quad[(i + 1) % 4])))
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// 文字を手で動かして寸法線から離したとき、文字と寸法線をつなぐ細い線を
+/// [`DimExpansion::label_segments`] へ足す（実使用 1 枚目を受けた修正、2026-11-01）。
+/// 塗りの上に描くので、文字側の端が塗りで欠けない。
+///
+/// 引くのは [`DimAnnotation::text_anchor`] が `Some` で、ラベル外形と寸法線の最短距離が
+/// `2 × text_gap_mm` の紙換算より大きいときだけ（重なっている・近いときは引かない）。
+/// 自動配置の文字は寸法線の隣に置かれるので対象にならない。
+///
+/// 端点は、ラベル側が外形の 4 辺の中点のうち寸法線に最も近いもの、寸法線側がその点から
+/// 寸法線上の最近点。並びは `[寸法線側, ラベル側]`。寸法線と同じストロークで描かれる。
+///
+/// 種別ごとの呼び出し側が `place_label` の後に呼ぶ（`label_box` を使うため）。
+/// 座標寸法（引出線がある）と退化時の `degenerate_label_only` は呼ばない。
+fn push_label_connector(
+    ex: &mut DimExpansion,
+    line: &DimLineShape,
+    annotation: &DimAnnotation,
+    render: DimRender<'_>,
+) {
+    if annotation.text_anchor.is_none() {
+        return;
+    }
+    let Some(quad) = ex.label_box else {
+        return;
+    };
+    let threshold = render.paper_mm_to_world(2.0 * render.style.text_gap_mm);
+    // NaN は比較が偽になり引かない側へ倒れる。
+    if line.distance_to_quad(&quad) <= threshold {
+        return;
+    }
+    let connector = (0..4)
+        .map(|i| {
+            let label_side = quad[i].midpoint(quad[(i + 1) % 4]);
+            let line_side = line.closest_point(label_side);
+            (line_side.distance(label_side), [line_side, label_side])
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some((_, segment)) = connector {
+        ex.label_segments.push(segment);
+    }
 }
 
 /// 直線的な寸法線を持つ寸法（長さ寸法・直径寸法）の共通展開。
@@ -864,7 +1030,24 @@ pub fn expand_linear(dim: &DimLinear, render: DimRender<'_>) -> DimExpansion {
         ex.segments
             .extend(extension_line(dim.p2, frame.d2, gap, overshoot));
     }
+    push_straight_label_connector(&mut ex, &dim.annotation, render);
     ex
+}
+
+/// 直線の寸法線を持つ展開（`segments[0]` が描画上の寸法線）へ接続線を足す
+/// （[`push_label_connector`]）。
+fn push_straight_label_connector(
+    ex: &mut DimExpansion,
+    annotation: &DimAnnotation,
+    render: DimRender<'_>,
+) {
+    let [a, b] = ex.segments[0];
+    push_label_connector(
+        ex,
+        &DimLineShape::Segment(LineSeg::new(a, b)),
+        annotation,
+        render,
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -927,6 +1110,7 @@ pub fn expand_radial(dim: &DimRadial, render: DimRender<'_>) -> DimExpansion {
         &dim.annotation,
         &mut ex,
     );
+    push_straight_label_connector(&mut ex, &dim.annotation, render);
     ex
 }
 
@@ -971,7 +1155,7 @@ pub fn diameter_distance(dim: &DimDiameter, p: Point2) -> f64 {
 #[must_use]
 pub fn expand_diameter(dim: &DimDiameter, render: DimRender<'_>) -> DimExpansion {
     let (dir, d1, d2) = diameter_frame(dim);
-    expand_straight(
+    let mut ex = expand_straight(
         d1,
         d2,
         dir,
@@ -979,7 +1163,9 @@ pub fn expand_diameter(dim: &DimDiameter, render: DimRender<'_>) -> DimExpansion
         &dim.annotation,
         DimKind::Diameter,
         render,
-    )
+    );
+    push_straight_label_connector(&mut ex, &dim.annotation, render);
+    ex
 }
 
 // ---------------------------------------------------------------------
@@ -1127,8 +1313,7 @@ pub fn angular_distance(dim: &DimAngular, p: Point2) -> f64 {
 /// 角度寸法を展開する（M11 タスク69）。
 ///
 /// - **寸法線は弧**（中心 = 頂点、半径 = [`DimAngular::arc_radius`]、掃引 = 2 辺の
-///   なす角）。弧は [`DimExpansion::symbol_strokes`] へ [`Shape::Arc`] として入れる。
-///   φ 記号と同じ経路なので、画面・SVG/PDF とも既存の描画分岐のまま描ける
+///   なす角）。弧は [`DimExpansion::line_strokes`] へ [`Shape::Arc`] として入れる
 ///   （[`DimExpansion::segments`] は直線専用なので弧を入れられない）。
 /// - **補助線**は頂点から各辺の向きへ、[`DimStyle::ext_gap_mm`] のすきまを空けて
 ///   始まり、弧を [`DimStyle::ext_overshoot_mm`] だけ越えて終わる。長さ寸法と同じ
@@ -1211,7 +1396,7 @@ pub fn expand_angular(dim: &DimAngular, render: DimRender<'_>) -> DimExpansion {
         Vec::new(),
         vec![place_arrow(s, tip_s, &glyph), place_arrow(e, tip_e, &glyph)],
     );
-    ex.symbol_strokes.push(Shape::Arc(drawn));
+    ex.line_strokes.push(Shape::Arc(drawn));
 
     let gap = render.paper_mm_to_world(render.style.ext_gap_mm);
     let overshoot = render.paper_mm_to_world(render.style.ext_overshoot_mm);
@@ -1243,6 +1428,7 @@ pub fn expand_angular(dim: &DimAngular, render: DimRender<'_>) -> DimExpansion {
         &dim.annotation,
         &mut ex,
     );
+    push_label_connector(&mut ex, &DimLineShape::Arc(drawn), &dim.annotation, render);
     ex
 }
 
@@ -1408,7 +1594,9 @@ fn degenerate_label_only(
 mod tests {
     use super::*;
     use crate::expand::dim_label::{ASCII_CHAR_WIDTH_RATIO, DimLabel, TextRun, layout_dim_label};
-    use crate::{DimAnnotation, DimKind, DimStyle, FitClass, SizeTolerance, ValueStyle};
+    use crate::{
+        DimAnnotation, DimKind, DimStyle, FitClass, OrdinateAxis, SizeTolerance, ValueStyle,
+    };
     use mcad_geom::{Aabb, DimSymbol, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
@@ -2163,8 +2351,8 @@ mod tests {
     }
 
     #[test]
-    fn expand_linear_underline_of_a_non_proportional_value_goes_into_segments() {
-        // 規定 5-10。下線は寸法線と同じストロークなので `segments` に混ぜる（型の doc）。
+    fn expand_linear_underline_of_a_non_proportional_value_goes_into_label_segments() {
+        // 規定 5-10。下線は文字に付くので塗りの上の層（型の doc「描画の層」）。
         let dim = DimLinear {
             p1: Point2::new(0.0, 0.0),
             p2: Point2::new(4.0, 0.0),
@@ -2178,9 +2366,10 @@ mod tests {
         };
         let ex = expand_linear(&dim, render(0.5, 1.0));
         assert_eq!(contents_of(&ex), ["50"]);
-        // 寸法線 + 下線 + 補助線 2。
-        assert_eq!(ex.segments.len(), 4);
-        let [a, b] = ex.segments[1];
+        // 寸法線 + 補助線 2 と、下線 1。
+        assert_eq!(ex.segments.len(), 3);
+        assert_eq!(ex.label_segments.len(), 1);
+        let [a, b] = ex.label_segments[0];
         assert!((a.y - b.y).abs() < T, "下線は寸法線と平行");
         assert!(a.y < ex.texts[0].anchor.y, "下線は値のベースラインより下");
     }
@@ -2710,7 +2899,7 @@ mod tests {
     fn assert_bounds_cover_content(label: &DimLabel) {
         let bounds = label.bounds.expanded(T);
         for run in &label.runs {
-            let width = run.content.chars().count() as f64 * ASCII_CHAR_WIDTH_RATIO * run.height;
+            let width = crate::approx_text_width(&run.content, run.height);
             let box_ = Aabb::new(
                 run.origin,
                 Point2::new(run.origin.x + width, run.origin.y + run.height),
@@ -2998,6 +3187,33 @@ mod tests {
         assert_bounds_cover_content(&label);
     }
 
+    /// 接頭辞 `2×` の `×` は非 ASCII で送りが 1.0×高さ。直後の記号（文字ラン `R`・
+    /// 図形記号 φ）は接頭辞の実幅（0.55 + 1.0）×高さの後ろから始まる（重なり防止）。
+    #[test]
+    fn label_symbol_starts_after_the_real_width_of_a_non_ascii_prefix() {
+        let prefix_width = H * (ASCII_CHAR_WIDTH_RATIO + 1.0);
+        let with_prefix = |symbol| DimAnnotation {
+            symbol: Some(symbol),
+            prefix: Some("2×".to_string()),
+            ..DimAnnotation::default()
+        };
+
+        let radius = layout(10.0, &with_prefix(DimSymbol::Radius));
+        assert_eq!(contents(&radius), ["2×", "R", "10"]);
+        assert!((radius.runs[1].origin.x - prefix_width).abs() < T);
+
+        let diameter = layout(10.0, &with_prefix(DimSymbol::Diameter));
+        let glyph_min_x = diameter
+            .strokes
+            .iter()
+            .map(|s| s.aabb().min.x)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            glyph_min_x >= prefix_width - T,
+            "φ ({glyph_min_x}) が接頭辞の幅 ({prefix_width}) と重なっている"
+        );
+    }
+
     /// [`crate::ValueStyle::Reference`]（参考寸法）は記号・値・接尾辞を丸括弧で囲む。
     /// `prefix` と公差は括弧の外。
     #[test]
@@ -3273,5 +3489,475 @@ mod tests {
         for (arrow_a, arrow_b) in ex_a.arrows.iter().zip(ex_b.arrows.iter()) {
             assert!(approx(arrow_tip(arrow_a), arrow_tip(arrow_b)));
         }
+    }
+
+    // --- 文字の下の塗り（実使用 1 枚目を受けた修正、2026-11-01）---
+
+    /// `quad` の中心・軸方向を保ったまま幅と高さが `2 * margin` ずつ増えていることを確かめる。
+    fn assert_inflated_by(quad: &[Point2; 4], mask: &[Point2; 4], margin: f64) {
+        let width = |q: &[Point2; 4]| q[0].distance(q[1]);
+        let height = |q: &[Point2; 4]| q[0].distance(q[3]);
+        assert!((width(mask) - width(quad) - 2.0 * margin).abs() < 1e-9);
+        assert!((height(mask) - height(quad) - 2.0 * margin).abs() < 1e-9);
+        assert!(approx(label_box_center(mask), label_box_center(quad)));
+        // 外周のどの辺も元の辺と平行（ラベルの軸に沿って膨らむ）。
+        let u = (quad[1] - quad[0]).normalize().unwrap();
+        let mask_u = (mask[1] - mask[0]).normalize().unwrap();
+        assert!((u.dot(mask_u) - 1.0).abs() < 1e-9);
+        // 元の四角形を完全に含む。
+        for p in quad {
+            assert!(label_box_contains(mask, *p));
+        }
+    }
+
+    #[test]
+    fn label_mask_quad_inflates_by_half_a_paper_mm() {
+        let quad = [
+            Point2::new(0.0, 0.0),
+            Point2::new(10.0, 0.0),
+            Point2::new(10.0, 2.0),
+            Point2::new(0.0, 2.0),
+        ];
+        let margin = mm_to_world(0.5);
+        let mask = label_mask_quad(&quad, render(0.5, 1.0));
+        assert_inflated_by(&quad, &mask, margin);
+        assert!(approx(mask[0], Point2::new(-margin, -margin)));
+        assert!(approx(mask[2], Point2::new(10.0 + margin, 2.0 + margin)));
+
+        // 尺度 1:2 の紙基準（文字高さ = 紙 mm × 2）では 0.5mm がワールド長 1.0。
+        let scaled = DimRender {
+            style: &DEFAULT_STYLE,
+            scale_world_per_paper_mm: 2.0,
+            arrow_len_world: DimStyle::DEFAULT.arrow_len_mm * 2.0,
+            text_height_world: DimStyle::DEFAULT.text_height_mm * 2.0,
+        };
+        assert_inflated_by(&quad, &label_mask_quad(&quad, scaled), 1.0);
+    }
+
+    #[test]
+    fn label_mask_quad_follows_a_rotated_label() {
+        // 文字姿勢を 30° に固定したラベル。外形は回転した四角形のまま膨らむ。
+        let dim = DimLinear {
+            annotation: DimAnnotation {
+                text_rotation: Some(30.0_f64.to_radians()),
+                ..DimAnnotation::default()
+            },
+            ..plain_linear(Point2::new(0.0, 0.0), Point2::new(100.0, 0.0), 10.0)
+        };
+        let quad = expand_linear(&dim, render(0.5, 1.0)).label_box.unwrap();
+        let axis = (quad[1] - quad[0]).normalize().unwrap();
+        assert!((axis.angle() - 30.0_f64.to_radians()).abs() < 1e-9);
+        let mask = label_mask_quad(&quad, render(0.5, 1.0));
+        assert_inflated_by(&quad, &mask, mm_to_world(0.5));
+        // 頂点ごとのずれはローカル軸の (−m, −m)。ワールドの x/y 軸に沿わない。
+        let m = mm_to_world(0.5);
+        let up = axis.perp();
+        assert!(approx(mask[0], quad[0] - axis * m - up * m));
+        assert!(approx(mask[2], quad[2] + axis * m + up * m));
+    }
+
+    #[test]
+    fn label_mask_quad_of_a_collapsed_box_still_has_area() {
+        let p = Point2::new(1.0, 1.0);
+        let m = mm_to_world(0.5);
+        let point = label_mask_quad(&[p; 4], render(0.5, 1.0));
+        assert!(approx(point[0], Point2::new(1.0 - m, 1.0 - m)));
+        assert!(approx(point[2], Point2::new(1.0 + m, 1.0 + m)));
+        // 高さ 0 の四角形は幅の軸の直交方向へ広がる。
+        let q = Point2::new(5.0, 1.0);
+        let flat = label_mask_quad(&[p, q, q, p], render(0.5, 1.0));
+        assert!((flat[0].distance(flat[3]) - 2.0 * m).abs() < 1e-9);
+    }
+
+    // --- 文字と寸法線をつなぐ線（実使用 1 枚目を受けた修正、2026-11-01）---
+
+    fn at(x: f64, y: f64) -> DimAnnotation {
+        DimAnnotation {
+            text_anchor: Some(Point2::new(x, y)),
+            ..DimAnnotation::default()
+        }
+    }
+
+    /// 接続線の判定距離（`2 × text_gap_mm` の紙換算）。[`render`] のパラメータでのワールド長。
+    fn connector_threshold() -> f64 {
+        mm_to_world(2.0 * DimStyle::DEFAULT.text_gap_mm)
+    }
+
+    fn linear_at(annotation: DimAnnotation) -> DimLinear {
+        DimLinear {
+            annotation,
+            ..plain_linear(Point2::new(0.0, 0.0), Point2::new(100.0, 0.0), 10.0)
+        }
+    }
+
+    /// ラベル外形の高さ（`text_anchor` の位置に依らない）。
+    fn label_height(ex: &DimExpansion) -> f64 {
+        let quad = ex.label_box.unwrap();
+        quad[0].distance(quad[3])
+    }
+
+    /// ラベル外形の 4 辺の中点のどれかか。
+    fn is_edge_midpoint(quad: &[Point2; 4], p: Point2) -> bool {
+        (0..4).any(|i| approx(quad[i].midpoint(quad[(i + 1) % 4]), p))
+    }
+
+    #[test]
+    fn linear_connector_joins_the_nearest_edge_midpoint_to_the_dimension_line() {
+        // 寸法線は y=10（x 0〜100）。文字を上へ離す → 下辺の中点から真下へ。
+        let plain = expand_linear(&linear_at(DimAnnotation::default()), render(0.5, 1.0));
+        let ex = expand_linear(&linear_at(at(50.0, 30.0)), render(0.5, 1.0));
+        assert_eq!(ex.label_segments.len(), 1);
+        let quad = ex.label_box.unwrap();
+        let [line_side, label_side] = ex.label_segments[0];
+        assert!(approx(line_side, Point2::new(50.0, 10.0)));
+        assert!(approx(label_side, quad[0].midpoint(quad[1])));
+        // 寸法線と補助線は変わらない。
+        assert_eq!(ex.segments, plain.segments);
+    }
+
+    #[test]
+    fn no_connector_without_a_manual_text_position() {
+        let ex = expand_linear(&linear_at(DimAnnotation::default()), render(0.5, 1.0));
+        assert_eq!(ex.segments.len(), 3, "寸法線 + 補助線 2 本だけ");
+        assert!(ex.label_segments.is_empty());
+    }
+
+    #[test]
+    fn no_connector_when_the_label_is_close_to_or_over_the_dimension_line() {
+        let h = label_height(&expand_linear(
+            &linear_at(DimAnnotation::default()),
+            render(0.5, 1.0),
+        ));
+        let count = |y: f64| {
+            expand_linear(&linear_at(at(50.0, y)), render(0.5, 1.0))
+                .label_segments
+                .len()
+        };
+        // 重なる（文字の中心が寸法線の上）。
+        assert_eq!(count(10.0), 0);
+        // 判定距離のすぐ内側と外側（下辺 = y − h/2、寸法線 = y=10）。
+        let t = connector_threshold();
+        assert_eq!(count(10.0 + h * 0.5 + t * 0.99), 0);
+        assert_eq!(count(10.0 + h * 0.5 + t * 1.01), 1);
+    }
+
+    #[test]
+    fn linear_connector_uses_the_line_extended_for_outward_arrows() {
+        // 短い寸法で矢を外向きにすると寸法線は両端へ矢先長 0.5 ずつ伸びる。
+        let dim = DimLinear {
+            annotation: DimAnnotation {
+                arrow_placement: ArrowPlacement::Outside,
+                ..at(20.0, 10.0)
+            },
+            ..plain_linear(Point2::new(0.0, 0.0), Point2::new(2.0, 0.0), 10.0)
+        };
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        assert!(approx(ex.segments[0][1], Point2::new(2.5, 10.0)));
+        let quad = ex.label_box.unwrap();
+        let [line_side, label_side] = ex.label_segments[0];
+        assert!(approx(line_side, Point2::new(2.5, 10.0)), "{line_side:?}");
+        assert!(approx(label_side, quad[3].midpoint(quad[0])), "左辺の中点");
+    }
+
+    #[test]
+    fn connector_attaches_to_a_rotated_label_at_an_edge_midpoint() {
+        let dim = linear_at(DimAnnotation {
+            text_rotation: Some(30.0_f64.to_radians()),
+            ..at(50.0, 30.0)
+        });
+        let ex = expand_linear(&dim, render(0.5, 1.0));
+        let quad = ex.label_box.unwrap();
+        let [line_side, label_side] = ex.label_segments[0];
+        assert!(is_edge_midpoint(&quad, label_side), "{label_side:?}");
+        assert!((line_side.y - 10.0).abs() < 1e-9, "寸法線上");
+        assert!((line_side.x - label_side.x).abs() < 1e-9, "真下の最近点");
+    }
+
+    #[test]
+    fn diameter_connector_reaches_the_drawn_line() {
+        // 実例「2×φ11 が穴から離れて浮く」。直径線は x −10〜10。
+        let dim = DimDiameter {
+            center: Point2::ORIGIN,
+            radius: 10.0,
+            angle: 0.0,
+            annotation: at(0.0, 20.0),
+        };
+        let ex = expand_diameter(&dim, render(0.5, 1.0));
+        assert_eq!(ex.segments.len(), 1);
+        assert_eq!(ex.label_segments.len(), 1);
+        let quad = ex.label_box.unwrap();
+        assert!(approx(ex.label_segments[0][0], Point2::ORIGIN));
+        assert!(approx(ex.label_segments[0][1], quad[0].midpoint(quad[1])));
+
+        // 矢が外向きに延びた線の先端へもつなぐ。
+        let dim = DimDiameter {
+            radius: 1.0,
+            annotation: DimAnnotation {
+                arrow_placement: ArrowPlacement::Outside,
+                ..at(20.0, 0.0)
+            },
+            ..dim
+        };
+        let ex = expand_diameter(&dim, render(0.5, 1.0));
+        assert!(approx(ex.segments[0][1], Point2::new(1.5, 0.0)));
+        assert!(approx(ex.label_segments[0][0], Point2::new(1.5, 0.0)));
+    }
+
+    #[test]
+    fn radial_connector_reaches_the_center_to_rim_segment() {
+        // 引出線は (0,0)-(10,0)。
+        let dim = |annotation| DimRadial {
+            center: Point2::ORIGIN,
+            radius: 10.0,
+            leader_angle: 0.0,
+            annotation,
+        };
+        let ex = expand_radial(&dim(at(5.0, 20.0)), render(0.5, 1.0));
+        assert_eq!(ex.segments.len(), 1);
+        assert_eq!(ex.label_segments.len(), 1);
+        let quad = ex.label_box.unwrap();
+        assert!(approx(ex.label_segments[0][0], Point2::new(5.0, 0.0)));
+        assert!(approx(ex.label_segments[0][1], quad[0].midpoint(quad[1])));
+
+        // 円周点より先へ離すと、線の端（円周点）へつなぐ。
+        let ex = expand_radial(&dim(at(30.0, 0.0)), render(0.5, 1.0));
+        let quad = ex.label_box.unwrap();
+        assert!(approx(ex.label_segments[0][0], Point2::new(10.0, 0.0)));
+        assert!(approx(ex.label_segments[0][1], quad[3].midpoint(quad[0])));
+
+        // 引出線に重なれば引かない。
+        let ex = expand_radial(&dim(at(5.0, 0.0)), render(0.5, 1.0));
+        assert!(ex.label_segments.is_empty());
+    }
+
+    fn right_angle(annotation: DimAnnotation) -> DimAngular {
+        // 弧は半径 10、0°〜90°。
+        DimAngular {
+            vertex: Point2::ORIGIN,
+            p1: Point2::new(1.0, 0.0),
+            p2: Point2::new(0.0, 1.0),
+            arc_radius: 10.0,
+            annotation,
+        }
+    }
+
+    #[test]
+    fn angular_connector_reaches_the_nearest_point_on_the_arc() {
+        let ux = FRAC_PI_4.cos();
+        // 45° 方向へ離す。ラベルは接線に沿うので、弧に向いた辺の中点から半径方向へ下りる。
+        let ex = expand_angular(&right_angle(at(30.0 * ux, 30.0 * ux)), render(0.5, 1.0));
+        assert_eq!(ex.label_segments.len(), 1);
+        let quad = ex.label_box.unwrap();
+        let [line_side, label_side] = ex.label_segments[0];
+        assert!(
+            approx(line_side, Point2::new(10.0 * ux, 10.0 * ux)),
+            "{line_side:?}"
+        );
+        assert!(is_edge_midpoint(&quad, label_side));
+        assert!(approx(label_side, quad[0].midpoint(quad[1])));
+
+        // 掃引の外へ離すと弧の端へつなぐ（矢は内向きに固定。外向きの延長は次のテスト）。
+        let inside = right_angle(DimAnnotation {
+            arrow_placement: ArrowPlacement::Inside,
+            ..at(30.0, -30.0)
+        });
+        let ex = expand_angular(&inside, render(0.5, 1.0));
+        let [line_side, _] = ex.label_segments[0];
+        assert!(approx(line_side, Point2::new(10.0, 0.0)), "{line_side:?}");
+    }
+
+    #[test]
+    fn angular_connector_uses_the_arc_extended_for_outward_arrows() {
+        // 外向きでは弧が矢先の占有長（弧長 0.5）ぶん延びる。端点はその延びた弧の端。
+        let dim = right_angle(DimAnnotation {
+            arrow_placement: ArrowPlacement::Outside,
+            ..at(30.0, -30.0)
+        });
+        let ex = expand_angular(&dim, render(0.5, 1.0));
+        let [line_side, _] = ex.label_segments[0];
+        let a: f64 = -0.5 / 10.0;
+        assert!(
+            approx(line_side, Point2::new(10.0 * a.cos(), 10.0 * a.sin())),
+            "{line_side:?}"
+        );
+    }
+
+    #[test]
+    fn angular_has_no_connector_when_the_label_is_close_to_or_over_the_arc() {
+        let ux = FRAC_PI_4.cos();
+        let count = |r: f64| {
+            expand_angular(&right_angle(at(r * ux, r * ux)), render(0.5, 1.0))
+                .label_segments
+                .len()
+        };
+        let base = expand_angular(&right_angle(DimAnnotation::default()), render(0.5, 1.0));
+        let h = label_height(&base);
+        assert_eq!(count(10.0), 0, "弧に重なる");
+        // ラベルの弧側の辺は弧の接線に平行で、その中点が最も近い。
+        let t = connector_threshold();
+        assert_eq!(count(10.0 + h * 0.5 + t * 0.99), 0);
+        assert_eq!(count(10.0 + h * 0.5 + t * 1.01), 1);
+    }
+
+    #[test]
+    fn ordinate_and_degenerate_dimensions_have_no_connector() {
+        // 座標寸法は引出線があるので文字を離しても足さない。
+        let ordinate = DimOrdinate {
+            origin: Point2::ORIGIN,
+            feature: Point2::new(10.0, 0.0),
+            leader_end: Point2::new(10.0, 10.0),
+            axis: OrdinateAxis::X,
+            annotation: at(50.0, 50.0),
+        };
+        let ex = expand_ordinate(&ordinate, render(0.5, 1.0));
+        assert_eq!(ex.segments.len(), 1);
+        assert!(ex.label_segments.is_empty());
+
+        // 退化した角度寸法は値ラベルだけ（線が無いのでつなぐ先も無い）。
+        let degenerate = DimAngular {
+            p1: Point2::ORIGIN,
+            ..right_angle(at(50.0, 50.0))
+        };
+        let ex = expand_angular(&degenerate, render(0.5, 1.0));
+        assert!(ex.segments.is_empty());
+        assert!(ex.label_segments.is_empty());
+    }
+
+    #[test]
+    fn arc_distance_to_a_quad_matches_a_dense_sampling() {
+        let arc = Arc::new(Point2::ORIGIN, 10.0, 0.0, FRAC_PI_2);
+        let line = DimLineShape::Arc(arc);
+        let rect = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            [
+                Point2::new(x0, y0),
+                Point2::new(x1, y0),
+                Point2::new(x1, y1),
+                Point2::new(x0, y1),
+            ]
+        };
+        let sampled = |quad: &[Point2; 4]| {
+            let mut best = f64::INFINITY;
+            for i in 0..=4000 {
+                let t = FRAC_PI_2 * f64::from(i) / 4000.0;
+                let p = Point2::new(10.0 * t.cos(), 10.0 * t.sin());
+                for e in 0..4 {
+                    let edge = LineSeg::new(quad[e], quad[(e + 1) % 4]);
+                    best = best.min(edge.closest_point(p).distance(p));
+                }
+            }
+            best
+        };
+        // 外側・内側（中心寄り）・掃引の外・弧をまたぐ・長い辺が弧の端の近くを通る。
+        for quad in [
+            rect(20.0, 20.0, 25.0, 22.0),
+            rect(1.0, 1.0, 3.0, 2.0),
+            rect(-8.0, -9.0, -6.0, -7.0),
+            rect(15.0, -6.0, 18.0, -4.0),
+            rect(6.0, 6.0, 9.0, 8.0),
+            rect(-30.0, 12.0, 30.0, 14.0),
+            rect(11.0, -1.0, 12.0, 1.0),
+        ] {
+            let exact = line.distance_to_quad(&quad);
+            let approx_d = sampled(&quad);
+            assert!(
+                (exact - approx_d).abs() < 1e-3,
+                "{quad:?}: {exact} vs {approx_d}"
+            );
+        }
+        // 弧がそっくり四角形の内側に収まる（辺と交わらない）ときも重なりとして 0。
+        assert_eq!(line.distance_to_quad(&rect(-1.0, -1.0, 11.0, 11.0)), 0.0);
+    }
+
+    #[test]
+    fn pick_segments_do_not_change_when_a_connector_is_drawn() {
+        // 文字を離して接続線が出ても、通常選択の pick 形状は保存データだけで決まる
+        // （ズーム非依存の pick 契約。モジュール doc）。
+        let linear = linear_at(at(50.0, 30.0));
+        assert_eq!(
+            expand_linear(&linear, render(0.5, 1.0))
+                .label_segments
+                .len(),
+            1,
+            "接続線が出ている前提"
+        );
+        assert_eq!(
+            linear_pick_segments(&linear),
+            linear_pick_segments(&linear_at(DimAnnotation::default()))
+        );
+
+        let radial = |annotation| DimRadial {
+            center: Point2::ORIGIN,
+            radius: 10.0,
+            leader_angle: 0.0,
+            annotation,
+        };
+        assert_eq!(
+            expand_radial(&radial(at(5.0, 20.0)), render(0.5, 1.0))
+                .label_segments
+                .len(),
+            1
+        );
+        assert_eq!(
+            radial_pick_segments(&radial(at(5.0, 20.0))),
+            radial_pick_segments(&radial(DimAnnotation::default()))
+        );
+
+        let diameter = |annotation| DimDiameter {
+            center: Point2::ORIGIN,
+            radius: 10.0,
+            angle: 0.0,
+            annotation,
+        };
+        assert_eq!(
+            expand_diameter(&diameter(at(0.0, 20.0)), render(0.5, 1.0))
+                .label_segments
+                .len(),
+            1
+        );
+        assert_eq!(
+            diameter_pick_segments(&diameter(at(0.0, 20.0))),
+            diameter_pick_segments(&diameter(DimAnnotation::default()))
+        );
+
+        assert_eq!(
+            angular_pick_segments(&right_angle(at(30.0, 30.0))),
+            angular_pick_segments(&right_angle(DimAnnotation::default()))
+        );
+    }
+
+    // --- 描画の層（`DimExpansion` の doc）---
+
+    #[test]
+    fn expansion_separates_line_elements_from_label_elements() {
+        // 枠は補助線より先に組まれるが、層はフィールドで決まる（順序に頼らない）。
+        let exact = expand_linear(
+            &linear_at(DimAnnotation {
+                value_style: ValueStyle::TheoreticallyExact,
+                ..at(50.0, 30.0)
+            }),
+            render(0.5, 1.0),
+        );
+        assert_eq!(exact.segments.len(), 3, "寸法線 + 補助線 2");
+        assert_eq!(exact.segments[0][0].y, 10.0, "先頭は寸法線");
+        // 枠 4 辺 + 接続線 1。
+        assert_eq!(exact.label_segments.len(), 5);
+
+        // 角度寸法の弧は塗りの下、記号ストロークとは混ざらない。
+        let angular = expand_angular(&right_angle(DimAnnotation::default()), render(0.5, 1.0));
+        assert!(matches!(angular.line_strokes.as_slice(), [Shape::Arc(_)]));
+        assert!(angular.symbol_strokes.is_empty());
+
+        // φ は塗りの上の記号ストローク。弧は無い。
+        let diameter = expand_diameter(
+            &DimDiameter {
+                center: Point2::ORIGIN,
+                radius: 10.0,
+                angle: 0.0,
+                annotation: DimAnnotation::default(),
+            },
+            render(0.5, 1.0),
+        );
+        assert!(!diameter.symbol_strokes.is_empty());
+        assert!(diameter.line_strokes.is_empty());
     }
 }

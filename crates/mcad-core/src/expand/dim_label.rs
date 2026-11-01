@@ -30,14 +30,15 @@ use mcad_geom::{Aabb, DimSymbol, Point2, Shape, SymbolGlyph, Vec2, dim_symbol_gl
 
 use crate::{DimAnnotation, DimKind, DimStyle, SizeTolerance, ValueStyle};
 
-/// 文字幅の近似係数。[`crate::approx_text_width`] と同じ ASCII 係数 0.55×height で幅を
-/// 近似する（純関数のまま中央寄せ配置を決めるための割り切り。DESIGN.md M6 設計判断1 の
+/// ASCII 文字の幅の近似係数。[`crate::approx_text_width`] と同じ ASCII 係数 0.55×height
+/// （純関数のまま中央寄せ配置を決めるための割り切り。DESIGN.md M6 設計判断1 の
 /// 近似方針に沿う）。
 ///
-/// 組版は ASCII 以外の文字（`±` や、値上書きに入りうる任意の文字）も同じ係数で数える。
-/// フォントメトリクスを持ち込まない以上いずれ近似でしかなく、mcad-geom の
-/// `symbol::FONT_CHAR_ADVANCE_RATIO`（記号の送り量）と**同じ量**なので値を食い違わせない
-/// ことのほうが重要である。
+/// ラン幅（`LabelBuilder::run_width`）は [`crate::approx_text_width`] に委ね、ASCII 以外の
+/// 文字（`×`・`±`・φ や値上書きに入りうる任意の文字）は 1.0×height で数える。埋め込み
+/// フォント（Noto Sans JP）の実測で `×`・`±` の送りは 1.0em であり、0.55 で数えると
+/// 直後の記号と重なるためである。一方 mcad-geom の `symbol::FONT_CHAR_ADVANCE_RATIO`
+/// （英字記号の送り量）は別の量で、この係数とは独立に保つ。
 pub(super) const ASCII_CHAR_WIDTH_RATIO: f64 = 0.55;
 
 /// 上下段公差（[`SizeTolerance::Deviations`]）の上段と下段の間に空ける縦すきま ÷
@@ -471,9 +472,9 @@ impl LabelBuilder {
         self.cursor += dx;
     }
 
-    /// 文字列の近似幅（[`ASCII_CHAR_WIDTH_RATIO`] × 文字数 × 高さ）。
+    /// 文字列の近似幅（[`crate::approx_text_width`]: ASCII 0.55・非 ASCII 1.0 × 高さ）。
     fn run_width(content: &str, height: f64) -> f64 {
-        content.chars().count() as f64 * ASCII_CHAR_WIDTH_RATIO * height
+        crate::approx_text_width(content, height)
     }
 
     /// 送り位置を動かさずに 1 ランを置き、その幅を返す。

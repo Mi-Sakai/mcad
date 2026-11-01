@@ -30,7 +30,7 @@ pub use dimension::{
     DimExpansion, DimRender, angular_distance, angular_pick_segments, arrow_kind_occupies_line,
     diameter_distance, diameter_pick_segments, dim_distance, expand_angular, expand_diameter,
     expand_dim, expand_linear, expand_ordinate, expand_radial, label_box_center,
-    label_box_contains, linear_distance, linear_pick_segments, ordinate_distance,
+    label_box_contains, label_mask_quad, linear_distance, linear_pick_segments, ordinate_distance,
     ordinate_pick_segments, radial_distance, radial_pick_segments,
 };
 /// 長さ寸法・角度寸法の AABB（[`crate::EntityGeom::aabb`]）が展開と同じ骨格を使う

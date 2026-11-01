@@ -207,7 +207,8 @@ mod tests {
     use super::*;
     use crate::plot::{PlotColorMode, PlotStroke, dash_pattern_mm, plot_page};
     use mcad_core::{
-        Command, DimAnnotation, DimDiameter, Document, Entity, EntityGeom, Linetype, Style,
+        Command, DimAnnotation, DimDiameter, DimDirection, DimLinear, Document, Entity, EntityGeom,
+        Linetype, Style,
     };
     use mcad_geom::Point2;
 
@@ -665,9 +666,10 @@ mod tests {
         // 背景は白なので背景 rect は出ない → q の数がそのままパス数。
         assert_eq!(operator_count(&tokens, "q"), page.paths.len());
         assert_eq!(operator_count(&tokens, "Q"), page.paths.len());
-        // ストローク 4 本（寸法線・下線・φ の円・φ の斜線）+ 塗り 3 つ（矢先 2・値 1）。
+        // ストローク 4 本（寸法線・下線・φ の円・φ の斜線）+ 塗り 4 つ（文字の下の塗り 1・
+        // 矢先 2・値 1）。
         assert_eq!(operator_count(&tokens, "S"), 4, "{stream}");
-        assert_eq!(operator_count(&tokens, "f"), 3, "{stream}");
+        assert_eq!(operator_count(&tokens, "f"), 4, "{stream}");
         assert_eq!(operator_count(&tokens, "d"), 0, "寸法は常に実線");
 
         // φ の円（3 次ベジエ 4 本 + `h`）の始点が `m` として書かれている（y 反転なし）。
@@ -731,6 +733,94 @@ mod tests {
                 + text.matches("/Type /Page ").count(),
             1
         );
+    }
+
+    // ---- 11b: 寸法の文字の下の塗りは白でも実際に出力され、線の後・文字の前に来る ----
+
+    /// `rg` 演算子の直前の 3 数値（塗り色）を順に取り出す。
+    fn fill_colors(tokens: &[Token]) -> Vec<[f64; 3]> {
+        tokens
+            .windows(4)
+            .filter_map(|w| match w {
+                [
+                    Token::Num(r),
+                    Token::Num(g),
+                    Token::Num(b),
+                    Token::Other(op),
+                ] if op == "rg" => Some([*r, *g, *b]),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn document_with_linear_dimension() -> Document {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(DimLinear {
+                    p1: Point2::new(20.0, 20.0),
+                    p2: Point2::new(120.0, 20.0),
+                    offset: 10.0,
+                    direction: DimDirection::Aligned,
+                    ext_angle: None,
+                    annotation: DimAnnotation::default(),
+                }),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        document
+    }
+
+    /// 描画演算子（`S` と `f`）を順に取り出す。
+    fn paint_operators(tokens: &[Token]) -> Vec<&str> {
+        tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Other(op) if op == "S" || op == "f" => Some(op.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn white_dimension_label_mask_is_written_between_the_lines_and_the_text() {
+        let page = plot_page(&document_with_linear_dimension(), PlotColorMode::Monochrome);
+        assert_eq!(page.background, Rgb::WHITE);
+        let stream = content_stream(&to_pdf(&page));
+        let tokens = tokenize(&stream);
+
+        // 用紙全面の白は省略される（`re` なし）が、文字の下の白は `f` で書かれる。
+        assert_eq!(operator_count(&tokens, "re"), 0);
+        // 寸法線 + 補助線 2 → 矢先 2 → 塗り → 文字。
+        assert_eq!(
+            paint_operators(&tokens),
+            ["S", "S", "S", "f", "f", "f", "f"],
+            "{stream}"
+        );
+        let black = [0.0, 0.0, 0.0];
+        assert_eq!(
+            fill_colors(&tokens),
+            [black, black, [1.0, 1.0, 1.0], black],
+            "{stream}"
+        );
+    }
+
+    #[test]
+    fn blueprint_dimension_label_mask_is_navy_in_the_pdf() {
+        let page = plot_page(&document_with_linear_dimension(), PlotColorMode::Blueprint);
+        let stream = content_stream(&to_pdf(&page));
+        let colors = fill_colors(&tokenize(&stream));
+        let navy = |c: &[f64; 3]| {
+            c[0].abs() < 1e-4
+                && (c[1] - f64::from(0x31_u8) / 255.0).abs() < 1e-4
+                && (c[2] - f64::from(0x53_u8) / 255.0).abs() < 1e-4
+        };
+        // 用紙全面の背景 → 矢先 2 → 文字の下の塗り → 文字。紺は背景と塗りの 2 回。
+        assert_eq!(colors.len(), 5, "{colors:?}");
+        assert!(navy(&colors[0]) && navy(&colors[3]), "{colors:?}");
+        assert_eq!(colors.iter().filter(|c| navy(c)).count(), 2);
     }
 
     // ---- 12: 背景は PlotPage::background に従う（白では出さない・非白では全面塗り） ----

@@ -109,9 +109,9 @@ pub use expand::{
     FRAME_DIVIDER_WIDTH_MM, TableCellText, TableExpansion, TableSegment, TextRun, angular_distance,
     angular_pick_segments, arrow_kind_occupies_line, diameter_distance, diameter_pick_segments,
     dim_distance, expand_angular, expand_diameter, expand_dim, expand_linear, expand_ordinate,
-    expand_radial, expand_table, label_box_center, label_box_contains, layout_dim_label,
-    linear_distance, linear_pick_segments, ordinate_distance, ordinate_pick_segments,
-    radial_distance, radial_pick_segments, table_world_aabb,
+    expand_radial, expand_table, label_box_center, label_box_contains, label_mask_quad,
+    layout_dim_label, linear_distance, linear_pick_segments, ordinate_distance,
+    ordinate_pick_segments, radial_distance, radial_pick_segments, table_world_aabb,
 };
 pub use id::{ConstraintId, EntityId, LayerId};
 pub use layer::Layer;

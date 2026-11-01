@@ -1790,17 +1790,20 @@ fn fill_polygon_to_dxf_solids(poly: &[Point2]) -> Vec<DxfEntity> {
 /// 組版は [`expand_dim`]（`mcad-core`、画面・SVG/PDF と同じ唯一の出所）に一任し、
 /// この関数は結果を DXF エンティティへ写すだけ。描く順序は画面・SVG/PDF の
 /// `push_dim`（`crates/mcad-app/src/plot/mod.rs`）と揃える: `segments` →
-/// `arrows`（`fills` → `strokes`）→ `symbol_strokes` → `texts`。
+/// `arrows`（`fills` → `strokes`）→ `line_strokes` →（画面・SVG/PDF はここで塗る）→
+/// `label_segments` → `symbol_strokes` → `texts`。
 ///
-/// - `segments` は `LINE`。
+/// - `segments` と `label_segments`（下線・枠・接続線）は `LINE`。
 /// - `arrows` の `fills` は [`fill_polygon_to_dxf_solids`] で `SOLID` へ、`strokes` は
 ///   `LINE` へ。
-/// - `symbol_strokes`（φ・□等の記号、角度寸法の弧 [`Shape::Arc`]）は
+/// - `line_strokes`（角度寸法の弧 [`Shape::Arc`]）と `symbol_strokes`（φ・□等の記号）は
 ///   [`shape_to_dxf_entity`] をそのまま再利用する。
 /// - `texts` は [`text_geom_to_dxf_text`] へ**ワールド長のまま**渡す（`× k` しない。
 ///   [`mcad_core::DimExpansion::texts`] の doc、モジュール doc「文字高さは二重換算
 ///   しない」参照）。
 /// - `label_box` は pick 用の当たり判定形状であり、描画対象ではないので出力しない。
+///   文字の下の塗り（`mcad_core::label_mask_quad`、画面・SVG/PDF のみ）も出力しない
+///   （DESIGN.md 7章「実使用1枚目（軸受ブラケット、2026-11-01）を受けた修正」設計判断4）。
 ///
 /// [`expand_dim`] が `None` を返す（退化した寸法）ときは空を返す。呼び出し側
 /// （[`export_dxf`]）はこの結果が空でも `skipped_entities` を増やさない（表の
@@ -1829,6 +1832,16 @@ fn dim_to_dxf_entities(geom: &EntityGeom, render: DimRender<'_>) -> Vec<DxfEntit
                 ..Default::default()
             })));
         }
+    }
+    for shape in &expansion.line_strokes {
+        entities.push(shape_to_dxf_entity(shape));
+    }
+    for seg in &expansion.label_segments {
+        entities.push(DxfEntity::new(EntityType::Line(DxfLine {
+            p1: to_dxf_point(seg[0]),
+            p2: to_dxf_point(seg[1]),
+            ..Default::default()
+        })));
     }
     for shape in &expansion.symbol_strokes {
         entities.push(shape_to_dxf_entity(shape));
@@ -3501,6 +3514,181 @@ mod tests {
         let export = export_dxf(&doc);
         assert_eq!(export.skipped_entities, 0);
         assert!(export.drawing.entities().count() > 0);
+    }
+
+    /// 文字を寸法線から離したときの接続線は `segments` の末尾なので、そのまま `LINE` になる。
+    /// 文字の下の塗りは DXF に出さない（`SOLID` の本数は矢先のぶんだけで変わらない）。
+    #[test]
+    fn export_writes_the_label_connector_as_a_line_and_no_label_mask() {
+        let export_of = |annotation: DimAnnotation| {
+            let mut doc = Document::new();
+            let layer = doc.current_layer();
+            let dim = EntityGeom::DimLinear(DimLinear {
+                p1: Point2::new(0.0, 0.0),
+                p2: Point2::new(100.0, 0.0),
+                offset: 10.0,
+                direction: DimDirection::Aligned,
+                ext_angle: None,
+                annotation,
+            });
+            doc.apply(Command::AddEntity(Entity::new(
+                dim.clone(),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+            let style = doc.dim_style();
+            let k = doc.sheet().scale.world_mm_per_paper_mm();
+            let render = DimRender {
+                style,
+                scale_world_per_paper_mm: k,
+                arrow_len_world: style.arrow_len_mm * k,
+                text_height_world: style.text_height_mm * k,
+            };
+            let ex = expand_dim(&dim, render).unwrap();
+            let export = export_dxf(&doc);
+            let lines: Vec<[Point2; 2]> = export
+                .drawing
+                .entities()
+                .filter_map(|e| match &e.specific {
+                    EntityType::Line(l) => Some([from_dxf_point(&l.p1), from_dxf_point(&l.p2)]),
+                    _ => None,
+                })
+                .collect();
+            let solids = export
+                .drawing
+                .entities()
+                .filter(|e| matches!(e.specific, EntityType::Solid(_)))
+                .count();
+            (ex, lines, solids)
+        };
+
+        let (_, plain_lines, plain_solids) = export_of(DimAnnotation::default());
+        let (ex, lines, solids) = export_of(DimAnnotation {
+            text_anchor: Some(Point2::new(50.0, 40.0)),
+            ..DimAnnotation::default()
+        });
+        assert_eq!(lines.len(), plain_lines.len() + 1);
+        assert_eq!(solids, plain_solids);
+
+        let [line_side, label_side] = ex.label_segments[0];
+        approx_point(line_side, Point2::new(50.0, 10.0));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l[0].distance(line_side) < 1e-9 && l[1].distance(label_side) < 1e-9),
+            "接続線が LINE に無い: {lines:?}"
+        );
+    }
+
+    /// 寸法の全要素が DXF に出る（`DimExpansion` のフィールドの取りこぼしの検出）。
+    /// 塗りの上下の層は DXF では意味を持たないので、本数と線分の座標で確かめる。
+    #[test]
+    fn export_writes_every_element_of_the_expansion() {
+        let far = Some(Point2::new(50.0, 40.0));
+        let linear = |annotation| {
+            EntityGeom::DimLinear(DimLinear {
+                p1: Point2::new(0.0, 0.0),
+                p2: Point2::new(100.0, 0.0),
+                offset: 10.0,
+                direction: DimDirection::Aligned,
+                ext_angle: None,
+                annotation,
+            })
+        };
+        let cases = [
+            // 下線 + 接続線。
+            linear(DimAnnotation {
+                value_override: Some("50".to_string()),
+                text_anchor: far,
+                ..DimAnnotation::default()
+            }),
+            // 枠 4 辺 + 接続線。
+            linear(DimAnnotation {
+                value_style: mcad_core::ValueStyle::TheoreticallyExact,
+                text_anchor: far,
+                ..DimAnnotation::default()
+            }),
+            // φ の記号ストローク + 接続線。
+            EntityGeom::DimDiameter(DimDiameter {
+                center: Point2::new(0.0, 0.0),
+                radius: 10.0,
+                angle: 0.0,
+                annotation: DimAnnotation {
+                    text_anchor: far,
+                    ..DimAnnotation::default()
+                },
+            }),
+            // 弧 + 補助線 + 接続線。
+            EntityGeom::DimAngular(DimAngular {
+                vertex: Point2::new(0.0, 0.0),
+                p1: Point2::new(1.0, 0.0),
+                p2: Point2::new(0.0, 1.0),
+                arc_radius: 10.0,
+                annotation: DimAnnotation {
+                    text_anchor: far,
+                    ..DimAnnotation::default()
+                },
+            }),
+        ];
+        for geom in cases {
+            let style = mcad_core::DimStyle::DEFAULT;
+            let render = DimRender {
+                style: &style,
+                scale_world_per_paper_mm: 1.0,
+                arrow_len_world: style.arrow_len_mm,
+                text_height_world: style.text_height_mm,
+            };
+            let ex = expand_dim(&geom, render).unwrap();
+            assert!(!ex.label_segments.is_empty(), "{geom:?}");
+
+            let solids: usize = ex
+                .arrows
+                .iter()
+                .flat_map(|g| &g.fills)
+                .map(|poly| fill_polygon_to_dxf_solids(poly).len())
+                .sum();
+            let arrow_strokes: usize = ex.arrows.iter().map(|g| g.strokes.len()).sum();
+            let entities = dim_to_dxf_entities(&geom, render);
+            assert_eq!(
+                entities.len(),
+                ex.segments.len()
+                    + ex.label_segments.len()
+                    + arrow_strokes
+                    + solids
+                    + ex.line_strokes.len()
+                    + ex.symbol_strokes.len()
+                    + ex.texts.len(),
+                "{geom:?}"
+            );
+
+            let lines: Vec<[Point2; 2]> = entities
+                .iter()
+                .filter_map(|e| match &e.specific {
+                    EntityType::Line(l) => Some([from_dxf_point(&l.p1), from_dxf_point(&l.p2)]),
+                    _ => None,
+                })
+                .collect();
+            for seg in ex.segments.iter().chain(&ex.label_segments) {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l[0].distance(seg[0]) < 1e-9 && l[1].distance(seg[1]) < 1e-9),
+                    "{seg:?} が LINE に無い: {geom:?}"
+                );
+            }
+            let arcs = entities
+                .iter()
+                .filter(|e| matches!(e.specific, EntityType::Arc(_)))
+                .count();
+            let expected_arcs = ex
+                .line_strokes
+                .iter()
+                .chain(&ex.symbol_strokes)
+                .filter(|s| matches!(s, Shape::Arc(_)))
+                .count();
+            assert_eq!(arcs, expected_arcs, "{geom:?}");
+        }
     }
 
     /// 分解した座標は [`expand_dim`] を直接呼んだ結果と一致する（画面描画の入力と

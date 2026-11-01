@@ -39,7 +39,7 @@ use mcad_core::{
     MAX_DIM_DECIMALS, Orientation, PaperSize, ProjectionMethod, Rgb, Scale, SheetMeta,
     SizeTolerance, Style, TableGeom, TableKind, TextGeom, TitleBlockFields, TitleBlockKind,
     ValueStyle, WidthMm, XLineGeom, arrow_kind_occupies_line, expand_dim, expand_table,
-    label_box_center, label_box_contains, linear_pick_segments, table_world_aabb,
+    label_box_center, label_box_contains, label_mask_quad, linear_pick_segments, table_world_aabb,
 };
 use mcad_geom::{
     Aabb, Arc, ArrowKind, DimSymbol, LineSeg, Point2, Polyline, Shape, clip_line_to_aabb,
@@ -560,6 +560,9 @@ const GRIP_COLOR: Color32 = SELECTION_COLOR;
 /// ドラッグ中のグリップ色（オフセットゴーストと同じ暖色。掴んでいるものだけ強調する）。
 const GRIP_DRAG_COLOR: Color32 = OFFSET_PREVIEW_COLOR;
 
+/// キャンバスの背景色。寸法の文字の下の塗り（[`draw_dim_label_mask`]）も同じ色を使う。
+const CANVAS_BACKGROUND: Color32 = Color32::from_gray(30);
+
 /// Text ツールの入力中プレビュー色（作図プレビューと同系統の暖色）。
 const TEXT_PREVIEW_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 
@@ -1030,6 +1033,15 @@ struct McadApp {
     dim_ext_angle_edit_input: String,
     /// 補助線の傾き入力の直近の拒否理由。
     dim_ext_angle_edit_input_error: Option<String>,
+    /// キャンバス上のカーソルのワールド座標（スナップ前）。上部パネルの `Cursor:` 表示用に
+    /// 前フレームの値を持つ。キャンバス外では `None`。
+    cursor_world: Option<Point2>,
+    /// 寸法線の間隔（`DimLinear::offset` の絶対値、mm）の入力欄。
+    dim_offset_input: String,
+    /// 間隔欄を最後に同期した時点の選択中 `DimLinear` の `(ID, offset)`（ID 昇順）。
+    /// 選択の変更だけでなくグリップドラッグ等による offset の変化も検知して
+    /// 入力欄を読み直すために持つ（[`sync_dim_offset_input`]）。
+    dim_offset_seen: Vec<(EntityId, f64)>,
     /// 寸法スタイルダイアログの作業コピー。`Some` の間はモーダルが開いている
     /// (表題欄編集ダイアログと同じ流儀。M9タスク50-3)。
     dim_style_dialog: Option<DimStyleDialogState>,
@@ -1052,8 +1064,8 @@ struct McadApp {
     polygon_sides_input: String,
 }
 
-/// Text ツールの高さ入力欄の既定値（ワールド単位）。既定ビュー（zoom=1）で読める大きさ。
-const DEFAULT_TEXT_HEIGHT: &str = "20";
+/// Text ツールの高さ入力欄の既定値（ワールド単位）。`DimStyle` の文字高さと同じ。
+const DEFAULT_TEXT_HEIGHT: &str = "3.5";
 
 /// 正多角形ツールの辺数入力欄の既定値（M12 タスク89、設計判断7）。
 const DEFAULT_POLYGON_SIDES: &str = "6";
@@ -1408,6 +1420,9 @@ impl McadApp {
             dim_dir_angle_input: String::new(),
             dim_dir_input_error: None,
             dim_ext_angle_edit_input: String::new(),
+            cursor_world: None,
+            dim_offset_input: String::new(),
+            dim_offset_seen: Vec::new(),
             dim_ext_angle_edit_input_error: None,
             dim_style_dialog: None,
             table_dialog: None,
@@ -1540,6 +1555,8 @@ impl McadApp {
         self.dim_dir_input_error = None;
         self.dim_ext_angle_edit_input.clear();
         self.dim_ext_angle_edit_input_error = None;
+        self.dim_offset_input.clear();
+        self.dim_offset_seen.clear();
         // 表編集ダイアログも別図面へ持ち越さない。
         self.table_dialog = None;
         // 打ちかけの数値入力も持ち越さない（ツールが Select へ戻るので受け手も無くなる）。
@@ -2792,6 +2809,10 @@ impl eframe::App for McadApp {
                     ui.separator();
                     ui.label(format!("Tool: {}", self.tool_kind.label()));
                     ui.separator();
+                    ui.label(
+                        egui::RichText::new(format_cursor_label(self.cursor_world)).monospace(),
+                    );
+                    ui.separator();
                     ui.label(format!(
                         "Snap: {}",
                         if self.config.snap_enabled {
@@ -3122,6 +3143,8 @@ impl eframe::App for McadApp {
                 &mut self.dim_dir_input_error,
                 &mut self.dim_ext_angle_edit_input,
                 &mut self.dim_ext_angle_edit_input_error,
+                &mut self.dim_offset_input,
+                &mut self.dim_offset_seen,
                 &mut self.status,
                 now,
             );
@@ -3197,6 +3220,11 @@ impl eframe::App for McadApp {
             if let Some(pos) = response.hover_pos() {
                 self.numeric_input.set_anchor(pos);
             }
+            // 上部パネルの「Cursor:」表示用（パネルはキャンバスより先に描かれるので、
+            // 次フレームで表示される）。スナップ前の生のワールド座標。
+            self.cursor_world = response
+                .hover_pos()
+                .map(|pos| self.viewport.screen_to_world(rect, pos));
 
             handle_pan_input(ui, &response, &mut self.viewport);
             handle_zoom_input(ui, &response, rect, &mut self.viewport);
@@ -3292,7 +3320,7 @@ impl eframe::App for McadApp {
             }
 
             let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 0.0, Color32::from_gray(30));
+            painter.rect_filled(rect, 0.0, CANVAS_BACKGROUND);
 
             // 紙 1mm あたりのワールド mm（判断4）。線幅（`draw_entities`）・寸法注記
             // （`draw_selection`・`tool.draw_preview`）・Text（`draw_text`）が共通で使う
@@ -6458,6 +6486,8 @@ fn dim_linear_panel(
     dir_input_error: &mut Option<String>,
     ext_angle_input: &mut String,
     ext_angle_input_error: &mut Option<String>,
+    offset_input: &mut String,
+    offset_seen: &mut Vec<(EntityId, f64)>,
     status: &mut Option<StatusMessage>,
     now: f64,
 ) {
@@ -6481,6 +6511,7 @@ fn dim_linear_panel(
         ext_angle_input,
         ext_angle_input_error,
     );
+    sync_dim_offset_input(offset_seen, offset_input, &linear_live);
 
     if linear_live.is_empty() {
         return;
@@ -6640,6 +6671,100 @@ fn dim_linear_panel(
     if let Some(err) = ext_angle_input_error {
         ui.colored_label(STATUS_MESSAGE_COLOR, err.as_str());
     }
+
+    // --- 寸法線の間隔: offset の絶対値（符号＝寸法線の側は保つ）---
+    ui.horizontal(|ui| {
+        ui.label("寸法線の間隔:");
+        ui.add(egui::TextEdit::singleline(offset_input).desired_width(64.0));
+        ui.label("mm");
+        if ui.button("確定").clicked() {
+            match parse_dim_offset_spacing(offset_input) {
+                Ok(spacing) => {
+                    let cmds = build_linear_offset_edit_commands(&linear_live, spacing);
+                    if !cmds.is_empty()
+                        && let Err(err) = document.apply(Command::Batch(cmds))
+                    {
+                        set_status(
+                            status,
+                            now,
+                            format!("寸法線の間隔の変更に失敗しました: {err}"),
+                        );
+                    }
+                }
+                Err(msg) => set_status(status, now, msg),
+            }
+        }
+    });
+}
+
+/// 上部パネルのカーソル座標表示。等幅フォントで描く前提で、桁数が変わっても周囲が
+/// ガタつかないよう数値は幅 9 に右詰めし、キャンバス外（`None`）も同じ幅に揃える。
+fn format_cursor_label(cursor: Option<Point2>) -> String {
+    match cursor {
+        Some(p) => format!("Cursor: {:>9.2}, {:>9.2}", p.x, p.y),
+        None => format!("{:<28}", "Cursor: -"),
+    }
+}
+
+/// 寸法線の間隔の入力文字列を解釈する。正の有限値のみ受け付ける。
+fn parse_dim_offset_spacing(input: &str) -> Result<f64, String> {
+    match input.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Ok(v),
+        _ => Err("寸法線の間隔は正の数値で入力してください".to_string()),
+    }
+}
+
+/// 選択中の [`DimLinear`] 全件の寸法線の間隔（[`DimLinear::offset`] の絶対値）を
+/// `spacing` に揃える `Command::ModifyEntity` 一式を組む。符号（寸法線がどちら側か）は
+/// 保ち、`offset == 0` は正の側へ置く。既に等しい寸法は含めない。
+fn build_linear_offset_edit_commands(
+    linear_live: &[(EntityId, DimLinear)],
+    spacing: f64,
+) -> Vec<Command> {
+    linear_live
+        .iter()
+        .filter_map(|(id, dim)| {
+            let new_offset = if dim.offset < 0.0 { -spacing } else { spacing };
+            (new_offset != dim.offset).then(|| Command::ModifyEntity {
+                id: *id,
+                new_geom: EntityGeom::DimLinear(DimLinear {
+                    offset: new_offset,
+                    ..dim.clone()
+                }),
+            })
+        })
+        .collect()
+}
+
+/// 間隔入力欄を、選択中 `DimLinear` の `(ID, offset)` が前回同期時から変わったとき
+/// （選択の変更・グリップドラッグ・undo 等）だけ読み直す。全件の `|offset|` が一致すれば
+/// その値、違えば空欄。変わっていないフレームでは入力途中の文字を消さない。
+fn sync_dim_offset_input(
+    seen: &mut Vec<(EntityId, f64)>,
+    input: &mut String,
+    linear_live: &[(EntityId, DimLinear)],
+) -> bool {
+    let mut current: Vec<(EntityId, f64)> =
+        linear_live.iter().map(|(id, d)| (*id, d.offset)).collect();
+    current.sort_by_key(|(id, _)| *id);
+    if *seen == current {
+        return false;
+    }
+    *seen = current;
+    input.clear();
+    if let Some(v) = all_same(linear_live.iter().map(|(_, d)| d.offset.abs())) {
+        *input = format_dim_offset_spacing(v);
+    }
+    true
+}
+
+/// 間隔欄の表示文字列。小数 3 桁に丸めて末尾の 0 を除く（ドラッグ後の長い桁を出さない）。
+/// 表示だけの丸めで、値は「確定」を押すまで変わらない。
+fn format_dim_offset_spacing(v: f64) -> String {
+    format!("{v:.3}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 /// 用紙サイズの日本語ラベル（右パネルの用紙コンボ専用）。
@@ -9646,7 +9771,14 @@ fn draw_entities(
             | EntityGeom::DimAngular(_)
             | EntityGeom::DimOrdinate(_) => {
                 let stroke = Stroke::new(stroke_px, color);
-                draw_dim_geom(painter, rect, viewport, &entity.geom, stroke, render);
+                if let Some(ex) = expand_dim(&entity.geom, render) {
+                    // 文字の下の塗りは文書の通常描画のここだけ（選択ハイライト・ゴースト・
+                    // プレビューで塗ると周りの線を消してしまう）。順序は `DimExpansion` の
+                    // 「描画の層」で、文字の下にある寸法自身の線も消える。
+                    draw_dim_line_layer(painter, rect, viewport, &ex, stroke);
+                    draw_dim_label_mask(painter, rect, viewport, &ex, render);
+                    draw_dim_label_layer(painter, rect, viewport, &ex, stroke);
+                }
             }
             // 表は罫線の幅を固定の定数（表題欄と同じ）から取るので `stroke_px` は
             // 使わない。線種も見ない（常に実線）。M10 詳細設計1・タスク58。
@@ -9827,6 +9959,36 @@ fn draw_dim_geom(
     }
 }
 
+/// 寸法の文字の下をキャンバスの背景色で塗る（core の [`label_mask_quad`]。SVG/PDF と同じ領域）。
+/// 文字が小さすぎて描かれない（[`MIN_TEXT_PX`] 未満）ときは、線だけ欠けることになるので塗らない。
+fn draw_dim_label_mask(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    ex: &DimExpansion,
+    render: DimRender<'_>,
+) {
+    let Some(quad) = ex.label_box else {
+        return;
+    };
+    let text_is_drawn = ex
+        .texts
+        .iter()
+        .any(|text| text.height * viewport.zoom >= MIN_TEXT_PX);
+    if !text_is_drawn {
+        return;
+    }
+    let pts = label_mask_quad(&quad, render)
+        .iter()
+        .map(|p| viewport.world_to_screen(rect, *p))
+        .collect();
+    painter.add(egui::Shape::convex_polygon(
+        pts,
+        CANVAS_BACKGROUND,
+        Stroke::NONE,
+    ));
+}
+
 /// 寸法の展開結果（線分・矢先・記号ストローク・文字）を Painter へ描く。プレビュー
 /// （`tool.rs` の `draw_preview`）と確定描画・選択ハイライトが共有する
 /// （`crate::draw_dim_expansion`）。矢先は塗り（`stroke.color`）と線（寸法線と同じ
@@ -9838,7 +10000,22 @@ fn draw_dim_geom(
 ///
 /// [`DimExpansion::symbol_strokes`]（φ・□ のストローク）は寸法線とまったく
 /// 同じ `stroke` で、既存の [`draw_shape`] へ通して描く（M9 タスク49-3）。
+///
+/// 文字の下の塗りはここでは描かない（強調表示・プレビューと共有するため。通常描画は
+/// [`draw_entities`] が 2 つの層の間に [`draw_dim_label_mask`] を挟む）。
 fn draw_dim_expansion(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    ex: &DimExpansion,
+    stroke: Stroke,
+) {
+    draw_dim_line_layer(painter, rect, viewport, ex, stroke);
+    draw_dim_label_layer(painter, rect, viewport, ex, stroke);
+}
+
+/// 塗りの下の層（寸法線・補助線・矢先・角度寸法の弧）を描く。
+fn draw_dim_line_layer(
     painter: &egui::Painter,
     rect: Rect,
     viewport: &Viewport,
@@ -9867,10 +10044,36 @@ fn draw_dim_expansion(
             painter.line_segment([a, b], stroke);
         }
     }
-    // 記号（φ・□）は値と同じラベルの一部なので、文字の直前へ置いて描画順を揃える。
     // 寸法は製図慣行として常に実線なので線種は `Continuous` 固定で、`draw_shape` の `k`
     // （破線パターンの紙 mm → px 換算にしか使わない）は使われない。`tool.rs` の
     // プレビュー描画が既に採っている流儀に合わせて 1.0 を渡す。
+    for shape in &ex.line_strokes {
+        draw_shape(
+            painter,
+            rect,
+            viewport,
+            shape,
+            stroke,
+            Linetype::Continuous,
+            1.0,
+        );
+    }
+}
+
+/// 塗りの上の層（下線・枠・接続線・記号ストローク・文字）を描く。
+fn draw_dim_label_layer(
+    painter: &egui::Painter,
+    rect: Rect,
+    viewport: &Viewport,
+    ex: &DimExpansion,
+    stroke: Stroke,
+) {
+    for seg in &ex.label_segments {
+        let a = viewport.world_to_screen(rect, seg[0]);
+        let b = viewport.world_to_screen(rect, seg[1]);
+        painter.line_segment([a, b], stroke);
+    }
+    // 記号（φ・□）は値と同じラベルの一部なので、文字の直前へ置いて描画順を揃える。
     for shape in &ex.symbol_strokes {
         draw_shape(
             painter,
@@ -14548,6 +14751,364 @@ mod tests {
             )))
             .unwrap();
         ids.entities[0]
+    }
+
+    fn linear_with_offset(document: &mut Document, offset: f64) -> (EntityId, DimLinear) {
+        let layer = document.current_layer();
+        let dim = DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(10.0, 0.0),
+            offset,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation: DimAnnotation::default(),
+        };
+        let ids = document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(dim.clone()),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        (ids.entities[0], dim)
+    }
+
+    #[test]
+    fn build_linear_offset_edit_commands_keeps_sign_and_treats_zero_as_positive() {
+        let mut document = Document::new();
+        let (a, da) = linear_with_offset(&mut document, 5.0);
+        let (b, db) = linear_with_offset(&mut document, -3.0);
+        let (c, dc) = linear_with_offset(&mut document, 0.0);
+        let (d, dd) = linear_with_offset(&mut document, 8.0);
+        let live = vec![(a, da), (b, db), (c, dc), (d, dd)];
+
+        let cmds = build_linear_offset_edit_commands(&live, 8.0);
+        // 既に 8 の d は除く。
+        assert_eq!(cmds.len(), 3);
+        document.apply(Command::Batch(cmds)).unwrap();
+        let offset_of = |document: &Document, id| match &document.entity(id).unwrap().geom {
+            EntityGeom::DimLinear(d) => d.offset,
+            _ => panic!("not DimLinear"),
+        };
+        assert_eq!(offset_of(&document, a), 8.0);
+        assert_eq!(offset_of(&document, b), -8.0);
+        assert_eq!(offset_of(&document, c), 8.0);
+        assert_eq!(offset_of(&document, d), 8.0);
+
+        // 複数選択でも undo 1 回で戻る。
+        assert!(document.undo());
+        assert_eq!(offset_of(&document, a), 5.0);
+        assert_eq!(offset_of(&document, b), -3.0);
+        assert_eq!(offset_of(&document, c), 0.0);
+    }
+
+    #[test]
+    fn parse_dim_offset_spacing_accepts_only_positive_finite() {
+        assert_eq!(parse_dim_offset_spacing(" 12.5 "), Ok(12.5));
+        for bad in ["", "abc", "0", "-3", "NaN", "inf"] {
+            assert!(parse_dim_offset_spacing(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn sync_dim_offset_input_follows_selection_and_offset_changes() {
+        let mut document = Document::new();
+        let (a, da) = linear_with_offset(&mut document, -5.0);
+        let (b, db) = linear_with_offset(&mut document, 5.0);
+        let mut seen = Vec::new();
+        let mut input = String::new();
+
+        // |offset| が全件一致すればその値（符号は無視）。
+        assert!(sync_dim_offset_input(
+            &mut seen,
+            &mut input,
+            &[(a, da.clone()), (b, db.clone())]
+        ));
+        assert_eq!(input, "5");
+
+        // 変化が無ければ入力途中の文字を消さない。
+        input = "12".to_string();
+        assert!(!sync_dim_offset_input(
+            &mut seen,
+            &mut input,
+            &[(a, da.clone()), (b, db.clone())]
+        ));
+        assert_eq!(input, "12");
+
+        // グリップドラッグ相当で offset が変わると読み直す（不一致なら空）。
+        let moved = DimLinear {
+            offset: 7.0,
+            ..db.clone()
+        };
+        assert!(sync_dim_offset_input(
+            &mut seen,
+            &mut input,
+            &[(a, da.clone()), (b, moved)]
+        ));
+        assert_eq!(input, "");
+
+        // 選択が変わると入力途中の文字を持ち越さない。
+        input = "99".to_string();
+        assert!(sync_dim_offset_input(
+            &mut seen,
+            &mut input,
+            &[(b, db.clone())]
+        ));
+        assert_eq!(input, "5");
+
+        // ドラッグ後の長い桁は小数 3 桁に丸めて見せる（値そのものは変えない）。
+        let dragged = DimLinear {
+            offset: 12.345678901,
+            ..db
+        };
+        assert!(sync_dim_offset_input(
+            &mut seen,
+            &mut input,
+            &[(b, dragged)]
+        ));
+        assert_eq!(input, "12.346");
+    }
+
+    #[test]
+    fn format_dim_offset_spacing_rounds_to_three_decimals_and_trims_zeros() {
+        assert_eq!(format_dim_offset_spacing(5.0), "5");
+        assert_eq!(format_dim_offset_spacing(100.0), "100");
+        assert_eq!(format_dim_offset_spacing(12.5), "12.5");
+        assert_eq!(format_dim_offset_spacing(12.3456), "12.346");
+        assert_eq!(format_dim_offset_spacing(7.0004), "7");
+    }
+
+    // --- 寸法の文字の下の塗り（文書の通常描画の経路だけで塗る）---
+
+    /// `paint` が Painter へ積んだ図形を順に取り出す。
+    fn painted_shapes(paint: impl Fn(&egui::Painter, Rect)) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| paint(ui.painter(), rect));
+        output.shapes.into_iter().map(|c| c.shape).collect()
+    }
+
+    fn is_canvas_mask(shape: &egui::Shape) -> bool {
+        matches!(shape, egui::Shape::Path(path) if path.fill == CANVAS_BACKGROUND)
+    }
+
+    fn document_with_line_and_dimension() -> (Document, EntityId) {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                Shape::Line(LineSeg::new(
+                    Point2::new(-50.0, 40.0),
+                    Point2::new(50.0, 40.0),
+                )),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        let (dim, _) = linear_with_offset(&mut document, 20.0);
+        (document, dim)
+    }
+
+    /// 幾何 1 つだけの図面。
+    fn document_with_geom(geom: impl Into<EntityGeom>) -> (Document, EntityId) {
+        let mut document = Document::new();
+        let layer = document.current_layer();
+        let ids = document
+            .apply(Command::AddEntity(Entity::new(
+                geom,
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        (document, ids.entities[0])
+    }
+
+    /// 文字を指定の位置へ置いた長さ寸法。寸法線は y=20、x 0〜100。
+    fn linear_with_annotation(annotation: DimAnnotation) -> DimLinear {
+        DimLinear {
+            p1: Point2::new(0.0, 0.0),
+            p2: Point2::new(100.0, 0.0),
+            offset: 20.0,
+            direction: DimDirection::Aligned,
+            ext_angle: None,
+            annotation,
+        }
+    }
+
+    fn on_line_annotation() -> DimAnnotation {
+        DimAnnotation {
+            text_anchor: Some(Point2::new(50.0, 20.0)),
+            ..DimAnnotation::default()
+        }
+    }
+
+    /// `draw_entities` が積む図形を、塗りの前と後に分けて返す。
+    fn shapes_around_mask(document: &Document) -> (Vec<egui::Shape>, Vec<egui::Shape>) {
+        let viewport = Viewport::new();
+        let shapes = painted_shapes(|painter, rect| {
+            draw_entities(painter, rect, document, &viewport, false);
+        });
+        assert_eq!(shapes.iter().filter(|s| is_canvas_mask(s)).count(), 1);
+        let mask = shapes.iter().position(is_canvas_mask).unwrap();
+        (shapes[..mask].to_vec(), shapes[mask + 1..].to_vec())
+    }
+
+    fn line_segment_count(shapes: &[egui::Shape]) -> usize {
+        shapes
+            .iter()
+            .filter(|s| matches!(s, egui::Shape::LineSegment { .. }))
+            .count()
+    }
+
+    fn has_text(shapes: &[egui::Shape]) -> bool {
+        shapes.iter().any(|s| matches!(s, egui::Shape::Text(_)))
+    }
+
+    #[test]
+    fn draw_entities_paints_lines_then_mask_then_text_for_a_label_on_its_own_line() {
+        // 先に描く線分 → 文字を自分の寸法線の上へ置いた寸法。
+        let (mut document, _) = document_with_geom(Shape::Line(LineSeg::new(
+            Point2::new(-50.0, 40.0),
+            Point2::new(50.0, 40.0),
+        )));
+        let layer = document.current_layer();
+        document
+            .apply(Command::AddEntity(Entity::new(
+                EntityGeom::DimLinear(linear_with_annotation(on_line_annotation())),
+                layer,
+                Style::inherited(),
+            )))
+            .unwrap();
+        let (before, after) = shapes_around_mask(&document);
+        // 寸法線 + 補助線 2 は塗りの下、文字は塗りの上で、上に線は残らない。
+        assert_eq!(line_segment_count(&before), 3, "{before:?}");
+        assert!(!has_text(&before));
+        assert_eq!(line_segment_count(&after), 0, "{after:?}");
+        assert!(has_text(&after));
+    }
+
+    #[test]
+    fn angular_arc_is_painted_under_the_mask() {
+        let ux = std::f64::consts::FRAC_PI_4.cos();
+        let (document, _) = document_with_geom(EntityGeom::DimAngular(DimAngular {
+            vertex: Point2::ORIGIN,
+            p1: Point2::new(1.0, 0.0),
+            p2: Point2::new(0.0, 1.0),
+            arc_radius: 100.0,
+            annotation: DimAnnotation {
+                text_anchor: Some(Point2::new(100.0 * ux, 100.0 * ux)),
+                ..DimAnnotation::default()
+            },
+        }));
+        let (before, after) = shapes_around_mask(&document);
+        let is_arc =
+            |s: &egui::Shape| matches!(s, egui::Shape::Path(p) if p.points.len() > 2 && !p.closed);
+        assert!(before.iter().any(is_arc), "{before:?}");
+        assert!(!after.iter().any(is_arc), "{after:?}");
+        assert!(has_text(&after));
+    }
+
+    #[test]
+    fn phi_symbol_underline_frame_and_connector_are_painted_over_the_mask() {
+        // φ: 直径線は塗りの下、記号ストロークと値は塗りの上。
+        let (document, _) = document_with_geom(EntityGeom::DimDiameter(DimDiameter {
+            center: Point2::new(50.0, 20.0),
+            radius: 40.0,
+            angle: 0.0,
+            annotation: on_line_annotation(),
+        }));
+        let (before, after) = shapes_around_mask(&document);
+        assert_eq!(line_segment_count(&before), 1, "直径線: {before:?}");
+        let strokes_after = after
+            .iter()
+            .filter(|s| !matches!(s, egui::Shape::Text(_)))
+            .count();
+        assert!(strokes_after >= 2, "φ の円と斜線: {after:?}");
+        assert!(has_text(&after));
+
+        // 下線 1、枠 4 辺、接続線 1 は塗りの上の線分（下は常に寸法線 + 補助線 2）。
+        for (annotation, over) in [
+            (
+                DimAnnotation {
+                    value_override: Some("50".to_owned()),
+                    ..on_line_annotation()
+                },
+                1,
+            ),
+            (
+                DimAnnotation {
+                    value_style: ValueStyle::TheoreticallyExact,
+                    ..on_line_annotation()
+                },
+                4,
+            ),
+            (
+                DimAnnotation {
+                    text_anchor: Some(Point2::new(50.0, 200.0)),
+                    ..DimAnnotation::default()
+                },
+                1,
+            ),
+        ] {
+            let (document, _) =
+                document_with_geom(EntityGeom::DimLinear(linear_with_annotation(annotation)));
+            let (before, after) = shapes_around_mask(&document);
+            assert_eq!(line_segment_count(&before), 3);
+            assert_eq!(line_segment_count(&after), over, "{after:?}");
+        }
+    }
+
+    #[test]
+    fn selection_highlight_does_not_paint_a_label_mask() {
+        // 文字を自分の寸法線の上へ置いた寸法を選択しても塗らない（周りの線を消さない）。
+        let (document, dim) = document_with_geom(EntityGeom::DimLinear(linear_with_annotation(
+            on_line_annotation(),
+        )));
+        let viewport = Viewport::new();
+        let mut select_tool = SelectTool::default();
+        select_tool.set_selection(vec![dim]);
+        let shapes = painted_shapes(|painter, rect| {
+            draw_selection(
+                painter,
+                rect,
+                &document,
+                &viewport,
+                &select_tool,
+                None,
+                false,
+                1.0,
+            );
+        });
+        assert!(!shapes.is_empty(), "強調表示は描かれる");
+        assert!(!shapes.iter().any(is_canvas_mask));
+    }
+
+    #[test]
+    fn label_mask_is_skipped_when_the_text_is_too_small_to_draw() {
+        let (document, _) = document_with_line_and_dimension();
+        // 紙基準表示 ON（文字 3.5mm）で、文字が MIN_TEXT_PX 未満になるズーム。
+        let viewport = Viewport {
+            zoom: 0.1,
+            center: Point2::ORIGIN,
+        };
+        let shapes = painted_shapes(|painter, rect| {
+            draw_entities(painter, rect, &document, &viewport, true);
+        });
+        assert!(!shapes.is_empty());
+        assert!(!shapes.iter().any(is_canvas_mask));
+    }
+
+    #[test]
+    fn format_cursor_label_has_fixed_width() {
+        assert_eq!(
+            format_cursor_label(Some(Point2::new(150.0, 150.0))),
+            "Cursor:    150.00,    150.00"
+        );
+        assert_eq!(
+            format_cursor_label(Some(Point2::new(-1.5, 12.0))).len(),
+            format_cursor_label(None).len()
+        );
+        assert_eq!(format_cursor_label(None).trim_end(), "Cursor: -");
     }
 
     #[test]

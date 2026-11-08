@@ -114,6 +114,30 @@ impl DimKind {
         }
     }
 
+    /// 記号が未指定（`annotation.symbol == None`）のとき、表示時に補う既定の記号。
+    ///
+    /// 半径・直径寸法は記号がないと値の意味が決まらない（R12 と φ24 の取り違えを招く。
+    /// M8 までの `expand_radial` も `R` を値文字列へ焼き込んでいた）。長さ寸法は記号なしが
+    /// 既定。
+    ///
+    /// **これは表示時の補完であり、core のデータへは書かない。** 書いてしまうと「未指定」と
+    /// 「明示的に R を選んだ」が区別できなくなり、`decimals_override` で避けたのと同じ
+    /// 「生きた参照が死ぬ」問題を起こす。UI は未指定状態の表示にこの表を使ってよい。
+    ///
+    /// [`DimKind`] は `#[non_exhaustive]` ではない（種別追加をコンパイルエラーで検出する
+    /// 設計）ので、ここも網羅 `match` で書く。
+    #[must_use]
+    pub const fn default_symbol(self) -> Option<DimSymbol> {
+        match self {
+            DimKind::Linear => None,
+            DimKind::Radial => Some(DimSymbol::Radius),
+            DimKind::Diameter => Some(DimSymbol::Diameter),
+            // 角度・座標には寸法補助記号が付かない（`allowed_symbols` も空）。
+            // 角度の単位記号 `°` は記号ではなく値の接尾辞。
+            DimKind::Angular | DimKind::Ordinate => None,
+        }
+    }
+
     /// `symbol` をこの種別の寸法へ付けてよいか（[`DimKind::allowed_symbols`] の表引き）。
     #[must_use]
     pub fn allows(self, symbol: DimSymbol) -> bool {

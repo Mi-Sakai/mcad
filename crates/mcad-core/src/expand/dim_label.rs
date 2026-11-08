@@ -196,7 +196,7 @@ pub fn layout_dim_label(
     let mut core = LabelBuilder::new();
 
     // 1) 寸法補助記号は数値の左（規定 5-2 4)）。
-    if let Some(symbol) = annotation.symbol.or_else(|| default_symbol(kind)) {
+    if let Some(symbol) = annotation.symbol.or_else(|| kind.default_symbol()) {
         core.push_symbol(symbol, text_height);
     }
 
@@ -314,30 +314,6 @@ pub fn layout_dim_label(
 #[inline]
 fn shift_point_pair([a, b]: [Point2; 2], dx: f64) -> [Point2; 2] {
     [Point2::new(a.x + dx, a.y), Point2::new(b.x + dx, b.y)]
-}
-
-/// 記号が明示されていないとき（[`DimAnnotation::symbol`] が `None`）に、寸法種別から
-/// 補う既定の記号。
-///
-/// 半径・直径寸法は記号がないと値の意味が決まらない（R12 と φ24 の取り違えを招く。
-/// M8 までの `expand_radial` も `R` を値文字列へ焼き込んでいた）。長さ寸法は記号なしが
-/// 既定。
-///
-/// **これは表示時の補完であり、core のデータへは書かない。** 書いてしまうと「未指定」と
-/// 「明示的に R を選んだ」が区別できなくなり、`decimals_override` で避けたのと同じ
-/// 「生きた参照が死ぬ」問題を起こす。
-///
-/// [`DimKind`] は `#[non_exhaustive]` ではない（種別追加をコンパイルエラーで検出する
-/// 設計）ので、ここも網羅 `match` で書く。
-fn default_symbol(kind: DimKind) -> Option<DimSymbol> {
-    match kind {
-        DimKind::Linear => None,
-        DimKind::Radial => Some(DimSymbol::Radius),
-        DimKind::Diameter => Some(DimSymbol::Diameter),
-        // 角度・座標には寸法補助記号が付かない（`DimKind::allowed_symbols` も空）。
-        // 角度の単位記号 `°` は記号ではなく値の接尾辞（[`value_suffix`]）。
-        DimKind::Angular | DimKind::Ordinate => None,
-    }
 }
 
 /// 値の**直後**へ隙間なく置く単位記号（M11 タスク69）。

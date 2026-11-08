@@ -5249,6 +5249,30 @@ fn dim_symbol_ui_label(symbol: DimSymbol) -> &'static str {
     }
 }
 
+/// 記号コンボの「未指定(`symbol == None`)」項目のラベル。`defaults` は選択中の各寸法の
+/// [`DimKind::default_symbol`]。全件が同じ `Some(s)` なら「R(既定)」のように描画される記号を
+/// 示し、全件 `None` なら「なし」、混在なら「既定」。
+fn dim_symbol_none_label(defaults: impl Iterator<Item = Option<DimSymbol>>) -> String {
+    match all_same(defaults) {
+        Some(Some(sym)) => format!("{}(既定)", dim_symbol_ui_label(sym)),
+        Some(None) => "なし".to_owned(),
+        None => "既定".to_owned(),
+    }
+}
+
+/// 記号コンボに `sym` の項目を出すか。全件の既定記号が `sym` で、かつ選択中のどの注記も
+/// `sym` を明示していない(未指定項目「R(既定)」と同じ記号が二重に並ぶ)ときだけ隠す。
+/// `common_default` は全件の `default_symbol()` の `all_same`(混在なら `None`)、
+/// `any_explicit` は選択中のどれかが `symbol == Some(sym)` か(明示が混在していても、
+/// 一括で明示し直せるよう項目を残す)。
+fn dim_symbol_item_visible(
+    sym: DimSymbol,
+    common_default: Option<Option<DimSymbol>>,
+    any_explicit: bool,
+) -> bool {
+    common_default != Some(Some(sym)) || any_explicit
+}
+
 /// 矢印配置コンボの日本語ラベル。
 fn dim_arrow_placement_label(placement: ArrowPlacement) -> &'static str {
     match placement {
@@ -5741,17 +5765,20 @@ fn dim_panel(
         let symbol_common = all_same(live.iter().map(|(_, _, a)| a.symbol));
         ui.horizontal(|ui| {
             ui.label("記号:");
+            let none_label =
+                dim_symbol_none_label(live.iter().map(|(_, kind, _)| kind.default_symbol()));
+            let common_default = all_same(live.iter().map(|(_, kind, _)| kind.default_symbol()));
             let selected_text = match symbol_common {
-                Some(Some(sym)) => dim_symbol_ui_label(sym),
-                Some(None) => "なし",
-                None => "(混在)",
+                Some(Some(sym)) => dim_symbol_ui_label(sym).to_owned(),
+                Some(None) => none_label.clone(),
+                None => "(混在)".to_owned(),
             };
             egui::ComboBox::from_id_salt(dim_combo_id_salt(ui, "dim_symbol"))
                 .height(DIM_COMBO_MAX_HEIGHT)
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
                     if ui
-                        .selectable_label(symbol_common == Some(None), "なし")
+                        .selectable_label(symbol_common == Some(None), none_label.as_str())
                         .clicked()
                     {
                         let (cmds, errs) =
@@ -5759,6 +5786,10 @@ fn dim_panel(
                         apply(cmds, errs);
                     }
                     for &sym in &allowed_symbols {
+                        let any_explicit = live.iter().any(|(_, _, a)| a.symbol == Some(sym));
+                        if !dim_symbol_item_visible(sym, common_default, any_explicit) {
+                            continue;
+                        }
                         if ui
                             .selectable_label(
                                 symbol_common == Some(Some(sym)),
@@ -14690,6 +14721,35 @@ mod tests {
     // -----------------------------------------------------------------
     // 寸法パネル（M9タスク50-2）: 記号コンボの選択肢・公差入力パース・注記編集
     // -----------------------------------------------------------------
+
+    #[test]
+    fn dim_symbol_none_label_follows_the_kind_defaults() {
+        let label =
+            |kinds: &[DimKind]| dim_symbol_none_label(kinds.iter().map(|k| k.default_symbol()));
+        assert_eq!(label(&[DimKind::Radial, DimKind::Radial]), "R(既定)");
+        assert_eq!(label(&[DimKind::Diameter]), "φ(既定)");
+        assert_eq!(label(&[DimKind::Linear, DimKind::Linear]), "なし");
+        assert_eq!(label(&[DimKind::Linear, DimKind::Radial]), "既定");
+        assert_eq!(label(&[DimKind::Radial, DimKind::Diameter]), "既定");
+    }
+
+    #[test]
+    fn dim_symbol_item_hides_only_the_unexplicit_default() {
+        let r = DimSymbol::Radius;
+        // 既定と同じで誰も明示していない→出さない
+        assert!(!dim_symbol_item_visible(r, Some(Some(r)), false));
+        // 既定と同じで全件または一部が明示済み→出す
+        assert!(dim_symbol_item_visible(r, Some(Some(r)), true));
+        // 既定と異なる記号→出す
+        assert!(dim_symbol_item_visible(
+            DimSymbol::SphereRadius,
+            Some(Some(r)),
+            false
+        ));
+        // 既定混在・既定なし→出す
+        assert!(dim_symbol_item_visible(r, None, false));
+        assert!(dim_symbol_item_visible(r, Some(None), false));
+    }
 
     #[test]
     fn common_allowed_symbols_intersects_the_grammar_matrix() {

@@ -1593,7 +1593,9 @@ fn degenerate_label_only(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expand::dim_label::{ASCII_CHAR_WIDTH_RATIO, DimLabel, TextRun, layout_dim_label};
+    use crate::expand::dim_label::{
+        ASCII_CHAR_WIDTH_RATIO, DimLabel, TextRun, label_text_width, layout_dim_label,
+    };
     use crate::{
         DimAnnotation, DimKind, DimStyle, FitClass, OrdinateAxis, SizeTolerance, ValueStyle,
     };
@@ -2899,7 +2901,7 @@ mod tests {
     fn assert_bounds_cover_content(label: &DimLabel) {
         let bounds = label.bounds.expanded(T);
         for run in &label.runs {
-            let width = crate::approx_text_width(&run.content, run.height);
+            let width = label_text_width(&run.content, run.height);
             let box_ = Aabb::new(
                 run.origin,
                 Point2::new(run.origin.x + width, run.origin.y + run.height),
@@ -3212,6 +3214,53 @@ mod tests {
             glyph_min_x >= prefix_width - T,
             "φ ({glyph_min_x}) が接頭辞の幅 ({prefix_width}) と重なっている"
         );
+    }
+
+    /// 接頭辞 `M`（ねじの呼び `M12`）の直後の値ランは、`M` の実際の送り（埋め込みフォント
+    /// Noto Sans JP で 0.812em）より右から始まる。0.55 で数えていたときは値の `1` が `M` の
+    /// 字形に重なって出力された（`dim_label::wide_ascii_advance_ratio` の doc 参照）。
+    /// 期待値は表を経由せず実測値の直書きで固定する（表の写し間違いも検出するため）。
+    #[test]
+    fn label_value_starts_after_the_real_advance_of_a_wide_ascii_prefix() {
+        let annotation = DimAnnotation {
+            prefix: Some("M".to_string()),
+            ..DimAnnotation::default()
+        };
+        let label = layout(12.0, &annotation);
+        assert_eq!(contents(&label), ["M", "12"]);
+        assert!(
+            label.runs[1].origin.x >= 0.812 * H - T,
+            "値の始点 {} が M の送り {} より左",
+            label.runs[1].origin.x,
+            0.812 * H
+        );
+        // 値ランそのもの（数字）の見積もりは従来どおり 0.55 × 文字数。
+        assert!((label.width() - (0.812 * H + 2.0 * CW)).abs() < T);
+        assert_bounds_cover_content(&label);
+    }
+
+    /// 接尾辞の幅広文字も同じ見積もりで数える: 接尾辞 `-M6` の後ろの対称許容差は、
+    /// `-`（0.55）・`M`（0.812）・`6`（0.55）の送りと値・公差間のすきま（0.55）の後ろから
+    /// 始まる。
+    #[test]
+    fn label_tolerance_starts_after_the_real_advance_of_a_wide_ascii_suffix() {
+        let annotation = DimAnnotation {
+            suffix: Some("-M6".to_string()),
+            tolerance: Some(SizeTolerance::Symmetric(0.5)),
+            ..DimAnnotation::default()
+        };
+        let label = layout(10.0, &annotation);
+        assert_eq!(contents(&label), ["10", "-M6", "± 0.5"]);
+        let suffix = &label.runs[1];
+        assert!((suffix.origin.x - 2.0 * CW).abs() < T);
+        let tolerance = &label.runs[2];
+        let expected = suffix.origin.x + (2.0 * CW + 0.812 * H) + CW;
+        assert!(
+            (tolerance.origin.x - expected).abs() < T,
+            "公差の始点 {} != {expected}",
+            tolerance.origin.x
+        );
+        assert_bounds_cover_content(&label);
     }
 
     /// [`crate::ValueStyle::Reference`]（参考寸法）は記号・値・接尾辞を丸括弧で囲む。

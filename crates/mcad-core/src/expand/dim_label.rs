@@ -26,20 +26,73 @@
 //! +y = 上）で、ワールドへの回転・平行移動は行わない
 //! （`super::dimension` の `place_label` が担う）。
 
-use mcad_geom::{Aabb, DimSymbol, Point2, Shape, SymbolGlyph, Vec2, dim_symbol_glyph};
+use mcad_geom::{
+    Aabb, DimSymbol, Point2, Shape, SymbolGlyph, Vec2, dim_symbol_glyph,
+    embedded_font_ascii_advance_ratio,
+};
 
 use crate::{DimAnnotation, DimKind, DimStyle, SizeTolerance, ValueStyle};
 
-/// ASCII 文字の幅の近似係数。[`crate::approx_text_width`] と同じ ASCII 係数 0.55×height
+/// ASCII 文字の幅の近似係数（数字・記号など、[`wide_ascii_advance_ratio`] の表に無い
+/// ASCII 文字の送り）。[`crate::approx_text_width`] と同じ ASCII 係数 0.55×height
 /// （純関数のまま中央寄せ配置を決めるための割り切り。DESIGN.md M6 設計判断1 の
-/// 近似方針に沿う）。
+/// 近似方針に沿う）。値と公差の間のすきま（ASCII 空白 1 文字ぶん）にも使う。
 ///
-/// ラン幅（`LabelBuilder::run_width`）は [`crate::approx_text_width`] に委ね、ASCII 以外の
-/// 文字（`×`・`±`・φ や値上書きに入りうる任意の文字）は 1.0×height で数える。埋め込み
-/// フォント（Noto Sans JP）の実測で `×`・`±` の送りは 1.0em であり、0.55 で数えると
-/// 直後の記号と重なるためである。一方 mcad-geom の `symbol::FONT_CHAR_ADVANCE_RATIO`
-/// （英字記号の送り量）は別の量で、この係数とは独立に保つ。
+/// ラン幅は [`label_text_width`] で数える。ASCII 以外の文字（`×`・`±`・φ や値上書きに
+/// 入りうる任意の文字）は 1.0×height で数える。埋め込みフォント（Noto Sans JP）の実測で
+/// `×`・`±` の送りは 1.0em であり、0.55 で数えると直後の記号と重なるためである。
+/// 英字記号（R・C・t など）の送りは mcad-geom の [`SymbolGlyph::advance`] が決める
+/// （[`LabelBuilder::push_symbol_text`] 参照）。
 pub(super) const ASCII_CHAR_WIDTH_RATIO: f64 = 0.55;
+
+/// 送りが数字より広い ASCII 文字の、埋め込みフォントでの実測の送り ÷ 文字高さ。
+/// それ以外の文字は `None`。
+///
+/// 0.55 は数字の送り（Noto Sans JP で 0.555em）とほぼ一致するが、`M`（0.812em）や `W`・
+/// `m`・`%` のような幅広の文字を 0.55 で数えると、直後のランがその文字の上へ置かれて
+/// 重なる（接頭辞 `M` + 値 `12` が「M12」ではなく M と 1 が重なって出る不具合）。
+///
+/// 実測値は mcad-geom の [`embedded_font_ascii_advance_ratio`]（埋め込みフォントの `hmtx`
+/// を写した定数表。測り方はその doc）から引く。寸法の英字記号の送り
+/// （[`dim_symbol_glyph`]）と同じ表なので、`R`・`C`・`S` の値が二重に書かれない。
+///
+/// **使うのは送りが数字（`'0'` の送り）より広い文字だけ**で、それ以外（数字・`.`・`+`・
+/// `-`・狭い英字など）は従来どおり 0.55 で数える。狭い文字を実測値まで縮めない理由は 2 つ:
+/// 数値だけのラベルの組版を 1 ビットも変えないこと（0.555 と 0.55 の差は 1 文字あたり
+/// 0.005em で目に見えない）と、ラン幅が常に [`crate::approx_text_width`] 以上になる
+/// （= ラベルの外形が、ランを `approx_text_width` で測る経路の箱を必ず覆う）ことを保つ
+/// ため。狭い文字の過大見積もりは重なりではなく隙間になるだけである。
+///
+/// `mcad-app` の `plot` モジュールのテスト（`dim_label_does_not_underestimate_embedded_font_advance`）
+/// が全 ASCII 文字について「直後のランが実際の送りより左に来ない」ことを、実フォントの
+/// 送りと突き合わせて検査する。
+fn wide_ascii_advance_ratio(c: char) -> Option<f64> {
+    let digit = embedded_font_ascii_advance_ratio('0')?;
+    embedded_font_ascii_advance_ratio(c).filter(|&ratio| ratio > digit)
+}
+
+/// 寸法ラベルの組版で使う、文字列 1 ランの送り幅の見積もり（`height` と同じ単位）。
+///
+/// 1 文字ずつ、ASCII は [`wide_ascii_advance_ratio`] の実測値（表に無ければ
+/// [`ASCII_CHAR_WIDTH_RATIO`]）、ASCII 以外は 1.0 を掛けて足す。
+///
+/// [`crate::approx_text_width`]（文字エンティティの外形・表のセル幅の推定に使う共通式）
+/// とは**幅広の ASCII 文字だけ**値が違い、常にそれ以上になる。寸法ラベルはランを
+/// 隙間なく横に連結するため、幅の過小見積もりがそのまま重なりとして見える。
+/// 文字エンティティ側の式は変えていない（影響範囲を寸法ラベルに限るため）。
+pub(super) fn label_text_width(content: &str, height: f64) -> f64 {
+    content
+        .chars()
+        .map(|c| {
+            let ratio = if c.is_ascii() {
+                wide_ascii_advance_ratio(c).unwrap_or(ASCII_CHAR_WIDTH_RATIO)
+            } else {
+                1.0
+            };
+            ratio * height
+        })
+        .sum()
+}
 
 /// 上下段公差（[`SizeTolerance::Deviations`]）の上段と下段の間に空ける縦すきま ÷
 /// 基準文字高さ。
@@ -448,9 +501,10 @@ impl LabelBuilder {
         self.cursor += dx;
     }
 
-    /// 文字列の近似幅（[`crate::approx_text_width`]: ASCII 0.55・非 ASCII 1.0 × 高さ）。
+    /// 文字列の近似幅（[`label_text_width`]: 幅広の ASCII は実測値・他の ASCII 0.55・
+    /// 非 ASCII 1.0 × 高さ）。
     fn run_width(content: &str, height: f64) -> f64 {
-        crate::approx_text_width(content, height)
+        label_text_width(content, height)
     }
 
     /// 送り位置を動かさずに 1 ランを置き、その幅を返す。
@@ -489,10 +543,11 @@ impl LabelBuilder {
     /// フォント文字の記号を現在位置へ置き、`advance` ぶん送る。
     ///
     /// 送り幅を文字数から計算せず [`SymbolGlyph::advance`] に従うのは、記号の幅の
-    /// 出所を mcad-geom 側へ一本化するためである（`ASCII_CHAR_WIDTH_RATIO` と
-    /// `symbol::FONT_CHAR_ADVANCE_RATIO` は同じ量なので現状は一致するが、二重に
-    /// 計算していると片方だけ変えたときに黙ってずれる）。外形はランの近似幅と
-    /// `advance` の両方を取り込むので、仮に食い違っても内容を覆い続ける。
+    /// 出所を mcad-geom 側へ一本化するためである（二重に計算していると片方だけ変えた
+    /// ときに黙ってずれる）。geom の送りは埋め込みフォントの実測の送り
+    /// （[`embedded_font_ascii_advance_ratio`] の和）で、`R`・`C`・`S` ではランの幅
+    /// （[`label_text_width`]）と一致する。`t`（0.377em）だけはランの幅（0.55）より狭く
+    /// 送るが、外形はランの近似幅と `advance` の両方を取り込むので内容を覆い続ける。
     fn push_symbol_text(&mut self, content: &str, advance: f64, height: f64) {
         self.place_run(self.cursor, content.to_string(), height, 0.0);
         self.reserve_symbol_cell(advance, height);

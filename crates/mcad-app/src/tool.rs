@@ -422,8 +422,9 @@ pub trait Tool {
     /// [`Tool::numeric_input_base`] も override する。
     ///
     /// override するのは点・線分・円・円弧・アイソメ円・ポリライン・矩形・正多角形・構築線の
-    /// 9 つ（後ろの 3 つは M12 タスク89・91）。既存図形を当てる
-    /// ツール（トリム・延長・フィレット・分割）・寸法ツール・文字・表は対象外
+    /// 9 つ（後ろの 3 つは M12 タスク89・91）と、文字（アンカー確定前だけ。確定後は上部パネルの
+    /// 入力欄と衝突するため `false` を返す）。既存図形を当てる
+    /// ツール（トリム・延長・フィレット・分割）・寸法ツール・表は対象外
     /// （DESIGN.md M12 設計判断3・10）。
     fn accepts_numeric_input(&self) -> bool {
         false
@@ -1898,6 +1899,14 @@ impl Tool for TextTool {
             TextState::Editing(anchor) => Some(anchor),
             TextState::WaitingAnchor => None,
         }
+    }
+
+    // アンカー未確定の間だけ数値入力を受ける。確定後は上部パネルの `Text`・`H` 欄へ
+    // 数字・`-`・`.`・`@` を打つので、入力欄を開いて奪ってはならない。基点は持たない
+    // （`numeric_input_base` は既定の `ortho_origin` = `None`）ため、点ツールと同じく
+    // 絶対座標 `x,y` だけが使え、`@dx,dy`・`L<A` は拒否される。
+    fn accepts_numeric_input(&self) -> bool {
+        matches!(self.state, TextState::WaitingAnchor)
     }
 }
 
@@ -12884,8 +12893,7 @@ mod tests {
             assert!(tool.accepts_numeric_input());
         }
         // 既存図形を当てるツール・寸法・文字・表は対象外（DESIGN.md M12 設計判断3・10）。
-        let rejecting: [Box<dyn Tool>; 12] = [
-            Box::new(TextTool::default()),
+        let rejecting: [Box<dyn Tool>; 11] = [
             Box::new(TableTool::default()),
             Box::new(DimLinearTool::default()),
             Box::new(DimRadialTool::default()),
@@ -12901,6 +12909,36 @@ mod tests {
         for tool in &rejecting {
             assert!(!tool.accepts_numeric_input());
         }
+    }
+
+    #[test]
+    fn text_tool_takes_numeric_input_only_before_the_anchor_is_set() {
+        let (_doc, ctx) = ctx();
+        let mut tool = TextTool::default();
+        assert!(tool.accepts_numeric_input(), "anchor not set yet");
+        // 相対系（`@dx,dy`・`L<A`）の基準点は無い（点ツールと同じ）。
+        assert_eq!(tool.numeric_input_base(), None);
+        let base = tool.numeric_input_base();
+        assert_eq!(
+            crate::numeric_input::resolve_point("12,34", base, None),
+            Ok(Point2::new(12.0, 34.0))
+        );
+        for text in ["@1,2", "10<30", "5"] {
+            assert_eq!(
+                crate::numeric_input::resolve_point(text, base, None),
+                Err(crate::numeric_input::NumericInputError::NoBasePoint),
+                "{text}"
+            );
+        }
+        // 数値入力欄で確定した点は Click として届き、クリックと同じ状態になる。
+        tool.on_input(&ctx, InputEvent::Click(Point2::new(12.0, 34.0)));
+        assert_eq!(tool.pending_text_anchor(), Some(Point2::new(12.0, 34.0)));
+        // 確定後は開かない（`Text` 欄への数字入力と衝突させない）。
+        assert!(!tool.accepts_numeric_input());
+        assert_eq!(tool.numeric_input_base(), None);
+        // Esc でアンカーを捨てると再び受け付ける。
+        tool.on_input(&ctx, InputEvent::Cancel);
+        assert!(tool.accepts_numeric_input());
     }
 
     #[test]

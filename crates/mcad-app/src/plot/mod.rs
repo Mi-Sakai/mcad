@@ -881,7 +881,7 @@ mod tests {
         DimStyle, HorizontalAlign, Layer, Scale, SheetMeta, SizeTolerance, Style, TableKind,
         ValueStyle, WidthMm, expand_linear,
     };
-    use mcad_geom::{ArrowKind, Circle, LineSeg, dim_symbol_glyph};
+    use mcad_geom::{ArrowKind, Circle, DimSymbol, LineSeg, dim_symbol_glyph};
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
     const T: f64 = 1e-9;
@@ -2199,6 +2199,79 @@ mod tests {
     #[test]
     fn embedded_font_parses() {
         assert!(GlyphOutliner::embedded().is_some());
+    }
+
+    /// 寸法ラベルの組版（core の `layout_dim_label`）が、接頭辞の幅を埋め込みフォントの
+    /// 実際の送りより狭く見積もらないこと。狭く見積もると直後の値ランが接頭辞の字形に
+    /// 重なって出力される（接頭辞 `M` + 値 `12` で M と 1 が重なった不具合の再発防止）。
+    ///
+    /// 印字可能な ASCII 全文字を接頭辞にして、値ランの始点が [`GlyphOutliner::advance_mm`]
+    /// （出力が実際に字を並べる送り）以上であることを見る。core 側の実測表
+    /// （`dim_label::wide_ascii_advance_ratio`）がフォントの差し替え等でずれたら落ちる。
+    /// 許容差は数字の割り切り（実際の送り 0.555em を 0.55 で数える。1 文字あたり
+    /// 0.005em で目に見えない）のぶんだけ取る。
+    #[test]
+    fn dim_label_does_not_underestimate_embedded_font_advance() {
+        let outliner = GlyphOutliner::embedded().unwrap();
+        let height = 3.5;
+        let tolerance = 0.005 * height + T;
+        for code in 0x20_u8..0x7f {
+            let prefix = char::from(code).to_string();
+            let annotation = DimAnnotation {
+                prefix: Some(prefix.clone()),
+                ..DimAnnotation::default()
+            };
+            let label = mcad_core::layout_dim_label(
+                12.0,
+                &annotation,
+                &DimStyle::DEFAULT,
+                mcad_core::DimKind::Linear,
+                height,
+            );
+            let value = label.runs.last().expect("値のラン");
+            assert_eq!(value.content, "12");
+            let advance = outliner.advance_mm(&prefix, height);
+            assert!(
+                value.origin.x >= advance - tolerance,
+                "接頭辞 {prefix:?}: 値の始点 {} < 実際の送り {advance}",
+                value.origin.x
+            );
+        }
+    }
+
+    /// フォント文字で描く寸法記号（R・SR・CR・C・t、Sφ の S）の送り（mcad-geom の
+    /// `dim_symbol_glyph`）が、埋め込みフォントの実際の送りを下回らないこと。下回ると
+    /// 直後の値の数字が記号の字形に食い込む（`CR` で 0.125em 重なっていた不具合の再発防止）。
+    /// geom の実測表（`ASCII_ADVANCE_UNITS`）がフォントの差し替え等でずれたら落ちる。
+    /// 許容差は [`dim_label_does_not_underestimate_embedded_font_advance`] と同じ。
+    #[test]
+    fn font_dim_symbols_do_not_underestimate_embedded_font_advance() {
+        let outliner = GlyphOutliner::embedded().unwrap();
+        let height = 3.5;
+        let tolerance = 0.005 * height + T;
+        let font_symbols = [
+            (DimSymbol::Radius, "R"),
+            (DimSymbol::SphereRadius, "SR"),
+            (DimSymbol::ControlRadius, "CR"),
+            (DimSymbol::Chamfer, "C"),
+            (DimSymbol::Thickness, "t"),
+        ];
+        for (symbol, text) in font_symbols {
+            let advance = dim_symbol_glyph(symbol, height).advance;
+            let real = outliner.advance_mm(text, height);
+            assert!(
+                advance >= real - tolerance,
+                "{symbol:?}: 記号の送り {advance} < 実際の送り {real}"
+            );
+        }
+        // Sφ は「フォント文字 S + ストロークの φ」。S の送り（Sφ と φ の送りの差）を見る。
+        let s_advance = dim_symbol_glyph(DimSymbol::SphereDiameter, height).advance
+            - dim_symbol_glyph(DimSymbol::Diameter, height).advance;
+        let real = outliner.advance_mm("S", height);
+        assert!(
+            s_advance >= real - tolerance,
+            "Sφ の S: 送り {s_advance} < 実際の送り {real}"
+        );
     }
 
     #[test]

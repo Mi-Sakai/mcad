@@ -31,12 +31,73 @@ const DIAMETER_SLASH_ANGLE_DEG: f64 = 65.0;
 /// 製図規定.md で確定した暫定比率（φ の円直径比率と揃えている）。
 const SQUARE_SIDE_RATIO: f64 = 0.7;
 
-/// ASCII 文字 1 文字あたりの幅 ÷ 文字高さ `h`。
+/// 埋め込みフォントの em ボックスの一辺（フォント単位）。[`ASCII_ADVANCE_UNITS`] の分母。
+const EMBEDDED_FONT_UNITS_PER_EM: f64 = 1000.0;
+
+/// 埋め込みフォントでの印字可能な ASCII 文字（U+0020 空白〜U+007E `~`、95 文字）の
+/// 送り幅（フォント単位）。添字は `文字コード − 0x20`。
 ///
-/// `mcad-core::entity_geom::text_aabb`・`mcad-app::dimension::ASCII_CHAR_WIDTH_RATIO`
-/// と同じ慣行値。フォント文字扱いの記号（R/SR/CR/C/t、および Sφ の "S" 部分）の
-/// 送り量をこの比率の文字数倍で見積もる。
-const FONT_CHAR_ADVANCE_RATIO: f64 = 0.55;
+/// # 実測の根拠
+///
+/// `crates/mcad-app/assets/fonts/NotoSansJP-Regular.otf`（`mcad-app` の `fonts.rs` が画面の
+/// フォールバックに登録し、SVG/PDF のアウトライン化が全文字に使う唯一の埋め込みフォント。
+/// Version 2.004、unitsPerEm = 1000）の `hmtx` の送り幅（advance width）を fontTools 4.46 で
+/// 読んだ値をそのまま載せた:
+///
+/// ```text
+/// from fontTools.ttLib import TTFont
+/// f = TTFont("NotoSansJP-Regular.otf"); cmap = f.getBestCmap(); hm = f["hmtx"]
+/// [hm[cmap[c]][0] for c in range(0x20, 0x7f)]
+/// ```
+///
+/// SVG/PDF 出力（`mcad-app` の `plot::text_outline::GlyphOutliner`）は文字高さを em
+/// ボックスの高さとして扱い、カーニングせずにこの送りで字を並べるので、
+/// `送り / unitsPerEm × 文字高さ` が出力上の送りと一致する。**フォントを差し替えたら測り
+/// 直すこと**（`mcad-app` の `plot` モジュールのテストが、寸法の英字記号と寸法ラベルの
+/// 送りがフォントの実際の送りを下回らないことを検査する）。
+///
+/// geom は GUI・フォント解析に依存しないので、値は定数表で持つ。寸法の英字記号の送り
+/// （[`dim_symbol_glyph`]）と、`mcad-core` の寸法ラベル組版（`expand::dim_label`）の
+/// 幅広文字の見積もりが、この表を唯一の出所として使う。
+#[rustfmt::skip]
+const ASCII_ADVANCE_UNITS: [u16; 95] = [
+    224, 323, 474, 555, 555, 921, 680, 278, // ' ' '!' '"' '#' '$' '%' '&' '\''
+    338, 338, 467, 555, 278, 347, 278, 392, // '(' ')' '*' '+' ',' '-' '.' '/'
+    555, 555, 555, 555, 555, 555, 555, 555, // '0' '1' '2' '3' '4' '5' '6' '7'
+    555, 555, 278, 278, 555, 555, 555, 474, // '8' '9' ':' ';' '<' '=' '>' '?'
+    946, 608, 657, 638, 688, 589, 552, 689, // '@' 'A' 'B' 'C' 'D' 'E' 'F' 'G'
+    728, 293, 535, 646, 543, 812, 723, 742, // 'H' 'I' 'J' 'K' 'L' 'M' 'N' 'O'
+    633, 742, 635, 596, 599, 721, 575, 878, // 'P' 'Q' 'R' 'S' 'T' 'U' 'V' 'W'
+    573, 531, 603, 338, 392, 338, 555, 559, // 'X' 'Y' 'Z' '[' '\\' ']' '^' '_'
+    606, 563, 618, 510, 620, 554, 325, 564, // '`' 'a' 'b' 'c' 'd' 'e' 'f' 'g'
+    607, 275, 275, 552, 284, 926, 610, 606, // 'h' 'i' 'j' 'k' 'l' 'm' 'n' 'o'
+    620, 620, 388, 468, 377, 607, 521, 802, // 'p' 'q' 'r' 's' 't' 'u' 'v' 'w'
+    498, 521, 475, 338, 270, 338, 555,      // 'x' 'y' 'z' '{' '|' '}' '~'
+];
+
+/// 印字可能な ASCII 文字 `c` の、埋め込みフォント（Noto Sans JP Regular）での送り幅 ÷
+/// 文字高さ（em 比）。印字可能な ASCII（U+0020〜U+007E）以外は `None`。
+///
+/// 値の出所と測り方は [`ASCII_ADVANCE_UNITS`] を参照。
+#[must_use]
+pub fn embedded_font_ascii_advance_ratio(c: char) -> Option<f64> {
+    let index = u32::from(c).checked_sub(0x20)?;
+    let units = ASCII_ADVANCE_UNITS.get(usize::try_from(index).ok()?)?;
+    Some(f64::from(*units) / EMBEDDED_FONT_UNITS_PER_EM)
+}
+
+/// フォント文字で描く寸法記号の文字列（ASCII）の送り幅（`h` と同じ単位）。
+///
+/// 1 文字ずつ [`embedded_font_ascii_advance_ratio`] を足す（出力はカーニングしないので
+/// 単純和が実際の送りに一致する）。呼び出しは [`dim_symbol_glyph`] の記号文字列
+/// （`R`・`SR`・`CR`・`C`・`t`・`S`）に限り、どれも表に載っているので `0.0` へ倒れる
+/// 枝は通らない（単体テスト `font_symbol_advances_match_the_embedded_font` で固定）。
+fn font_text_advance(text: &str, h: f64) -> f64 {
+    text.chars()
+        .map(|c| embedded_font_ascii_advance_ratio(c).unwrap_or(0.0))
+        .sum::<f64>()
+        * h
+}
 
 /// 寸法記号の種類。
 ///
@@ -80,28 +141,31 @@ pub struct SymbolGlyph {
 /// ジオメトリを生成するのは φ（[`DimSymbol::Diameter`]）と □（[`DimSymbol::Square`]）
 /// だけ。それ以外（R/SR/CR/C/t、および Sφ の "S" 部分）は ASCII 文字そのものなので、
 /// **呼び出し側がフォント文字として組版すること**。ここでは `shapes` を空にし、
-/// `advance` には実際の文字数に応じた幅（[`FONT_CHAR_ADVANCE_RATIO`] × 文字数 × `h`）
-/// を返す。実際の送り量はフォント側の実測に委ねる目安値である点は変わらない。
+/// `advance` には記号の文字列の、埋め込みフォントでの実際の送り
+/// （[`embedded_font_ascii_advance_ratio`] の和 × `h`）を返す。
+///
+/// かつては文字数 × 0.55 × `h` の目安値だったが、`R`（0.635em）・`C`（0.638em）・`S`
+/// （0.596em）はそれより広く、直後の数字の字形に食い込んでいた（`CR` で最大 0.125em）。
+/// 逆に `t`（0.377em）は狭く、目安値では数字との間が空きすぎていた。
 #[must_use]
 pub fn dim_symbol_glyph(sym: DimSymbol, h: f64) -> SymbolGlyph {
+    let font_symbol = |text: &str| SymbolGlyph {
+        shapes: Vec::new(),
+        advance: font_text_advance(text, h),
+    };
     match sym {
         DimSymbol::Diameter => diameter_glyph(h),
         DimSymbol::Square => square_glyph(h),
-        // 1 文字（R / C / t）。
-        DimSymbol::Radius | DimSymbol::Chamfer | DimSymbol::Thickness => SymbolGlyph {
-            shapes: Vec::new(),
-            advance: h * FONT_CHAR_ADVANCE_RATIO,
-        },
-        // 2 文字（SR / CR）。
-        DimSymbol::SphereRadius | DimSymbol::ControlRadius => SymbolGlyph {
-            shapes: Vec::new(),
-            advance: h * FONT_CHAR_ADVANCE_RATIO * 2.0,
-        },
-        // Sφ: "S" はフォント文字 1 文字分、φ は diameter_glyph と同じ幅を app 層が
+        DimSymbol::Radius => font_symbol("R"),
+        DimSymbol::Chamfer => font_symbol("C"),
+        DimSymbol::Thickness => font_symbol("t"),
+        DimSymbol::SphereRadius => font_symbol("SR"),
+        DimSymbol::ControlRadius => font_symbol("CR"),
+        // Sφ: "S" はフォント文字 1 文字、φ は diameter_glyph と同じ形を組版側が
         // 並べる想定なので、両者の advance を合算する。
         DimSymbol::SphereDiameter => SymbolGlyph {
             shapes: Vec::new(),
-            advance: h * FONT_CHAR_ADVANCE_RATIO + diameter_glyph(h).advance,
+            advance: font_text_advance("S", h) + diameter_glyph(h).advance,
         },
     }
 }
@@ -445,22 +509,24 @@ mod tests {
         assert!((l2.b.y - l1.b.y * 2.0).abs() < 1e-9);
     }
 
+    /// フォント文字の記号の送りは、埋め込みフォントの実測（`hmtx`）の和に一致する。
+    /// 期待値は表を経由せず実測値の直書きで固定する（表の写し間違いも検出するため）。
     #[test]
-    fn two_char_symbols_have_roughly_double_advance_of_one_char_symbols() {
+    fn font_symbol_advances_match_the_embedded_font() {
         let h = 3.5;
-        let one_char_advance = h * FONT_CHAR_ADVANCE_RATIO;
-        for sym in [DimSymbol::Radius, DimSymbol::Chamfer, DimSymbol::Thickness] {
+        for (sym, em) in [
+            (DimSymbol::Radius, 0.635),
+            (DimSymbol::Chamfer, 0.638),
+            (DimSymbol::Thickness, 0.377),
+            (DimSymbol::SphereRadius, 0.596 + 0.635),
+            (DimSymbol::ControlRadius, 0.638 + 0.635),
+        ] {
             let glyph = dim_symbol_glyph(sym, h);
             assert!(
-                (glyph.advance - one_char_advance).abs() < 1e-9,
-                "expected 1-char advance for {sym:?}"
-            );
-        }
-        for sym in [DimSymbol::SphereRadius, DimSymbol::ControlRadius] {
-            let glyph = dim_symbol_glyph(sym, h);
-            assert!(
-                (glyph.advance - one_char_advance * 2.0).abs() < 1e-9,
-                "expected 2-char advance for {sym:?}"
+                (glyph.advance - em * h).abs() < 1e-9,
+                "{sym:?}: {} != {}",
+                glyph.advance,
+                em * h
             );
         }
     }
@@ -468,14 +534,25 @@ mod tests {
     #[test]
     fn sphere_diameter_advance_includes_diameter_glyph_advance() {
         let h = 3.5;
-        let one_char_advance = h * FONT_CHAR_ADVANCE_RATIO;
+        let s_advance = 0.596 * h;
         let sphere_diameter = dim_symbol_glyph(DimSymbol::SphereDiameter, h);
         let diameter = dim_symbol_glyph(DimSymbol::Diameter, h);
 
         // Sφ の advance は "S" 1 文字分より大きく（φ 分を含む）、
         // "S" 1 文字分 + φ の advance に一致する。
-        assert!(sphere_diameter.advance > one_char_advance);
-        assert!((sphere_diameter.advance - (one_char_advance + diameter.advance)).abs() < 1e-9);
+        assert!(sphere_diameter.advance > s_advance);
+        assert!((sphere_diameter.advance - (s_advance + diameter.advance)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn embedded_font_ascii_advance_table_covers_printable_ascii_only() {
+        assert_eq!(embedded_font_ascii_advance_ratio(' '), Some(0.224));
+        assert_eq!(embedded_font_ascii_advance_ratio('0'), Some(0.555));
+        assert_eq!(embedded_font_ascii_advance_ratio('M'), Some(0.812));
+        assert_eq!(embedded_font_ascii_advance_ratio('~'), Some(0.555));
+        assert_eq!(embedded_font_ascii_advance_ratio('\u{1f}'), None);
+        assert_eq!(embedded_font_ascii_advance_ratio('\u{7f}'), None);
+        assert_eq!(embedded_font_ascii_advance_ratio('×'), None);
     }
 
     #[test]

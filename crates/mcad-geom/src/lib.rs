@@ -16,7 +16,8 @@
 //!   [`trim_extend`] モジュール）、
 //!   [`fillet_lines`]（[`fillet`] モジュール）
 //! - 寸法記号: [`DimSymbol`], [`dim_symbol_glyph`]（[`symbol`] モジュール。φ・□ の
-//!   ジオメトリを生成し、他の記号はフォント文字として組版する側に委ねる）
+//!   ジオメトリを生成し、他の記号はフォント文字として組版する側に委ねる）。英字記号の
+//!   送りは埋め込みフォントの実測表 [`embedded_font_ascii_advance_ratio`] から出す
 //! - 寸法矢先: [`ArrowKind`], [`ArrowGlyph`], [`arrow_glyph`]（[`symbol`] モジュール。
 //!   7 種の矢先形状を「塗る多角形＋描く線分」で生成し、画面と SVG/PDF で同一の形を保つ）
 //! - ジオメトリ検証: [`Shape::validate`]（非有限座標・負半径・空ポリラインなどを検出）
@@ -53,7 +54,10 @@ pub use primitives::{
     Arc, Circle, LineSeg, OffsetError, Polyline, Shape, circumcircle, closest_point, distance_to,
 };
 pub use split::{SplitError, split};
-pub use symbol::{ArrowGlyph, ArrowKind, DimSymbol, SymbolGlyph, arrow_glyph, dim_symbol_glyph};
+pub use symbol::{
+    ArrowGlyph, ArrowKind, DimSymbol, SymbolGlyph, arrow_glyph, dim_symbol_glyph,
+    embedded_font_ascii_advance_ratio,
+};
 pub use trim_extend::{
     TrimExtendError, TrimResult, extend, extend_reach, extend_to_line, trim, trim_by_line,
 };

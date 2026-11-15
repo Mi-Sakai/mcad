@@ -17942,6 +17942,33 @@ mod numeric_input_app_tests {
         assert_eq!(h.app.tool_kind, ToolKind::Rectangle);
     }
 
+    /// 文字ツールはアンカー未確定の間だけ数値入力（`x,y`）を受け、確定後は数字キーで
+    /// 入力欄を開かない（上部パネルの `Text`・`H` 欄との衝突を避ける）。基準点が無いので
+    /// `@dx,dy` は拒否する。
+    #[test]
+    fn text_tool_takes_numeric_anchor_only_before_the_anchor_is_set() {
+        let mut h = Harness::new();
+        h.press(Key::T);
+        assert_eq!(h.app.tool_kind, ToolKind::Text);
+        let anchor = |h: &Harness| h.app.tool.as_ref().and_then(|t| t.pending_text_anchor());
+        assert_eq!(anchor(&h), None);
+        // 相対系は基準点が無いので拒否され、アンカーは決まらない。
+        h.enter("@1,2");
+        assert_eq!(anchor(&h), None);
+        // 絶対座標でアンカーが決まる（クリックと同じ状態）。
+        h.press(Key::Escape);
+        assert_eq!(h.app.tool_kind, ToolKind::Text, "Esc closes only the box");
+        h.type_text("12,34");
+        assert!(h.app.numeric_input.is_open());
+        h.press(Key::Enter);
+        assert_eq!(anchor(&h), Some(Point2::new(12.0, 34.0)));
+        assert!(!h.app.numeric_input.is_open());
+        // 確定後は数字・`-`・`.` で入力欄が開かない。
+        h.type_text("5-.");
+        assert!(!h.app.numeric_input.is_open());
+        assert_eq!(anchor(&h), Some(Point2::new(12.0, 34.0)));
+    }
+
     /// `1`（点ツール）への切替は選択モードからだけ（DESIGN.md M12 設計判断3、2026-09-25 の
     /// ユーザー確認）。数値入力を受け付けない作図ツールでも止め、入力欄も開かない。
     #[test]
@@ -17950,7 +17977,6 @@ mod numeric_input_app_tests {
         for (switch, kind) in [
             (Key::D, ToolKind::DimLinear),
             (Key::X, ToolKind::Trim),
-            (Key::T, ToolKind::Text),
             (Key::F, ToolKind::Fillet),
             (Key::Q, ToolKind::Constraint),
         ] {

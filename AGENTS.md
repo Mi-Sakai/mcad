@@ -1,7 +1,9 @@
 # AGENTS.md — AI開発エージェント向けガイド
 
 このリポジトリで開発を引き継ぐAIエージェント(および人間)向けの規約集。
-全体設計と現在のタスク分割は [`DESIGN.md`](./DESIGN.md)、変更履歴は [`CHANGELOG.md`](./CHANGELOG.md) を参照。
+全体設計とロードマップは [`DESIGN.md`](./DESIGN.md)、利用者から見た振る舞いと形式の約束は [`docs/mcad仕様書.md`](./docs/mcad仕様書.md)、変更履歴は [`CHANGELOG.md`](./CHANGELOG.md) を参照。
+v1.0.0 以前の「DESIGN.md ○○」という参照(コードのコメント等)は、凍結した旧版 [`docs/design/DESIGN-v0.md`](./docs/design/DESIGN-v0.md) と `docs/design/M5.md`〜`M13.md` を指す(読み替えは DESIGN.md 0章)。
+設計の記録の置き場所(マイルストーンは `docs/design/Mxx.md`、番号外は `docs/design/番号外.md`)は `design-record` skill。
 このリポジトリで図面を作成する際の製図規約は `製図規定.md` を参照
 (mcad の機能要件の源泉としての扱いは [`M8を始める前に.md`](./M8を始める前に.md) 第7章)。
 **`製図規定.md` は策定中のため未公開**(ローカルのみ・gitignore 対象)。完成後に追跡へ戻して公開する。
@@ -10,7 +12,7 @@
 ## プロジェクト概要
 
 Rust + egui の 2D CAD。現在 **v1.0.0**(初の安定版。2026-11-15、v1.0.0 の3基準を満了)。次のマイルストーンは未定(DESIGN.md 7章。v1.0.0 後の課題と M14「文字の揃え」の設計が候補)。
-各バージョンの実装内容は CHANGELOG.md、マイルストーンとタスクの現況は DESIGN.md を参照。
+各バージョンの実装内容は CHANGELOG.md、ロードマップは DESIGN.md 7章、進行中のマイルストーンの設計とタスクは `docs/design/Mxx.md` を参照。
 
 ## ビルド・検証
 
@@ -49,13 +51,13 @@ GUI に関わる変更(ダイアログ・ビューポート・パネル等)は�
 ## 外部クレートの既知の制約
 
 - **`dxf` クレート(0.6.1)**: R2007 ヘッダ固定、ACI 色のみ、レイヤーのロック・重ね順・線幅が保存できない等、**踏んではいけない制約が多数ある**。`crates/mcad-io/src/dxf_file.rs` を触る前に `dxf-constraints` skill を読むこと(実測根拠は同ファイルのモジュール doc)。
-  - **非対称往復を許している経路**: 表(`EntityGeom::Table`)は export 時に罫線 `LINE` とセル `TEXT` へ分解し、import では表に戻さない。中央・右揃えの列(M12 タスク93)のセル `TEXT` は水平揃え(group 72・11)を使って書くため、re-import では位置基準が Left 以外の `TEXT` として `ImportSummary::skipped_entities` に計上される(左揃えの列は通常の Text として取り込まれる)。`ACAD_TABLE` はクレートに対応する型が無くパーサ側で読み飛ばされるためスキップ件数にも出ない。寸法(`DimLinear`/`DimRadial`/`DimDiameter`/`DimAngular`/`DimOrdinate`)も M11 タスク72 で同じ非対称往復になった: export は寸法線・補助線・文字との接続線・矢先・文字を `LINE`/`SOLID`/`ARC`/`TEXT` へ分解して書き、import では寸法エンティティへ戻さない。矢先の塗りに使う `SOLID` はクレートの `EntityType::Solid` に対応するが `dxf_entity_to_geom` 側が対応しないため、re-import 時に `ImportSummary::skipped_entities` へ計上される(`LINE`/`ARC`/`TEXT` は通常の Shape/Text として取り込まれる)。他 CAD が書いた `DIMENSION` は M11 タスク67・69 で import 済みなので、「mcad が書いた寸法は読み戻せないが、他 CAD が書いた `DIMENSION` は読める」という二重の非対称になる。図面枠・表題欄は用紙メタを DXF へ載せられないため出力しない。
+  - **非対称往復を許している経路**(表・寸法は書き出し時に線・文字へ分解し、読み戻しても元に戻らない等): 一覧は仕様書 [12.5「往復の性質」](./docs/mcad仕様書.md#125-往復の性質)が一次情報。DXF の経路を変えたら仕様書の 12章も同じコミットで直す。
 - **`rfd`(ネイティブダイアログ)**: フレームコールバック内で同期(ブロッキング)呼び出し。MVP としては許容だがプラットフォーム依存の癖があるため、変更時は手動確認する。
 
 ## リポジトリ運用
 
 - `A-*.md`(外部レビュー等)は**ユーザー管理のメモで、コミット・変更・削除の対象外**(ルート・`資料/` 配下とも .gitignore 済み)。
 - 過去のマイルストーンの Codex レビュー記録は `資料/` に置く(追跡対象)。
-- タグは `v0.X.0` 形式でマイルストーン完了時に付ける。GitHub(`origin`)へ公開しており、タグも `git push --tags` でリモートへ反映する。リリース時の手順(バージョン更新箇所・CHANGELOG・タグ)は `release` skill を参照。
+- タグは `vX.Y.0` 形式でマイルストーン完了時に付ける(番号外のまとめは `vX.Y.Z`)。GitHub(`origin`)へ公開しており、タグも `git push --tags` でリモートへ反映する。リリース時の手順(バージョン更新箇所・CHANGELOG・タグ)は `release` skill を参照。
 - コミットの author は GitHub の noreply アドレスを使う(リポジトリローカルの `user.email` に設定済み)。
-- ドキュメント(README / DESIGN / CHANGELOG)は実装と同じコミットで更新し、乖離させない。
+- ドキュメント(仕様書 / DESIGN / CHANGELOG / README)は実装と同じコミットで更新し、乖離させない。振る舞いを変えたら `docs/mcad仕様書.md` の該当章も直す。

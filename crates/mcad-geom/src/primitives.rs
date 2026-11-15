@@ -794,8 +794,7 @@ impl Polyline {
 
         // 出力頂点はベベルで増えうるので下限のみ確保する。
         let mut out_vertices = Vec::with_capacity(n);
-        for j in 0..n {
-            let v = self.vertices[j];
+        for (j, &v) in self.vertices.iter().enumerate() {
             let (inc, out) = incident(j);
             let inc_line = inc.and_then(|i| offset_line(i, v));
             let out_line = out.and_then(|i| offset_line(i, v));

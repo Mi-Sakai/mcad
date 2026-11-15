@@ -4,6 +4,11 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+### 変更
+
+- Rust 1.100.0 の clippy(`needless_range_loop`)に対応し、`crates/mcad-geom/src/primitives.rs` のポリラインのオフセットで頂点を
+  添字ではなくイテレータで回す。挙動は変わらない(v1.0.0 の CI は Rust 1.100.0 の clippy で失敗していた)
+
 ## [1.0.0] - 2026-11-15 — 初の安定版
 
 v1.0.0 の3つの基準(DESIGN.md 7章「v1.0.0 の定義」)を満たしたので、v0.13.0 の次を 1.0.0 とする。実使用3枚(軸受ブラケット・

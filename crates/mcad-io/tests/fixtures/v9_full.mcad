@@ -1,0 +1,826 @@
+{
+  "version": 9,
+  "sheet": {
+    "unit": "Millimeter",
+    "scale": {
+      "num": 2,
+      "den": 1
+    },
+    "paper": "A4",
+    "orientation": "Portrait",
+    "title_block": {
+      "Custom": {
+        "width_mm": 90.0,
+        "rows": [
+          {
+            "height_mm": 10.0,
+            "cells": [
+              {
+                "width_mm": 50.0,
+                "bind": "DrawingTitle",
+                "text_height_mm": 5.0
+              },
+              {
+                "width_mm": 40.0,
+                "bind": "DrawingNumber",
+                "text_height_mm": 5.0
+              }
+            ]
+          },
+          {
+            "height_mm": 8.0,
+            "cells": [
+              {
+                "width_mm": 15.0,
+                "bind": "Author",
+                "text_height_mm": 3.5
+              },
+              {
+                "width_mm": 15.0,
+                "bind": "Date",
+                "text_height_mm": 3.5
+              },
+              {
+                "width_mm": 12.0,
+                "bind": "Scale",
+                "text_height_mm": 3.5
+              },
+              {
+                "width_mm": 12.0,
+                "bind": "Projection",
+                "text_height_mm": 3.5
+              },
+              {
+                "width_mm": 12.0,
+                "bind": "PaperSize",
+                "text_height_mm": 3.5
+              },
+              {
+                "width_mm": 12.0,
+                "bind": "Revision",
+                "text_height_mm": 3.5
+              },
+              {
+                "width_mm": 12.0,
+                "bind": null,
+                "text_height_mm": 3.5
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "fields": {
+      "drawing_number": "MCAD-FULL-001",
+      "drawing_title": "v9 full fixture",
+      "projection": "FirstAngle",
+      "author": "almaz",
+      "date": "2026-11-15",
+      "revision": "B"
+    },
+    "frame_visible": false,
+    "use_bom": true
+  },
+  "layers": [
+    {
+      "name": "0",
+      "color": {
+        "r": 255,
+        "g": 255,
+        "b": 255
+      },
+      "linetype": "Continuous",
+      "width_mm": 0.35,
+      "visible": true,
+      "locked": false,
+      "order": 0
+    },
+    {
+      "name": "dashed",
+      "color": {
+        "r": 200,
+        "g": 120,
+        "b": 0
+      },
+      "linetype": "Dashed",
+      "width_mm": 0.25,
+      "visible": true,
+      "locked": false,
+      "order": 1
+    },
+    {
+      "name": "chain",
+      "color": {
+        "r": 0,
+        "g": 100,
+        "b": 200
+      },
+      "linetype": "DashDot",
+      "width_mm": 0.18,
+      "visible": true,
+      "locked": false,
+      "order": 2
+    },
+    {
+      "name": "hidden",
+      "color": {
+        "r": 120,
+        "g": 120,
+        "b": 120
+      },
+      "linetype": "DashDotDot",
+      "width_mm": 0.5,
+      "visible": false,
+      "locked": false,
+      "order": 3
+    }
+  ],
+  "current_layer": 0,
+  "entities": [
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "Shape": {
+          "Point": {
+            "x": 5.0,
+            "y": 5.0
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": {
+          "r": 200,
+          "g": 30,
+          "b": 30
+        },
+        "width_mm": 0.5,
+        "linetype": "Dashed"
+      },
+      "geom": {
+        "Shape": {
+          "Polyline": {
+            "vertices": [
+              {
+                "x": 0.0,
+                "y": 0.0
+              },
+              {
+                "x": 40.0,
+                "y": 0.0
+              },
+              {
+                "x": 40.0,
+                "y": 30.0
+              },
+              {
+                "x": 0.0,
+                "y": 30.0
+              }
+            ],
+            "closed": true
+          }
+        }
+      }
+    },
+    {
+      "layer": 2,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": "DashDotDot"
+      },
+      "geom": {
+        "Shape": {
+          "Line": {
+            "a": {
+              "x": -20.0,
+              "y": 0.0
+            },
+            "b": {
+              "x": -20.0,
+              "y": 30.0
+            }
+          }
+        }
+      }
+    },
+    {
+      "layer": 3,
+      "style": {
+        "color": {
+          "r": 0,
+          "g": 0,
+          "b": 0
+        },
+        "width_mm": 0.13,
+        "linetype": "Continuous"
+      },
+      "geom": {
+        "Shape": {
+          "Arc": {
+            "center": {
+              "x": 60.0,
+              "y": 15.0
+            },
+            "radius": 12.0,
+            "start_angle": 0.25,
+            "end_angle": 2.5
+          }
+        }
+      }
+    },
+    {
+      "layer": 1,
+      "style": {
+        "color": null,
+        "width_mm": 2.0,
+        "linetype": "DashDot"
+      },
+      "geom": {
+        "Shape": {
+          "Circle": {
+            "center": {
+              "x": 90.0,
+              "y": 15.0
+            },
+            "radius": 8.0
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "Text": {
+          "anchor": {
+            "x": 10.0,
+            "y": 40.0
+          },
+          "content": "寸法 ABC",
+          "height": 5.0,
+          "angle": 0.5
+        }
+      }
+    },
+    {
+      "layer": 1,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "Shape": {
+          "Line": {
+            "a": {
+              "x": 0.0,
+              "y": -50.0
+            },
+            "b": {
+              "x": 100.0,
+              "y": -50.0
+            }
+          }
+        }
+      }
+    },
+    {
+      "layer": 1,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "Shape": {
+          "Circle": {
+            "center": {
+              "x": 50.0,
+              "y": -70.0
+            },
+            "radius": 20.0
+          }
+        }
+      }
+    },
+    {
+      "layer": 1,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "Shape": {
+          "Circle": {
+            "center": {
+              "x": 200.0,
+              "y": -70.0
+            },
+            "radius": 10.0
+          }
+        }
+      }
+    },
+    {
+      "layer": 1,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "Shape": {
+          "Circle": {
+            "center": {
+              "x": 205.0,
+              "y": -70.0
+            },
+            "radius": 15.0
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimLinear": {
+          "p1": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "p2": {
+            "x": 40.0,
+            "y": 0.0
+          },
+          "offset": -10.0,
+          "direction": "Aligned",
+          "annotation": {
+            "symbol": "Diameter",
+            "tolerance": {
+              "Symmetric": 0.05
+            },
+            "decimals_override": 1,
+            "text_anchor": {
+              "x": 20.0,
+              "y": -14.0
+            },
+            "arrow_placement": "Outside",
+            "value_override": null,
+            "text_rotation": 0.0,
+            "value_style": "Reference",
+            "prefix": "2×",
+            "suffix": "-M6"
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimLinear": {
+          "p1": {
+            "x": 40.0,
+            "y": 0.0
+          },
+          "p2": {
+            "x": 40.0,
+            "y": 30.0
+          },
+          "offset": 8.0,
+          "direction": {
+            "Rotated": 1.5707963267948966
+          },
+          "ext_angle": 1.4,
+          "annotation": {
+            "symbol": "Square",
+            "tolerance": {
+              "Deviations": {
+                "upper": 0.1,
+                "lower": -0.05
+              }
+            },
+            "decimals_override": null,
+            "text_anchor": null,
+            "arrow_placement": "Inside",
+            "value_override": "30-35",
+            "text_rotation": null,
+            "value_style": "TheoreticallyExact",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimLinear": {
+          "p1": {
+            "x": 0.0,
+            "y": 30.0
+          },
+          "p2": {
+            "x": 40.0,
+            "y": 30.0
+          },
+          "offset": 6.0,
+          "direction": "Aligned",
+          "annotation": {
+            "symbol": "Chamfer",
+            "tolerance": {
+              "Fit": "H7"
+            },
+            "decimals_override": null,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimLinear": {
+          "p1": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "p2": {
+            "x": 0.0,
+            "y": 30.0
+          },
+          "offset": -6.0,
+          "direction": "Aligned",
+          "annotation": {
+            "symbol": "Thickness",
+            "tolerance": {
+              "Deviations": {
+                "upper": 0.0,
+                "lower": -0.2
+              }
+            },
+            "decimals_override": null,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimLinear": {
+          "p1": {
+            "x": -20.0,
+            "y": 0.0
+          },
+          "p2": {
+            "x": -20.0,
+            "y": 30.0
+          },
+          "offset": -5.0,
+          "direction": "Aligned",
+          "annotation": {
+            "symbol": "SphereDiameter",
+            "tolerance": null,
+            "decimals_override": null,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimRadial": {
+          "center": {
+            "x": 60.0,
+            "y": 60.0
+          },
+          "radius": 8.0,
+          "leader_angle": 0.6,
+          "annotation": {
+            "symbol": "Radius",
+            "tolerance": null,
+            "decimals_override": null,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimRadial": {
+          "center": {
+            "x": 90.0,
+            "y": 60.0
+          },
+          "radius": 9.0,
+          "leader_angle": 1.0,
+          "annotation": {
+            "symbol": "SphereRadius",
+            "tolerance": null,
+            "decimals_override": null,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimRadial": {
+          "center": {
+            "x": 120.0,
+            "y": 60.0
+          },
+          "radius": 10.0,
+          "leader_angle": 1.4,
+          "annotation": {
+            "symbol": "ControlRadius",
+            "tolerance": null,
+            "decimals_override": null,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimDiameter": {
+          "center": {
+            "x": 150.0,
+            "y": 20.0
+          },
+          "radius": 10.0,
+          "angle": 0.8,
+          "annotation": {
+            "symbol": "Diameter",
+            "tolerance": null,
+            "decimals_override": 0,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimDiameter": {
+          "center": {
+            "x": 190.0,
+            "y": 20.0
+          },
+          "radius": 12.0,
+          "angle": 0.8,
+          "annotation": {
+            "symbol": "SphereDiameter",
+            "tolerance": null,
+            "decimals_override": 0,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimAngular": {
+          "vertex": {
+            "x": 0.0,
+            "y": 100.0
+          },
+          "p1": {
+            "x": 30.0,
+            "y": 100.0
+          },
+          "p2": {
+            "x": 20.0,
+            "y": 120.0
+          },
+          "arc_radius": 18.0,
+          "annotation": {
+            "symbol": null,
+            "tolerance": null,
+            "decimals_override": 1,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": null,
+            "suffix": null
+          }
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimOrdinate": {
+          "origin": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "feature": {
+            "x": -30.0,
+            "y": 25.0
+          },
+          "leader_end": {
+            "x": -30.0,
+            "y": 45.0
+          },
+          "axis": "X"
+        }
+      }
+    },
+    {
+      "layer": 0,
+      "style": {
+        "color": null,
+        "width_mm": null,
+        "linetype": null
+      },
+      "geom": {
+        "DimOrdinate": {
+          "origin": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "feature": {
+            "x": 25.0,
+            "y": 10.0
+          },
+          "leader_end": {
+            "x": 45.0,
+            "y": 10.0
+          },
+          "axis": "Y",
+          "annotation": {
+            "symbol": null,
+            "tolerance": null,
+            "decimals_override": null,
+            "text_anchor": null,
+            "arrow_placement": "Auto",
+            "value_override": null,
+            "text_rotation": null,
+            "value_style": "Plain",
+            "prefix": "Y=",
+            "suffix": null
+          }
+        }
+      }
+    }
+  ],
+  "dim_style": {
+    "text_height_mm": 2.5,
+    "arrow_len_mm": 4.0,
+    "decimals": 3,
+    "trim_trailing_zeros": false,
+    "ext_gap_mm": 0.8,
+    "ext_overshoot_mm": 1.5,
+    "text_gap_mm": 1.0,
+    "tolerance_scale": 0.6,
+    "arrow_kind": "Open30"
+  },
+  "constraints": [
+    {
+      "TangentLineCircle": {
+        "line": 6,
+        "circle": 7,
+        "side": "Right"
+      }
+    },
+    {
+      "TangentCircles": {
+        "a": 8,
+        "b": 9,
+        "kind": {
+          "Internal": "Second"
+        }
+      }
+    }
+  ]
+}

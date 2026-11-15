@@ -42,8 +42,13 @@ mcad の各バージョンの変更履歴。形式は [Keep a Changelog](https:/
 
 ### テスト
 
-- 1817本 → 1867本(うち ignored 6本)。寸法の SVG スナップショット 36 本は塗りのパス 1 本ずつが増え、
+- 1817本 → 1874本(うち ignored 6本)。`cargo test --workspace` の各 `test result` 行の passed と ignored の合計(passed 1868 + ignored 6)。寸法の SVG スナップショット 36 本は塗りのパス 1 本ずつが増え、
   `annotation_text_anchor_manual` はさらに接続線が 1 本増えた
+- **`.mcad` 後方互換テストの拡充**(`crates/mcad-io/tests`、7 本。`.mcad` の形式・読込の挙動は変えていない): 網羅した v9 見本
+  `v9_full.mcad`(文字・半径/直径/角度/座標寸法・寸法の注記全般・整列寸法・点と閉じたポリライン・非既定の寸法スタイル・
+  非既定のレイヤーとスタイル・Custom 様式の図面メタ・接線拘束の Right と Internal(Second)。exporter の出力から作り、
+  書き出しとの完全一致も固定)、用紙・向き・様式・矢先・レイヤー線種の往復、version 10 を `from_json` / `load_mcad` で拒否すること、
+  version 9 の未知キーを無視することの固定
 
 ## [0.13.0] - 2026-10-31 — 幾何拘束ソルバー
 

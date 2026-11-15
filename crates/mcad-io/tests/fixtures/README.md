@@ -5,6 +5,7 @@
 | `v1.mcad`〜`v9.mcad` | `.mcad` の後方互換 | `tests/backward_compat.rs` |
 | `v7_legacy_boms.mcad` | v7 以前の旧部品表を表として読む(推測しない) | `tests/backward_compat.rs` |
 | `v8_before_col_aligns.mcad` | `col_aligns` が無いタスク93以前の v8 を左揃え補完で読む | `tests/backward_compat.rs` |
+| `v9_full.mcad` | v9 で表現できる要素のうち `v9.mcad` が持たないものの網羅(文字・各種寸法・注記・非既定の寸法スタイル/レイヤー/スタイル/図面メタ・接線拘束の別の側) | `tests/backward_compat.rs` |
 | `synthetic_dimensions.dxf` | 他 CAD が書いた DXF の DIMENSION import | `tests/dxf_dimensions.rs` |
 
 ## `synthetic_dimensions.dxf`
@@ -35,7 +36,7 @@ fixture 自体の役割は「今後の実装変更で読込結果が変わらな
 ## `.mcad` 後方互換 fixture
 
 `v1.mcad` 〜 `v9.mcad` は各フォーマットバージョンのスキーマが表現できる要素を
-一通り含む実ファイル。テストは `crates/mcad-io/tests/backward_compat.rs`。
+一通り含む実ファイル(v9 だけは `v9.mcad` が持たない要素を `v9_full.mcad` が補う)。テストは `crates/mcad-io/tests/backward_compat.rs`。
 
 各版のスキーマの一次情報は `crates/mcad-io/src/mcad_file.rs` のモジュール doc と
 DTO 定義（`FileDocument` / `FileDocumentV8` / `FileLayer` / `EntityGeomV5` / `EntityGeomV6` /
@@ -97,3 +98,32 @@ DTO 定義（`FileDocument` / `FileDocumentV8` / `FileLayer` / `EntityGeomV5` / 
 (書き換えるなら手順を再実行して作り直す。v9 のまま exporter の出力だけが変わって完全一致のテストが
 落ちたときは、現在の `v9.mcad` を `from_json` で読み `to_json` で書き直せば足りる)。v8 以前に拘束が無いことは `fixtures_before_v9_have_no_constraints`、
 v8 が v9 へ引き上がって書き出されることは `v8_fixture_still_loads_and_is_upgraded_on_export`。
+
+`v9_full.mcad` は v1.0.0 の「`.mcad` 後方互換の宣言」の前提として追加した、`v9.mcad` が持たない要素の網羅見本。
+**手書きせず、exporter（`to_json`）の出力を一度書き出して作った**(`v9.mcad` と同じ流儀。生成に使ったコードは残していない)。
+組み立て手順(新しい `Document` から。`v8.mcad` は引き継がない):
+
+1. 既定レイヤー `0` に加え、`dashed`(破線)・`chain`(一点鎖線)・`hidden`(二点鎖線・非表示)を `Command::AddLayer` で足す。
+2. 図形を `Command::AddEntity` で足す: 点・閉じたポリライン(明示の色・線幅・`Dashed`)・線分(`DashDotDot` の線種上書き)・
+   円弧(明示の色・線幅・`Continuous`)・円(線幅 2.0・`DashDot`)・文字(`寸法 ABC`)。接線拘束用に線分 1・円 3(下の 5)。
+3. 寸法を足す。長さ寸法 5 本(整列 4・回転 1。補助線の傾きは 1 本だけ)、半径寸法 3 本(R・SR・CR)、直径寸法 2 本(φ・Sφ)、
+   角度寸法 1 本、座標寸法 2 本(X・Y)。長さ寸法に φ・Sφ・□・C・t、サイズ公差 3 種(`Symmetric`・`Deviations`・`Fit("H7")`)、
+   矢の配置 3 値、値の表記 3 値、`value_override`・`decimals_override`・`text_anchor`・`text_rotation`・`prefix`・`suffix` を
+   割り当てる(値の組合せは `backward_compat.rs` の `v9_full_fixture_loads_with_expected_content` が期待値として持つ)。
+4. 接線拘束を `Constraint::tangent_line_circle` / `tangent_circles` で作って `Command::AddConstraint { hold: None }` で足す。
+   線分の右側にある円(`Side::Right`)と、2 つ目が大きい内接(`Internal(Second)`)になるよう、形を置いておく。
+5. `Command::SetDimStyle` で全フィールドを既定以外にし(矢先は `Open30`)、`Command::SetSheet` で A4・縦・尺度 2:1・
+   様式 `Custom`(`TitleBlockField` を 8 種すべてと予備欄 1 つへ割り当てた 2 段・幅 90 mm)・枠非表示・`use_bom = true`・
+   第一角法にする。
+6. `to_json` の出力を `v9_full.mcad` として保存する。
+
+1 つの `.mcad` は sheet・dim_style を 1 つしか持てないので、`v9.mcad`・`v9_full.mcad` が固定しない値(用紙 A0〜A3・横/縦・様式 A/B/C・
+`frame_visible`・`use_bom`・投影法の全組合せ、`ArrowKind` 7 種、レイヤーの線種 4 種 × 表示/非表示)は、fixture を増やさず
+`backward_compat.rs` の往復テスト(`sheet_variants_round_trip_through_the_exporter`・
+`dim_style_arrow_kinds_round_trip_through_the_exporter`・`layer_linetypes_visibility_and_order_round_trip_through_the_exporter`)で
+確かめる。テストは `v9_full_fixture_loads_with_expected_content`(内容)と
+`v9_full_fixture_is_exactly_what_the_exporter_writes`(書き出しとの完全一致)。**手で書き換えないこと**(`v9.mcad` と同じ扱い)。
+
+fixture ではなくテスト内で確かめるもの: version 10 のファイルを `from_json` / `load_mcad` が `UnsupportedVersion(10)` で拒否すること
+(`version_10_file_is_rejected_by_the_regular_load_paths`)、v9 の未知キー(トップレベル・レイヤー・sheet・`sheet.fields`・
+`dim_style`・エンティティ・`style`・図形の構造体)を無視して同じ内容で読めること(`unknown_keys_in_a_v9_file_are_ignored`)。

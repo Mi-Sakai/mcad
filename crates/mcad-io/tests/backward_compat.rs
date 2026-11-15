@@ -23,6 +23,13 @@
 //! `v9.mcad` は手書きせず、exporter（`to_json`）の出力を一度書き出して作った
 //! （組み立て手順は `tests/fixtures/README.md`）。
 //!
+//! `v9_full.mcad` は v9 で表現できる要素のうち `v9.mcad` が持たないもの（文字・半径/直径/
+//! 角度/座標寸法・寸法の注記全般・整列寸法・点と閉じたポリライン・非既定の寸法スタイル・
+//! レイヤー・スタイル・図面メタ・接線拘束の別の側）を集めた v9（v1.0.0 の「`.mcad` 後方互換の
+//! 宣言」の前提）。作り方は `v9.mcad` と同じ。1 つの `.mcad` が持てない値（用紙・様式・
+//! `ArrowKind` の全種など）は、fixture を増やさず exporter の往復テストで確かめる。
+//! 版 10 の拒否と v9 の未知キーの無視もここ（fixture の内容を使う通常の読込経路のテスト）。
+//!
 //! 「不正な JSON の拒否」「偽装 `Table` の拒否」「v6 に `direction` を混ぜた
 //! ファイルの拒否」のような**壊れた入力**のテストはここへは置かない
 //! （`mcad_file.rs` の `#[cfg(test)]` に残す）。fixture ディレクトリは
@@ -39,20 +46,26 @@
 //!    （新フィールドの既定値補完・ラウンドトリップ）を1ケース足す。
 //! 3. `all_fixtures_declare_their_own_version_and_reexport_as_current` は
 //!    `1..=FORMAT_VERSION` を回すだけなので、`FORMAT_VERSION` を上げれば自動で対象に入る。
-//! 4. 旧版（このときは v9）が変わらず読めることは、既存の `v9_*` テストが
+//! 4. 旧版（このときは v9）が変わらず読めることは、既存の `v9_*` テスト（`v9_full_*` を含む）が
 //!    そのまま回帰網として働く。`v9_fixture_is_exactly_what_the_exporter_writes` は
 //!    「現行版の書き出しと一致」を見るので、v10 では「v9 として読めて内容が保たれる」
 //!    検査へ書き換える（`v8_fixture_still_loads_and_is_upgraded_on_export` の形）。
+//! 5. `version_10_file_is_rejected_by_the_regular_load_paths` は「現行より新しい版」を 10 で
+//!    作っているので、版を上げたら 11 へ、文言の `supported: 1..=9` も合わせて直す。
+//!    `unknown_keys_in_a_v9_file_are_ignored` と `v9_full_*` も、v10 では「v9 として読める」検査へ
+//!    寄せる（v10 の網羅見本を足すかは、そのとき決める）。
 
 use std::fs;
 use std::path::PathBuf;
 
 use mcad_core::{
-    ArrowPlacement, CircleTangency, Constraint, DimDirection, Document, EntityGeom,
-    HorizontalAlign, LargerCircle, Linetype, PointKind, Side, TableKind,
+    ArrowPlacement, CircleTangency, Command, Constraint, DimAnnotation, DimDirection, DimStyle,
+    Document, EntityGeom, HorizontalAlign, LargerCircle, Layer, Linetype, OrdinateAxis,
+    Orientation, PaperSize, PointKind, ProjectionMethod, Rgb, Scale, SheetMeta, Side,
+    SizeTolerance, TableKind, TitleBlockField, TitleBlockKind, ValueStyle, WidthMm,
 };
-use mcad_geom::{ArrowKind, DimSymbol, Point2, Vec2};
-use mcad_io::{FORMAT_VERSION, export_document, from_json};
+use mcad_geom::{ArrowKind, DimSymbol, Point2, Shape, Vec2};
+use mcad_io::{FORMAT_VERSION, IoError, export_document, from_json, load_mcad, to_json};
 
 /// `tests/fixtures/v{version}.mcad` の内容を読む。
 fn fixture(version: u32) -> String {
@@ -95,7 +108,10 @@ enum GeomKind {
     DimLinear,
     DimRadial,
     DimDiameter,
+    DimAngular,
+    DimOrdinate,
     Table,
+    XLine,
     /// `EntityGeom` が `#[non_exhaustive]` なので、テスト時点で知らないバリアントを
     /// 網羅させるための受け皿（このテストが失敗しなければ知らないバリアントは無い）。
     Unknown,
@@ -108,7 +124,10 @@ fn geom_kind(geom: &EntityGeom) -> GeomKind {
         EntityGeom::DimLinear(_) => GeomKind::DimLinear,
         EntityGeom::DimRadial(_) => GeomKind::DimRadial,
         EntityGeom::DimDiameter(_) => GeomKind::DimDiameter,
+        EntityGeom::DimAngular(_) => GeomKind::DimAngular,
+        EntityGeom::DimOrdinate(_) => GeomKind::DimOrdinate,
         EntityGeom::Table(_) => GeomKind::Table,
+        EntityGeom::XLine(_) => GeomKind::XLine,
         _ => GeomKind::Unknown,
     }
 }
@@ -742,6 +761,531 @@ fn v9_fixture_is_exactly_what_the_exporter_writes() {
     assert_eq!(actual, expected, "書き出し: {written}");
 }
 
+// ---------------------------------------------------------------------
+// v9_full（v9 で表現できる要素の網羅。v9.mcad が持たないもの）
+// ---------------------------------------------------------------------
+
+#[test]
+fn v9_full_fixture_loads_with_expected_content() {
+    // v9.mcad が持たない要素（文字・半径/直径/角度/座標寸法・寸法の注記全般・整列寸法・
+    // 点と閉じたポリライン・非既定の DimStyle・非既定のレイヤー/スタイル・Custom 様式の図面
+    // メタ・接線拘束の Right / Internal(Second)）を 1 枚に集めた v9。
+    let summary = from_json(&fixture_named("v9_full.mcad")).expect("v9_full は読めるべき");
+    let doc = summary.document;
+
+    assert_eq!(summary.clamped_widths, 0);
+    assert_eq!(doc.layer_count(), 4);
+    assert_eq!(doc.entity_count(), 23);
+    assert_eq!(doc.constraint_count(), 2);
+    assert!(!doc.can_undo(), "読込操作は undo できない");
+
+    // 種類ごとの件数。
+    let count = |kind: GeomKind| {
+        doc.entities()
+            .filter(|(_, e)| geom_kind(&e.geom) == kind)
+            .count()
+    };
+    assert_eq!(count(GeomKind::Shape), 9);
+    assert_eq!(count(GeomKind::Text), 1);
+    assert_eq!(count(GeomKind::DimLinear), 5);
+    assert_eq!(count(GeomKind::DimRadial), 3);
+    assert_eq!(count(GeomKind::DimDiameter), 2);
+    assert_eq!(count(GeomKind::DimAngular), 1);
+    assert_eq!(count(GeomKind::DimOrdinate), 2);
+    assert_eq!(count(GeomKind::Table), 0);
+    assert_eq!(count(GeomKind::XLine), 0);
+    assert_eq!(count(GeomKind::Unknown), 0);
+
+    // レイヤー: 非表示と、実線以外の 3 線種。重ね順の昇順で並ぶ。
+    let layers: Vec<(String, bool, Linetype, i32)> = doc
+        .layers_in_order()
+        .into_iter()
+        .map(|(_, l)| (l.name.clone(), l.visible, l.linetype, l.order))
+        .collect();
+    assert_eq!(
+        layers,
+        vec![
+            ("0".to_owned(), true, Linetype::Continuous, 0),
+            ("dashed".to_owned(), true, Linetype::Dashed, 1),
+            ("chain".to_owned(), true, Linetype::DashDot, 2),
+            ("hidden".to_owned(), false, Linetype::DashDotDot, 3),
+        ]
+    );
+
+    // Shape: 点・閉じたポリライン・線・円弧・円。
+    let shapes: Vec<&Shape> = doc
+        .entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::Shape(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        shapes
+            .iter()
+            .any(|s| matches!(s, Shape::Point(p) if *p == Point2::new(5.0, 5.0)))
+    );
+    assert!(
+        shapes
+            .iter()
+            .any(|s| matches!(s, Shape::Polyline(pl) if pl.closed && pl.vertices.len() == 4))
+    );
+    assert!(shapes.iter().any(|s| matches!(s, Shape::Arc(_))));
+
+    // 明示スタイル: 色・線幅・線種（Dashed / DashDotDot / Continuous / DashDot）。
+    let styles: Vec<_> = doc.entities().map(|(_, e)| e.style).collect();
+    assert!(styles.iter().any(|s| s.color == Some(Rgb::new(200, 30, 30))
+        && s.width_mm == Some(WidthMm::new(0.5).unwrap())
+        && s.linetype == Some(Linetype::Dashed)));
+    assert!(styles.iter().any(|s| s.color.is_none()
+        && s.width_mm.is_none()
+        && s.linetype == Some(Linetype::DashDotDot)));
+    assert!(styles.iter().any(|s| s.color == Some(Rgb::new(0, 0, 0))
+        && s.width_mm == Some(WidthMm::new(0.13).unwrap())
+        && s.linetype == Some(Linetype::Continuous)));
+    assert!(
+        styles
+            .iter()
+            .any(|s| s.width_mm == Some(WidthMm::new(2.0).unwrap())
+                && s.linetype == Some(Linetype::DashDot))
+    );
+
+    // 文字（CJK 混じり）。
+    let text = doc
+        .entities()
+        .find_map(|(_, e)| match &e.geom {
+            EntityGeom::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(text.content, "寸法 ABC");
+    assert_eq!((text.height, text.angle), (5.0, 0.5));
+    assert_eq!(text.anchor, Point2::new(10.0, 40.0));
+
+    // 寸法の注記（全寸法を通した集計）。
+    let annotations: Vec<&DimAnnotation> = doc
+        .entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::DimLinear(d) => Some(&d.annotation),
+            EntityGeom::DimRadial(d) => Some(&d.annotation),
+            EntityGeom::DimDiameter(d) => Some(&d.annotation),
+            EntityGeom::DimAngular(d) => Some(&d.annotation),
+            EntityGeom::DimOrdinate(d) => Some(&d.annotation),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(annotations.len(), 13);
+    // 寸法補助記号 8 種すべて。
+    for symbol in [
+        DimSymbol::Diameter,
+        DimSymbol::SphereDiameter,
+        DimSymbol::Square,
+        DimSymbol::Radius,
+        DimSymbol::SphereRadius,
+        DimSymbol::ControlRadius,
+        DimSymbol::Chamfer,
+        DimSymbol::Thickness,
+    ] {
+        assert!(
+            annotations.iter().any(|a| a.symbol == Some(symbol)),
+            "{symbol:?} が無い"
+        );
+    }
+    // サイズ公差 3 種。
+    assert!(
+        annotations
+            .iter()
+            .any(|a| a.tolerance == Some(SizeTolerance::Symmetric(0.05)))
+    );
+    assert!(annotations.iter().any(|a| a.tolerance
+        == Some(SizeTolerance::Deviations {
+            upper: 0.1,
+            lower: -0.05
+        })));
+    assert!(annotations.iter().any(|a| matches!(
+        &a.tolerance,
+        Some(SizeTolerance::Fit(f)) if f.as_str() == "H7"
+    )));
+    // 矢の配置 3 値・値の表記 3 値。
+    for placement in [
+        ArrowPlacement::Auto,
+        ArrowPlacement::Inside,
+        ArrowPlacement::Outside,
+    ] {
+        assert!(annotations.iter().any(|a| a.arrow_placement == placement));
+    }
+    for style in [
+        ValueStyle::Plain,
+        ValueStyle::Reference,
+        ValueStyle::TheoreticallyExact,
+    ] {
+        assert!(annotations.iter().any(|a| a.value_style == style));
+    }
+
+    // 1 本目の長さ寸法（整列・補助線の傾きなし・全フィールドが埋まった注記）。
+    let linears: Vec<_> = doc
+        .entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::DimLinear(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect();
+    let first = &linears[0];
+    assert_eq!(first.direction, DimDirection::Aligned);
+    assert_eq!(first.ext_angle, None);
+    assert_eq!(first.offset, -10.0);
+    assert_eq!(
+        first.annotation,
+        DimAnnotation {
+            symbol: Some(DimSymbol::Diameter),
+            tolerance: Some(SizeTolerance::Symmetric(0.05)),
+            decimals_override: Some(1),
+            text_anchor: Some(Point2::new(20.0, -14.0)),
+            arrow_placement: ArrowPlacement::Outside,
+            value_override: None,
+            text_rotation: Some(0.0),
+            value_style: ValueStyle::Reference,
+            prefix: Some("2×".to_owned()),
+            suffix: Some("-M6".to_owned()),
+        }
+    );
+    // 2 本目: 回転寸法・補助線の傾き・表示値の上書き。
+    let second = &linears[1];
+    assert_eq!(
+        second.direction,
+        DimDirection::Rotated(std::f64::consts::FRAC_PI_2)
+    );
+    assert_eq!(second.ext_angle, Some(1.4));
+    assert_eq!(second.annotation.value_override.as_deref(), Some("30-35"));
+    assert_eq!(
+        linears
+            .iter()
+            .filter(|d| d.direction == DimDirection::Aligned)
+            .count(),
+        4
+    );
+
+    // 座標寸法: X・Y の両軸。値は符号つき（X は -30）。
+    let ordinates: Vec<_> = doc
+        .entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::DimOrdinate(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ordinates.len(), 2);
+    let x = ordinates
+        .iter()
+        .find(|d| d.axis == OrdinateAxis::X)
+        .unwrap();
+    let y = ordinates
+        .iter()
+        .find(|d| d.axis == OrdinateAxis::Y)
+        .unwrap();
+    assert_eq!(x.measured_value(), -30.0);
+    assert_eq!(y.measured_value(), 10.0);
+    assert_eq!(y.annotation.prefix.as_deref(), Some("Y="));
+
+    // 角度寸法: 頂点 (0,100) から (30,100) と (20,120) の方向のなす角（atan2(20, 20) = π/4）。
+    let angular = doc
+        .entities()
+        .find_map(|(_, e)| match &e.geom {
+            EntityGeom::DimAngular(d) => Some(d.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(angular.arc_radius, 18.0);
+    assert!((angular.measured_value() - std::f64::consts::FRAC_PI_4).abs() < 1e-9);
+    assert_eq!(angular.annotation.decimals_override, Some(1));
+
+    // 半径寸法の値と記号。
+    let radial_symbols: Vec<_> = doc
+        .entities()
+        .filter_map(|(_, e)| match &e.geom {
+            EntityGeom::DimRadial(d) => Some((d.radius, d.annotation.symbol)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        radial_symbols,
+        vec![
+            (8.0, Some(DimSymbol::Radius)),
+            (9.0, Some(DimSymbol::SphereRadius)),
+            (10.0, Some(DimSymbol::ControlRadius)),
+        ]
+    );
+
+    // 寸法スタイル: すべて既定と異なる値。矢先は ClosedFilled 以外。
+    assert_eq!(
+        *doc.dim_style(),
+        DimStyle {
+            text_height_mm: 2.5,
+            arrow_len_mm: 4.0,
+            decimals: 3,
+            trim_trailing_zeros: false,
+            ext_gap_mm: 0.8,
+            ext_overshoot_mm: 1.5,
+            text_gap_mm: 1.0,
+            tolerance_scale: 0.6,
+            arrow_kind: ArrowKind::Open30,
+        }
+    );
+
+    // 図面メタ: v9.mcad と違う側の値（A4・縦・Custom 様式・枠なし・部品表を使う・第一角法）。
+    let sheet = doc.sheet();
+    assert_eq!(sheet.paper, PaperSize::A4);
+    assert_eq!(sheet.orientation, Orientation::Portrait);
+    assert_eq!(sheet.scale, Scale::new(2, 1).unwrap());
+    assert!(!sheet.frame_visible);
+    assert!(sheet.use_bom);
+    assert_eq!(sheet.fields.projection, ProjectionMethod::FirstAngle);
+    assert_eq!(sheet.fields.drawing_number, "MCAD-FULL-001");
+    let TitleBlockKind::Custom(template) = &sheet.title_block else {
+        panic!("様式は Custom のはず: {:?}", sheet.title_block);
+    };
+    assert_eq!(template.width_mm, 90.0);
+    let binds: Vec<Option<TitleBlockField>> = template
+        .rows
+        .iter()
+        .flat_map(|r| r.cells.iter().map(|c| c.bind))
+        .collect();
+    assert_eq!(
+        binds,
+        vec![
+            Some(TitleBlockField::DrawingTitle),
+            Some(TitleBlockField::DrawingNumber),
+            Some(TitleBlockField::Author),
+            Some(TitleBlockField::Date),
+            Some(TitleBlockField::Scale),
+            Some(TitleBlockField::Projection),
+            Some(TitleBlockField::PaperSize),
+            Some(TitleBlockField::Revision),
+            None,
+        ]
+    );
+
+    // 接線拘束: 線の右側にある円（Right）と、2 つ目が大きい内接（Internal(Second)）。
+    let all: Vec<&Constraint> = doc.constraints().map(|(_, c)| c).collect();
+    assert!(all.iter().any(|c| matches!(
+        c,
+        Constraint::TangentLineCircle {
+            side: Side::Right,
+            ..
+        }
+    )));
+    assert!(all.iter().any(|c| matches!(
+        c,
+        Constraint::TangentCircles {
+            kind: CircleTangency::Internal(LargerCircle::Second),
+            ..
+        }
+    )));
+    for c in &all {
+        assert_eq!(c.is_satisfied(&doc), Ok(true), "{c:?}");
+    }
+
+    // ラウンドトリップ: 読込 → 保存 → 再読込で内容が保たれる。
+    let exported = export_document(&doc);
+    assert_eq!(exported.version, FORMAT_VERSION);
+    let reloaded = from_json(&to_json(&doc).unwrap()).unwrap().document;
+    assert_eq!(export_document(&reloaded), exported);
+}
+
+#[test]
+fn v9_full_fixture_is_exactly_what_the_exporter_writes() {
+    // `v9_fixture_is_exactly_what_the_exporter_writes` と同じ最も強い形の固定。
+    let text = fixture_named("v9_full.mcad");
+    let doc = from_json(&text).unwrap().document;
+    let written = to_json(&doc).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(actual, expected, "書き出し: {written}");
+}
+
+/// 文書の書き出しを読み戻した文書（書き出し → 読込の 1 往復）。
+fn round_trip(doc: &Document) -> Document {
+    from_json(&to_json(doc).unwrap()).unwrap().document
+}
+
+#[test]
+fn sheet_variants_round_trip_through_the_exporter() {
+    // 1 つの `.mcad` は sheet を 1 つしか持てないので、用紙・向き・様式の取りうる値は
+    // fixture では 1 組しか固定できない（v9.mcad = A3・横・様式A、v9_full.mcad = A4・縦・
+    // Custom）。残りの値は、exporter の出力を読み戻す往復で網羅する（Custom は
+    // v9_full.mcad が固定している）。
+    let papers = [
+        PaperSize::A0,
+        PaperSize::A1,
+        PaperSize::A2,
+        PaperSize::A3,
+        PaperSize::A4,
+    ];
+    let kinds = [TitleBlockKind::A, TitleBlockKind::B, TitleBlockKind::C];
+    let mut checked = 0;
+    for paper in papers {
+        for orientation in [Orientation::Landscape, Orientation::Portrait] {
+            for title_block in &kinds {
+                for frame_visible in [false, true] {
+                    for use_bom in [false, true] {
+                        for projection in
+                            [ProjectionMethod::ThirdAngle, ProjectionMethod::FirstAngle]
+                        {
+                            let mut sheet = SheetMeta {
+                                paper,
+                                orientation,
+                                title_block: title_block.clone(),
+                                frame_visible,
+                                use_bom,
+                                ..SheetMeta::default()
+                            };
+                            sheet.fields.projection = projection;
+                            let mut doc = Document::new();
+                            doc.apply(Command::SetSheet(sheet.clone())).unwrap();
+                            let reloaded = round_trip(&doc);
+                            assert_eq!(*reloaded.sheet(), sheet);
+                            assert_eq!(to_json(&reloaded).unwrap(), to_json(&doc).unwrap());
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 5 * 2 * 3 * 2 * 2 * 2);
+}
+
+#[test]
+fn dim_style_arrow_kinds_round_trip_through_the_exporter() {
+    // v9_full.mcad は ArrowKind を 1 つ（Open30）しか持てない。7 種すべてを往復で確かめる。
+    for arrow_kind in [
+        ArrowKind::ClosedFilled,
+        ArrowKind::ClosedBlank,
+        ArrowKind::Open30,
+        ArrowKind::Open90,
+        ArrowKind::Oblique,
+        ArrowKind::Dot,
+        ArrowKind::None,
+    ] {
+        let style = DimStyle {
+            arrow_kind,
+            ..DimStyle::DEFAULT
+        };
+        let mut doc = Document::new();
+        doc.apply(Command::SetDimStyle(style)).unwrap();
+        assert_eq!(*round_trip(&doc).dim_style(), style, "{arrow_kind:?}");
+    }
+}
+
+#[test]
+fn layer_linetypes_visibility_and_order_round_trip_through_the_exporter() {
+    // レイヤーの線種 4 種 × 表示/非表示を往復で確かめる（fixture が持つ組み合わせに依存しない）。
+    let mut doc = Document::new();
+    let mut expected = vec![(
+        "0".to_owned(),
+        true,
+        Linetype::Continuous,
+        doc.layer(doc.default_layer()).unwrap().order,
+    )];
+    for (i, linetype) in [
+        Linetype::Continuous,
+        Linetype::Dashed,
+        Linetype::DashDot,
+        Linetype::DashDotDot,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for visible in [true, false] {
+            let name = format!("{linetype:?}-{visible}");
+            let mut layer = Layer::new(name.clone(), Rgb::new(10 * i as u8, 20, 30));
+            layer.linetype = linetype;
+            layer.visible = visible;
+            layer.order = 10 + expected.len() as i32;
+            expected.push((name, visible, linetype, layer.order));
+            doc.apply(Command::AddLayer(layer)).unwrap();
+        }
+    }
+    let actual: Vec<(String, bool, Linetype, i32)> = round_trip(&doc)
+        .layers_in_order()
+        .into_iter()
+        .map(|(_, l)| (l.name.clone(), l.visible, l.linetype, l.order))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+// ---------------------------------------------------------------------
+// 将来の版・未知のキー
+// ---------------------------------------------------------------------
+
+#[test]
+fn version_10_file_is_rejected_by_the_regular_load_paths() {
+    // 現行より新しい版は、アプリが使う通常の読込経路（文字列の `from_json` と、ファイルの
+    // `load_mcad`）で拒否する。内容が現行版と同一で `version` だけが 10 のファイルでも拒否される
+    // （新しい版のファイルを、現行版のスキーマとして読み違えない）。
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fixture_named("v9_full.mcad")).unwrap();
+    value["version"] = serde_json::json!(10);
+    let text = serde_json::to_string_pretty(&value).unwrap();
+
+    // 文言の版番号は意図的にリテラルで書く（FORMAT_VERSION を上げたら、この期待が落ちて
+    // 「読める版の範囲」が変わったことに気づける）。
+    let expected = "unsupported format version: 10 (supported: 1..=9)";
+
+    let err = from_json(&text).err().expect("version 10 は拒否されるべき");
+    assert!(matches!(err, IoError::UnsupportedVersion(10)), "{err:?}");
+    assert_eq!(err.to_string(), expected);
+
+    let path = std::env::temp_dir().join(format!(
+        "mcad_backward_compat_v10_{}.mcad",
+        std::process::id()
+    ));
+    fs::write(&path, &text).unwrap();
+    let result = load_mcad(&path);
+    fs::remove_file(&path).unwrap();
+    let err = result.err().expect("version 10 は拒否されるべき");
+    assert!(matches!(err, IoError::UnsupportedVersion(10)), "{err:?}");
+    assert_eq!(err.to_string(), expected);
+}
+
+#[test]
+fn unknown_keys_in_a_v9_file_are_ignored() {
+    // 現行版（v9）の DTO は `deny_unknown_fields` を付けていないので、知らないキーは黙って
+    // 無視して読める。この挙動を固定する（凍結 DTO の v4〜v7 は別: 未知キーの一部を拒否する。
+    // それは `mcad_file.rs` のテストが固定している）。
+    for name in ["v9.mcad", "v9_full.mcad"] {
+        let original = fixture_named(name);
+        let baseline = to_json(&from_json(&original).unwrap().document).unwrap();
+
+        let mut value: serde_json::Value = serde_json::from_str(&original).unwrap();
+        let unknown = serde_json::json!({"future": [1, 2, {"nested": true}]});
+        value["unknown_top_level"] = unknown.clone();
+        value["layers"][0]["unknown_in_layer"] = unknown.clone();
+        value["sheet"]["unknown_in_sheet"] = unknown.clone();
+        value["sheet"]["fields"]["unknown_in_fields"] = unknown.clone();
+        value["dim_style"]["unknown_in_dim_style"] = unknown.clone();
+        value["entities"][0]["unknown_in_entity"] = unknown.clone();
+        value["entities"][0]["style"]["unknown_in_style"] = unknown.clone();
+        // 幾何（`geom` → `Shape` → 図形の構造体）にも混ぜる。1 つ目のエンティティは Shape。
+        let geom = value["entities"][0]["geom"].as_object_mut().unwrap();
+        let shape = geom["Shape"].as_object_mut().unwrap();
+        let (_, body) = shape.iter_mut().next().unwrap();
+        body.as_object_mut()
+            .unwrap()
+            .insert("unknown_in_shape".to_owned(), unknown.clone());
+        let mixed = serde_json::to_string_pretty(&value).unwrap();
+        assert!(mixed.contains("unknown_in_entity"));
+
+        let loaded = from_json(&mixed)
+            .unwrap_or_else(|e| panic!("{name}: 未知のキーを混ぜても読めるべき: {e}"))
+            .document;
+        assert_eq!(
+            to_json(&loaded).unwrap(),
+            baseline,
+            "{name}: 未知のキーを無視した結果は、混ぜる前と同じ内容のはず"
+        );
+    }
+}
+
 #[test]
 fn fixtures_before_v9_have_no_constraints() {
     // v8 以前は拘束を持たない。読むと空で、書き出すと `constraints` が空配列で付く。
@@ -805,6 +1349,22 @@ fn all_fixtures_declare_their_own_version_and_reexport_as_current() {
             export_document(&summary.document).version,
             FORMAT_VERSION,
             "v{version} の再書き出しは現行版であるべき"
+        );
+    }
+    // 版ごとの代表ではない追加の fixture も、自称する版で読めて現行版へ書き出される。
+    for (name, declared) in [
+        ("v7_legacy_boms.mcad", 7),
+        ("v8_before_col_aligns.mcad", 8),
+        ("v9_full.mcad", 9),
+    ] {
+        let text = fixture_named(name);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["version"], declared, "{name} が自称する版");
+        let summary = from_json(&text).unwrap_or_else(|e| panic!("{name} が読めない: {e}"));
+        assert_eq!(
+            export_document(&summary.document).version,
+            FORMAT_VERSION,
+            "{name} の再書き出しは現行版であるべき"
         );
     }
 }

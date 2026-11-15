@@ -2,7 +2,7 @@
 
 *[日本語版 README](./README.md)*
 
-A 2D CAD application built with Rust and egui. Current version: **v0.13.0**.
+A 2D CAD application built with Rust and egui. Current version: **v1.0.0** (first stable release).
 
 > **Note on language.** The project's design documents (`DESIGN.md`, `AGENTS.md`,
 > `CHANGELOG.md`) are written in Japanese, and the application UI is being migrated
@@ -108,7 +108,8 @@ a settings file and restored on the next launch (see "Settings" below).
 
 ## File formats
 
-- **`.mcad`**: the native JSON format. As of v0.13.0 the schema is v9, which stores geometric constraints; v1 through v8 files still load, with no constraints (backward compatible: v7 has no table kind, per-column alignment or "use a parts list" flag, so tables load as ordinary tables, all columns left-aligned, and "use a parts list" as ON — a legacy parts list is never guessed from its contents. v6 files get the dimension types and annotation fields added in v7 filled in with defaults, v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era). v8 added the table kind (table / parts list, `TableGeom.kind`), a per-drawing "use a parts list" flag (`SheetMeta.use_bom`), per-column text alignment for tables (`TableGeom.col_aligns`), and construction lines (`EntityGeom::XLine`)
+- **`.mcad`**: the native JSON format. As of v1.0.0 the schema is v9, which stores geometric constraints; v1 through v8 files still load, with no constraints (backward compatible: v7 has no table kind, per-column alignment or "use a parts list" flag, so tables load as ordinary tables, all columns left-aligned, and "use a parts list" as ON — a legacy parts list is never guessed from its contents. v6 files get the dimension types and annotation fields added in v7 filled in with defaults, v5 and earlier have no tables, and v4 and earlier get dimension settings filled in with the defaults of their era). v8 added the table kind (table / parts list, `TableGeom.kind`), a per-drawing "use a parts list" flag (`SheetMeta.use_bom`), per-column text alignment for tables (`TableGeom.col_aligns`), and construction lines (`EntityGeom::XLine`)
+- **`.mcad` compatibility promise**: mcad 1.x opens every `.mcad` saved by 1.0.0 or later, and formats v1 through v9 saved by 0.x. Opening a newer-format file in an older mcad is not guaranteed: it is refused by version number, with `Open failed: unsupported format version: …` in the status bar. DXF, app settings (`config.json`) and undo history are not covered. The full promise and the rules for future format changes are in DESIGN.md chapter 7, "v1.0.0 の定義", criterion 3
 - **New drawings** start with `"0"` plus five layers matching the drafting standard's line table (centre line, hidden line, outline, dimension line, text, with their linetypes and widths) and a bottommost `構築線` (construction line) layer (continuous, 0.13mm), six layers in all, and the current layer is the outline layer. Dimensions, text and construction lines are placed automatically on layers named `寸法線` (dimension line), `文字` (text) and `構築線` (construction line) when those exist (in a loaded drawing without them, the current layer is used). The standard layers can be deleted, but `"0"` is the document's default layer and cannot be. Renaming a layer is not yet available in the UI
 
 ## Settings
